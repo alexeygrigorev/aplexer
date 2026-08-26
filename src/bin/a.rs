@@ -1268,6 +1268,22 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
     Ok(())
 }
 
+/// Deletes a session's full on-disk state: the state dir holding
+/// `session.json` (the record itself), plus a best-effort cleanup of its
+/// runtime dir (control socket, worker lock -- already gone or about to be,
+/// in every caller). Takes the registry lock the same way `cmd_start`'s
+/// superseding logic does, to avoid racing a concurrent `a start` that
+/// might be reclaiming the same workspace+tag at the same moment. Shared by
+/// every `a kill` path that actually retires a session's record, so
+/// "removed" means the same thing everywhere instead of each call site
+/// growing its own slightly-different deletion routine.
+fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
+    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    fs::remove_dir_all(paths.state_session(id))?;
+    let _ = fs::remove_dir_all(paths.runtime_session(id));
+    Ok(())
+}
+
 fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
@@ -1281,8 +1297,55 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     );
     if let Err(error) = rpc {
         let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
-        if worker_alive {
+        // A worker whose pid is still in the process table but whose
+        // control socket is gone (see check_attachable's third case) is
+        // unreachable, not "alive" from the CLI's perspective: it can't be
+        // asked to kill its workload or record an exit, so refusing to
+        // touch the record here (as the branch below does for a genuinely
+        // reachable worker) would leave the session stuck forever with no
+        // way to reclaim it. This is deliberately narrower than "rpc
+        // failed while worker_alive": a live, reachable worker can also
+        // fail an individual RPC (e.g. transient busy/EPIPE), and that case
+        // must keep hitting the `return Err(error)` below unchanged -- only
+        // a missing socket file is unambiguous proof the worker cannot be
+        // listening at all.
+        let socket_missing = worker_alive && !record.socket_path.exists();
+        if worker_alive && !socket_missing {
             return Err(error);
+        }
+        if socket_missing {
+            // The worker is unreachable through its normal control
+            // protocol -- there's no socket to ask it to signal its
+            // workload or record its own exit -- so there's nothing left
+            // to negotiate with. Rather than leaving worker_pid untouched
+            // and asking the user to `kill -9` it themselves (confusing,
+            // and requires a manual follow-up step), just SIGKILL it
+            // directly and remove the record in one step: the same
+            // end state a normal, reachable `a kill` would reach anyway.
+            // A graceful SIGTERM+grace-period dance doesn't apply here --
+            // this worker is already uncontrollable via its normal
+            // protocol, so there's no "ask nicely first" to attempt.
+            // ESRCH (it's already gone by the time we get here) is
+            // success, not an error.
+            if let Some(pid) = record.worker_pid {
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(err).context("force-kill unreachable worker");
+                    }
+                }
+            }
+            remove_session_state(paths, record.id)
+                .with_context(|| format!("remove stale session {}", record.id))?;
+            eprintln!(
+                "a: killed session {} (worker pid {} was unreachable; force-killed and removed)",
+                record.id,
+                record.worker_pid.unwrap_or(0),
+            );
+            if json_output {
+                println!("{}", json!({"id":record.id,"signal":signal}));
+            }
+            return Ok(());
         }
         // The worker exits once its workload is gone, so a terminal-phase
         // session has no socket to talk to; killing something already dead
@@ -1315,10 +1378,8 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             // registry lock the same way `cmd_start`'s superseding logic
             // does, to avoid racing a concurrent `a start` that might be
             // reclaiming the same workspace+tag at the same moment.
-            let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
-            fs::remove_dir_all(paths.state_session(record.id))
+            remove_session_state(paths, record.id)
                 .with_context(|| format!("remove finished session {}", record.id))?;
-            let _ = fs::remove_dir_all(paths.runtime_session(record.id));
             eprintln!("a: removed {} session {}", phase_name(&record.phase), record.id);
         }
     }
@@ -1782,6 +1843,19 @@ fn phase_name(phase: &Phase) -> &'static str {
 /// deliberately exempt: for a terminal-phase session it now has a real
 /// action to take (removing the state, see cmd_kill), and it already
 /// handles the broken case itself via `kill_broken_workload`.
+///
+/// A third, rarer case: `phase` is non-terminal and `worker_pid` is alive,
+/// but `socket_path` doesn't exist on disk. This happens when the worker's
+/// runtime directory (which holds `control.sock`) got removed out from under
+/// it -- observed in practice as a race during worker startup under heavy
+/// concurrent load. The worker process is technically still running, but
+/// it's unreachable, so treating it as attachable would just trade the
+/// clear checks above for the same bare `UnixStream::connect` OS error this
+/// function exists to avoid. `a kill` again has a real action to take here
+/// (see cmd_kill's socket-missing force-clean path), so it's not exempted
+/// from this check the way the other two cases exempt it -- `a kill` relies
+/// on `rpc_simple` failing and inspects the socket itself rather than going
+/// through `check_attachable`.
 fn check_attachable(record: &SessionRecord) -> Result<()> {
     if matches!(record.phase, Phase::Exited | Phase::Failed) {
         bail!(
@@ -1797,6 +1871,18 @@ fn check_attachable(record: &SessionRecord) -> Result<()> {
             "session {}'s worker is not running (state: {}); run `a status` for details, `a kill` to reclaim it",
             record.id,
             display_state(&record.phase, worker_alive)
+        );
+    }
+    if !record.socket_path.exists() {
+        bail!(
+            "session {} looks alive (worker pid {} running) but its control socket is gone \
+             ({}); this usually means the worker's runtime directory was removed out from \
+             under it -- run `a kill {}` to force-clean the record, or investigate why that \
+             directory disappeared",
+            record.id,
+            record.worker_pid.unwrap_or(0),
+            record.socket_path.display(),
+            record.id
         );
     }
     Ok(())
@@ -3557,7 +3643,11 @@ mod switching_tests {
             phase,
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
-            socket_path: PathBuf::from("/nonexistent"),
+            // Must exist on disk: check_attachable now checks socket_path
+            // (this test binary's own executable is a convenient stand-in
+            // for "some file that's there"; only .exists() is probed, never
+            // actually connected to).
+            socket_path: std::env::current_exe().unwrap(),
             history_path: PathBuf::from("/nonexistent"),
             exit: None,
             error: None,
@@ -3644,6 +3734,238 @@ mod switching_tests {
         let err = pick_switch_target(&groups, Path::new("/ws/b"), b1, SwitchTarget::Next, None)
             .unwrap_err();
         assert!(err.to_string().contains("no other running session"));
+    }
+
+    /// The orphaned-session bug this test guards against: `phase: Running`
+    /// plus an alive `worker_pid` used to sail straight through
+    /// `check_attachable` and hit a raw `UnixStream::connect` OS error deep
+    /// inside `rpc_simple`/`attach` if the socket file was gone. Now it's
+    /// caught up front with a clear diagnostic.
+    #[test]
+    fn check_attachable_reports_missing_socket() {
+        let mut r = mk_record("/ws/a", "main", Phase::Running);
+        r.socket_path = PathBuf::from("/definitely/does/not/exist/control.sock");
+        let err = check_attachable(&r).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("control socket is gone"), "{msg}");
+        assert!(msg.contains(&format!("a kill {}", r.id)), "{msg}");
+    }
+
+    /// `check_attachable`'s other two cases (terminal phase, dead
+    /// worker_pid) must be unaffected by the new socket check -- they bail
+    /// before ever looking at `socket_path`.
+    #[test]
+    fn check_attachable_unchanged_for_terminal_and_dead_worker() {
+        let mut exited = mk_record("/ws/a", "main", Phase::Exited);
+        exited.socket_path = PathBuf::from("/does/not/matter");
+        let err = check_attachable(&exited).unwrap_err().to_string();
+        assert!(err.contains("has already exited"), "{err}");
+
+        let mut dead_worker = mk_record("/ws/a", "main", Phase::Running);
+        dead_worker.worker_pid = None;
+        dead_worker.socket_path = PathBuf::from("/does/not/matter");
+        let err = check_attachable(&dead_worker).unwrap_err().to_string();
+        assert!(err.contains("worker is not running"), "{err}");
+    }
+
+    /// `a kill` against a record whose worker_pid is alive but whose
+    /// control socket is gone (the exact bug scenario this task fixes)
+    /// must force-kill that unreachable worker_pid directly and fully
+    /// remove the record, rather than refusing with the raw connect error
+    /// OR leaving the pid untouched with a "clean it up yourself" message.
+    /// Uses a real throwaway child process as the stand-in worker_pid
+    /// (never the test process's own pid, which `mk_record` defaults to --
+    /// this test's whole point is that the pid now DOES get signalled, so
+    /// reusing the test runner's pid here would kill the test runner).
+    #[test]
+    fn cmd_kill_force_kills_and_removes_stale_socket_record() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let mut record = mk_record("/ws/stale", "main", Phase::Running);
+        // A real, throwaway process standing in for the orphaned worker --
+        // long-lived enough that if `a kill` did nothing, it would still be
+        // alive when we check.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        record.worker_pid = Some(child.id());
+        // Runtime session dir is deliberately never created -- this is the
+        // race being simulated: the record claims a socket that isn't
+        // there.
+        record.socket_path = paths.socket(record.id);
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+        let args = KillArgs {
+            target: TargetArgs {
+                selector: Some(record.id.to_string()),
+                workspace: None,
+                tag: None,
+            },
+            signal: "TERM".to_string(),
+            grace_ms: 50,
+        };
+        cmd_kill(&paths, args, false).expect("force-kill-and-remove should succeed, not error");
+        assert!(
+            !paths.state_session(record.id).exists(),
+            "stale record should have been fully removed"
+        );
+        // Reap before checking liveness: a just-SIGKILLed child is a zombie
+        // (still "alive" to a bare kill(pid, 0) probe) until waited on.
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "child should have died from a signal, not exited cleanly");
+        assert!(
+            !process_alive(record.worker_pid.unwrap()),
+            "the unreachable worker_pid should have been force-killed, not left untouched"
+        );
+    }
+
+    /// The safety property this whole feature must preserve: a session
+    /// whose worker is genuinely alive AND reachable (real socket on disk)
+    /// must still be refused, exactly as before -- only the narrower
+    /// socket-missing case gets the new force-kill behavior.
+    #[test]
+    fn cmd_kill_still_refuses_live_reachable_worker() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let record = mk_record("/ws/live", "main", Phase::Running);
+        // worker_pid defaults (via mk_record) to this test process's own
+        // pid, i.e. genuinely alive. socket_path defaults to this test
+        // binary's own executable path, i.e. genuinely exists on disk --
+        // so `socket_missing` must be false and the RPC-failure path below
+        // must hit the unchanged `return Err(error)` refusal, never the
+        // force-kill/remove branch.
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+        let args = KillArgs {
+            target: TargetArgs {
+                selector: Some(record.id.to_string()),
+                workspace: None,
+                tag: None,
+            },
+            signal: "TERM".to_string(),
+            grace_ms: 50,
+        };
+        let err = cmd_kill(&paths, args, false)
+            .expect_err("a live, reachable worker must not be force-killed by `a kill`");
+        // The error is the raw RPC/connect failure (there's no real worker
+        // listening on that socket path), not a "removed" success -- and
+        // the record and the still-alive pid must both be untouched.
+        drop(err);
+        assert!(
+            paths.state_session(record.id).exists(),
+            "a live/reachable session's record must not be removed"
+        );
+        assert!(
+            process_alive(record.worker_pid.unwrap()),
+            "a live/reachable session's worker must not be signalled"
+        );
+    }
+
+    // -- draw_status_bar's "did it actually write" contract, which the
+    // status thread's STATUS_BAR_MAX_INTERVAL overdue-timer depends on to
+    // avoid the timer-starvation bug: resetting `last_draw` on every tick
+    // regardless of whether draw_status_bar performed a real write would
+    // let a frequent-but-unchanging redraw (a spinner, streamed tokens with
+    // pauses) keep the overdue timer perpetually "recently fired" without
+    // ever actually re-writing a margin/row a full-screen erase clobbered.
+    // See draw_status_bar's and the status thread's doc comments.
+
+    /// `draw_status_bar` writes straight to the real `io::Stdout` (no
+    /// injectable writer to swap in for a test), so exercising its
+    /// real-write path here would otherwise leak raw DECSTBM/reverse-video
+    /// escape sequences into whatever terminal happens to be running
+    /// `cargo test` interactively -- and leave that terminal's scroll
+    /// region permanently narrowed, since nothing in this test ever runs
+    /// the reset-on-detach path that would restore it. Redirecting the
+    /// process's real fd 1 to `/dev/null` for the guard's lifetime (and
+    /// restoring the original fd on drop) makes the write land somewhere
+    /// harmless instead.
+    struct StdoutToDevNull {
+        saved_fd: i32,
+    }
+    impl StdoutToDevNull {
+        fn new() -> Self {
+            let saved_fd = unsafe { libc::dup(1) };
+            assert!(saved_fd >= 0, "dup(1) failed");
+            let devnull = std::ffi::CString::new("/dev/null").unwrap();
+            let devnull_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_WRONLY) };
+            assert!(devnull_fd >= 0, "open /dev/null failed");
+            let rc = unsafe { libc::dup2(devnull_fd, 1) };
+            unsafe { libc::close(devnull_fd) };
+            assert!(rc >= 0, "dup2 to /dev/null failed");
+            Self { saved_fd }
+        }
+    }
+    impl Drop for StdoutToDevNull {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.saved_fd, 1);
+                libc::close(self.saved_fd);
+            }
+        }
+    }
+
+    fn status_ctx_for_test(reserved: bool) -> StatusBarCtx {
+        StatusBarCtx {
+            stdout: Arc::new(Mutex::new(io::stdout())),
+            term: Arc::new(Mutex::new(TermGeom {
+                rows: 24,
+                cols: 80,
+                reserved,
+            })),
+            paths: Paths {
+                runtime_root: PathBuf::from("/nonexistent-aplexer-test-runtime"),
+                state_root: PathBuf::from("/nonexistent-aplexer-test-state"),
+                config_file: PathBuf::from("/nonexistent-aplexer-test-state/config.toml"),
+            },
+            record: Arc::new(Mutex::new(mk_record("/ws/status-bar-test", "t", Phase::Running))),
+            flash: Arc::new(Mutex::new(None)),
+            last_drawn: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn draw_status_bar_not_reserved_never_writes() {
+        let ctx = status_ctx_for_test(false);
+        assert!(!draw_status_bar(&ctx, false));
+        assert!(!draw_status_bar(&ctx, true));
+    }
+
+    #[test]
+    fn draw_status_bar_dirty_check_reports_skip_vs_real_write() {
+        let _guard = StdoutToDevNull::new();
+        let ctx = status_ctx_for_test(true);
+        // Nothing drawn yet: even a non-forced call must actually write
+        // (there's no `last_drawn` to compare against).
+        assert!(draw_status_bar(&ctx, false), "first draw must be a real write");
+        // Same record/geometry, so the rendered text is unchanged: a
+        // non-forced call must be a dirty-check no-op, not a real write --
+        // this is exactly the case the timer-starvation bug got wrong by
+        // treating a no-op the same as a real write for timer-reset
+        // purposes.
+        assert!(
+            !draw_status_bar(&ctx, false),
+            "unchanged text must be a dirty-check skip, not a real write"
+        );
+        // `force: true` must bypass the dirty-check unconditionally, since
+        // that's the self-heal guarantee the overdue timer and every
+        // switch/flash redraw rely on.
+        assert!(
+            draw_status_bar(&ctx, true),
+            "force=true must always be a real write, even with unchanged text"
+        );
     }
 }
 
