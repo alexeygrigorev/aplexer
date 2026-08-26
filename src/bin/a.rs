@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use aplexer::*;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
+use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -30,7 +31,7 @@ struct Cli {
     )]
     json: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -48,6 +49,19 @@ enum Commands {
     Engines,
     Profiles,
     Doctor,
+    /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
+    /// main() before argument parsing -- not a name a user types directly.
+    #[command(hide = true)]
+    QuickAttach(QuickAttachArgs),
+}
+
+#[derive(Args)]
+struct QuickAttachArgs {
+    /// 1-based index into the workspaces as shown by `a list` (alphabetical).
+    workspace_index: usize,
+    /// 1-based index into that workspace's sessions (list order), or a
+    /// literal tag. Defaults to that workspace's first session.
+    session: Option<String>,
 }
 
 #[derive(Args)]
@@ -156,9 +170,13 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let args = rewrite_quick_attach_args(std::env::args().collect());
+    let cli = Cli::parse_from(args);
     let paths = Paths::discover()?;
-    match cli.command {
+    // Bare `a` with no subcommand defaults to `a list`, matching how tmux
+    // and similar tools default to a listing rather than printing usage.
+    let command = cli.command.unwrap_or(Commands::List(ListArgs { running: false }));
+    match command {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
         Commands::List(args) | Commands::Snapshot(args) => cmd_list(&paths, args, cli.json),
         Commands::Attach(args) => {
@@ -173,7 +191,29 @@ fn run() -> Result<()> {
         Commands::Engines => cmd_engines(&paths, cli.json),
         Commands::Profiles => cmd_profiles(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
+        Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
     }
+}
+
+/// `a <N> [session]` is rewritten to `a quick-attach <N> [session]` before
+/// clap ever sees it, the same trick tmuxctl's `t` uses in its own
+/// argv-rewriting main() (see ~/git/tmuxctl/tmuxctl/cli.py) to let a bare
+/// positional number mean "attach" without a subcommand keyword. Only the
+/// first argument is inspected, and only when it's non-empty and all
+/// digits -- none of `a`'s real subcommand names collide with that.
+fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
+    let is_quick_index = args
+        .get(1)
+        .map(|first| !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false);
+    if !is_quick_index {
+        return args;
+    }
+    let mut rewritten = Vec::with_capacity(args.len() + 1);
+    rewritten.push(args[0].clone());
+    rewritten.push("quick-attach".to_string());
+    rewritten.extend(args.into_iter().skip(1));
+    rewritten
 }
 
 fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
@@ -344,24 +384,35 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&enriched)?);
         return Ok(());
     }
-    println!(
-        "{:<12} {:<10} {:<18} {:<16} WORKSPACE",
-        "ID", "STATE", "TAG", "ENGINE/PROFILE"
-    );
-    for r in records {
-        let ep = match &r.profile {
-            Some(p) => format!("{}/{}", r.engine, p),
-            None => r.engine.clone(),
-        };
-        let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+    // Group by workspace as a compact tree -- spec.md's own presentation of
+    // the model (sections 2 and 22.1) is a workspace tree with tags
+    // underneath, not a flat table repeating the workspace on every row.
+    // `a <N>` quick-attach (see cmd_quick_attach) numbers workspaces and
+    // sessions using this exact same grouping, so what a user sees here is
+    // what those numbers mean.
+    let by_workspace = group_by_workspace(records);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    for (workspace, group) in &by_workspace {
         println!(
-            "{:<12} {:<10} {:<18} {:<16} {}",
-            &r.id.to_string()[..12],
-            display_state(&r.phase, alive),
-            r.tag,
-            ep,
-            r.workspace.display()
+            "{} ({})",
+            display_workspace(workspace, home.as_deref()),
+            running_summary(group)
         );
+        let last = group.len().saturating_sub(1);
+        for (i, r) in group.iter().enumerate() {
+            let connector = if i == last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251c}\u{2500}\u{2500}" };
+            let ep = match &r.profile {
+                Some(p) => format!("{}/{}", r.engine, p),
+                None => r.engine.clone(),
+            };
+            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+            println!(
+                "{connector} {:<14} {:<16} {}",
+                r.tag,
+                ep,
+                display_state(&r.phase, alive),
+            );
+        }
     }
     Ok(())
 }
@@ -379,6 +430,96 @@ fn display_state(phase: &Phase, worker_alive: bool) -> &'static str {
     } else {
         phase_name(phase)
     }
+}
+
+/// Shortens a workspace path under $HOME to `~/...`, matching spec.md's own
+/// display examples (e.g. section 2's `~/git/pocketshell` tree).
+fn display_workspace(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if let Ok(rest) = path.strip_prefix(home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    path.display().to_string()
+}
+
+fn running_summary(group: &[SessionRecord]) -> String {
+    let running = group
+        .iter()
+        .filter(|r| {
+            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+            display_state(&r.phase, alive) == "running"
+        })
+        .count();
+    let total = group.len();
+    if running == total {
+        format!("running {running}")
+    } else if running == 0 {
+        format!("stopped {total}")
+    } else {
+        format!("running {running}/{total}")
+    }
+}
+
+fn group_by_workspace(records: Vec<SessionRecord>) -> Vec<(PathBuf, Vec<SessionRecord>)> {
+    let mut groups: Vec<(PathBuf, Vec<SessionRecord>)> = Vec::new();
+    for r in records {
+        match groups.iter_mut().find(|(ws, _)| *ws == r.workspace) {
+            Some((_, group)) => group.push(r),
+            None => groups.push((r.workspace.clone(), vec![r])),
+        }
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    groups
+}
+
+/// `a <N>` / `a <N> <M>` / `a <N> <tag>` -- attach by position in the same
+/// workspace tree `a list` prints, or by tag within a chosen workspace.
+fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
+    let groups = group_by_workspace(list_records(paths)?);
+    if groups.is_empty() {
+        bail!("no sessions found (see `a start`)");
+    }
+    if args.workspace_index < 1 || args.workspace_index > groups.len() {
+        bail!(
+            "workspace index {} out of range: {} workspace(s) found (see `a list`)",
+            args.workspace_index,
+            groups.len()
+        );
+    }
+    let (workspace, sessions) = &groups[args.workspace_index - 1];
+    if sessions.is_empty() {
+        bail!("workspace {} has no sessions", workspace.display());
+    }
+    let record = match args.session.as_deref() {
+        None => sessions[0].clone(),
+        Some(selector) if !selector.is_empty() && selector.bytes().all(|b| b.is_ascii_digit()) => {
+            let index: usize = selector.parse().unwrap_or(0);
+            if index < 1 || index > sessions.len() {
+                bail!(
+                    "session index {index} out of range: workspace {} has {} session(s)",
+                    workspace.display(),
+                    sessions.len()
+                );
+            }
+            sessions[index - 1].clone()
+        }
+        Some(tag) => sessions
+            .iter()
+            .find(|r| r.tag == tag)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "no session tagged {tag:?} in workspace {}",
+                    workspace.display()
+                )
+            })?,
+    };
+    attach(&record, None)
 }
 
 fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
