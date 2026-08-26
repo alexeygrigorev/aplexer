@@ -1433,8 +1433,7 @@ fn cmd_launch_exec(paths: &Paths, args: LaunchArgs) -> Result<()> {
 /// stable, scriptable "nothing/non-zero if not inside one" contract, the
 /// same shape `$TMUX` serves for tmux but structured instead of a bare path.
 fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
-    let Some(id_text) = env::var_os("APLEXER_SESSION_ID").and_then(|v| v.into_string().ok())
-    else {
+    let Some(id) = discover_session_id() else {
         // Deliberately silent on stdout either way -- a script doing
         // `id=$(a whoami --json)` should see empty output and rely on the
         // exit code, not have to filter out a "not in a session" sentence.
@@ -1443,9 +1442,6 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         }
         std::process::exit(1);
     };
-    let id: Uuid = id_text
-        .parse()
-        .with_context(|| format!("APLEXER_SESSION_ID {id_text:?} is not a valid UUID"))?;
     let record = read_record(&paths.record(id))
         .with_context(|| format!("session {id} (from APLEXER_SESSION_ID) has no persisted record"))?;
     if json_output {
@@ -1556,15 +1552,10 @@ fn resolve_transcript_target(paths: &Paths, args: &TranscriptArgs) -> Result<Ses
         || args.target.workspace.is_some()
         || args.target.tag.is_some();
     if !targeted {
-        if let Ok(id_text) = env::var("APLEXER_SESSION_ID") {
-            if !id_text.is_empty() {
-                let id: Uuid = id_text.parse().with_context(|| {
-                    format!("APLEXER_SESSION_ID {id_text:?} is not a valid UUID")
-                })?;
-                return read_record(&paths.record(id)).with_context(|| {
-                    format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
-                });
-            }
+        if let Some(id) = discover_session_id() {
+            return read_record(&paths.record(id)).with_context(|| {
+                format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
+            });
         }
     }
     resolve(paths, &args.target)

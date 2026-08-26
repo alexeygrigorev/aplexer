@@ -231,6 +231,72 @@ fn transcript_last_and_whoami() {
 }
 
 #[test]
+fn whoami_inside_session_survives_cleared_env() {
+    let h = Harness::new();
+    let ws = h.home.path().join("proj");
+    fs::create_dir_all(&ws).unwrap();
+    let ws_str = ws.display().to_string();
+    let stdout = {
+        let output = h.run(
+            &[
+                "start",
+                "--json",
+                "--workspace",
+                &ws_str,
+                "--cwd",
+                &ws_str,
+                "--tag",
+                "me",
+                "--engine",
+                "shell",
+                "--startup-timeout-ms",
+                "15000",
+                "--",
+                "/bin/bash",
+                "--norc",
+                "-i",
+            ],
+            Duration::from_secs(20),
+        );
+        assert!(
+            output.status.success(),
+            "start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let record: Value = serde_json::from_str(&stdout).expect("start json");
+    let id = record["id"].as_str().expect("id").to_string();
+
+    h.run_ok(&[
+        "send",
+        &id,
+        "--enter",
+        "env -u APLEXER_SESSION_ID a whoami; echo WHOAMI_DONE",
+    ]);
+    h.run_ok(&["send", &id, "--hex", "0d"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut captured = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = h.run(&["capture", &id, "--bytes", "4000"], Duration::from_secs(5));
+        captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        if captured.contains("WHOAMI_DONE") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = h.run(&["kill", &id], Duration::from_secs(8));
+    assert!(
+        captured.contains(&id),
+        "whoami inside session should print {id} even with APLEXER_SESSION_ID unset; capture:\n{captured}"
+    );
+    assert!(
+        captured.contains("engine: shell"),
+        "whoami should report engine; capture:\n{captured}"
+    );
+}
+
+#[test]
 fn exec_subcommand_is_gone() {
     let h = Harness::new();
     let output = h.run(&["exec", "--help"], Duration::from_secs(5));

@@ -37,6 +37,69 @@ pub fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Session identity for `a whoami` / bare `a transcript` / messaging.
+///
+/// Prefer `APLEXER_SESSION_ID` on this process (the worker stamps it on the
+/// workload). If a tool subprocess cleared its environment, walk parent
+/// `/proc/<pid>/environ` until we find the stamp -- agent CLIs often spawn
+/// `bash`/`env -i` without passing the aplexer vars through.
+pub fn discover_session_id() -> Option<Uuid> {
+    parse_session_id_env(env::var_os("APLEXER_SESSION_ID"))
+        .or_else(session_id_from_ancestor_environ)
+}
+
+fn parse_session_id_env(raw: Option<std::ffi::OsString>) -> Option<Uuid> {
+    let raw = raw?.into_string().ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn session_id_from_ancestor_environ() -> Option<Uuid> {
+    let mut pid = proc_ppid(std::process::id())?;
+    for _ in 0..64 {
+        if pid == 0 {
+            break;
+        }
+        if let Some(id) = session_id_in_proc_environ(pid) {
+            return Some(id);
+        }
+        let next = proc_ppid(pid)?;
+        if next == pid {
+            break;
+        }
+        pid = next;
+    }
+    None
+}
+
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn session_id_in_proc_environ(pid: u32) -> Option<Uuid> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    for entry in bytes.split(|b| *b == 0) {
+        let Ok(s) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(val) = s.strip_prefix("APLEXER_SESSION_ID=") {
+            if let Ok(id) = val.parse() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub runtime_root: PathBuf,

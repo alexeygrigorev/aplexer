@@ -2,6 +2,7 @@ use crate::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -401,6 +402,19 @@ fn spawn_workload(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Put the `a` next to this worker first on PATH so `a whoami` inside
+    // the session is the same CLI that started it, not some other `a` later
+    // on PATH.
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let mut path = dir.as_os_str().to_os_string();
+            path.push(":");
+            if let Some(existing) = env::var_os("PATH") {
+                path.push(existing);
+            }
+            command.env("PATH", path);
+        }
+    }
     // Provider-key safety strip (pocketshell-integration-plan.md 0.2): the
     // workload must not inherit these vars from the WORKER's own process
     // environment either, not just avoid getting them freshly set above --

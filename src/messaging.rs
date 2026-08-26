@@ -455,25 +455,23 @@ pub fn resolve_sender(paths: &Paths, canonical_workspace: &Path, from_tag: Optio
             external: false,
         });
     }
-    if let Ok(raw_id) = std::env::var("APLEXER_SESSION_ID") {
-        if let Ok(session_id) = raw_id.parse::<Uuid>() {
-            if let Some(record) = list_records(paths)?.into_iter().find(|r| r.id == session_id) {
-                return Ok(MessageFrom {
-                    session_id: Some(record.id),
-                    tag: Some(record.tag),
-                    engine: Some(record.engine),
-                    profile: record.profile,
-                    external: false,
-                });
-            }
+    if let Some(session_id) = crate::discover_session_id() {
+        if let Some(record) = list_records(paths)?.into_iter().find(|r| r.id == session_id) {
             return Ok(MessageFrom {
-                session_id: Some(session_id),
-                tag: std::env::var("APLEXER_TAG").ok(),
-                engine: None,
-                profile: None,
+                session_id: Some(record.id),
+                tag: Some(record.tag),
+                engine: Some(record.engine),
+                profile: record.profile,
                 external: false,
             });
         }
+        return Ok(MessageFrom {
+            session_id: Some(session_id),
+            tag: std::env::var("APLEXER_TAG").ok(),
+            engine: None,
+            profile: None,
+            external: false,
+        });
     }
     Ok(MessageFrom::anonymous())
 }
@@ -499,15 +497,13 @@ pub fn resolve_consumer(
             })?;
         return Ok((record.id, record.tag, record.engine));
     }
-    if let Ok(raw_id) = std::env::var("APLEXER_SESSION_ID") {
-        if let Ok(session_id) = raw_id.parse::<Uuid>() {
-            let (tag, engine) = list_records(paths)?
-                .into_iter()
-                .find(|r| r.id == session_id)
-                .map(|r| (r.tag, r.engine))
-                .unwrap_or_else(|| (std::env::var("APLEXER_TAG").unwrap_or_default(), String::new()));
-            return Ok((session_id, tag, engine));
-        }
+    if let Some(session_id) = crate::discover_session_id() {
+        let (tag, engine) = list_records(paths)?
+            .into_iter()
+            .find(|r| r.id == session_id)
+            .map(|r| (r.tag, r.engine))
+            .unwrap_or_else(|| (std::env::var("APLEXER_TAG").unwrap_or_default(), String::new()));
+        return Ok((session_id, tag, engine));
     }
     bail!(
         "no session identity: APLEXER_SESSION_ID is not set (you're not inside an aplexer \
