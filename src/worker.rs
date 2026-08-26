@@ -728,6 +728,21 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
             if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
                 value["cgroup"] = cgroup.stats();
             }
+            // Live-only, never persisted (see foreground_command's doc
+            // comment on WorkerRuntime -- deliberately not a SessionRecord
+            // field): what's actually in the foreground of the pty right
+            // now, which can differ from `engine`/`command` the moment the
+            // workload execs or forks something new (e.g. a plain `shell`
+            // session where the user manually ran another program). Merged
+            // into the Status response the same way `cgroup` is above,
+            // rather than added to the persisted record, so this never
+            // costs a disk write and an old client's `serde_json` simply
+            // ignores the unrecognized field.
+            if let Some(fd) = lock(&runtime.pty_write)?.as_ref().map(|f| f.as_raw_fd()) {
+                if let Some(cmd) = foreground_command(fd) {
+                    value["foreground_command"] = json!(cmd);
+                }
+            }
             write_json(&mut stream, &Response::ok(id, value))?;
         }
         Operation::Send { bytes } => {

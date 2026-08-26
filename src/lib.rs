@@ -1677,6 +1677,36 @@ pub fn set_winsize(fd: RawFd, rows: u16, cols: u16) -> Result<()> {
     Ok(())
 }
 
+/// The name (from `/proc/<pgid>/comm`) of whatever is currently in the
+/// foreground of the pty referred to by `fd` -- the same mechanism tmux
+/// uses for `pane_current_command`: `tcgetpgrp(fd)` to get the foreground
+/// process group of the pty (this updates automatically as the shell
+/// forks/foregrounds jobs, standard POSIX job control -- no polling of the
+/// workload itself needed), then read that pgid's name straight out of
+/// procfs. `comm` is used over parsing `/proc/<pid>/stat`'s second field
+/// because it's already a single line stripped of parens and args.
+///
+/// `fd` need not be `fd`'s own controlling terminal -- this is exactly how
+/// tmux's server (which is not part of the pane's session) queries a pty
+/// it merely holds the master side of. Best-effort throughout: any failure
+/// (no foreground group yet, the process exited between the two syscalls,
+/// procfs unmounted) yields `None` rather than an error, since this is a
+/// cosmetic status-bar signal, never something worth failing a request or
+/// blocking a hot loop over.
+pub fn foreground_command(fd: RawFd) -> Option<String> {
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    if pgid <= 0 {
+        return None;
+    }
+    let comm = fs::read_to_string(format!("/proc/{pgid}/comm")).ok()?;
+    let trimmed = comm.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn peer_uid(fd: RawFd) -> Result<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;

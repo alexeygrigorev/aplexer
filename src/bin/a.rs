@@ -1088,6 +1088,14 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     let raw = rpc_result.unwrap_or_else(|_| serde_json::to_value(&record).unwrap_or(Value::Null));
     let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
     let cgroup_stats = raw.get("cgroup").cloned();
+    // Live-only (see foreground_command in lib.rs / Operation::Status):
+    // never persisted to session.json, so this is only available while the
+    // worker is reachable -- absent on a dead/unreachable session, same as
+    // cgroup_stats above.
+    let foreground_command = raw
+        .get("foreground_command")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let worker_alive =
         rpc_reachable || current.worker_pid.map(process_alive).unwrap_or(false);
     if json_output {
@@ -1095,12 +1103,28 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         if let Some(stats) = cgroup_stats {
             value["cgroup"] = stats;
         }
+        if let Some(fg) = &foreground_command {
+            value["foreground_command"] = json!(fg);
+        }
         value["worker_alive"] = json!(worker_alive);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
         println!("state: {}", display_state(&current.phase, worker_alive));
+        let ep = match &current.profile {
+            Some(p) => format!("{}/{p}", current.engine),
+            None => current.engine.clone(),
+        };
+        // Filtered the same way the attach status bar filters it
+        // (`foreground_override`): omit a bare interactive shell or a
+        // foreground command that's just the engine's own launch command
+        // running as expected, so this line matches what `a status` calls
+        // out as "different from what you started."
+        match foreground_override(&current, &raw) {
+            Some(fg) => println!("engine: {ep} (foreground: {fg})"),
+            None => println!("engine: {ep}"),
+        }
         println!(
             "worker_pid: {}",
             current
@@ -2366,19 +2390,62 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// One `Operation::Status` round-trip per status-bar redraw, shared by the
+/// memory and foreground-command indicators below so a single bar refresh
+/// costs one worker round-trip, not one per indicator. `None` on any RPC
+/// failure (worker briefly unreachable) -- every indicator built from this
+/// just degrades to "omitted" in that case, same as before this was
+/// shared.
+fn live_status(record: &SessionRecord) -> Option<Value> {
+    rpc_simple(record, Operation::Status, None).ok()
+}
+
 /// Live memory indicator from the session's cgroup, if it has one -- a
 /// small "useful for our application" touch given aplexer's whole reason
-/// for existing is resource-isolated agent sessions. Best-effort: any RPC
-/// failure (worker briefly unreachable, no cgroup configured) just omits
-/// the indicator rather than disrupting the status bar.
-fn memory_indicator(record: &SessionRecord) -> Option<String> {
-    let raw = rpc_simple(record, Operation::Status, None).ok()?;
+/// for existing is resource-isolated agent sessions. Best-effort: absence
+/// of cgroup stats in `raw` (no cgroup configured) just omits the
+/// indicator rather than disrupting the status bar.
+fn memory_indicator(record: &SessionRecord, raw: &Value) -> Option<String> {
     let current = raw.get("cgroup")?.get("memory_current")?.as_u64()?;
     let used = format_bytes(current);
     Some(match record.limits.memory_bytes {
         Some(max) => format!("{used}/{}", format_bytes(max)),
         None => used,
     })
+}
+
+/// Plain interactive shells: showing e.g. `[shell -> bash]` for an ordinary
+/// shell session would be redundant noise (that's what `shell` already
+/// means), not information. Only an actually interesting foreground
+/// program -- something manually run inside the session that isn't just
+/// its own shell -- is worth surfacing.
+const PLAIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"];
+
+/// The live foreground-command override for the status bar, if there's
+/// anything worth showing beyond `record.engine` alone (see
+/// `foreground_command` in lib.rs and `Operation::Status`'s worker-side
+/// handler for where `raw["foreground_command"]` comes from -- a live,
+/// never-persisted read of the pty's current foreground process, the same
+/// mechanism tmux uses for `pane_current_command`). `None` when: the
+/// worker didn't report one (RPC failure, no foreground process group
+/// yet); it's a bare interactive shell (`PLAIN_SHELLS`); or it's just the
+/// engine's own launch command running as expected (e.g. a `codex`-engine
+/// session actually running `codex` shouldn't redundantly show
+/// `[codex -> codex]`).
+fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
+    let fg = raw.get("foreground_command")?.as_str()?;
+    if PLAIN_SHELLS.contains(&fg) {
+        return None;
+    }
+    let launched = record
+        .command
+        .first()
+        .and_then(|c| Path::new(c).file_name())
+        .and_then(|n| n.to_str());
+    if launched == Some(fg) {
+        return None;
+    }
+    Some(fg.to_string())
 }
 
 /// `{i}:{tag}[*][({state})]` for every session in the current workspace,
@@ -2485,12 +2552,16 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     let record = ctx.record.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let home = env::var_os("HOME").map(PathBuf::from);
     let ws = display_workspace(&record.workspace, home.as_deref());
-    let ep = match &record.profile {
+    let mut ep = match &record.profile {
         Some(p) => format!("{}/{}", record.engine, p),
         None => record.engine.clone(),
     };
+    let raw = live_status(&record);
+    if let Some(fg) = raw.as_ref().and_then(|raw| foreground_override(&record, raw)) {
+        ep.push_str(&format!(" -> {fg}"));
+    }
     let mut text = format!("{ws}:{} [{ep}]", record.tag);
-    if let Some(mem) = memory_indicator(&record) {
+    if let Some(mem) = raw.as_ref().and_then(|raw| memory_indicator(&record, raw)) {
         text.push_str(&format!("  mem {mem}"));
     }
     let siblings = workspace_summary(ctx, &record);
@@ -2535,20 +2606,29 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 /// `STATUS_BAR_MAX_INTERVAL` forced tick, and every switch/flash redraw,
 /// which are already low-frequency, user-triggered events where bandwidth
 /// isn't the concern -- pass `true`.
-fn draw_status_bar(ctx: &StatusBarCtx, force: bool) {
+///
+/// Returns whether a real write to the terminal happened (`false` when the
+/// reserved row doesn't exist, or the dirty-check skipped an unchanged
+/// redraw). Callers that drive `STATUS_BAR_MAX_INTERVAL`'s overdue timer
+/// must only reset it on `true` -- resetting on a dirty-check no-op would
+/// let a workload with frequent-but-unchanging redraws (a spinner, streamed
+/// tokens with pauses) keep the timer perpetually "recently fired" without
+/// ever actually rewriting a margin a full-screen erase clobbered, breaking
+/// the self-heal guarantee this constant exists for.
+fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if !geom.reserved {
-        return;
+        return false;
     }
     let text = status_bar_text(ctx, geom.cols as usize);
     {
         let mut last = ctx.last_drawn.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (text.clone(), geom.rows, geom.cols);
         if !force && last.as_ref() == Some(&key) {
-            return;
+            return false;
         }
         *last = Some(key);
     }
