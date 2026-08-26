@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -1881,8 +1881,8 @@ fn memory_indicator(record: &SessionRecord) -> Option<String> {
 /// `tag(state)` for every other session in the same workspace, mirroring how
 /// `a list`'s tree groups sessions by workspace (see `group_by_workspace`) --
 /// a live glance at what else is running here without detaching.
-fn sibling_summary(paths: &Paths, record: &SessionRecord) -> String {
-    let records = match list_records(paths) {
+fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
+    let records = match list_records(&ctx.paths) {
         Ok(r) => r,
         Err(_) => return String::new(),
     };
@@ -1916,11 +1916,43 @@ fn pad_or_truncate(text: &str, cols: usize) -> String {
     }
 }
 
+/// Everything a status-bar redraw needs, cloned into each thread that might
+/// trigger one (status thread, input thread on a switch flash, main loop
+/// after a switch) instead of five loose `Arc` parameters -- see
+/// docs/fast-session-switching-design.md section 3. `record` is shared and
+/// swappable so an in-process switch is visible to the bar without
+/// respawning the thread; `flash` is a transient error line (switch
+/// failures).
+#[derive(Clone)]
+struct StatusBarCtx {
+    stdout: Arc<Mutex<io::Stdout>>,
+    term: Arc<Mutex<TermGeom>>,
+    paths: Paths,
+    record: Arc<Mutex<SessionRecord>>,
+    flash: Arc<Mutex<Option<(String, Instant)>>>,
+}
+
+/// How long a switch-failure message stays on the status bar before the
+/// normal text resumes (docs/fast-session-switching-design.md section 6.1).
+const FLASH_DURATION: Duration = Duration::from_secs(2);
+
 /// Compact, agent-first status-bar line: workspace, tag, engine/profile,
-/// live memory (if the session has a cgroup), and sibling sessions in the
-/// same workspace -- the aplexer analogue of tmux's window list, adapted for
-/// a per-session/per-tag model rather than tmux's single-server window set.
-fn status_bar_text(paths: &Paths, record: &SessionRecord, cols: usize) -> String {
+/// live memory (if the session has a cgroup), and the current workspace's
+/// numbered session list -- the aplexer analogue of tmux's window list,
+/// adapted for a per-session/per-tag model rather than tmux's single-server
+/// window set. Renders a flashed error instead of the normal text while one
+/// is active (section 6.1).
+fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
+    {
+        let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((msg, at)) = flash.clone() {
+            if at.elapsed() < FLASH_DURATION {
+                return pad_or_truncate(&format!("[{msg}]"), cols);
+            }
+            *flash = None;
+        }
+    }
+    let record = ctx.record.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let home = env::var_os("HOME").map(PathBuf::from);
     let ws = display_workspace(&record.workspace, home.as_deref());
     let ep = match &record.profile {
@@ -1928,10 +1960,10 @@ fn status_bar_text(paths: &Paths, record: &SessionRecord, cols: usize) -> String
         None => record.engine.clone(),
     };
     let mut text = format!("{ws}:{} [{ep}]", record.tag);
-    if let Some(mem) = memory_indicator(record) {
+    if let Some(mem) = memory_indicator(&record) {
         text.push_str(&format!("  mem {mem}"));
     }
-    let siblings = sibling_summary(paths, record);
+    let siblings = workspace_summary(ctx, &record);
     if !siblings.is_empty() {
         text.push_str("  |  ");
         text.push_str(&siblings);
@@ -1944,28 +1976,156 @@ fn status_bar_text(paths: &Paths, record: &SessionRecord, cols: usize) -> String
 /// cursor -- so a redraw racing a keystroke never disturbs the shell's own
 /// cursor position. No-ops when the current terminal is too small to have a
 /// reserved row.
-fn draw_status_bar(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermGeom>>, paths: &Paths, record: &SessionRecord) {
-    let geom = match term.lock() {
+fn draw_status_bar(ctx: &StatusBarCtx) {
+    let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return,
     };
     if !geom.reserved {
         return;
     }
-    let text = status_bar_text(paths, record, geom.cols as usize);
+    let text = status_bar_text(ctx, geom.cols as usize);
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b7");
     seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
     seq.extend_from_slice(b"\x1b[2K\x1b[7m");
     seq.extend_from_slice(text.as_bytes());
     seq.extend_from_slice(b"\x1b[0m\x1b8");
-    let _ = write_locked(stdout, &seq);
+    let _ = write_locked(&ctx.stdout, &seq);
 }
 
-fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
-    check_attachable(record)?;
+/// Which session a `Ctrl-b` switch chord asks for
+/// (docs/fast-session-switching-design.md section 3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SwitchTarget {
+    /// `Ctrl-b n`: next session in the current workspace.
+    Next,
+    /// `Ctrl-b p`: previous session in the current workspace.
+    Prev,
+    /// `Ctrl-b N`: next session across all workspaces (`a list` order).
+    NextGlobal,
+    /// `Ctrl-b P`: previous session across all workspaces.
+    PrevGlobal,
+    /// `Ctrl-b l`: toggle back to whatever was attached before this one.
+    Last,
+    /// `Ctrl-b 1`..`9`: the Nth session (1-based) of the current workspace,
+    /// no skipping -- must mean exactly what the status bar shows.
+    Index(usize),
+}
+
+/// True iff `check_attachable` would pass; used to skip dead sessions when
+/// cycling with n/p/N/P (never for explicit `Index`/`Last` addressing,
+/// which report the real error instead of silently hopping past it).
+fn is_attachable(r: &SessionRecord) -> bool {
+    check_attachable(r).is_ok()
+}
+
+/// Walks `group` from `current_id`'s position (or position 0 if the current
+/// session isn't in this group -- e.g. it was killed underneath us) by +1
+/// (`prev = false`) or -1 (`prev = true`) with wraparound, skipping
+/// `current_id` itself and any candidate that fails `is_attachable`.
+/// Returns `None` once every other candidate has been tried and rejected.
+fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<SessionRecord> {
+    let len = group.len();
+    if len == 0 {
+        return None;
+    }
+    let start = group.iter().position(|r| r.id == current_id).unwrap_or(0);
+    for step in 1..=len {
+        let idx = if prev {
+            (start + len - step) % len
+        } else {
+            (start + step) % len
+        };
+        let candidate = &group[idx];
+        if candidate.id != current_id && is_attachable(candidate) {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// Pure candidate selection over the same groups `a list` prints (see
+/// `group_by_workspace`). Split from `resolve_switch_target` (the
+/// paths-touching wrapper) so it is unit-testable without a filesystem.
+/// Semantics are docs/fast-session-switching-design.md section 3.2:
+///
+/// - `Next`/`Prev`: candidates are the current session's own workspace
+///   group; skips dead sessions; wraps; errors if nothing else is
+///   attachable there.
+/// - `NextGlobal`/`PrevGlobal`: candidates are every group flattened in
+///   group order (alphabetical workspace, then list order) -- exactly the
+///   top-to-bottom order of `a list`'s tree.
+/// - `Index(n)`: 1-based, into the current workspace group only, **no**
+///   skipping of dead sessions -- the number must mean exactly what the
+///   status bar shows (`workspace_summary`); an unattachable target is
+///   still returned here and rejected later by `perform_switch`'s
+///   `check_attachable` call, so the error names the actual session.
+/// - `Last`: resolved by UUID against every group (survives renames, works
+///   across workspaces).
+fn pick_switch_target(
+    groups: &[(PathBuf, Vec<SessionRecord>)],
+    current_workspace: &Path,
+    current_id: Uuid,
+    target: SwitchTarget,
+    last: Option<Uuid>,
+) -> Result<SessionRecord> {
+    let current_group = || -> Result<&[SessionRecord]> {
+        groups
+            .iter()
+            .find(|(ws, _)| ws == current_workspace)
+            .map(|(_, g)| g.as_slice())
+            .ok_or_else(|| anyhow!("current workspace has no sessions"))
+    };
+    match target {
+        SwitchTarget::Next | SwitchTarget::Prev => {
+            let group = current_group()?;
+            walk_group(group, current_id, target == SwitchTarget::Prev)
+                .ok_or_else(|| anyhow!("no other running session in this workspace"))
+        }
+        SwitchTarget::NextGlobal | SwitchTarget::PrevGlobal => {
+            let flat: Vec<SessionRecord> = groups.iter().flat_map(|(_, g)| g.clone()).collect();
+            walk_group(&flat, current_id, target == SwitchTarget::PrevGlobal)
+                .ok_or_else(|| anyhow!("no other running session"))
+        }
+        SwitchTarget::Index(n) => {
+            let group = current_group()?;
+            if n < 1 || n > group.len() {
+                bail!(
+                    "no session {n} here: this workspace has {} session(s)",
+                    group.len()
+                );
+            }
+            Ok(group[n - 1].clone())
+        }
+        SwitchTarget::Last => {
+            let id = last.ok_or_else(|| anyhow!("no previous session"))?;
+            groups
+                .iter()
+                .flat_map(|(_, g)| g.iter())
+                .find(|r| r.id == id)
+                .cloned()
+                .ok_or_else(|| anyhow!("previous session is gone"))
+        }
+    }
+}
+
+fn resolve_switch_target(
+    paths: &Paths,
+    current: &SessionRecord,
+    target: SwitchTarget,
+    last: Option<Uuid>,
+) -> Result<SessionRecord> {
+    let groups = group_by_workspace(list_records(paths)?);
+    pick_switch_target(&groups, &current.workspace, current.id, target, last)
+}
+
+/// Extracted attach handshake (connect + `Operation::Attach` request +
+/// response check + initial history frame), used by both the initial
+/// attach and every in-process switch (docs/fast-session-switching-design.md
+/// section 3.1).
+fn establish(record: &SessionRecord, replay_bytes: Option<usize>) -> Result<(UnixStream, Vec<u8>)> {
     let mut reader = connect(record)?;
-    let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
     let request = Request::new(Operation::Attach {
         history_bytes: replay_bytes,
     });
@@ -1981,8 +2141,216 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     if initial.kind != FrameKind::Data {
         bail!("expected history data");
     }
+    Ok((reader, initial.payload))
+}
+
+/// Default amount of history replayed on an in-process switch
+/// (`Ctrl-b n/p/N/P/l/1-9`), separate from `DEFAULT_ATTACH_REPLAY_BYTES`
+/// used by a fresh `a attach`.
+///
+/// Deviation from docs/fast-session-switching-design.md section 3.1, which
+/// specifies reusing the exact same replay budget as a fresh attach: a
+/// switch target is a session the user was just attached to, or explicitly
+/// picked off the status bar's own sibling list -- not a cold, unfamiliar
+/// session -- so the "show what's currently on its screen" justification
+/// for a full 32KB tail is considerably weaker than on first attach, and
+/// every byte here sits on the hot path the user actually experiences as
+/// switch latency (it's written to the real terminal, and the terminal
+/// emulator parsing/painting it dominates the whole switch -- see the
+/// design doc's own section 8 budget). 4KB is still ~2-4 screens of typical
+/// tail -- comfortably enough for a shell prompt or an agent CLI's last few
+/// lines -- at 1/8th the bytes and, per informal measurement during
+/// implementation, a visibly snappier repaint than 32KB on a small
+/// terminal. An explicit `--history-bytes` from the CLI is still honored
+/// (see `switch_replay_bytes` in `attach()`) -- this only changes the
+/// *default*, the same way `DEFAULT_ATTACH_REPLAY_BYTES` is only a default.
+const SWITCH_REPLAY_BYTES: usize = 4 * 1024;
+
+/// A fully established connection to the new session, handed from the
+/// input thread (which runs `perform_switch`) to the main frame loop
+/// (which installs it -- see the `'session` loop in `attach()`).
+struct SwitchOutcome {
+    record: SessionRecord,
+    /// Attach handshake already completed on this socket.
+    reader: UnixStream,
+    /// The replay tail read during that handshake.
+    history: Vec<u8>,
+}
+
+/// What one `InputScanner::scan` call decided to do with a chunk of raw
+/// stdin bytes; several may result from a single `read()` (e.g.
+/// `"a\x02n"` -> `Forward([b'a'])`, `Switch(Next)`).
+enum InputAction {
+    /// Ordinary input for the currently attached session.
+    Forward(Vec<u8>),
+    /// `Ctrl-]` or `Ctrl-b d`.
+    Detach,
+    /// `Ctrl-b n/p/N/P/l/1-9`.
+    Switch(SwitchTarget),
+}
+
+/// Byte-scanning state for the `Ctrl-b` prefix state machine, split out of
+/// the input thread body so the split-across-`read()` cases are
+/// unit-testable independent of any real socket/thread (see the `#[cfg(test)]`
+/// module below). `pending_ctrl_b` has to survive across `scan()` calls, not
+/// just within one buffer: `Ctrl-b` can legitimately arrive as the very
+/// last byte of one `read()` and the following key as the first byte of the
+/// next.
+#[derive(Default)]
+struct InputScanner {
+    pending_ctrl_b: bool,
+}
+
+impl InputScanner {
+    /// Scan rules (docs/fast-session-switching-design.md section 5.1):
+    /// existing `Ctrl-]`/`Ctrl-b d` semantics preserved exactly; `n p N P l
+    /// 1-9` newly consumed after a pending `Ctrl-b`; anything else pending
+    /// is "not a real prefix" -- the withheld `Ctrl-b` byte is forwarded
+    /// and the current byte is reprocessed normally, so unbound `Ctrl-b`
+    /// sequences still pass through to the workload untouched.
+    fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
+        let mut actions = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < buffer.len() {
+            let byte = buffer[i];
+            if self.pending_ctrl_b {
+                self.pending_ctrl_b = false;
+                let switch = match byte {
+                    b'd' => {
+                        if !out.is_empty() {
+                            actions.push(InputAction::Forward(std::mem::take(&mut out)));
+                        }
+                        actions.push(InputAction::Detach);
+                        return actions;
+                    }
+                    b'n' => Some(SwitchTarget::Next),
+                    b'p' => Some(SwitchTarget::Prev),
+                    b'N' => Some(SwitchTarget::NextGlobal),
+                    b'P' => Some(SwitchTarget::PrevGlobal),
+                    b'l' => Some(SwitchTarget::Last),
+                    b'1'..=b'9' => Some(SwitchTarget::Index((byte - b'0') as usize)),
+                    _ => None,
+                };
+                if let Some(target) = switch {
+                    if !out.is_empty() {
+                        actions.push(InputAction::Forward(std::mem::take(&mut out)));
+                    }
+                    actions.push(InputAction::Switch(target));
+                    i += 1;
+                    continue;
+                }
+                // Not a bound chord: forward the withheld Ctrl-b and
+                // reprocess this byte normally (it might itself be Ctrl-]
+                // or a fresh Ctrl-b) -- do not advance `i`.
+                out.push(0x02);
+                continue;
+            }
+            if byte == 0x1d {
+                if !out.is_empty() {
+                    actions.push(InputAction::Forward(std::mem::take(&mut out)));
+                }
+                actions.push(InputAction::Detach);
+                return actions;
+            }
+            if byte == 0x02 {
+                self.pending_ctrl_b = true;
+                i += 1;
+                continue;
+            }
+            out.push(byte);
+            i += 1;
+        }
+        if !out.is_empty() {
+            actions.push(InputAction::Forward(out));
+        }
+        actions
+    }
+}
+
+/// Atomic switch-or-stay, run on the input thread
+/// (docs/fast-session-switching-design.md section 3.3). The critical
+/// ordering property: the new connection is fully established *before* the
+/// old one is touched, so any failure (resolution, `check_attachable`, or
+/// `establish` itself) leaves the attachment to the current session
+/// completely undisturbed.
+fn perform_switch(
+    paths: &Paths,
+    target: SwitchTarget,
+    replay_bytes: Option<usize>,
+    shared_record: &Arc<Mutex<SessionRecord>>,
+    last_session: &Arc<Mutex<Option<Uuid>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    pending_switch: &Arc<Mutex<Option<SwitchOutcome>>>,
+    switch_in_progress: &Arc<AtomicBool>,
+) -> Result<()> {
+    let current = shared_record
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let last = *last_session.lock().unwrap_or_else(PoisonError::into_inner);
+    let next = resolve_switch_target(paths, &current, target, last)?;
+    if next.id == current.id {
+        return Ok(()); // switching to yourself: silent no-op
+    }
+    check_attachable(&next)?;
+    switch_in_progress.store(true, Ordering::Relaxed);
+    let result = (|| -> Result<()> {
+        let (reader, history) = establish(&next, replay_bytes)?;
+        let writer_clone = reader.try_clone()?; // before mutating anything
+        // Repoint every forwarding thread (input, resize) at B, then retire
+        // A's stream. From this instant keystrokes land in B.
+        let old = {
+            let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *w, writer_clone)
+        };
+        *pending_switch.lock().unwrap_or_else(PoisonError::into_inner) = Some(SwitchOutcome {
+            record: next.clone(),
+            reader,
+            history,
+        });
+        *last_session.lock().unwrap_or_else(PoisonError::into_inner) = Some(current.id);
+        // Polite detach from A, then shutdown so the main loop's blocked
+        // read_frame on A's socket returns immediately. shutdown() is
+        // socket-wide, so it also unblocks the reader fd cloned from this
+        // stream -- the same mechanism the existing detach path relies on.
+        let mut old = old;
+        let _ = write_json(&mut old, &AttachControl::Detach);
+        let _ = old.shutdown(std::net::Shutdown::Both);
+        Ok(())
+    })();
+    switch_in_progress.store(false, Ordering::Relaxed);
+    result
+}
+
+/// Closes the race where the frame loop breaks because A's worker died at
+/// the same moment the user pressed a switch chord, *before* the input
+/// thread finished storing the outcome: if `pending_switch` is `None` but
+/// `switch_in_progress` is true, poll briefly for the outcome before giving
+/// up and treating it as a normal exit (docs/fast-session-switching-design.md
+/// section 5.2).
+fn take_pending_switch(
+    pending: &Arc<Mutex<Option<SwitchOutcome>>>,
+    in_progress: &Arc<AtomicBool>,
+) -> Option<SwitchOutcome> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(o) = pending.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            return Some(o);
+        }
+        if !in_progress.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
+    check_attachable(record)?;
+    let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
+    let (mut reader, initial_history) = establish(record, replay_bytes)?;
     let stdout = Arc::new(Mutex::new(io::stdout()));
-    write_locked(&stdout, &initial.payload)?;
+    write_locked(&stdout, &initial_history)?;
     let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let _raw = if tty {
         Some(RawMode::enter(libc::STDIN_FILENO)?)
@@ -2000,7 +2368,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         None
     };
     if tty {
-        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches]");
+        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches; Ctrl-b n/p/1-9/l switches]");
     }
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
@@ -2025,29 +2393,51 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             )?;
         }
     }
+
+    // -- Fast in-process session switching state (survives across
+    //    switches, unlike `reader`/`writer`'s inner stream/`record`; see
+    //    docs/fast-session-switching-design.md sections 2-3) --
+    let shared_record = Arc::new(Mutex::new(record.clone()));
+    let pending_switch: Arc<Mutex<Option<SwitchOutcome>>> = Arc::new(Mutex::new(None));
+    let switch_in_progress = Arc::new(AtomicBool::new(false));
+    let last_session: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let switch_replay_bytes = Some(history_bytes.unwrap_or(SWITCH_REPLAY_BYTES));
+    let status_ctx = StatusBarCtx {
+        stdout: stdout.clone(),
+        term: term.clone(),
+        paths: paths.clone(),
+        record: shared_record.clone(),
+        flash: Arc::new(Mutex::new(None)),
+    };
+
     let input_writer = writer.clone();
     let input_active = active.clone();
+    let input_paths = paths.clone();
+    let input_shared_record = shared_record.clone();
+    let input_last_session = last_session.clone();
+    let input_pending_switch = pending_switch.clone();
+    let input_switch_in_progress = switch_in_progress.clone();
+    let input_status_ctx = status_ctx.clone();
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
-        // Ctrl-b (0x02) immediately followed by `d` (0x64) detaches, same as
-        // Ctrl-] -- tmux's actual default prefix-key detach binding, added
-        // so tmux muscle memory works here too. This state has to survive
-        // across separate read() calls (not just within one buffer): Ctrl-b
-        // can legitimately arrive as the very last byte of one read and `d`
-        // as the first byte of the next.
+        // Ctrl-b (0x02) prefix state machine -- Ctrl-] and Ctrl-b d detach,
+        // Ctrl-b n/p/N/P/l/1-9 switch sessions, anything else pending is
+        // not a real prefix (both bytes forward to the workload). See
+        // `InputScanner` for the byte-level rules and why this needs to
+        // survive across separate read() calls, not just within one
+        // buffer.
         //
         // Design choice: real tmux turns Ctrl-b into a standing "prefix"
         // that consumes the next keystroke as a command (or no-ops/bells if
         // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
         // has no such command-prefix system and isn't growing one just for
-        // this, so the simplest reasonable behavior is used instead: Ctrl-b
-        // followed by `d` detaches; Ctrl-b followed by anything else is not
-        // a prefix at all -- both bytes are forwarded through as ordinary
-        // input, so a program that wants a literal Ctrl-b (some editors and
-        // REPLs use it) isn't broken by this feature when the user doesn't
-        // follow it with `d`.
-        let mut pending_ctrl_b = false;
+        // this, so the simplest reasonable behavior is used instead: a
+        // *bound* Ctrl-b sequence (d/n/p/N/P/l/1-9) is consumed; anything
+        // else is not a prefix at all -- both bytes are forwarded through as
+        // ordinary input, so a program that wants a literal Ctrl-b (some
+        // editors and REPLs use it) isn't broken by this feature.
+        let mut scanner = InputScanner::default();
         'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
                 Ok(0) => break,
@@ -2061,44 +2451,47 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 }
                 continue;
             }
-            let mut out = Vec::with_capacity(n);
-            let mut i = 0;
-            while i < n {
-                let byte = buffer[i];
-                if pending_ctrl_b {
-                    pending_ctrl_b = false;
-                    if byte == b'd' {
-                        if !out.is_empty() {
-                            let _ = send_data(&input_writer, &out);
+            for action in scanner.scan(&buffer[..n]) {
+                match action {
+                    InputAction::Forward(bytes) => {
+                        // Ordering matters: a Forward before a Switch goes
+                        // to the old session (keystrokes typed before the
+                        // chord); a Forward after it goes to the new one,
+                        // automatically, because perform_switch swapped the
+                        // stream inside input_writer's mutex.
+                        if send_data(&input_writer, &bytes).is_err() {
+                            break 'outer;
                         }
+                    }
+                    InputAction::Detach => {
                         let _ = send_control(&input_writer, &AttachControl::Detach);
                         input_active.store(false, Ordering::Relaxed);
                         break 'outer;
                     }
-                    // Not a detach: forward the withheld Ctrl-b and then
-                    // reprocess this byte normally (it might itself be
-                    // Ctrl-] or a fresh Ctrl-b).
-                    out.push(0x02);
-                    continue;
-                }
-                if byte == 0x1d {
-                    if !out.is_empty() {
-                        let _ = send_data(&input_writer, &out);
+                    InputAction::Switch(target) => {
+                        let result = perform_switch(
+                            &input_paths,
+                            target,
+                            switch_replay_bytes,
+                            &input_shared_record,
+                            &input_last_session,
+                            &input_writer,
+                            &input_pending_switch,
+                            &input_switch_in_progress,
+                        );
+                        // On Err nothing was sent to A and nothing swapped
+                        // (perform_switch's ordering guarantee) -- the user
+                        // just stays where they were with an explanation on
+                        // the bar. The consumed chord bytes are never
+                        // forwarded either way.
+                        if let Err(e) = result {
+                            if let Ok(mut flash) = input_status_ctx.flash.lock() {
+                                *flash = Some((format!("{e:#}"), Instant::now()));
+                            }
+                            draw_status_bar(&input_status_ctx);
+                        }
                     }
-                    let _ = send_control(&input_writer, &AttachControl::Detach);
-                    input_active.store(false, Ordering::Relaxed);
-                    break 'outer;
                 }
-                if byte == 0x02 {
-                    pending_ctrl_b = true;
-                    i += 1;
-                    continue;
-                }
-                out.push(byte);
-                i += 1;
-            }
-            if !out.is_empty() && send_data(&input_writer, &out).is_err() {
-                break;
             }
         }
     });
@@ -2114,6 +2507,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 if size != last {
                     if let Some((rows, cols)) = size {
                         apply_terminal_layout(&resize_stdout, &resize_term, rows, cols);
+                        // A switch deliberately shuts down the old socket to
+                        // unblock the main frame loop's read (see
+                        // perform_switch); if a real terminal resize races
+                        // that exact window this send_control can fail on
+                        // the about-to-die stream even though nothing is
+                        // actually wrong going forward. `continue` (not
+                        // `break`) so this thread keeps polling across a
+                        // switch instead of leaving resizes dead for the
+                        // rest of the attach -- the post-switch explicit
+                        // Resize the main loop sends covers any update lost
+                        // in that exact window.
                         if send_control(
                             &resize_writer,
                             &AttachControl::Resize {
@@ -2123,7 +2527,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         )
                         .is_err()
                         {
-                            break;
+                            last = size;
+                            continue;
                         }
                     }
                     last = size;
@@ -2131,12 +2536,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 thread::sleep(Duration::from_millis(200));
             }
         });
-        let status_stdout = stdout.clone();
-        let status_term = term.clone();
         let status_active = active.clone();
-        let status_paths = paths.clone();
-        let status_record = record.clone();
         let status_last_activity = last_activity.clone();
+        let thread_status_ctx = status_ctx.clone();
         thread::spawn(move || {
             let mut last_draw = Instant::now();
             // Edge-triggered, not level-triggered: once the PTY has been
@@ -2164,56 +2566,310 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 let idle_for = activity.elapsed();
                 let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
                 if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
-                    draw_status_bar(&status_stdout, &status_term, &status_paths, &status_record);
+                    draw_status_bar(&thread_status_ctx);
                     last_draw = Instant::now();
                     drawn_for_current_idle = true;
                 }
             }
         });
     }
-    loop {
-        let frame = match read_frame(&mut reader) {
-            Ok(Some(f)) => f,
-            Ok(None) => break,
-            Err(e)
-                if e.downcast_ref::<io::Error>()
-                    .map(|x| {
-                        matches!(
-                            x.kind(),
-                            io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
-                        )
-                    })
-                    .unwrap_or(false) =>
-            {
-                break
-            }
-            Err(e) => return Err(e),
-        };
-        match frame.kind {
-            FrameKind::Data => {
-                write_locked(&stdout, &frame.payload)?;
-                if let Ok(mut t) = last_activity.lock() {
-                    *t = Instant::now();
+
+    'session: loop {
+        loop {
+            let frame = match read_frame(&mut reader) {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e)
+                    if e.downcast_ref::<io::Error>()
+                        .map(|x| {
+                            matches!(
+                                x.kind(),
+                                io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                            )
+                        })
+                        .unwrap_or(false) =>
+                {
+                    break
                 }
-            }
-            FrameKind::End => break,
-            FrameKind::Json => {
-                let event: ServerEvent = serde_json::from_slice(&frame.payload)?;
-                match event {
-                    ServerEvent::Exit { .. } => break,
-                    ServerEvent::Error { message } => {
-                        eprintln!("[aplexer: {message}]");
-                        break;
+                Err(e) => return Err(e),
+            };
+            match frame.kind {
+                FrameKind::Data => {
+                    write_locked(&stdout, &frame.payload)?;
+                    if let Ok(mut t) = last_activity.lock() {
+                        *t = Instant::now();
+                    }
+                }
+                FrameKind::End => break,
+                FrameKind::Json => {
+                    let event: ServerEvent = serde_json::from_slice(&frame.payload)?;
+                    match event {
+                        ServerEvent::Exit { .. } => break,
+                        ServerEvent::Error { message } => {
+                            eprintln!("[aplexer: {message}]");
+                            break;
+                        }
                     }
                 }
             }
         }
+        // The frame loop broke: either the session ended/we detached, or
+        // the input thread killed the old stream to hand us a switch.
+        let outcome = take_pending_switch(&pending_switch, &switch_in_progress);
+        let Some(outcome) = outcome else { break };
+
+        *shared_record.lock().unwrap_or_else(PoisonError::into_inner) = outcome.record;
+        reader = outcome.reader; // old stream dropped (closed) here
+
+        // Light-variant reset: clear screen + home + show cursor, but keep
+        // the DECSTBM scroll region and raw mode -- they are terminal
+        // state, not session state. ?25h because A's TUI may have hidden
+        // the cursor and B never knows to show it; same rationale as
+        // reset_terminal's.
+        let mut seq: Vec<u8> = b"\x1b[2J\x1b[H\x1b[?25h".to_vec();
+        seq.extend_from_slice(&outcome.history);
+        let _ = write_locked(&stdout, &seq);
+        if let Ok(mut t) = last_activity.lock() {
+            *t = Instant::now();
+        }
+
+        // B's PTY may still be sized for its previous client (or the
+        // 24x80 default). The resize thread won't resend an unchanged
+        // terminal size (its `last` cache), so push the current geometry
+        // explicitly.
+        let geom = term.lock().map(|g| *g).unwrap_or(TermGeom {
+            rows: 0,
+            cols: 0,
+            reserved: false,
+        });
+        if geom.rows > 0 {
+            let _ = send_control(
+                &writer,
+                &AttachControl::Resize {
+                    rows: reserved_rows(geom.rows),
+                    cols: geom.cols,
+                },
+            );
+        }
+        draw_status_bar(&status_ctx); // clear wiped the reserved row; redraw now
+        continue 'session;
     }
     active.store(false, Ordering::Relaxed);
     if let Ok(stream) = writer.lock() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod switching_tests {
+    use super::*;
+
+    fn bytes(actions: &[InputAction]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for a in actions {
+            if let InputAction::Forward(b) = a {
+                out.extend_from_slice(b);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scan_ctrl_b_n_is_switch_next() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, b'n']);
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Switch(SwitchTarget::Next)]
+        ));
+    }
+
+    #[test]
+    fn scan_split_across_reads() {
+        let mut s = InputScanner::default();
+        assert!(s.scan(&[0x02]).is_empty());
+        let actions = s.scan(&[b'n']);
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Switch(SwitchTarget::Next)]
+        ));
+    }
+
+    #[test]
+    fn scan_unbound_ctrl_b_forwards_both_bytes() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, b'x']);
+        match actions.as_slice() {
+            [InputAction::Forward(b)] => assert_eq!(b, &[0x02, b'x']),
+            other => panic!("unexpected: {}", other.len()),
+        }
+    }
+
+    #[test]
+    fn scan_forward_switch_forward() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[b'a', 0x02, b'3', b'z']);
+        assert_eq!(actions.len(), 3);
+        match &actions[0] {
+            InputAction::Forward(b) => assert_eq!(b, &[b'a']),
+            _ => panic!("expected Forward"),
+        }
+        assert!(matches!(
+            &actions[1],
+            InputAction::Switch(SwitchTarget::Index(3))
+        ));
+        match &actions[2] {
+            InputAction::Forward(b) => assert_eq!(b, &[b'z']),
+            _ => panic!("expected Forward"),
+        }
+    }
+
+    #[test]
+    fn scan_ctrl_b_d_detaches() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, b'd']);
+        assert!(matches!(actions.as_slice(), [InputAction::Detach]));
+    }
+
+    #[test]
+    fn scan_ctrl_bracket_discards_rest() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[b'a', 0x1d, b'b', b'c']);
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            InputAction::Forward(b) => assert_eq!(b, &[b'a']),
+            _ => panic!("expected Forward"),
+        }
+        assert!(matches!(&actions[1], InputAction::Detach));
+    }
+
+    #[test]
+    fn scan_double_ctrl_b_then_d() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, 0x02, b'd']);
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            InputAction::Forward(b) => assert_eq!(b, &[0x02]),
+            _ => panic!("expected Forward"),
+        }
+        assert!(matches!(&actions[1], InputAction::Detach));
+    }
+
+    #[test]
+    fn scan_ctrl_b_zero_forwards_both() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, b'0']);
+        assert_eq!(bytes(&actions), vec![0x02, b'0']);
+    }
+
+    fn mk_record(workspace: &str, tag: &str, phase: Phase) -> SessionRecord {
+        let id = Uuid::new_v4();
+        SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id,
+            workspace: PathBuf::from(workspace),
+            tag: tag.to_string(),
+            engine: "shell".to_string(),
+            profile: None,
+            command: vec![],
+            cwd: PathBuf::from(workspace),
+            env: Default::default(),
+            limits: Default::default(),
+            history_bytes: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            phase,
+            worker_pid: Some(std::process::id()), // our own pid: always "alive"
+            workload_pid: None,
+            socket_path: PathBuf::from("/nonexistent"),
+            history_path: PathBuf::from("/nonexistent"),
+            exit: None,
+            error: None,
+        }
+    }
+
+    fn sample_groups() -> Vec<(PathBuf, Vec<SessionRecord>)> {
+        let ws_a = "/ws/a";
+        let ws_b = "/ws/b";
+        let mut a1 = mk_record(ws_a, "main", Phase::Running);
+        let mut a2 = mk_record(ws_a, "review", Phase::Running);
+        let mut a3 = mk_record(ws_a, "dead", Phase::Exited);
+        a1.worker_pid = Some(std::process::id());
+        a2.worker_pid = Some(std::process::id());
+        a3.worker_pid = None; // exited, unattachable regardless
+        let b1 = mk_record(ws_b, "only", Phase::Running);
+        vec![
+            (PathBuf::from(ws_a), vec![a1, a2, a3]),
+            (PathBuf::from(ws_b), vec![b1]),
+        ]
+    }
+
+    #[test]
+    fn next_prev_wrap_and_skip_dead() {
+        let groups = sample_groups();
+        let a1 = groups[0].1[0].id;
+        let a2 = groups[0].1[1].id;
+        let next = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Next, None)
+            .unwrap();
+        assert_eq!(next.id, a2); // dead a3 skipped
+        let prev = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Prev, None)
+            .unwrap();
+        assert_eq!(prev.id, a2); // wraps backward past dead a3 too
+    }
+
+    #[test]
+    fn index_returns_dead_session_without_skipping() {
+        let groups = sample_groups();
+        let a1 = groups[0].1[0].id;
+        let dead = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Index(3), None)
+            .unwrap();
+        assert_eq!(dead.phase, Phase::Exited);
+    }
+
+    #[test]
+    fn index_out_of_range_errors() {
+        let groups = sample_groups();
+        let a1 = groups[0].1[0].id;
+        let err = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Index(9), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("no session 9"));
+    }
+
+    #[test]
+    fn next_global_crosses_workspace_boundary() {
+        let groups = sample_groups();
+        let a2 = groups[0].1[1].id; // last live session in ws/a
+        let next = pick_switch_target(
+            &groups,
+            Path::new("/ws/a"),
+            a2,
+            SwitchTarget::NextGlobal,
+            None,
+        )
+        .unwrap();
+        assert_eq!(next.workspace, PathBuf::from("/ws/b"));
+    }
+
+    #[test]
+    fn last_resolves_by_id() {
+        let groups = sample_groups();
+        let a1 = groups[0].1[0].id;
+        let a2 = groups[0].1[1].id;
+        let found =
+            pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Last, Some(a2))
+                .unwrap();
+        assert_eq!(found.id, a2);
+    }
+
+    #[test]
+    fn single_live_session_workspace_errors_on_next() {
+        let groups = sample_groups();
+        let b1 = groups[1].1[0].id;
+        let err = pick_switch_target(&groups, Path::new("/ws/b"), b1, SwitchTarget::Next, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("no other running session"));
+    }
 }
 
 fn send_data(writer: &Arc<Mutex<UnixStream>>, data: &[u8]) -> Result<()> {
