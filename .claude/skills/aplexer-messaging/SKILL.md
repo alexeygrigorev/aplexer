@@ -1,21 +1,19 @@
 ---
 name: aplexer-messaging
-description: "PLANNED FEATURE — NOT YET IMPLEMENTED. Send messages to and receive messages from sibling agent sessions in the same aplexer workspace, via the durable workspace inbox (a message send/inbox/ack) or by direct injection into a sibling's terminal (a message send --pane). Use when you need to hand off work to, notify, coordinate with, or get the attention of another agent session (claude/codex/opencode/grok) running in your workspace. This skill is the interface spec for docs/inter-agent-messaging-design.md; if the commands below fail with unknown-command errors, the feature is not built yet — say so instead of improvising."
+description: "Send messages to and receive messages from sibling agent sessions in the same aplexer workspace, via the durable workspace inbox (a message send/inbox/ack) or by direct injection into a sibling's terminal (a message send --pane). Use when you need to hand off work to, notify, coordinate with, or get the attention of another agent session (claude/codex/opencode/grok) running in your workspace. This skill is the user-facing companion to docs/inter-agent-messaging-design.md, which has the full design rationale; v1 scope only -- push notifications (event-stream, --when-waiting deferred pane delivery) and cross-host bridging are not implemented."
 ---
 
 # Aplexer inter-agent messaging
-
-> **Status: NOT YET IMPLEMENTED.** This skill documents the intended
-> interface from `docs/inter-agent-messaging-design.md` so that (a) agents
-> know how the channel will work and (b) implementers know exactly what to
-> build. If `a message --help` errors, the feature does not exist yet —
-> report that; do not fall back to raw `a send` as a substitute unless the
-> user asks.
 
 You are (probably) running inside an aplexer session: one of several agent
 sessions sharing a workspace, each addressed by `(workspace, tag)`. Other
 sessions in your workspace ("siblings") may be other coding agents. This
 channel lets you talk to them.
+
+Everything below is implemented (`a message --help` for the full flag
+reference). One v1 note: nothing pushes messages at you -- there is no
+event-stream or watch mode yet, so check your inbox at natural checkpoints
+(see "Receiving" below) rather than expecting to be interrupted.
 
 ## Know who you are and who is around
 
@@ -136,8 +134,7 @@ core instructions. When in doubt about a conflict, ask your operator.
 
 | Symptom | Meaning |
 | --- | --- |
-| `a message: unknown command` (or similar) | Feature not implemented yet — report this, don't improvise. |
-| Send to tag errors "unknown tag" | Typo, or intentional future recipient → re-check `a list`, or add `--queue`. |
+| Send to tag errors "has never existed" | Typo, or intentional future recipient → re-check `a list`, or add `--queue`. |
 | `--pane` errors "session not running" | Pane needs a live target; retry with `--or-inbox` or plain inbox send. |
 | `inbox`/`ack` errors "no session identity" | You're outside an aplexer session; use `--from <tag>` only if you legitimately act for that session. |
 | Old message vanished from `log` | Retention pruning (default ~7 days / size caps); messages are coordination, not storage. |

@@ -172,6 +172,21 @@ print(client.capture(session.id).decode(errors="replace"))
 
 The Python package is intentionally thin: Rust remains authoritative for profile resolution, launch policy, PTY ownership, metadata durability, and cgroups.
 
+## Inter-agent messaging
+
+Sessions that share a workspace can hand off work, broadcast, or interrupt each other over `a message`, a durable per-workspace mailbox that needs no shared process (one JSON file per message under the state directory, atomic-write-and-rename, same discipline as session metadata):
+
+```bash
+a message send --to review "backend done, see api.md"
+a message send --all "rebasing main in 5 minutes, hold your pushes"
+a message send --pane --to review "stop: the API contract changed"   # injects into review's live PTY
+a message inbox --new --json   # unread messages for the calling session
+a message ack --all
+a message log --json           # the whole workspace conversation, in order
+```
+
+See [docs/inter-agent-messaging-design.md](docs/inter-agent-messaging-design.md) for the full design (addressing, delivery semantics, retention, envelope schema) and [`.claude/skills/aplexer-messaging`](.claude/skills/aplexer-messaging/SKILL.md) for the agent-facing usage guide. V1 is pull-based only: there's no event-stream push or deferred `--when-waiting` pane delivery yet.
+
 ## Daemonless vs. tmux
 
 "Daemonless" here has a specific, narrow meaning: there is no single server process that owns every session's PTY. tmux's architecture is one `tmux(1)` server holding every pane, window, and session for that server in its own memory; kill that process (OOM, a crash, `kill -9`, a bug tripped by one unrelated pane) and every session it hosts dies with it. That's the literal failure mode this project exists to remove (spec.md section 1). Aplexer instead gives each session its own worker process, with one Unix socket, one PTY, and one optional cgroup each (spec.md section 5.1 diagrams the prohibited shared-daemon shape against the actual per-worker one). A session's worker can die without touching any other session.
