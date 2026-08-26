@@ -1878,27 +1878,50 @@ fn memory_indicator(record: &SessionRecord) -> Option<String> {
     })
 }
 
-/// `tag(state)` for every other session in the same workspace, mirroring how
-/// `a list`'s tree groups sessions by workspace (see `group_by_workspace`) --
-/// a live glance at what else is running here without detaching.
+/// `{i}:{tag}[*][({state})]` for every session in the current workspace,
+/// mirroring how `a list`'s tree groups sessions by workspace (see
+/// `group_by_workspace`) -- a live glance at what else is running here
+/// without detaching, and (unlike the old `sibling_summary` it replaces)
+/// self-documenting: `i` is exactly the number `Ctrl-b 1`..`9` jumps to
+/// (`pick_switch_target`'s `Index` arm), because both walk the same
+/// `list_records` order (`Reverse(created_at_ms)`) that `group_by_workspace`
+/// preserves within a group -- see the equivalence note on
+/// `resolve_quick_index`. `*` marks the currently attached session;
+/// `(state)` is appended only when the state is not "running" (the common
+/// case needs no label). Lists **all** sessions including the current one
+/// (the old version listed only "the others") because the numbering only
+/// makes sense as a complete index. Example: `1:main* 2:review
+/// 3:build(broken)`. A single-session workspace omits the segment (empty
+/// string), same as before.
 fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
     let records = match list_records(&ctx.paths) {
         Ok(r) => r,
         Err(_) => return String::new(),
     };
-    let parts: Vec<String> = records
+    let siblings: Vec<SessionRecord> = records
         .into_iter()
-        .filter(|r| r.workspace == record.workspace && r.id != record.id)
-        .map(|r| {
-            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-            format!("{}({})", r.tag, display_state(&r.phase, alive))
-        })
+        .filter(|r| r.workspace == record.workspace)
         .collect();
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("siblings: {}", parts.join(" "))
+    if siblings.len() <= 1 {
+        return String::new();
     }
+    siblings
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+            let state = display_state(&r.phase, alive);
+            let mut part = format!("{}:{}", i + 1, r.tag);
+            if r.id == record.id {
+                part.push('*');
+            }
+            if state != "running" {
+                part.push_str(&format!("({state})"));
+            }
+            part
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Pads or truncates (by character, not byte, so multi-byte UTF-8 in a tag
@@ -1922,7 +1945,7 @@ fn pad_or_truncate(text: &str, cols: usize) -> String {
 /// docs/fast-session-switching-design.md section 3. `record` is shared and
 /// swappable so an in-process switch is visible to the bar without
 /// respawning the thread; `flash` is a transient error line (switch
-/// failures).
+/// failures); `last_drawn` backs the dirty-check in `draw_status_bar`.
 #[derive(Clone)]
 struct StatusBarCtx {
     stdout: Arc<Mutex<io::Stdout>>,
@@ -1930,6 +1953,10 @@ struct StatusBarCtx {
     paths: Paths,
     record: Arc<Mutex<SessionRecord>>,
     flash: Arc<Mutex<Option<(String, Instant)>>>,
+    /// (text, rows, cols) last actually written, so an unchanged bar isn't
+    /// rewritten every debounce tick -- see `draw_status_bar`'s doc comment
+    /// and docs/low-bandwidth-remote-access-design.md section 2.1.
+    last_drawn: Arc<Mutex<Option<(String, u16, u16)>>>,
 }
 
 /// How long a switch-failure message stays on the status bar before the
@@ -1976,7 +2003,36 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 /// cursor -- so a redraw racing a keystroke never disturbs the shell's own
 /// cursor position. No-ops when the current terminal is too small to have a
 /// reserved row.
-fn draw_status_bar(ctx: &StatusBarCtx) {
+///
+/// Two deliberate additions beyond the original version:
+///
+/// - **Dirty-checked**: skips the write entirely when the rendered text and
+///   geometry are byte-identical to the last actual write (`ctx.last_drawn`).
+///   An idle session's bar is naturally quantized (memory rounds to whole
+///   units, sibling states rarely change), so this removes nearly all idle
+///   redraw chatter with no behavior change when something *did* change.
+///   See docs/low-bandwidth-remote-access-design.md section 2.1.
+/// - **Defensively reasserts the DECSTBM margin** (`apply_terminal_layout`'s
+///   own `\x1b[1;{rows-1}r`) every time it actually writes. A full-screen
+///   TUI switching to the alternate screen buffer, or resetting margins
+///   itself before laying out its own UI, can silently undo the reservation
+///   outside our control; the resize-poll thread only reapplies it when the
+///   physical terminal *size* changes, so a clobbered margin would
+///   otherwise stay clobbered for the rest of the attach. Reasserting it
+///   here means the reservation self-heals within one redraw cycle instead
+///   of being lost permanently. Cheap (a handful of extra bytes) and
+///   wrapped in the same save/restore-cursor pair so it can't disturb the
+///   workload's own cursor position.
+///
+/// `force`: bypass the dirty-check and write unconditionally. The
+/// dirty-check alone would let a *clobbered margin* go unrepaired
+/// indefinitely during a long idle stretch where the bar's *text* never
+/// changes (nothing to detect); callers that need the margin-defense
+/// guarantee to actually bound in time -- the status thread's own
+/// `STATUS_BAR_MAX_INTERVAL` forced tick, and every switch/flash redraw,
+/// which are already low-frequency, user-triggered events where bandwidth
+/// isn't the concern -- pass `true`.
+fn draw_status_bar(ctx: &StatusBarCtx, force: bool) {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return,
@@ -1985,8 +2041,17 @@ fn draw_status_bar(ctx: &StatusBarCtx) {
         return;
     }
     let text = status_bar_text(ctx, geom.cols as usize);
+    {
+        let mut last = ctx.last_drawn.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (text.clone(), geom.rows, geom.cols);
+        if !force && last.as_ref() == Some(&key) {
+            return;
+        }
+        *last = Some(key);
+    }
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b7");
+    seq.extend_from_slice(format!("\x1b[1;{}r", geom.rows - 1).as_bytes());
     seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
     seq.extend_from_slice(b"\x1b[2K\x1b[7m");
     seq.extend_from_slice(text.as_bytes());
@@ -2408,6 +2473,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         paths: paths.clone(),
         record: shared_record.clone(),
         flash: Arc::new(Mutex::new(None)),
+        last_drawn: Arc::new(Mutex::new(None)),
     };
 
     let input_writer = writer.clone();
@@ -2488,7 +2554,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                             if let Ok(mut flash) = input_status_ctx.flash.lock() {
                                 *flash = Some((format!("{e:#}"), Instant::now()));
                             }
-                            draw_status_bar(&input_status_ctx);
+                            draw_status_bar(&input_status_ctx, true);
                         }
                     }
                 }
@@ -2566,7 +2632,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 let idle_for = activity.elapsed();
                 let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
                 if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
-                    draw_status_bar(&thread_status_ctx);
+                    // `overdue` forces the write even if the text is
+                    // unchanged -- see draw_status_bar's doc comment on why
+                    // the margin-defense guarantee needs that.
+                    draw_status_bar(&thread_status_ctx, overdue);
                     last_draw = Instant::now();
                     drawn_for_current_idle = true;
                 }
@@ -2651,7 +2720,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 },
             );
         }
-        draw_status_bar(&status_ctx); // clear wiped the reserved row; redraw now
+        draw_status_bar(&status_ctx, true); // clear wiped the reserved row; redraw now
         continue 'session;
     }
     active.store(false, Ordering::Relaxed);
