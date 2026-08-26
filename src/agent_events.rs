@@ -1,88 +1,76 @@
-//! Headless agent-invocation streaming (`a exec`) and native-transcript
-//! tailing (`a transcript`) -- both emit the same `UnifiedEvent` envelope
-//! `src/watch.rs` already defined for `a watch --jsonl`
-//! (docs/pocketshell-integration-plan.md Part 2 / heru's `UnifiedEvent`).
+//! Parse an aplexer session's native engine conversation log into heru
+//! `UnifiedEvent` JSONL (`a transcript`). PocketShell's conversation pane
+//! is the intended consumer -- last-N for the initial view, `--before` for
+//! older pages, `--after` plus `--follow` for live tail.
 //!
-//! This is a DIFFERENT, complementary capability from `a watch`: `a watch`
-//! derives coarse host-level session-lifecycle events (created/exited/
-//! oom/a running-vs-waiting heuristic) by polling `session.json` records --
-//! it never looks at what an agent is actually saying or doing. This module
-//! ports heru's real, working Python adapters (`heru/base.py`,
-//! `heru/adapters/{claude,codex}.py` + their `_*_impl.py` field-mapping
-//! helpers, read in full at `/home/alexey/git/heru` commit `7278523`) so
-//! aplexer can parse an agent's own conversation -- messages, tool calls,
-//! tool results, usage, continuation ids -- into the SAME envelope.
+//! This is a different layer from `a watch`: `a watch` derives coarse
+//! host-level session-lifecycle events (created/exited/oom / a
+//! running-vs-waiting heuristic) by polling `session.json`. It never looks
+//! at what an agent is saying. This module parses the conversation the
+//! agent CLI already writes to disk during an ordinary interactive
+//! `a start`/`a attach` session.
 //!
-//! Two independent sources feed the same parsers:
+//! Capture and keep (deliberate, not a copy of the PTY history):
 //!
-//! - **`a exec`**: invokes `claude`/`codex`/`grok` in their own documented
-//!   HEADLESS/non-interactive mode (`codex exec --json`, `claude --print
-//!   --output-format stream-json`, `grok -p --output-format
-//!   streaming-messages-json`) as a plain child process (NOT a PTY -- see
-//!   `run_exec`'s doc comment for why) and streams its stdout JSONL,
-//!   translated live, until the run completes.
-//! - **`a transcript`**: locates and parses the NATIVE, PERSISTED JSONL
-//!   conversation log an agent CLI writes during a completely ordinary
-//!   INTERACTIVE session (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`,
-//!   `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`) -- no special launch
-//!   mode needed at all, since aplexer's actual common case is a long-lived
-//!   `a start`/`a attach` PTY session, not a one-shot headless invocation.
-//!   Ported from `/home/alexey/git/pocketshell/tools/pocketshell/src/
-//!   pocketshell/agent_log.py`'s path-resolution rules (read in full).
+//! - **Source of truth** is the engine's own append-only JSONL, not aplexer
+//!   state. We do not duplicate conversation bytes under the session dir
+//!   (that would go stale, double disk, and fight the engine's own log).
+//!   PTY `history.bin` stays the raw terminal capture; this is the
+//!   structured conversation.
+//! - **Location** is a heuristic the first time: aplexer has the session's
+//!   cwd + created_at, not the engine-native session id. Rules are ported
+//!   from pocketshell's `agent_log.py` (`~/.claude/projects/<encoded-cwd>/`,
+//!   `~/.codex/sessions/<Y>/<M>/<D>/`, `$GROK_HOME/sessions/<urlencoded-cwd>/`).
+//! - **Bind**: once located, the path is written to
+//!   `<state>/sessions/<id>/transcript.json` so later reads and `--follow`
+//!   hit the same file even if a second session shares the cwd. The bind
+//!   is a sidecar, not a `SessionRecord` field, so the worker's periodic
+//!   `last_activity_ms` writes cannot race it away.
+//! - **Re-locate** if the bound path disappears (agent rotated the log).
 //!
-//! Claude's headless wire format and its native transcript format are
-//! VERIFIED BYTE-IDENTICAL in shape (both are the raw `claude --print
-//! --output-format stream-json` per-line event shape -- confirmed by
-//! inspecting a real `~/.claude/projects/.../*.jsonl` file on this machine),
-//! so one set of translate functions (`claude_wire_events`) serves `a exec
-//! --engine claude`, `a exec --engine grok` (grok's `streaming-messages-json`
-//! headless format is the Anthropic Messages API wire format too -- verified
-//! with a real `grok -p ... --output-format streaming-messages-json`
-//! invocation), AND `a transcript --engine claude`. Codex's headless
-//! (`item.completed`/`agent_message`) and native (`response_item`/
-//! `event_msg` rollout envelope) formats are GENUINELY DIFFERENT wire
-//! shapes -- ported as two separate functions, `codex_exec_events` and
-//! `codex_native_events`.
+//! Supported engines: claude, codex, grok. `shell`/`gemini`/`opencode` have
+//! no reader here yet. Claude's native `.jsonl` is the Anthropic Messages
+//! API event shape (same functions as heru's claude adapter). Codex's
+//! native rollout (`response_item`) is a different shape from `codex exec
+//! --json` -- only the native shape is parsed, because this is not a
+//! headless launcher. Grok Build writes ACP `updates.jsonl`.
 //!
-//! Known, deliberate departures from heru's Python source (found while
-//! validating against real CLI output on this machine, documented rather
-//! than silently "fixed" out from under the port):
+//! Known, deliberate departures from heru's Python source:
 //!
-//! - heru's claude `live_events()` has an unreachable `tool_result` branch:
-//!   it matches a top-level `{"type":"tool_result",...}` event, but real
-//!   `claude --print --output-format stream-json` output never emits that
-//!   shape -- tool results arrive nested as `{"type":"user","message":
-//!   {"content":[{"type":"tool_result",...}]}}` (the Anthropic Messages API
-//!   convention). This port keeps heru's (dead) top-level branch for fidelity
-//!   AND additionally unwraps the real `"user"` shape, so `a exec --engine
-//!   claude`/`grok` actually surfaces `tool_result` events end to end.
-//! - heru's codex `command_execution` mapping assumes `item.command` is
-//!   always a JSON array and reads `command[0]` as the tool name; real
-//!   `codex exec --json` output on this machine emits `item.command` as a
-//!   plain string (`"/bin/bash -lc ls"`). This port accepts both shapes.
-//! - Claude's partial `content_block_delta` text chunks AND the later,
-//!   complete top-level `"assistant"` message BOTH translate to `message`-
-//!   kind events -- this is heru's actual behavior (ported faithfully, not a
-//!   bug here): a consumer wanting only the final text should read the
-//!   larger, later `message` events per turn, not sum every delta.
+//! - heru's claude `live_events()` has an unreachable top-level
+//!   `tool_result` branch; real logs nest tool results inside
+//!   `{"type":"user","message":{"content":[{"type":"tool_result",...}]}}`.
+//!   This keeps the dead branch and unwraps the real `"user"` shape, and
+//!   also emits user **text** turns from that same `"user"` event (needed
+//!   for PocketShell display; heru's live adapter was assistant-centric).
+//! - Claude `content_block_delta` chunks AND the later complete
+//!   `"assistant"` message both become `message` events -- heru's behavior,
+//!   ported faithfully. A consumer that wants only the final text should
+//!   skip the small deltas.
 
 use crate::watch::{iso8601_utc, UnifiedEvent};
-use crate::{now_ms, Result};
+use crate::{atomic_write_json, now_ms, Result, SessionRecord};
 use anyhow::{anyhow, bail, Context};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+/// Byte-identical to PocketShell's `LINE_TRUNCATION_SENTINEL` so a client
+/// that already recognises the marker can render a truncation chip instead
+/// of feeding an oversized line to a parser.
+const LINE_TRUNCATION_SENTINEL: &str = "@@PS_LINE_TRUNCATED@@";
+
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------
-// JSONL payload assembly -- tolerant of one-JSON-object-per-line (the
-// common case for all three engines observed on this machine) AND of a
+// JSONL payload assembly -- tolerant of one-JSON-object-per-line AND of a
 // JSON object split across multiple lines (heru's `_codex_impl.py::
-// iter_codex_payloads` defends against this with brace/bracket/string
-// balance tracking; ported here as `JsonAssembler` and used uniformly
-// for all engines/sources since it is a strict superset of "one line is
-// already valid JSON").
+// iter_codex_payloads` brace/bracket/string balance tracking).
 // ---------------------------------------------------------------------
 
 #[derive(Default)]
@@ -151,12 +139,7 @@ fn ev(kind: &'static str) -> UnifiedEvent {
     UnifiedEvent {
         kind,
         // heru's `UnifiedEvent.raw` defaults to `{}` (`Field(default_factory
-        // =dict)`), not null -- `Value`'s own `Default` is `Null`, so this
-        // is set explicitly here rather than left to `..Default::default()`.
-        // Callers that have a real native payload overwrite this before the
-        // event is emitted (see `run_exec`/`read_transcript_events`); the
-        // batched-at-the-end `continuation` event is the one case with no
-        // single native payload to attach, and keeps this `{}`.
+        // =dict)`), not null -- `Value`'s own `Default` is `Null`.
         raw: json!({}),
         ..Default::default()
     }
@@ -173,10 +156,7 @@ fn int_meta(map: &mut BTreeMap<String, Value>, key: &str, v: &Value) {
 }
 
 // ---------------------------------------------------------------------
-// Claude wire format (heru's `_claude_impl.py::live_events` +
-// `claude_continuation`) -- also used for grok's headless
-// `streaming-messages-json`, verified byte-shape-identical, and for
-// `a transcript --engine claude`'s native `.jsonl` (verified identical).
+// Claude native JSONL (Anthropic Messages API event shape).
 // ---------------------------------------------------------------------
 
 /// `unwrap_stream_event`: partial-delta lines arrive wrapped as
@@ -222,8 +202,32 @@ fn claude_final_messages(payload: &Value) -> Vec<String> {
     out
 }
 
+fn claude_tool_result_event(engine: &str, block: &Value) -> UnifiedEvent {
+    let tool_output = match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => String::new(),
+    };
+    let mut e = ev("tool_result");
+    e.engine = engine.to_string();
+    e.role = Some("user".to_string());
+    e.tool_output = Some(tool_output);
+    if let Some(id) = str_field(block, "tool_use_id") {
+        e.metadata.insert("tool_use_id".into(), json!(id));
+    }
+    e
+}
+
+fn claude_user_text_event(engine: &str, text: &str) -> UnifiedEvent {
+    let mut e = ev("message");
+    e.engine = engine.to_string();
+    e.role = Some("user".to_string());
+    e.content = text.to_string();
+    e
+}
+
 /// Ported `_claude_impl.py::live_events`, PLUS the real-shape `"user"`
-/// tool_result unwrap documented in the module doc comment above.
+/// unwrap (tool_result AND user text -- PocketShell needs both).
 fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
     let unwrapped = claude_unwrap(payload);
     let event_type = unwrapped.get("type").and_then(|t| t.as_str());
@@ -261,8 +265,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
                 }
             }
         }
-        // Ported as-is from heru (unreachable against real output on this
-        // machine, kept for fidelity -- see module doc comment).
         Some("tool_result") => {
             let content = unwrapped.get("content");
             let tool_output = match content {
@@ -276,31 +278,27 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
             e.tool_output = Some(tool_output);
             out.push(e);
         }
-        // Deliberate addition over heru: real headless/native output nests
-        // tool_result blocks inside a top-level "user" message.
         Some("user") => {
-            if let Some(blocks) = unwrapped
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                        let tool_output = match block.get("content") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(v) if !v.is_null() => v.to_string(),
-                            _ => String::new(),
-                        };
-                        let mut e = ev("tool_result");
-                        e.engine = engine.to_string();
-                        e.role = Some("user".to_string());
-                        e.tool_output = Some(tool_output);
-                        if let Some(id) = str_field(block, "tool_use_id") {
-                            e.metadata.insert("tool_use_id".into(), json!(id));
+            match unwrapped.get("message").and_then(|m| m.get("content")) {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    out.push(claude_user_text_event(engine, s));
+                }
+                Some(Value::Array(blocks)) => {
+                    for block in blocks {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("tool_result") => out.push(claude_tool_result_event(engine, block)),
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        out.push(claude_user_text_event(engine, text));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        out.push(e);
                     }
                 }
+                _ => {}
             }
         }
         Some("assistant") => {
@@ -363,95 +361,10 @@ fn claude_wire_continuation(payload: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// Codex headless (`codex exec --json`) -- ported `_codex_impl.py::
-// codex_live_events` + `codex_continuation`.
-// ---------------------------------------------------------------------
-
-fn codex_command_tool_name(item: &Value) -> Option<String> {
-    match item.get("command") {
-        Some(Value::Array(arr)) => arr.first().and_then(|v| v.as_str()).map(str::to_string),
-        // Deliberate addition over heru: real `codex exec --json` output on
-        // this machine emits `command` as a plain string, not an array.
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-fn codex_exec_events(payload: &Value) -> Vec<UnifiedEvent> {
-    let event_type = payload.get("type").and_then(|t| t.as_str());
-    let mut out = Vec::new();
-    match event_type {
-        Some("item.completed") => {
-            if let Some(item) = payload.get("item") {
-                match item.get("type").and_then(|t| t.as_str()) {
-                    Some("agent_message") => {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            if !text.is_empty() {
-                                let mut e = ev("message");
-                                e.engine = "codex".to_string();
-                                e.role = Some("assistant".to_string());
-                                e.content = text.to_string();
-                                out.push(e);
-                            }
-                        }
-                    }
-                    Some("command_execution") => {
-                        let mut e = ev("tool_result");
-                        e.engine = "codex".to_string();
-                        e.tool_name = codex_command_tool_name(item);
-                        e.tool_output = item
-                            .get("aggregated_output")
-                            .and_then(|o| o.as_str())
-                            .map(str::to_string);
-                        if let Some(code) = item.get("exit_code").and_then(|c| c.as_i64()) {
-                            e.metadata.insert("exit_code".into(), json!(code));
-                        }
-                        out.push(e);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Some("turn.completed") => {
-            if let Some(usage) = payload.get("usage").filter(|u| u.is_object()) {
-                let mut meta = BTreeMap::new();
-                int_meta(&mut meta, "input_tokens", usage);
-                int_meta(&mut meta, "output_tokens", usage);
-                int_meta(&mut meta, "total_tokens", usage);
-                let mut e = ev("usage");
-                e.engine = "codex".to_string();
-                e.usage_delta = meta;
-                out.push(e);
-            }
-        }
-        Some("error") | Some("turn.failed") => {
-            if let Some(message) = payload.get("message").and_then(|m| m.as_str()) {
-                if !message.trim().is_empty() {
-                    let mut e = ev("error");
-                    e.engine = "codex".to_string();
-                    e.error = Some(message.trim().to_string());
-                    out.push(e);
-                }
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-fn codex_exec_continuation(payload: &Value) -> Option<String> {
-    if payload.get("type").and_then(|t| t.as_str()) != Some("thread.started") {
-        return None;
-    }
-    str_field(payload, "thread_id")
-}
-
-// ---------------------------------------------------------------------
-// Codex NATIVE rollout transcript (`~/.codex/sessions/.../<id>.jsonl`) --
-// no heru equivalent; genuinely different wire shape from `exec --json`
-// (see module doc comment). Parses only `response_item` rows (the raw
-// per-turn model log) to avoid double-counting against the separate
-// `event_msg` progress-notification rows, which mirror the same content.
+// Codex NATIVE rollout transcript (`~/.codex/sessions/.../<id>.jsonl`).
+// Parses only `response_item` rows (the raw per-turn model log) to avoid
+// double-counting against the separate `event_msg` progress-notification
+// rows, which mirror the same content.
 // ---------------------------------------------------------------------
 
 fn codex_native_text_parts(content: &Value, allowed: &[&str]) -> Vec<String> {
@@ -570,211 +483,166 @@ fn codex_native_cwd(payload: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// `a exec` -- headless one-shot invocation.
+// Grok Build ACP `updates.jsonl` (`session/update` rows). Field mapping
+// follows pocketshell's `GrokBuildParser.kt`.
 // ---------------------------------------------------------------------
 
-/// Which wire format a payload should be run through. `a exec` always uses
-/// the `*Exec` variants; `a transcript` always uses the `*Native` variants
-/// (Claude shares one variant for both, since the shapes are identical).
+fn grok_chunk_text(update: &Value) -> Option<String> {
+    match update.get("content") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Object(obj)) => obj
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn grok_tool_result_text(update: &Value) -> String {
+    if let Some(items) = update.get("content").and_then(|c| c.as_array()) {
+        let mut parts = Vec::new();
+        for item in items {
+            let inner = item.get("content").unwrap_or(item);
+            if let Some(text) = inner.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+    match update.get("rawOutput") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn grok_native_events(payload: &Value) -> Vec<UnifiedEvent> {
+    let Some(params) = payload.get("params") else {
+        return Vec::new();
+    };
+    let Some(update) = params.get("update") else {
+        return Vec::new();
+    };
+    let Some(kind) = update.get("sessionUpdate").and_then(|k| k.as_str()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match kind {
+        "user_message_chunk" => {
+            if let Some(text) = grok_chunk_text(update) {
+                let mut e = ev("message");
+                e.engine = "grok".to_string();
+                e.role = Some("user".to_string());
+                e.content = text;
+                out.push(e);
+            }
+        }
+        "agent_message_chunk" => {
+            if let Some(text) = grok_chunk_text(update) {
+                let mut e = ev("message");
+                e.engine = "grok".to_string();
+                e.role = Some("assistant".to_string());
+                e.content = text;
+                out.push(e);
+            }
+        }
+        "tool_call" => {
+            let mut e = ev("tool_call");
+            e.engine = "grok".to_string();
+            e.role = Some("assistant".to_string());
+            e.tool_name = str_field(update, "title").or_else(|| Some("tool".into()));
+            e.tool_input = update.get("rawInput").map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+            if let Some(id) = str_field(update, "toolCallId") {
+                e.metadata.insert("tool_call_id".into(), json!(id));
+            }
+            out.push(e);
+        }
+        "tool_call_update" => {
+            let status = update
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_ascii_lowercase());
+            if status.as_deref() != Some("completed") && status.is_some() {
+                return out;
+            }
+            let output = grok_tool_result_text(update);
+            if output.is_empty() && status.as_deref() != Some("completed") {
+                return out;
+            }
+            let mut e = ev("tool_result");
+            e.engine = "grok".to_string();
+            e.tool_output = Some(output);
+            if let Some(id) = str_field(update, "toolCallId") {
+                e.metadata.insert("tool_call_id".into(), json!(id));
+            }
+            out.push(e);
+        }
+        _ => {}
+    }
+    out
+}
+
+fn grok_native_continuation(payload: &Value) -> Option<String> {
+    payload
+        .get("params")
+        .and_then(|p| str_field(p, "sessionId"))
+}
+
+fn grok_row_timestamp(payload: &Value) -> String {
+    if let Some(n) = payload.get("timestamp").and_then(|t| t.as_i64()) {
+        let ms = if n < 10_000_000_000 { (n as u64) * 1000 } else { n as u64 };
+        return iso8601_utc(ms);
+    }
+    if let Some(n) = payload
+        .get("params")
+        .and_then(|p| p.get("_meta"))
+        .and_then(|m| m.get("agentTimestampMs"))
+        .and_then(|t| t.as_u64())
+    {
+        return iso8601_utc(n);
+    }
+    String::new()
+}
+
+// ---------------------------------------------------------------------
+// Wire format dispatch (native logs only -- there is no headless exec).
+// ---------------------------------------------------------------------
+
 #[derive(Clone, Copy)]
-pub enum WireFormat {
-    ClaudeOrGrok,
-    CodexExec,
+enum WireFormat {
+    Claude,
     CodexNative,
-}
-
-fn translate(format: WireFormat, engine: &str, payload: &Value) -> (Vec<UnifiedEvent>, Option<String>) {
-    match format {
-        WireFormat::ClaudeOrGrok => (
-            claude_wire_events(engine, payload),
-            claude_wire_continuation(payload),
-        ),
-        WireFormat::CodexExec => (codex_exec_events(payload), codex_exec_continuation(payload)),
-        WireFormat::CodexNative => (codex_native_events(payload), codex_native_continuation(payload)),
-    }
-}
-
-/// Builds the headless/structured-output argv for one engine. `base` is the
-/// engine's own configured command (normally just `["codex"]`/`["claude"]`/
-/// `["grok"]`, but may carry extra leading args from a user's profile
-/// override) -- reused from `Config::resolve` rather than hard-coding the
-/// binary name, matching `a launch-spec`/`a launch-exec`'s reuse pattern.
-///
-/// Each engine's flags are the ones its own `--help` documents for
-/// non-interactive structured output, confirmed working on this machine:
-/// `codex exec --json`, `claude --print --output-format stream-json`,
-/// `grok -p --output-format streaming-messages-json`. None of these need a
-/// PTY -- see `run_exec`'s doc comment.
-pub fn build_headless_argv(
-    engine: &str,
-    base: &[String],
-    prompt: &str,
-    resume: Option<&str>,
-    model: Option<&str>,
-) -> Result<Vec<String>> {
-    if base.is_empty() {
-        bail!("engine {engine} has no command");
-    }
-    let mut argv: Vec<String> = base.to_vec();
-    match engine {
-        "codex" => {
-            argv.push("exec".into());
-            if let Some(id) = resume {
-                argv.push("resume".into());
-                argv.push(id.into());
-            }
-            argv.push("--json".into());
-            argv.push("--dangerously-bypass-approvals-and-sandbox".into());
-            argv.push("--skip-git-repo-check".into());
-            if let Some(m) = model {
-                argv.push("--model".into());
-                argv.push(m.into());
-            }
-            argv.push(prompt.into());
-        }
-        "claude" => {
-            if let Some(id) = resume {
-                argv.push("--resume".into());
-                argv.push(id.into());
-            }
-            argv.push("-p".into());
-            argv.push(prompt.into());
-            argv.push("--output-format".into());
-            argv.push("stream-json".into());
-            argv.push("--include-partial-messages".into());
-            argv.push("--verbose".into());
-            argv.push("--dangerously-skip-permissions".into());
-            if let Some(m) = model {
-                argv.push("--model".into());
-                argv.push(m.into());
-            }
-        }
-        "grok" => {
-            if let Some(id) = resume {
-                argv.push("--resume".into());
-                argv.push(id.into());
-            }
-            argv.push("-p".into());
-            argv.push(prompt.into());
-            argv.push("--output-format".into());
-            argv.push("streaming-messages-json".into());
-            argv.push("--include-partial-messages".into());
-            argv.push("--always-approve".into());
-            if let Some(m) = model {
-                argv.push("--model".into());
-                argv.push(m.into());
-            }
-        }
-        other => bail!("a exec supports claude, codex, and grok only (got engine {other})"),
-    }
-    Ok(argv)
+    Grok,
 }
 
 fn wire_format_for(engine: &str) -> Result<WireFormat> {
     match engine {
-        "claude" | "grok" => Ok(WireFormat::ClaudeOrGrok),
-        "codex" => Ok(WireFormat::CodexExec),
-        other => bail!("a exec supports claude, codex, and grok only (got engine {other})"),
+        "claude" => Ok(WireFormat::Claude),
+        "codex" => Ok(WireFormat::CodexNative),
+        "grok" => Ok(WireFormat::Grok),
+        other => bail!(
+            "a transcript supports claude, codex, and grok only (got engine {other})"
+        ),
     }
 }
 
-/// Runs one headless agent invocation to completion, streaming normalized
-/// `UnifiedEvent`s as they arrive and returning the child's exit code.
-///
-/// Deliberately a plain piped subprocess, NOT a PTY: heru's own
-/// `ExternalCLIAdapter.run`/`run_live` (`heru/base.py`, read in full) spawns
-/// every engine adapter with `subprocess.Popen(..., stdout=PIPE,
-/// stderr=PIPE, ...)` -- no pty allocation anywhere in that file. This
-/// matches the actual contract: `codex exec --json`/`claude --print
-/// --output-format stream-json`/`grok -p --output-format
-/// streaming-messages-json` are documented to write structured JSONL
-/// directly to stdout in headless mode, not to a terminal -- there is
-/// nothing for a PTY to capture that a pipe doesn't already give directly,
-/// and a PTY would add line-buffering/echo/terminal-control-sequence noise
-/// that would have to be stripped back out before JSON parsing. This is
-/// also why `a exec` does not go through aplexer's worker/PTY session
-/// machinery at all (see the module doc comment): it is a bounded,
-/// one-shot call, not a persistent interactive session.
-pub fn run_exec(
-    engine: &str,
-    argv: &[String],
-    cwd: &Path,
-    env_set: &BTreeMap<String, String>,
-    env_unset: &[String],
-    json_output: bool,
-) -> Result<i32> {
-    let format = wire_format_for(engine)?;
-    let program = argv.first().ok_or_else(|| anyhow!("empty argv"))?;
-    let mut command = Command::new(program);
-    command
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .envs(env_set)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for name in env_unset {
-        command.env_remove(name);
+fn translate(format: WireFormat, engine: &str, payload: &Value) -> (Vec<UnifiedEvent>, Option<String>) {
+    match format {
+        WireFormat::Claude => (
+            claude_wire_events(engine, payload),
+            claude_wire_continuation(payload),
+        ),
+        WireFormat::CodexNative => (codex_native_events(payload), codex_native_continuation(payload)),
+        WireFormat::Grok => (grok_native_events(payload), grok_native_continuation(payload)),
     }
-    let mut child: Child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", argv.join(" ")))?;
-
-    // Forward the child's stderr live (auth errors, warnings) rather than
-    // swallowing it -- the JSONL contract only covers stdout.
-    let stderr = child.stderr.take();
-    let stderr_thread = stderr.map(|s| {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(s);
-            let mut err = std::io::stderr();
-            for line in reader.lines().map_while(std::io::Result::ok) {
-                let _ = writeln!(err, "{line}");
-            }
-        })
-    });
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("child has no stdout"))?;
-    let reader = BufReader::new(stdout);
-    let mut assembler = JsonAssembler::default();
-    let mut sequence: u64 = 0;
-    let mut last_continuation: Option<String> = None;
-    let mut stdout_out = std::io::stdout();
-
-    for line in reader.lines() {
-        let line = line.context("read child stdout")?;
-        let Some(payload) = assembler.feed(&line) else {
-            continue;
-        };
-        let (events, continuation) = translate(format, engine, &payload);
-        if let Some(id) = continuation {
-            last_continuation = Some(id);
-        }
-        for mut event in events {
-            event.engine = engine.to_string();
-            event.sequence = sequence;
-            sequence += 1;
-            event.timestamp = iso8601_utc(now_ms());
-            event.raw = payload_to_raw(&payload);
-            emit(&mut stdout_out, event, json_output)?;
-        }
-    }
-
-    let status = child.wait().context("wait for child")?;
-    if let Some(t) = stderr_thread {
-        let _ = t.join();
-    }
-    if let Some(id) = last_continuation {
-        let mut e = ev("continuation");
-        e.engine = engine.to_string();
-        e.sequence = sequence;
-        e.timestamp = iso8601_utc(now_ms());
-        e.continuation_id = Some(id);
-        emit(&mut stdout_out, e, json_output)?;
-    }
-    Ok(status.code().unwrap_or(-1))
 }
 
 fn payload_to_raw(payload: &Value) -> Value {
@@ -785,11 +653,36 @@ fn payload_to_raw(payload: &Value) -> Value {
     }
 }
 
-fn emit(out: &mut impl Write, event: UnifiedEvent, json_output: bool) -> Result<()> {
+fn row_timestamp(format: WireFormat, payload: &Value) -> String {
+    match format {
+        WireFormat::Grok => grok_row_timestamp(payload),
+        WireFormat::Claude | WireFormat::CodexNative => payload
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn stamp_session(event: &mut UnifiedEvent, record: &SessionRecord) {
+    event
+        .metadata
+        .insert("session_id".into(), json!(record.id.to_string()));
+    event.metadata.insert(
+        "workspace".into(),
+        json!(record.workspace.display().to_string()),
+    );
+    event.metadata.insert("tag".into(), json!(record.tag));
+    if let Some(profile) = &record.profile {
+        event.metadata.insert("profile".into(), json!(profile));
+    }
+}
+
+fn emit(out: &mut impl Write, event: &UnifiedEvent, json_output: bool) -> Result<()> {
     if json_output {
-        writeln!(out, "{}", serde_json::to_string(&event)?)?;
+        writeln!(out, "{}", serde_json::to_string(event)?)?;
     } else {
-        writeln!(out, "{}", render_human(&event))?;
+        writeln!(out, "{}", render_human(event))?;
     }
     out.flush()?;
     Ok(())
@@ -842,10 +735,84 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------
-// `a transcript` -- native persisted-log location + parsing.
-// Ported from pocketshell's `agent_log.py` path-resolution rules (read in
-// full). Claude/codex only in this pass -- see module doc comment.
+// Location + bind sidecar.
 // ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptBind {
+    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocatedTranscript {
+    pub path: PathBuf,
+    pub engine_session_id: Option<String>,
+}
+
+/// Locate (or reuse the bound path of) the native log for `record`.
+/// Writes `<state>/sessions/<id>/transcript.json` on a successful first
+/// find so `--follow` and later pages do not re-run the cwd/mtime heuristic.
+pub fn resolve_transcript(record: &SessionRecord, bind_path: &Path) -> Result<LocatedTranscript> {
+    if let Ok(bytes) = fs::read(bind_path) {
+        if let Ok(bind) = serde_json::from_slice::<TranscriptBind>(&bytes) {
+            if bind.path.is_file() {
+                return Ok(LocatedTranscript {
+                    path: bind.path,
+                    engine_session_id: bind.engine_session_id,
+                });
+            }
+        }
+    }
+    let path = locate_transcript(&record.engine, &record.cwd, record.created_at_ms).ok_or_else(
+        || {
+            anyhow!(
+                "no {} transcript found for session {} (cwd {}); the agent may not have written anything yet",
+                record.engine,
+                record.id,
+                record.cwd.display()
+            )
+        },
+    )?;
+    let engine_session_id = peek_continuation(&record.engine, &path);
+    let bind = TranscriptBind {
+        path: path.clone(),
+        engine_session_id: engine_session_id.clone(),
+    };
+    // Best-effort: a bind write failing must not hide a successful locate.
+    let _ = atomic_write_json(bind_path, &bind);
+    Ok(LocatedTranscript {
+        path,
+        engine_session_id,
+    })
+}
+
+pub fn locate_transcript(engine: &str, cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
+    match engine {
+        "claude" => locate_claude_transcript(cwd, created_at_ms),
+        "codex" => locate_codex_transcript(cwd, created_at_ms),
+        "grok" => locate_grok_transcript(cwd, created_at_ms),
+        _ => None,
+    }
+}
+
+fn peek_continuation(engine: &str, path: &Path) -> Option<String> {
+    let format = wire_format_for(engine).ok()?;
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut assembler = JsonAssembler::default();
+    for line in reader.lines().map_while(std::io::Result::ok).take(64) {
+        let Some(payload) = assembler.feed(&line) else {
+            continue;
+        };
+        let (_events, continuation) = translate(format, engine, &payload);
+        if continuation.is_some() {
+            return continuation;
+        }
+    }
+    None
+}
 
 /// Claude Code: `~/.claude/projects/<encoded-cwd>/<session>.jsonl`, where
 /// `<encoded-cwd>` replaces every `/` with `-` (`agent_log.py::
@@ -856,7 +823,8 @@ fn truncate(s: &str, max: usize) -> String {
 /// than the aplexer session's creation (with a few seconds of slack for
 /// startup ordering). This is a heuristic, not an exact session-id match:
 /// if two aplexer claude sessions share the exact same cwd and are both
-/// live, this can pick the wrong one. Documented, not silently assumed.
+/// live, the bind sidecar is what keeps later reads on the first-found
+/// file. Documented, not silently assumed.
 pub fn locate_claude_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let encoded = cwd.display().to_string().replace('/', "-");
@@ -886,7 +854,7 @@ pub fn locate_codex_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf
         if mtime_ms < since {
             return;
         }
-        if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(file) = File::open(path) {
             let mut reader = BufReader::new(file);
             let mut first_line = String::new();
             if std::io::BufRead::read_line(&mut reader, &mut first_line).unwrap_or(0) > 0 {
@@ -904,8 +872,94 @@ pub fn locate_codex_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf
     best.map(|(_, p)| p)
 }
 
+/// Grok Build: `$GROK_HOME/sessions/<urlencoded-cwd>/<session-id>/updates.jsonl`
+/// (default `GROK_HOME` is `~/.grok`). Percent-encoding matches
+/// `urllib.parse.quote(cwd, safe="")` in pocketshell's `agent_log.py`.
+pub fn locate_grok_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
+    let root = grok_sessions_root()?;
+    if !root.is_dir() {
+        return None;
+    }
+    let since = created_at_ms.saturating_sub(5_000);
+    let encoded = encode_grok_cwd(&cwd.display().to_string());
+    let project = root.join(&encoded);
+    if project.is_dir() {
+        if let Some(path) = best_grok_updates(&project, since) {
+            return Some(path);
+        }
+    }
+    // Encoded-cwd miss: walk every project dir (cwd string may have drifted
+    // via symlink resolution) and pick the newest updates.jsonl since start.
+    let mut best: Option<(u64, PathBuf)> = None;
+    let Ok(entries) = fs::read_dir(&root) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(path) = best_grok_updates(&dir, since) {
+            let mtime = file_mtime_ms(&path).unwrap_or(0);
+            if best.as_ref().map(|(m, _)| mtime > *m).unwrap_or(true) {
+                best = Some((mtime, path));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn grok_sessions_root() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("GROK_HOME") {
+        return Some(PathBuf::from(home).join("sessions"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".grok/sessions"))
+}
+
+fn encode_grok_cwd(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+    let mut out = String::new();
+    for b in trimmed.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn best_grok_updates(project_dir: &Path, since_ms: u64) -> Option<PathBuf> {
+    let entries = fs::read_dir(project_dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("updates.jsonl");
+        if !candidate.is_file() {
+            continue;
+        }
+        let Some(mtime) = file_mtime_ms(&candidate) else {
+            continue;
+        };
+        if mtime < since_ms {
+            continue;
+        }
+        if best.as_ref().map(|(m, _)| mtime > *m).unwrap_or(true) {
+            best = Some((mtime, candidate));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as u64)
+}
+
 fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path, u64)) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -913,12 +967,8 @@ fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path, u64)) {
         if path.is_dir() {
             walk_jsonl(&path, visit);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
-                        visit(&path, dur.as_millis() as u64);
-                    }
-                }
+            if let Some(mtime_ms) = file_mtime_ms(&path) {
+                visit(&path, mtime_ms);
             }
         }
     }
@@ -930,19 +980,16 @@ fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path, u64)) {
 /// walked -- those are sub-agent transcripts, not the top-level session).
 fn best_candidate(dir: &Path, since_ms: u64, recurse: bool) -> Option<PathBuf> {
     let _ = recurse;
-    let entries = std::fs::read_dir(dir).ok()?;
+    let entries = fs::read_dir(dir).ok()?;
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        let Some(mtime_ms) = file_mtime_ms(&path) else {
             continue;
         };
-        let mtime_ms = dur.as_millis() as u64;
         if mtime_ms < since_ms {
             continue;
         }
@@ -953,51 +1000,233 @@ fn best_candidate(dir: &Path, since_ms: u64, recurse: bool) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Reads and parses one transcript file into `UnifiedEvent`s, in file
-/// order, sequence-numbered from 0. `engine` selects the wire format
-/// (`WireFormat::ClaudeOrGrok` for claude, `WireFormat::CodexNative` for
-/// codex's rollout shape).
-pub fn read_transcript_events(engine: &str, path: &Path) -> Result<Vec<UnifiedEvent>> {
-    let format = match engine {
-        "claude" => WireFormat::ClaudeOrGrok,
-        "codex" => WireFormat::CodexNative,
-        other => bail!("a transcript supports claude and codex only (got engine {other})"),
-    };
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let mut assembler = JsonAssembler::default();
-    let mut events = Vec::new();
-    let mut sequence: u64 = 0;
-    for line in text.lines() {
-        let Some(payload) = assembler.feed(line) else {
-            continue;
+// ---------------------------------------------------------------------
+// Incremental native-log reader, pagination, follow.
+// ---------------------------------------------------------------------
+
+/// PocketShell-facing query: last-N initial view, `--before` older page,
+/// `--after` catch-up cursor, `--follow` live tail.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptQuery {
+    pub last: Option<usize>,
+    pub kind: Option<String>,
+    pub after: Option<u64>,
+    pub before: Option<u64>,
+    pub follow: bool,
+    pub max_line_bytes: Option<usize>,
+}
+
+struct NativeLogReader {
+    path: PathBuf,
+    engine: String,
+    format: WireFormat,
+    assembler: JsonAssembler,
+    sequence: u64,
+    byte_offset: u64,
+    pending: String,
+    max_line_bytes: Option<usize>,
+}
+
+impl NativeLogReader {
+    fn open(engine: &str, path: &Path, max_line_bytes: Option<usize>) -> Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            engine: engine.to_string(),
+            format: wire_format_for(engine)?,
+            assembler: JsonAssembler::default(),
+            sequence: 0,
+            byte_offset: 0,
+            pending: String::new(),
+            max_line_bytes,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.assembler = JsonAssembler::default();
+        self.sequence = 0;
+        self.byte_offset = 0;
+        self.pending.clear();
+    }
+
+    /// Read newly appended complete lines. `consume_tail` is true for a
+    /// one-shot snapshot (last line may lack a trailing newline) and false
+    /// for `--follow` (wait for a newline so a mid-write row is not parsed
+    /// as truncated JSON).
+    fn read_available(
+        &mut self,
+        record: &SessionRecord,
+        consume_tail: bool,
+    ) -> Result<Vec<UnifiedEvent>> {
+        let mut file = File::open(&self.path)
+            .with_context(|| format!("read {}", self.path.display()))?;
+        let len = file.metadata()?.len();
+        if len < self.byte_offset {
+            self.reset();
+        }
+        file.seek(SeekFrom::Start(self.byte_offset))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        if buf.is_empty() && self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chunk = String::from_utf8_lossy(&buf);
+        let mut data = std::mem::take(&mut self.pending);
+        data.push_str(&chunk);
+
+        let has_trailing_newline = data.ends_with('\n') || data.ends_with('\r');
+        let mut lines: Vec<&str> = data.split('\n').collect();
+        let remainder = if !has_trailing_newline && !consume_tail {
+            lines.pop().unwrap_or("").to_string()
+        } else {
+            if let Some(last) = lines.last() {
+                if last.is_empty() {
+                    lines.pop();
+                }
+            }
+            String::new()
         };
-        // Both claude's native rows and codex's rollout envelope carry their
-        // own real top-level `"timestamp"` string (unlike `a exec`, where
-        // there is no such field and `now_ms()` at translate time is the
-        // right answer) -- prefer the row's own historical timestamp so a
-        // paginated transcript reads in real wall-clock order, not "now".
-        let row_timestamp = payload
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let (drafted, _continuation) = translate(format, engine, &payload);
-        for mut event in drafted {
-            event.engine = engine.to_string();
-            event.sequence = sequence;
-            sequence += 1;
-            event.timestamp = row_timestamp.clone();
-            event.raw = payload_to_raw(&payload);
-            events.push(event);
+        let consumed = data.len() - remainder.len();
+        self.byte_offset += consumed as u64;
+        self.pending = remainder;
+
+        let mut events = Vec::new();
+        for line in lines {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(max) = self.max_line_bytes {
+                let byte_len = line.len();
+                if byte_len > max {
+                    let mut e = ev("error");
+                    e.engine = self.engine.clone();
+                    e.error = Some(format!("{LINE_TRUNCATION_SENTINEL}{byte_len}"));
+                    e.sequence = self.sequence;
+                    self.sequence += 1;
+                    e.timestamp = iso8601_utc(now_ms());
+                    stamp_session(&mut e, record);
+                    events.push(e);
+                    continue;
+                }
+            }
+            let Some(payload) = self.assembler.feed(line) else {
+                continue;
+            };
+            let ts = row_timestamp(self.format, &payload);
+            let (drafted, _continuation) = translate(self.format, &self.engine, &payload);
+            for mut event in drafted {
+                event.engine = self.engine.clone();
+                event.sequence = self.sequence;
+                self.sequence += 1;
+                event.timestamp = ts.clone();
+                event.raw = payload_to_raw(&payload);
+                stamp_session(&mut event, record);
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+pub fn paginate(mut events: Vec<UnifiedEvent>, query: &TranscriptQuery) -> Vec<UnifiedEvent> {
+    if let Some(kind) = &query.kind {
+        events.retain(|e| e.kind == kind);
+    }
+    if let Some(after) = query.after {
+        events.retain(|e| e.sequence > after);
+    }
+    if let Some(before) = query.before {
+        events.retain(|e| e.sequence < before);
+    }
+    if let Some(n) = query.last {
+        if events.len() > n {
+            events = events.split_off(events.len() - n);
         }
     }
-    Ok(events)
+    events
+}
+
+/// One-shot page, or a page followed by a live tail of the same file.
+pub fn run_transcript(
+    record: &SessionRecord,
+    path: &Path,
+    query: TranscriptQuery,
+    json_output: bool,
+) -> Result<()> {
+    let mut reader = NativeLogReader::open(&record.engine, path, query.max_line_bytes)?;
+    let mut stdout = std::io::stdout();
+    let snapshot = reader.read_available(record, true)?;
+    let page = paginate(snapshot, &query);
+    for event in &page {
+        if emit(&mut stdout, event, json_output).is_err() {
+            return Ok(());
+        }
+    }
+    if !query.follow {
+        return Ok(());
+    }
+    let mut after = page.last().map(|e| e.sequence).or(query.after);
+    loop {
+        thread::sleep(FOLLOW_POLL);
+        let more = reader.read_available(record, false)?;
+        let follow_query = TranscriptQuery {
+            last: None,
+            before: None,
+            after,
+            kind: query.kind.clone(),
+            follow: true,
+            max_line_bytes: query.max_line_bytes,
+        };
+        let page = paginate(more, &follow_query);
+        for event in &page {
+            if emit(&mut stdout, event, json_output).is_err() {
+                return Ok(());
+            }
+            after = Some(event.sequence);
+        }
+    }
+}
+
+/// Reads and parses one transcript file into `UnifiedEvent`s, in file
+/// order, sequence-numbered from 0. Kept for unit tests and any in-process
+/// caller that does not need `--follow`.
+pub fn read_transcript_events(engine: &str, path: &Path) -> Result<Vec<UnifiedEvent>> {
+    let dummy = dummy_record(engine);
+    let mut reader = NativeLogReader::open(engine, path, None)?;
+    reader.read_available(&dummy, true)
+}
+
+fn dummy_record(engine: &str) -> SessionRecord {
+    SessionRecord {
+        schema_version: crate::SCHEMA_VERSION,
+        id: uuid::Uuid::nil(),
+        workspace: PathBuf::from("/"),
+        tag: "t".into(),
+        engine: engine.to_string(),
+        profile: None,
+        command: vec![engine.to_string()],
+        cwd: PathBuf::from("/"),
+        env: Default::default(),
+        env_unset: Default::default(),
+        limits: Default::default(),
+        history_bytes: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        last_activity_ms: None,
+        phase: crate::Phase::Running,
+        worker_pid: None,
+        workload_pid: None,
+        socket_path: PathBuf::from("/"),
+        history_path: PathBuf::from("/"),
+        exit: None,
+        error: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn json_assembler_single_line() {
@@ -1053,44 +1282,25 @@ mod tests {
     }
 
     #[test]
+    fn claude_user_text_message() {
+        let payload: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"please review"}]}}"#,
+        )
+        .unwrap();
+        let events = claude_wire_events("claude", &payload);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "message");
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].content, "please review");
+    }
+
+    #[test]
     fn claude_continuation_from_system_init() {
         let payload: Value = serde_json::from_str(
             r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#,
         )
         .unwrap();
         assert_eq!(claude_wire_continuation(&payload).as_deref(), Some("abc-123"));
-    }
-
-    #[test]
-    fn codex_agent_message_maps_to_message() {
-        let payload: Value = serde_json::from_str(
-            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done"}}"#,
-        )
-        .unwrap();
-        let events = codex_exec_events(&payload);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "message");
-        assert_eq!(events[0].content, "done");
-    }
-
-    #[test]
-    fn codex_command_execution_string_command() {
-        let payload: Value = serde_json::from_str(
-            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc ls","aggregated_output":"a\nb","exit_code":0}}"#,
-        )
-        .unwrap();
-        let events = codex_exec_events(&payload);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "tool_result");
-        assert_eq!(events[0].tool_name.as_deref(), Some("/bin/bash -lc ls"));
-        assert_eq!(events[0].tool_output.as_deref(), Some("a\nb"));
-    }
-
-    #[test]
-    fn codex_thread_started_continuation() {
-        let payload: Value =
-            serde_json::from_str(r#"{"type":"thread.started","thread_id":"th-1"}"#).unwrap();
-        assert_eq!(codex_exec_continuation(&payload).as_deref(), Some("th-1"));
     }
 
     #[test]
@@ -1139,24 +1349,194 @@ mod tests {
     }
 
     #[test]
-    fn build_headless_argv_codex_fresh() {
-        let argv = build_headless_argv("codex", &["codex".into()], "hi", None, None).unwrap();
-        assert_eq!(argv[0], "codex");
-        assert_eq!(argv[1], "exec");
-        assert!(argv.contains(&"--json".to_string()));
-        assert_eq!(argv.last().unwrap(), "hi");
+    fn grok_user_and_agent_chunks() {
+        let user: Value = serde_json::from_str(
+            r#"{"params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"text":"hi"}}}}"#,
+        )
+        .unwrap();
+        let events = grok_native_events(&user);
+        assert_eq!(events[0].kind, "message");
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].content, "hi");
+
+        let agent: Value = serde_json::from_str(
+            r#"{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":"hello back"}}}"#,
+        )
+        .unwrap();
+        let events = grok_native_events(&agent);
+        assert_eq!(events[0].role.as_deref(), Some("assistant"));
+        assert_eq!(events[0].content, "hello back");
     }
 
     #[test]
-    fn build_headless_argv_claude_resume() {
-        let argv =
-            build_headless_argv("claude", &["claude".into()], "hi", Some("sess-1"), None).unwrap();
-        assert!(argv.windows(2).any(|w| w == ["--resume", "sess-1"]));
-        assert!(argv.windows(2).any(|w| w == ["-p", "hi"]));
+    fn grok_tool_call_and_completed_result() {
+        let call: Value = serde_json::from_str(
+            r#"{"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read","rawInput":{"path":"a.rs"}}}}"#,
+        )
+        .unwrap();
+        let events = grok_native_events(&call);
+        assert_eq!(events[0].kind, "tool_call");
+        assert_eq!(events[0].tool_name.as_deref(), Some("Read"));
+
+        let result: Value = serde_json::from_str(
+            r#"{"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed","content":[{"content":{"text":"ok"}}]}}}"#,
+        )
+        .unwrap();
+        let events = grok_native_events(&result);
+        assert_eq!(events[0].kind, "tool_result");
+        assert_eq!(events[0].tool_output.as_deref(), Some("ok"));
     }
 
     #[test]
-    fn build_headless_argv_unknown_engine() {
-        assert!(build_headless_argv("gemini", &["gemini".into()], "hi", None, None).is_err());
+    fn paginate_last_after_before() {
+        let mk = |seq: u64, kind: &'static str| UnifiedEvent {
+            kind,
+            sequence: seq,
+            engine: "claude".into(),
+            timestamp: String::new(),
+            raw: json!({}),
+            ..Default::default()
+        };
+        let events = vec![
+            mk(0, "message"),
+            mk(1, "tool_call"),
+            mk(2, "message"),
+            mk(3, "message"),
+            mk(4, "usage"),
+        ];
+        let last = paginate(
+            events.clone(),
+            &TranscriptQuery {
+                last: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(last.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![3, 4]);
+
+        let after = paginate(
+            events.clone(),
+            &TranscriptQuery {
+                after: Some(1),
+                kind: Some("message".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(after.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2, 3]);
+
+        let older = paginate(
+            events,
+            &TranscriptQuery {
+                before: Some(4),
+                last: Some(2),
+                kind: Some("message".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(older.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn encode_grok_cwd_matches_python_quote_safe_empty() {
+        assert_eq!(
+            encode_grok_cwd("/home/alexey/git/aplexer"),
+            "%2Fhome%2Falexey%2Fgit%2Faplexer"
+        );
+    }
+
+    #[test]
+    fn read_transcript_events_claude_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"one"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"two"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"three"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = read_transcript_events("claude", &path).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].content, "one");
+        assert_eq!(events[2].content, "three");
+        assert_eq!(events[2].sequence, 2);
+    }
+
+    #[test]
+    fn bind_sidecar_reuses_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let bind = dir.path().join("transcript.json");
+        let record = dummy_record("claude");
+        // First locate would fail (HOME is not this dir); write a bind first.
+        atomic_write_json(
+            &bind,
+            &TranscriptBind {
+                path: log.clone(),
+                engine_session_id: Some("x".into()),
+            },
+        )
+        .unwrap();
+        let located = resolve_transcript(&record, &bind).unwrap();
+        assert_eq!(located.path, log);
+        assert_eq!(located.engine_session_id.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn max_line_bytes_emits_truncation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let huge = format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#, "x".repeat(200));
+        std::fs::write(&path, format!("{huge}\n")).unwrap();
+        let record = dummy_record("claude");
+        let mut reader = NativeLogReader::open("claude", &path, Some(50)).unwrap();
+        let events = reader.read_available(&record, true).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "error");
+        assert!(events[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with(LINE_TRUNCATION_SENTINEL));
+    }
+
+    #[test]
+    fn follow_reader_picks_up_appended_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let record = dummy_record("claude");
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        let first = reader.read_available(&record, true).unwrap();
+        assert_eq!(first.len(), 1);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                concat!(
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"yo"}]}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let second = reader.read_available(&record, false).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].content, "yo");
+        assert_eq!(second[0].sequence, 1);
     }
 }

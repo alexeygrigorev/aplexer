@@ -174,30 +174,25 @@ a watch --jsonl --all   # also include shell (non-agent) sessions
 
 `a watch` is a client-side poller, not a server-push mechanism — it scans the same durable session records `a list` reads, on a timer, and emits one JSON line per detected change: session creation/exit/deletion, OOM kills, and a coarse `agent.state` (`running`/`waiting`) signal derived from PTY-output recency. By default it only watches agent sessions (`engine != "shell"`), matching how it's meant to be used. The event envelope is heru's `UnifiedEvent` schema; see spec.md section 19 for the event stream's design intent and [docs/pocketshell-integration-plan.md](docs/pocketshell-integration-plan.md) Part 2 for the full field-by-field mapping rationale. `src/watch.rs` has the implementation and its own reasoning for the poll interval, activity threshold, and startup-replay behavior.
 
-**`a watch` never looks at what an agent is actually saying or doing** — it only sees host-level lifecycle (created/exited/oom/a running-vs-waiting heuristic). `a exec` and `a transcript` (below) are a different, complementary capability: parsing an agent's real conversation — messages, tool calls, tool results, usage, continuation ids — into the same `UnifiedEvent` envelope. Use `a watch` to know a session changed state; use `a exec`/`a transcript` to know what the agent actually said or did.
+**`a watch` never looks at what an agent is actually saying or doing** — it only sees host-level lifecycle (created/exited/oom/a running-vs-waiting heuristic). `a transcript` (below) is the complementary capability: parsing an agent's real conversation — messages, tool calls, tool results, usage — into the same `UnifiedEvent` envelope. Use `a watch` to know a session changed state; use `a transcript` to know what the agent actually said or did.
 
-## Headless agent invocation and conversation events
+## Conversation events (`a transcript`)
 
-Ported from [heru](https://github.com/alexeygrigorev/heru)'s real Python adapters (`heru/base.py`, `heru/adapters/{claude,codex}.py`) — see `src/agent_events.rs` for the full design notes, including deliberate departures from heru found while validating against real CLI output.
+PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`).
 
-**`a exec`** invokes an agent CLI in its own documented headless/non-interactive structured-output mode (`codex exec --json`, `claude --print --output-format stream-json`, `grok -p --output-format streaming-messages-json`) as a bounded, one-shot call — a plain piped subprocess, not a PTY and not an `a start` session — and streams normalized `UnifiedEvent` JSONL as the run progresses:
-
-```bash
-a exec --engine codex --json "add a CHANGELOG entry for the last commit"
-a exec --engine claude --json --profile zlaude "summarize open TODOs"
-a exec --engine grok --resume <session-id> "continue from before"
-```
-
-Without `--json` it prints a compact human rendering instead (`[assistant] ...`, `[tool_call] ...`), matching `a launch-spec`'s dual-mode convention. `--resume <id>` resumes an explicit prior engine-native session id; heru's "continue the latest session" sentinel is deferred. `gemini`/`opencode`/`copilot` are out of scope for this pass (gemini/copilot have no working heru adapter to port here; opencode was explicitly deferred).
-
-**`a transcript`** reads an `a start`/`a attach` session's underlying engine's own *native, persisted* conversation log — the JSONL file the agent CLI already writes during a completely ordinary interactive session (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`) — no special launch mode needed, since the file exists just because the agent ran normally:
+How the log is captured and kept: aplexer does **not** copy conversation bytes into its own state. The engine's append-only JSONL is the source of truth (PTY `history.bin` is a separate, raw terminal capture). The first successful locate writes a bind sidecar `<state>/sessions/<id>/transcript.json` so later pages and `--follow` hit the same file even if another session shares the cwd. If the bound file disappears, the next call re-runs the heuristic.
 
 ```bash
-a transcript --tag review --last 5 --json          # last 5 parsed events
-a transcript --tag review --kind message --last 3  # last 3 conversation turns only
+a transcript --tag review --last 5 --json            # last 5 parsed events
+a transcript --tag review --kind message --last 3    # last 3 turns only
+a transcript --tag review --before 12 --last 20 --json   # older page
+a transcript --tag review --after 31 --follow --json     # live tail
+a transcript --json --last 5                         # inside a session: uses $APLEXER_SESSION_ID (`a whoami`)
 ```
 
-Claude/codex only in this pass (ported from pocketshell's `agent_log.py` path-resolution rules); grok/opencode native-transcript support is deferred. Locating the right transcript file is a heuristic (aplexer has no direct handle on the engine's own session id, only the aplexer session's cwd and creation time) — see `locate_claude_transcript`/`locate_codex_transcript` in `src/agent_events.rs` for exactly what it matches on.
+`--last` / `--before` / `--after` are the PocketShell pagination cursors (sequence is stable across calls as long as the native file is append-only). `--follow` is `tail -f` of parsed events. `--max-line-bytes N` replaces a huge native line with PocketShell's `@@PS_LINE_TRUNCATED@@` marker so one oversized tool result cannot balloon an SSH read.
+
+Claude, Codex, and Grok native logs in this pass; `opencode`/`gemini`/`shell` are out of scope. Location is a cwd+mtime heuristic until the bind sidecar exists — see `src/agent_events.rs`.
 
 ## Python client
 

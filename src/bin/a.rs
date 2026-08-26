@@ -56,7 +56,6 @@ enum Commands {
     Whoami,
     Message(MessageArgs),
     Watch(WatchArgs),
-    Exec(ExecArgs),
     Transcript(TranscriptArgs),
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
@@ -201,51 +200,41 @@ struct WatchArgs {
     workspace: Option<PathBuf>,
 }
 
-/// `a exec` -- headless one-shot agent invocation (docs: `src/
-/// agent_events.rs` module doc comment). Not a persistent session: no
-/// workspace/tag, no worker, no PTY -- see `--engine`'s doc comment on why
-/// this can't just reuse `a start`.
-#[derive(Args)]
-struct ExecArgs {
-    /// Which agent CLI to invoke headlessly. Only engines with a documented
-    /// non-interactive structured-output mode are supported (see
-    /// `agent_events::build_headless_argv`).
-    #[arg(long, value_name = "claude|codex|grok")]
-    engine: String,
-    #[arg(long)]
-    profile: Option<String>,
-    #[arg(long)]
-    cwd: Option<PathBuf>,
-    /// Resume a prior engine-native session/thread id (NOT an aplexer
-    /// session id). Plain explicit-id resume only -- heru's "continue the
-    /// latest session" sentinel is deferred (see the module's doc comment
-    /// in src/agent_events.rs / this feature's commit history).
-    #[arg(long, value_name = "SESSION_ID")]
-    resume: Option<String>,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(value_name = "PROMPT")]
-    prompt: String,
-}
-
-/// `a transcript` -- reads a running or finished aplexer session's
-/// UNDERLYING engine's own native, persisted conversation log (the file the
-/// agent CLI already writes during an ordinary interactive session), not a
-/// special headless invocation. Complementary to `a exec`: see
-/// src/agent_events.rs's module doc comment for the full distinction.
+/// `a transcript` -- parse a session's native engine conversation log into
+/// heru UnifiedEvent JSONL for PocketShell (and `a transcript --follow`).
+/// See src/agent_events.rs.
 #[derive(Args)]
 struct TranscriptArgs {
     #[command(flatten)]
     target: TargetArgs,
-    /// Only the last N (post `--kind` filtering) parsed events -- pagination
-    /// for "show me the last 5 messages" style reads instead of always
-    /// dumping the whole transcript.
+    /// Only the last N events after `--kind` / `--after` / `--before`
+    /// filtering. PocketShell's initial conversation pane is `--last 50`
+    /// (or `--last 5` for a compact peek).
     #[arg(long, value_name = "N")]
     last: Option<usize>,
-    /// Filter to one UnifiedEvent kind (message|tool_call|tool_result|
-    /// error|usage) before applying --last.
+    /// Filter to one UnifiedEvent kind (message, tool_call, tool_result, error, usage)
+    /// before applying --last/--after/--before.
     #[arg(long)]
     kind: Option<String>,
+    /// Events with sequence > N. Catch-up / follow-resume cursor: PocketShell
+    /// stores the last sequence it rendered and asks for everything after.
+    #[arg(long, value_name = "SEQ")]
+    after: Option<u64>,
+    /// Events with sequence < N. Older page: combine with `--last` to walk
+    /// backward (`--before 12 --last 20`).
+    #[arg(long, value_name = "SEQ")]
+    before: Option<u64>,
+    /// After emitting the current page, keep watching the native log and
+    /// print new events as the agent writes them (`tail -f` of parsed
+    /// UnifiedEvent JSONL). Implies a long-lived stdout stream; Ctrl-C
+    /// to stop. Combine with `--after` / `--last` for the initial page.
+    #[arg(long)]
+    follow: bool,
+    /// Replace any native JSONL line longer than N bytes with a truncation
+    /// marker before parsing, so one huge tool_result cannot balloon the
+    /// read (PocketShell `agent-log --max-line-bytes`).
+    #[arg(long, value_name = "N")]
+    max_line_bytes: Option<usize>,
 }
 
 #[derive(Args)]
@@ -404,7 +393,6 @@ fn run() -> Result<()> {
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::Watch(args) => cmd_watch(&paths, args),
-        Commands::Exec(args) => cmd_exec(&paths, args, cli.json),
         Commands::Transcript(args) => cmd_transcript(&paths, args, cli.json),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
@@ -1510,103 +1498,62 @@ fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
     aplexer::watch::run(paths, args.all, workspace.as_deref())
 }
 
-/// `a exec --engine <claude|codex|grok> [--profile P] [--cwd D]
-/// [--resume ID] [--model M] "<prompt>"` -- headless one-shot invocation,
-/// streaming normalized `UnifiedEvent` JSONL (with `--json`) or a compact
-/// human rendering (without it, matching `a launch-spec`'s dual-mode
-/// convention) as the agent runs, then exits. See src/agent_events.rs's
-/// module doc comment for the full design (why no PTY, what's ported from
-/// heru, what's deferred).
+/// `a transcript [SESSION] [--last N] [--after SEQ] [--before SEQ]
+/// [--kind K] [--follow] [--json]` -- parse the native conversation log of
+/// an aplexer session (the JSONL the engine CLI already writes) into heru
+/// UnifiedEvent JSONL. PocketShell's conversation pane is the consumer:
+/// last-N for the initial view, `--before` for older pages, `--after` plus
+/// `--follow` for live tail. See src/agent_events.rs for capture/bind.
 ///
-/// Reuses `Config::resolve` for the base command/profile env/env_unset --
-/// same infra `a launch-spec`/`a launch-exec` build on -- then layers the
-/// engine's own headless/structured-output flags on top via
-/// `agent_events::build_headless_argv` (a genuinely different argv shape
-/// from the engine's normal interactive launch command).
-fn cmd_exec(paths: &Paths, args: ExecArgs, json_output: bool) -> Result<()> {
-    let config = Config::load(paths)?;
-    let workspace = canonical_workspace(Path::new("."))?;
-    let launch = config.resolve(
-        Vec::new(),
-        Some(args.engine.as_str()),
-        args.profile.as_deref(),
-        &workspace,
-        args.cwd.as_deref(),
-        &BTreeMap::new(),
-        &Limits::default(),
-        None,
-    )?;
-    let argv = aplexer::agent_events::build_headless_argv(
-        &launch.engine,
-        &launch.command,
-        &args.prompt,
-        args.resume.as_deref(),
-        args.model.as_deref(),
-    )?;
-    let cwd = canonical_workspace(&launch.cwd).unwrap_or(launch.cwd);
-    let exit_code = aplexer::agent_events::run_exec(
-        &launch.engine,
-        &argv,
-        &cwd,
-        &launch.env,
-        &launch.env_unset,
-        json_output,
-    )?;
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-    Ok(())
-}
-
-/// `a transcript [SESSION] [--last N] [--kind K]` -- reads an aplexer
-/// session's UNDERLYING engine's own native, persisted conversation log
-/// (claude/codex only in this pass; see src/agent_events.rs). Complementary
-/// to `a exec`: this needs no special launch mode at all, since the file
-/// already exists because the agent ran (or is running) normally under
-/// `a start`/`a attach`.
+/// With no SESSION, `--workspace`, or `--tag`, falls back to
+/// `$APLEXER_SESSION_ID` (`a whoami`) so an agent or hook inside a session
+/// can dump its own log without addressing itself.
 fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Result<()> {
-    let record = resolve(paths, &args.target)?;
-    let path = match record.engine.as_str() {
-        "claude" => aplexer::agent_events::locate_claude_transcript(&record.cwd, record.created_at_ms),
-        "codex" => aplexer::agent_events::locate_codex_transcript(&record.cwd, record.created_at_ms),
-        other => bail!(
-            "a transcript supports claude and codex only (got engine {other}); \
-             grok/opencode native-transcript support is deferred, see the a-exec-and-transcript commit"
-        ),
-    }
-    .ok_or_else(|| {
-        anyhow!(
-            "no {} transcript found for session {} (cwd {}); the agent may not have written anything yet",
-            record.engine,
-            record.id,
-            record.cwd.display()
-        )
-    })?;
-    let mut events = aplexer::agent_events::read_transcript_events(&record.engine, &path)?;
-    if let Some(kind) = &args.kind {
-        events.retain(|e| e.kind == kind);
-    }
-    if let Some(n) = args.last {
-        if events.len() > n {
-            events = events.split_off(events.len() - n);
-        }
-    }
-    if json_output {
-        for event in &events {
-            println!("{}", serde_json::to_string(event)?);
-        }
-    } else {
+    let record = resolve_transcript_target(paths, &args)?;
+    let bind_path = paths.state_session(record.id).join("transcript.json");
+    let located = aplexer::agent_events::resolve_transcript(&record, &bind_path)?;
+    let path = located.path;
+    if !json_output && !args.follow {
         println!(
-            "transcript: {} ({} events, engine {})",
+            "transcript: {} (engine {})",
             path.display(),
-            events.len(),
             record.engine
         );
-        for event in &events {
-            println!("{}", aplexer::agent_events::render_human(event));
+    }
+    aplexer::agent_events::run_transcript(
+        &record,
+        &path,
+        aplexer::agent_events::TranscriptQuery {
+            last: args.last,
+            kind: args.kind.clone(),
+            after: args.after,
+            before: args.before,
+            follow: args.follow,
+            max_line_bytes: args.max_line_bytes,
+        },
+        json_output,
+    )
+}
+
+/// Prefer an explicit selector; otherwise the session this process is
+/// running inside (`APLEXER_SESSION_ID` from worker spawn / `a whoami`).
+fn resolve_transcript_target(paths: &Paths, args: &TranscriptArgs) -> Result<SessionRecord> {
+    let targeted = args.target.selector.is_some()
+        || args.target.workspace.is_some()
+        || args.target.tag.is_some();
+    if !targeted {
+        if let Ok(id_text) = env::var("APLEXER_SESSION_ID") {
+            if !id_text.is_empty() {
+                let id: Uuid = id_text.parse().with_context(|| {
+                    format!("APLEXER_SESSION_ID {id_text:?} is not a valid UUID")
+                })?;
+                return read_record(&paths.record(id)).with_context(|| {
+                    format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
+                });
+            }
         }
     }
-    Ok(())
+    resolve(paths, &args.target)
 }
 
 fn path_check(name: &str, path: &Path) -> Value {

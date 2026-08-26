@@ -435,9 +435,9 @@ pub fn run(paths: &Paths, all: bool, workspace: Option<&Path>) -> Result<()> {
 /// (Howard Hinnant's `civil_from_days` algorithm) rather than adding a
 /// chrono/time dependency for one formatting function.
 ///
-/// `pub(crate)` so `src/agent_events.rs` (heru-style headless-exec/transcript
-/// event parsing, a different producer of the same `UnifiedEvent` envelope)
-/// can reuse it instead of re-deriving the same formatting logic.
+/// `pub(crate)` so `src/agent_events.rs` (native transcript parsing, a
+/// different producer of the same `UnifiedEvent` envelope) can reuse it
+/// instead of re-deriving the same formatting logic.
 pub(crate) fn iso8601_utc(epoch_ms: u64) -> String {
     let secs = (epoch_ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
