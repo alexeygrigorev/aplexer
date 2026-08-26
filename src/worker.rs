@@ -228,7 +228,33 @@ enum LifeEvent {
     },
 }
 
-pub fn run_worker(id: Uuid) -> Result<()> {
+/// Runs the worker for session `id`.
+///
+/// `initial_size`, when given, is the (rows, cols) to open the workload's
+/// PTY at from the very first moment it's spawned, instead of the
+/// hard-coded 24x80 default. This closes a startup race: previously every
+/// session's PTY was opened at a fixed 24x80 regardless of the attaching
+/// client's real terminal size, and the correction only arrived later as a
+/// SIGWINCH-driven `AttachControl::Resize` once the client finished
+/// connecting -- microseconds to milliseconds after the workload was
+/// already running. A full-screen TUI that reads terminal geometry at
+/// startup (ncurses `initscr()`) initializes against the wrong size, and
+/// ncurses' resize handling does not always cleanly re-layout after a
+/// startup-time resize, producing visibly garbled output (footer/rows
+/// interleaved, stale leftover text) even though the PTY's winsize ends up
+/// numerically correct moments later.
+///
+/// The caller (`cmd_start` in src/bin/a.rs) supplies this only for the
+/// common immediate-attach case (`a start --attach`, `a -`), where it
+/// already knows the attaching client's terminal size before the worker is
+/// even spawned -- so the workload can be started at its true final size
+/// with no resize-after-spawn step needed at all. A session started
+/// detached, with no client attaching yet, has no size to offer and falls
+/// back to the 24x80 default here; that session still gets resized
+/// normally the first time someone does attach (see `attach()` in
+/// src/bin/a.rs), the same as before this fix -- this only eliminates the
+/// race for the case where the size is already known at spawn time.
+pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     let paths = Paths::discover()?;
     let record_path = paths.record(id);
     let mut record = read_record(&record_path)?;
@@ -252,7 +278,8 @@ pub fn run_worker(id: Uuid) -> Result<()> {
         Ok(value) => value,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
-    let (master_read, slave) = match open_pty(24, 80) {
+    let (rows, cols) = initial_size.unwrap_or((24, 80));
+    let (master_read, slave) = match open_pty(rows, cols) {
         Ok(value) => value,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };

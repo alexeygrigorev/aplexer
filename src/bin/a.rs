@@ -367,6 +367,26 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(worker_log));
+    if args.attach {
+        // We're about to attach right after the worker comes up (`a start
+        // --attach` / `a -`), so this client's terminal size is already
+        // known -- pass it through so the worker opens the workload's PTY
+        // at its real, final (reserved-row-adjusted) size from the start,
+        // instead of the 24x80 default that would otherwise be corrected a
+        // moment later by attach()'s own resize. See `run_worker`'s
+        // `initial_size` doc comment in src/worker.rs for the race this
+        // closes. A non-tty stdin (piped/scripted use) has no size to
+        // offer, so the worker falls back to its own default in that case,
+        // same as a detached start.
+        let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if let Some((rows, cols)) = tty.then(|| terminal_size(libc::STDIN_FILENO)).flatten() {
+            command
+                .arg("--rows")
+                .arg(reserved_rows(rows).to_string())
+                .arg("--cols")
+                .arg(cols.to_string());
+        }
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -1224,6 +1244,28 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
 /// cursor-position/clear escapes and renders close enough.
 const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 
+/// aplexer has no real terminal emulation (spec.md's v1 non-goal), so the
+/// status-bar thread has no way to know what the workload's screen actually
+/// looks like right now or whether interjecting a redraw would visually
+/// collide with something the workload just drew -- unlike tmux, which can
+/// place its status line safely because it tracks real per-pane terminal
+/// state server-side. The save-cursor/jump/draw/restore-cursor sequence in
+/// `draw_status_bar` is byte-safe (serialized under the shared stdout
+/// mutex, so writes never tear or interleave), but a fast-redrawing
+/// full-screen TUI (htop's ~1-2s full-screen cycle) can still visibly
+/// reflect our redraw firing mid-cycle, or have its own cursor-position
+/// bookkeeping thrown off by our jump-away-and-back. Building real terminal
+/// state tracking to eliminate this completely is a much bigger project
+/// than this fix -- so instead of a fixed independent timer, the status
+/// thread redraws when the PTY has been quiet for `STATUS_BAR_IDLE_GAP`
+/// (tending to land in the gaps between a TUI's own redraws rather than
+/// racing them on an unrelated clock), falling back to a forced redraw
+/// every `STATUS_BAR_MAX_INTERVAL` for workloads that stream continuously
+/// (agent CLIs during generation, a chatty build) and so never go quiet.
+const STATUS_BAR_IDLE_GAP: Duration = Duration::from_millis(450);
+const STATUS_BAR_MAX_INTERVAL: Duration = Duration::from_secs(3);
+const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
 /// Physical terminal geometry as last observed by the resize-poll thread,
 /// shared with the status-bar thread so its redraws always target the
 /// current last row/width without a second ioctl.
@@ -1290,7 +1332,17 @@ fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermG
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
-    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H");
+    // `\x1b[?25h` (DECTCEM show cursor) is included unconditionally: a
+    // full-screen TUI in the workload (htop, vim, an agent CLI's spinner,
+    // ...) commonly hides the cursor with `\x1b[?25l` while it owns the
+    // screen and relies on its own exit path to show it again -- but that
+    // exit path runs on the *workload's* side, and detaching doesn't wait
+    // for or depend on it. Without this, a detach can leave the user's real
+    // terminal with an invisible cursor after the workload's last draw
+    // happened to hide it. Showing an already-visible cursor is a no-op, so
+    // this is safe to send regardless of what state the workload (or our
+    // own status-bar redraw, which never hides the cursor) left it in.
+    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
 }
 
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
@@ -1459,7 +1511,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         None
     };
     if tty {
-        eprintln!("[aplexer attached; Ctrl-] detaches]");
+        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches]");
     }
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
@@ -1468,6 +1520,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         cols: 0,
         reserved: false,
     }));
+    // Last time PTY output was written to the real terminal -- read by the
+    // status-bar thread to decide when it's a good moment to redraw (see
+    // STATUS_BAR_IDLE_GAP's doc comment above).
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
     if tty {
         if let Some((rows, cols)) = terminal_size(libc::STDIN_FILENO) {
             apply_terminal_layout(&stdout, &term, rows, cols);
@@ -1485,24 +1541,74 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
-        while input_active.load(Ordering::Relaxed) {
+        // Ctrl-b (0x02) immediately followed by `d` (0x64) detaches, same as
+        // Ctrl-] -- tmux's actual default prefix-key detach binding, added
+        // so tmux muscle memory works here too. This state has to survive
+        // across separate read() calls (not just within one buffer): Ctrl-b
+        // can legitimately arrive as the very last byte of one read and `d`
+        // as the first byte of the next.
+        //
+        // Design choice: real tmux turns Ctrl-b into a standing "prefix"
+        // that consumes the next keystroke as a command (or no-ops/bells if
+        // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
+        // has no such command-prefix system and isn't growing one just for
+        // this, so the simplest reasonable behavior is used instead: Ctrl-b
+        // followed by `d` detaches; Ctrl-b followed by anything else is not
+        // a prefix at all -- both bytes are forwarded through as ordinary
+        // input, so a program that wants a literal Ctrl-b (some editors and
+        // REPLs use it) isn't broken by this feature when the user doesn't
+        // follow it with `d`.
+        let mut pending_ctrl_b = false;
+        'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            if tty {
-                if let Some(pos) = buffer[..n].iter().position(|b| *b == 0x1d) {
-                    if pos > 0 {
-                        let _ = send_data(&input_writer, &buffer[..pos]);
+            if !tty {
+                if send_data(&input_writer, &buffer[..n]).is_err() {
+                    break;
+                }
+                continue;
+            }
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0;
+            while i < n {
+                let byte = buffer[i];
+                if pending_ctrl_b {
+                    pending_ctrl_b = false;
+                    if byte == b'd' {
+                        if !out.is_empty() {
+                            let _ = send_data(&input_writer, &out);
+                        }
+                        let _ = send_control(&input_writer, &AttachControl::Detach);
+                        input_active.store(false, Ordering::Relaxed);
+                        break 'outer;
+                    }
+                    // Not a detach: forward the withheld Ctrl-b and then
+                    // reprocess this byte normally (it might itself be
+                    // Ctrl-] or a fresh Ctrl-b).
+                    out.push(0x02);
+                    continue;
+                }
+                if byte == 0x1d {
+                    if !out.is_empty() {
+                        let _ = send_data(&input_writer, &out);
                     }
                     let _ = send_control(&input_writer, &AttachControl::Detach);
                     input_active.store(false, Ordering::Relaxed);
-                    break;
+                    break 'outer;
                 }
+                if byte == 0x02 {
+                    pending_ctrl_b = true;
+                    i += 1;
+                    continue;
+                }
+                out.push(byte);
+                i += 1;
             }
-            if send_data(&input_writer, &buffer[..n]).is_err() {
+            if !out.is_empty() && send_data(&input_writer, &out).is_err() {
                 break;
             }
         }
@@ -1541,10 +1647,38 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let status_active = active.clone();
         let status_paths = paths.clone();
         let status_record = record.clone();
+        let status_last_activity = last_activity.clone();
         thread::spawn(move || {
+            let mut last_draw = Instant::now();
+            // Edge-triggered, not level-triggered: once the PTY has been
+            // idle for STATUS_BAR_IDLE_GAP, redraw exactly once and then
+            // stay quiet -- not on every poll tick for as long as it
+            // remains idle. Tracking "have we already redrawn for the
+            // current idle stretch" (reset the moment new PTY activity is
+            // observed) is what makes this an actual debounce instead of a
+            // redraw storm during any sufficiently long idle period.
+            let mut last_seen_activity = status_last_activity
+                .lock()
+                .map(|t| *t)
+                .unwrap_or_else(|_| Instant::now());
+            let mut drawn_for_current_idle = false;
             while status_active.load(Ordering::Relaxed) {
-                draw_status_bar(&status_stdout, &status_term, &status_paths, &status_record);
-                thread::sleep(Duration::from_millis(1500));
+                thread::sleep(STATUS_BAR_POLL_INTERVAL);
+                let activity = match status_last_activity.lock() {
+                    Ok(t) => *t,
+                    Err(_) => continue,
+                };
+                if activity != last_seen_activity {
+                    last_seen_activity = activity;
+                    drawn_for_current_idle = false;
+                }
+                let idle_for = activity.elapsed();
+                let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
+                if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
+                    draw_status_bar(&status_stdout, &status_term, &status_paths, &status_record);
+                    last_draw = Instant::now();
+                    drawn_for_current_idle = true;
+                }
             }
         });
     }
@@ -1569,6 +1703,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         match frame.kind {
             FrameKind::Data => {
                 write_locked(&stdout, &frame.payload)?;
+                if let Ok(mut t) = last_activity.lock() {
+                    *t = Instant::now();
+                }
             }
             FrameKind::End => break,
             FrameKind::Json => {
