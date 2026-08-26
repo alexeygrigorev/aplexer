@@ -1,6 +1,6 @@
 # Inter-agent messaging: a per-workspace communication channel
 
-Status: design proposal (nothing here is implemented)
+Status: implemented (v1 scope -- see `a message --help`); event-stream push notification, `--when-waiting` deferred pane delivery, and cross-host bridging remain design-only, see section 8's open questions
 Scope: messaging between aplexer sessions that share a workspace
 Related spec sections: 5.1 (no shared PTY owner), 14 (runtime storage), 18 (machine API), 19 (event stream), 26 (security), 32 (recovery)
 
