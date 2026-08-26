@@ -345,6 +345,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         history_bytes: launch.history_bytes,
         created_at_ms: now,
         updated_at_ms: now,
+        last_activity_ms: None,
         phase: Phase::Starting,
         worker_pid: None,
         workload_pid: None,

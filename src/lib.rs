@@ -216,6 +216,17 @@ pub struct SessionRecord {
     pub history_bytes: usize,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Last time the workload's PTY produced output, as observed by the
+    /// worker (see worker.rs's periodic debounce thread) -- deliberately a
+    /// separate field from `updated_at_ms`, which already fires on unrelated
+    /// record writes (phase transitions, rename, ...) and would be a noisy,
+    /// misleading proxy for "is this session's PTY currently active" if
+    /// reused for that purpose. `a watch`'s `agent.state` heuristic
+    /// (running/waiting) is built on this field; see its doc comments for
+    /// the important caveat that PTY-output recency is a coarse proxy for
+    /// activity, not true agent-semantic state (spec.md section 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<u64>,
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_pid: Option<u32>,
