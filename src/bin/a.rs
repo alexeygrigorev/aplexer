@@ -52,6 +52,7 @@ enum Commands {
     Doctor,
     Whoami,
     Message(MessageArgs),
+    Watch(WatchArgs),
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
@@ -164,6 +165,21 @@ struct KillArgs {
     #[arg(long, default_value_t = 2_000)]
     grace_ms: u64,
 }
+#[derive(Args)]
+struct WatchArgs {
+    /// Currently the only supported output mode -- required explicitly
+    /// rather than defaulted so a bare `a watch` fails loudly instead of
+    /// silently assuming a format that isn't implemented.
+    #[arg(long)]
+    jsonl: bool,
+    /// Also watch shell (non-agent) sessions. Default is agent-only (engine
+    /// != "shell"), an explicit scope decision -- see src/watch.rs.
+    #[arg(long)]
+    all: bool,
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<PathBuf>,
+}
+
 #[derive(Args)]
 struct RenameArgs {
     #[arg(value_name = "SESSION")]
@@ -317,6 +333,7 @@ fn run() -> Result<()> {
         Commands::Whoami => cmd_whoami(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
+        Commands::Watch(args) => cmd_watch(&paths, args),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
     }
@@ -462,6 +479,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         history_bytes: launch.history_bytes,
         created_at_ms: now,
         updated_at_ms: now,
+        last_activity_ms: None,
         phase: Phase::Starting,
         worker_pid: None,
         workload_pid: None,
@@ -1258,6 +1276,20 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
         bail!("one or more doctor checks failed");
     }
     Ok(())
+}
+
+/// `a watch --jsonl [--all] [--workspace PATH]` -- see src/watch.rs for the
+/// poll/diff loop and the heru UnifiedEvent mapping it emits.
+fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
+    if !args.jsonl {
+        bail!("a watch currently requires --jsonl (no other output format is implemented yet)");
+    }
+    let workspace = args
+        .workspace
+        .as_deref()
+        .map(canonical_workspace)
+        .transpose()?;
+    aplexer::watch::run(paths, args.all, workspace.as_deref())
 }
 
 fn path_check(name: &str, path: &Path) -> Value {

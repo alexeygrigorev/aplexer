@@ -73,6 +73,9 @@
     "updated_at_ms": {
       "type": "integer"
     },
+    "last_activity_ms": {
+      "type": ["integer", "null"]
+    },
     "phase": {
       "enum": [
         "starting",

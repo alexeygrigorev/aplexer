@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -120,6 +120,14 @@ struct WorkerRuntime {
     /// (with a timeout) before exiting the worker so in-flight responses
     /// (e.g. the reply to the `kill` that ended the workload) are not lost.
     active_connections: AtomicUsize,
+    /// Last PTY-output timestamp (ms since epoch), updated on every PTY read
+    /// with a single relaxed atomic store -- no lock, no I/O -- so this can
+    /// sit directly in the hot PTY-reader loop without reintroducing the
+    /// per-read write amplification the history-persistence debounce fix
+    /// (see HISTORY_FLUSH_INTERVAL) already solved once. The periodic flush
+    /// thread piggybacks on that same tick to persist this into
+    /// `SessionRecord::last_activity_ms`, and only when it actually changed.
+    last_activity_ms: AtomicU64,
 }
 
 impl WorkerRuntime {
@@ -311,16 +319,34 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         kill_gate: Mutex::new(()),
         output: OutputHub::new(history),
         active_connections: AtomicUsize::new(0),
+        last_activity_ms: AtomicU64::new(0),
     });
     let (life_tx, life_rx) = mpsc::channel();
     {
         // Debounced history persistence (see History::append) needs a
         // periodic sweep so output followed by silence still reaches disk.
+        // The same tick also persists last_activity_ms (see its doc comment
+        // on WorkerRuntime) -- reusing this interval rather than adding a
+        // second timer, and only writing the record when the in-memory
+        // timestamp actually moved since the previous tick, so an idle
+        // session does not get its record rewritten every interval forever.
         let runtime = runtime.clone();
-        thread::spawn(move || loop {
-            thread::sleep(HISTORY_FLUSH_INTERVAL);
-            if let Err(error) = runtime.output.flush() {
-                eprintln!("aplexer worker: flush history: {error:#}");
+        thread::spawn(move || {
+            let mut persisted_activity_ms: u64 = 0;
+            loop {
+                thread::sleep(HISTORY_FLUSH_INTERVAL);
+                if let Err(error) = runtime.output.flush() {
+                    eprintln!("aplexer worker: flush history: {error:#}");
+                }
+                let current = runtime.last_activity_ms.load(Ordering::Relaxed);
+                if current != 0 && current != persisted_activity_ms {
+                    persisted_activity_ms = current;
+                    if let Err(error) =
+                        runtime.update_record(|r| r.last_activity_ms = Some(current))
+                    {
+                        eprintln!("aplexer worker: persist activity: {error:#}");
+                    }
+                }
             }
         });
     }
@@ -425,6 +451,12 @@ fn spawn_pty_reader(mut master: File, runtime: Arc<WorkerRuntime>, tx: mpsc::Sen
                     break;
                 }
                 Ok(n) => {
+                    // Cheap, lock-free activity marker (see WorkerRuntime's
+                    // last_activity_ms doc comment) -- deliberately updated
+                    // unconditionally here, before the debounced/possibly
+                    // I/O-performing append below, so it reflects PTY output
+                    // recency even if history persistence is momentarily slow.
+                    runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
                     if let Err(error) = runtime.output.append(&buffer[..n]) {
                         let _ = tx.send(LifeEvent::PtyError(format!("persist output: {error:#}")));
                         break;
