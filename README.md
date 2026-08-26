@@ -212,3 +212,5 @@ In short: aplexer trades a single, simple, inspectable server for a swarm of sma
 ## Full design doc
 
 See [spec.md](spec.md) (mirrored at [docs/SPEC.md](docs/SPEC.md)) for the complete architecture: identity model, session types, control protocol, machine API, event stream, and the PocketShell integration plan.
+
+For using aplexer on a remote host over a slow or flaky link (PocketShell on cellular), see [docs/low-bandwidth-remote-access-design.md](docs/low-bandwidth-remote-access-design.md) — what SSH compression already solves for free, status-bar/replay frugality, and reconnect/resume semantics (planning doc, not yet implemented).
