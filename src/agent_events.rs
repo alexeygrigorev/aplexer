@@ -765,16 +765,20 @@ pub fn resolve_transcript(record: &SessionRecord, bind_path: &Path) -> Result<Lo
             }
         }
     }
-    let path = locate_transcript(&record.engine, &record.cwd, record.created_at_ms).ok_or_else(
-        || {
-            anyhow!(
-                "no {} transcript found for session {} (cwd {}); the agent may not have written anything yet",
-                record.engine,
-                record.id,
-                record.cwd.display()
-            )
-        },
-    )?;
+    let path = locate_transcript(
+        &record.engine,
+        &record.cwd,
+        record.created_at_ms,
+        &record.env,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "no {} transcript found for session {} (cwd {}); the agent may not have written anything yet",
+            record.engine,
+            record.id,
+            record.cwd.display()
+        )
+    })?;
     let engine_session_id = peek_continuation(&record.engine, &path);
     let bind = TranscriptBind {
         path: path.clone(),
@@ -788,11 +792,16 @@ pub fn resolve_transcript(record: &SessionRecord, bind_path: &Path) -> Result<Lo
     })
 }
 
-pub fn locate_transcript(engine: &str, cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
+pub fn locate_transcript(
+    engine: &str,
+    cwd: &Path,
+    created_at_ms: u64,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
     match engine {
-        "claude" => locate_claude_transcript(cwd, created_at_ms),
-        "codex" => locate_codex_transcript(cwd, created_at_ms),
-        "grok" => locate_grok_transcript(cwd, created_at_ms),
+        "claude" => locate_claude_transcript(cwd, created_at_ms, env),
+        "codex" => locate_codex_transcript(cwd, created_at_ms, env),
+        "grok" => locate_grok_transcript(cwd, created_at_ms, env),
         _ => None,
     }
 }
@@ -825,10 +834,17 @@ fn peek_continuation(engine: &str, path: &Path) -> Option<String> {
 /// if two aplexer claude sessions share the exact same cwd and are both
 /// live, the bind sidecar is what keeps later reads on the first-found
 /// file. Documented, not silently assumed.
-pub fn locate_claude_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+pub fn locate_claude_transcript(
+    cwd: &Path,
+    created_at_ms: u64,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    let config_dir = env
+        .get("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))?;
     let encoded = cwd.display().to_string().replace('/', "-");
-    let dir = PathBuf::from(home).join(".claude/projects").join(encoded);
+    let dir = config_dir.join("projects").join(encoded);
     if !dir.is_dir() {
         return None;
     }
@@ -841,9 +857,15 @@ pub fn locate_claude_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBu
 /// (`agent_log.py::_resolve_codex_path`). Each rollout file's first line is
 /// a `session_meta` row carrying its own `cwd`, which lets this disambiguate
 /// candidates precisely rather than relying on mtime alone.
-pub fn locate_codex_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let root = PathBuf::from(home).join(".codex/sessions");
+pub fn locate_codex_transcript(
+    cwd: &Path,
+    created_at_ms: u64,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    let root = env
+        .get("CODEX_HOME")
+        .map(|h| PathBuf::from(h).join("sessions"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex/sessions")))?;
     if !root.is_dir() {
         return None;
     }
@@ -875,42 +897,29 @@ pub fn locate_codex_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf
 /// Grok Build: `$GROK_HOME/sessions/<urlencoded-cwd>/<session-id>/updates.jsonl`
 /// (default `GROK_HOME` is `~/.grok`). Percent-encoding matches
 /// `urllib.parse.quote(cwd, safe="")` in pocketshell's `agent_log.py`.
-pub fn locate_grok_transcript(cwd: &Path, created_at_ms: u64) -> Option<PathBuf> {
-    let root = grok_sessions_root()?;
+pub fn locate_grok_transcript(
+    cwd: &Path,
+    created_at_ms: u64,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    let root = grok_sessions_root(env)?;
     if !root.is_dir() {
         return None;
     }
     let since = created_at_ms.saturating_sub(5_000);
     let encoded = encode_grok_cwd(&cwd.display().to_string());
     let project = root.join(&encoded);
+    // Stay inside this cwd's encoded directory. Walking every grok session
+    // tree would bind an unrelated live session (this agent's own
+    // updates.jsonl is the usual false match).
     if project.is_dir() {
-        if let Some(path) = best_grok_updates(&project, since) {
-            return Some(path);
-        }
+        return best_grok_updates(&project, since);
     }
-    // Encoded-cwd miss: walk every project dir (cwd string may have drifted
-    // via symlink resolution) and pick the newest updates.jsonl since start.
-    let mut best: Option<(u64, PathBuf)> = None;
-    let Ok(entries) = fs::read_dir(&root) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        if let Some(path) = best_grok_updates(&dir, since) {
-            let mtime = file_mtime_ms(&path).unwrap_or(0);
-            if best.as_ref().map(|(m, _)| mtime > *m).unwrap_or(true) {
-                best = Some((mtime, path));
-            }
-        }
-    }
-    best.map(|(_, p)| p)
+    None
 }
 
-fn grok_sessions_root() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("GROK_HOME") {
+fn grok_sessions_root(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    if let Some(home) = env.get("GROK_HOME").cloned().or_else(|| std::env::var("GROK_HOME").ok()) {
         return Some(PathBuf::from(home).join("sessions"));
     }
     let home = std::env::var_os("HOME")?;
@@ -918,12 +927,18 @@ fn grok_sessions_root() -> Option<PathBuf> {
 }
 
 fn encode_grok_cwd(cwd: &str) -> String {
+    // urllib.parse.quote(cwd, safe="") -- RFC 3986 unreserved
+    // (ALPHA / DIGIT / "-" / "." / "_" / "~") stay literal; everything
+    // else, including `/`, is percent-encoded. `safe=""` only *adds*
+    // extra unencoded bytes; it does not encode `-_.~`.
     let trimmed = cwd.trim();
     let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
     let mut out = String::new();
     for b in trimmed.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -1440,6 +1455,10 @@ mod tests {
         assert_eq!(
             encode_grok_cwd("/home/alexey/git/aplexer"),
             "%2Fhome%2Falexey%2Fgit%2Faplexer"
+        );
+        assert_eq!(
+            encode_grok_cwd("/tmp/aplexer-tx-test"),
+            "%2Ftmp%2Faplexer-tx-test"
         );
     }
 
