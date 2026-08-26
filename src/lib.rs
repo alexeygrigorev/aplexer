@@ -1216,15 +1216,25 @@ pub enum ServerEvent {
     Error { message: String },
     /// The workload did something that invalidates the client's DECSTBM
     /// status-bar reservation: reset its scroll margins (RIS or a bare/
-    /// full-range `\x1b[r`), or flipped alternate-screen state (design doc
-    /// section 7). Sent **only** to subscribers that attached with
-    /// `want_screen: true` -- an old client's `serde_json::from_slice`
+    /// full-range `\x1b[r`), flipped alternate-screen state, or issued an
+    /// Erase in Display (`CSI ... J`, which ignores scroll margins per spec
+    /// and so can wipe the reserved row even under an active sub-range --
+    /// design doc section 7). Sent **only** to subscribers that attached
+    /// with `want_screen: true` -- an old client's `serde_json::from_slice`
     /// would hard-fail on an unrecognized `event` tag, so gating this on
     /// the request flag (done at the worker's send site, not here) keeps
     /// old clients safe (design doc section 6.3).
     Layout {
         alt_screen: bool,
         margins_reset: bool,
+        // `default` so a new client attaching to an OLD, already-running
+        // worker (started before this field existed) doesn't hard-fail
+        // deserializing that worker's `Layout` events -- workers are
+        // long-lived and outlive a client rebuild, unlike the `event` tag
+        // gating described above which only covers new tags, not new fields
+        // on an existing one.
+        #[serde(default)]
+        erase_reset: bool,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

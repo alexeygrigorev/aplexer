@@ -862,6 +862,7 @@ fn handle_attach(
                                 &ServerEvent::Layout {
                                     alt_screen: change.alt_screen,
                                     margins_reset: change.margins_reset,
+                                    erase_reset: change.erase_reset,
                                 },
                             )?;
                         }

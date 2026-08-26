@@ -48,6 +48,17 @@ const MARGIN_PARAM_CAP: usize = 32;
 ///   status-bar row -- see design doc section 7); anything that fails
 ///   validation is ignored (no state change, no report), matching how real
 ///   terminals silently ignore a malformed DECSTBM.
+/// - `ESC [ ... J` (Erase in Display / ED), any parameter and any private
+///   marker: reported unconditionally as a `CsiEvent::erase` trigger,
+///   regardless of the `Ps` value. ED ignores scroll margins per spec, so
+///   even a scoped DECSTBM sub-range doesn't protect the client's reserved
+///   bottom row from an `ED2`/`ED3` full-screen erase -- and Ink-based TUIs
+///   (Codex, Claude Code) send exactly that on nearly every redraw. Being
+///   unconditional (not trying to determine from cursor position whether a
+///   bare/`0J` "cursor to end of screen" could reach the last row) is a
+///   deliberate over-trigger: the fallout is one extra harmless status-bar
+///   redraw, while under-triggering means the bar can stay silently wiped
+///   until the next debounce/max-interval tick.
 #[derive(Debug, Clone)]
 pub struct MarginTracker {
     rows: u16,
@@ -90,44 +101,47 @@ impl MarginTracker {
         self.disqualified = false;
     }
 
-    /// Feed a chunk of raw PTY bytes. Returns `true` if this chunk caused a
-    /// margin *reset* the client should react to (re-assert its own
-    /// status-bar reservation) -- see design doc section 7.
-    pub fn scan(&mut self, data: &[u8]) -> bool {
-        let mut reset = false;
+    /// Feed a chunk of raw PTY bytes. Returns the triggers this chunk
+    /// caused that the client should react to (re-assert its own
+    /// status-bar reservation) -- see design doc section 7 and `CsiEvent`.
+    pub fn scan(&mut self, data: &[u8]) -> CsiEvent {
+        let mut result = CsiEvent::default();
         for &byte in data {
-            if self.step(byte) {
-                reset = true;
-            }
+            let event = self.step(byte);
+            result.margins_reset |= event.margins_reset;
+            result.erase |= event.erase;
         }
-        reset
+        result
     }
 
-    fn step(&mut self, byte: u8) -> bool {
+    fn step(&mut self, byte: u8) -> CsiEvent {
         match self.state {
             MarginParseState::Ground => {
                 if byte == 0x1b {
                     self.state = MarginParseState::Esc;
                 }
-                false
+                CsiEvent::default()
             }
             MarginParseState::Esc => match byte {
                 b'c' => {
                     self.state = MarginParseState::Ground;
                     self.margins = None;
-                    true
+                    CsiEvent {
+                        margins_reset: true,
+                        erase: false,
+                    }
                 }
                 b'[' => {
                     self.state = MarginParseState::Csi;
                     self.param_buf.clear();
                     self.disqualified = false;
-                    false
+                    CsiEvent::default()
                 }
                 _ => {
                     // Not a sequence we track -- back to ground so the next
                     // byte is processed fresh.
                     self.state = MarginParseState::Ground;
-                    false
+                    CsiEvent::default()
                 }
             },
             MarginParseState::Csi => match byte {
@@ -138,40 +152,51 @@ impl MarginTracker {
                     } else {
                         self.param_buf.push(byte);
                     }
-                    false
+                    CsiEvent::default()
                 }
                 b'?' | b'<' | b'=' | b'>' => {
                     self.disqualified = true;
-                    false
+                    CsiEvent::default()
                 }
                 0x20..=0x2f => {
                     // Intermediate byte.
                     self.disqualified = true;
-                    false
+                    CsiEvent::default()
                 }
                 0x40..=0x7e => {
-                    let reset = self.finish_csi(byte);
+                    let event = self.finish_csi(byte);
                     self.state = MarginParseState::Ground;
-                    reset
+                    event
                 }
-                _ => false,
+                _ => CsiEvent::default(),
             },
         }
     }
 
-    /// `final_byte` is the CSI sequence's terminating byte. Returns whether
-    /// this was a margin-resetting DECSTBM/RIS-equivalent.
-    fn finish_csi(&mut self, final_byte: u8) -> bool {
+    /// `final_byte` is the CSI sequence's terminating byte. Returns the
+    /// triggers this sequence caused, if any.
+    fn finish_csi(&mut self, final_byte: u8) -> CsiEvent {
+        if final_byte == b'J' {
+            // Erase in Display -- see `CsiEvent::erase`'s doc comment above:
+            // unconditional, regardless of Ps or `disqualified`.
+            return CsiEvent {
+                margins_reset: false,
+                erase: true,
+            };
+        }
         if final_byte != b'r' || self.disqualified {
-            return false;
+            return CsiEvent::default();
         }
         let text = match std::str::from_utf8(&self.param_buf) {
             Ok(text) => text,
-            Err(_) => return false,
+            Err(_) => return CsiEvent::default(),
         };
         if text.is_empty() {
             self.margins = None;
-            return true;
+            return CsiEvent {
+                margins_reset: true,
+                erase: false,
+            };
         }
         let mut parts = text.splitn(2, ';');
         let top_raw = parts.next().unwrap_or("");
@@ -181,7 +206,7 @@ impl MarginTracker {
         } else {
             match top_raw.parse() {
                 Ok(value) => value,
-                Err(_) => return false,
+                Err(_) => return CsiEvent::default(),
             }
         };
         let bottom: u16 = if bottom_raw.is_empty() {
@@ -189,35 +214,53 @@ impl MarginTracker {
         } else {
             match bottom_raw.parse() {
                 Ok(value) => value,
-                Err(_) => return false,
+                Err(_) => return CsiEvent::default(),
             }
         };
         if top < 1 || bottom > self.rows || top >= bottom {
             // Malformed / out of range: real terminals ignore this; so do
             // we -- no state change, no report.
-            return false;
+            return CsiEvent::default();
         }
         if top == 1 && bottom == self.rows {
             self.margins = None;
-            true
+            CsiEvent {
+                margins_reset: true,
+                erase: false,
+            }
         } else {
             self.margins = Some((top, bottom));
-            false
+            CsiEvent::default()
         }
     }
 }
 
+/// What a scanned chunk of PTY bytes did that `ScreenTracker::process`
+/// should fold into a `LayoutChange` -- see `MarginTracker`'s doc comment
+/// for exactly which sequences set which field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CsiEvent {
+    pub margins_reset: bool,
+    pub erase: bool,
+}
+
 /// What the workload did that the attached client must react to (design doc
 /// section 5.1/7): re-assert its DECSTBM status-bar reservation and redraw
-/// the bar. Fired on a margin reset (RIS or a full-range/empty DECSTBM) or
-/// on an alternate-screen enter/exit -- margins are formally preserved
-/// across 1049 on xterm, but emulator variance exists and TUIs commonly wrap
+/// the bar. Fired on a margin reset (RIS or a full-range/empty DECSTBM), on
+/// an alternate-screen enter/exit -- margins are formally preserved across
+/// 1049 on xterm, but emulator variance exists and TUIs commonly wrap
 /// transitions in `\x1b[r`, so the client re-asserts unconditionally on
-/// every flip; it is idempotent and cheap.
+/// every flip -- or on an Erase in Display (`CSI ... J`), which ignores
+/// scroll margins per spec and so can wipe the client's reserved bottom row
+/// even under an otherwise-untouched DECSTBM sub-range. All three triggers
+/// are idempotent and cheap to react to, so being liberal about firing them
+/// (`erase_reset` in particular is unconditional on `Ps`, see
+/// `CsiEvent::erase`'s doc comment) costs nothing but an extra redraw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutChange {
     pub alt_screen: bool,
     pub margins_reset: bool,
+    pub erase_reset: bool,
 }
 
 /// The live per-session screen model: a `vt100::Parser` fed continuously by
@@ -247,15 +290,16 @@ impl ScreenTracker {
     /// Feed PTY bytes; returns `Some(LayoutChange)` when the workload did
     /// something the attached client must react to.
     pub fn process(&mut self, data: &[u8]) -> Option<LayoutChange> {
-        let margins_reset = self.margins.scan(data);
+        let csi = self.margins.scan(data);
         self.parser.process(data);
         let now_alt = self.parser.screen().alternate_screen();
         let alt_flip = now_alt != self.alt_screen;
         self.alt_screen = now_alt;
-        if margins_reset || alt_flip {
+        if csi.margins_reset || csi.erase || alt_flip {
             Some(LayoutChange {
                 alt_screen: now_alt,
-                margins_reset,
+                margins_reset: csi.margins_reset,
+                erase_reset: csi.erase,
             })
         } else {
             None
@@ -320,8 +364,9 @@ mod tests {
     #[test]
     fn margin_tracker_sub_range_stored_no_reset() {
         let mut t = MarginTracker::new(24);
-        let reset = t.scan(b"\x1b[3;20r");
-        assert!(!reset);
+        let event = t.scan(b"\x1b[3;20r");
+        assert!(!event.margins_reset);
+        assert!(!event.erase);
         assert_eq!(t.margins(), Some((3, 20)));
     }
 
@@ -329,8 +374,8 @@ mod tests {
     fn margin_tracker_full_range_reports_reset() {
         let mut t = MarginTracker::new(24);
         t.scan(b"\x1b[3;20r");
-        let reset = t.scan(b"\x1b[1;24r");
-        assert!(reset);
+        let event = t.scan(b"\x1b[1;24r");
+        assert!(event.margins_reset);
         assert_eq!(t.margins(), None);
     }
 
@@ -338,8 +383,8 @@ mod tests {
     fn margin_tracker_bare_r_reports_reset() {
         let mut t = MarginTracker::new(24);
         t.scan(b"\x1b[3;20r");
-        let reset = t.scan(b"\x1b[r");
-        assert!(reset);
+        let event = t.scan(b"\x1b[r");
+        assert!(event.margins_reset);
         assert_eq!(t.margins(), None);
     }
 
@@ -347,8 +392,8 @@ mod tests {
     fn margin_tracker_ris_reports_reset() {
         let mut t = MarginTracker::new(24);
         t.scan(b"\x1b[3;20r");
-        let reset = t.scan(b"\x1bc");
-        assert!(reset);
+        let event = t.scan(b"\x1bc");
+        assert!(event.margins_reset);
         assert_eq!(t.margins(), None);
     }
 
@@ -357,9 +402,12 @@ mod tests {
         let seq = b"\x1b[3;20r";
         for split in 0..=seq.len() {
             let mut t = MarginTracker::new(24);
-            let reset1 = t.scan(&seq[..split]);
-            let reset2 = t.scan(&seq[split..]);
-            assert!(!reset1 && !reset2, "split at {split} reported a spurious reset");
+            let event1 = t.scan(&seq[..split]);
+            let event2 = t.scan(&seq[split..]);
+            assert!(
+                !event1.margins_reset && !event2.margins_reset,
+                "split at {split} reported a spurious reset"
+            );
             assert_eq!(t.margins(), Some((3, 20)), "split at {split} lost the margin");
         }
     }
@@ -368,8 +416,8 @@ mod tests {
     fn margin_tracker_esc_then_c_split() {
         let mut t = MarginTracker::new(24);
         t.scan(b"\x1b[3;20r");
-        assert!(!t.scan(b"\x1b"));
-        assert!(t.scan(b"c"));
+        assert!(!t.scan(b"\x1b").margins_reset);
+        assert!(t.scan(b"c").margins_reset);
         assert_eq!(t.margins(), None);
     }
 
@@ -378,16 +426,17 @@ mod tests {
         let mut t = MarginTracker::new(24);
         // DECSET/DECRST-shaped private sequence ending in 'r' must not be
         // mistaken for DECSTBM.
-        let reset = t.scan(b"\x1b[?1049r");
-        assert!(!reset);
+        let event = t.scan(b"\x1b[?1049r");
+        assert!(!event.margins_reset);
         assert_eq!(t.margins(), None);
     }
 
     #[test]
     fn margin_tracker_alt_screen_enter_not_mistaken_for_margin() {
         let mut t = MarginTracker::new(24);
-        let reset = t.scan(b"\x1b[?1049h");
-        assert!(!reset);
+        let event = t.scan(b"\x1b[?1049h");
+        assert!(!event.margins_reset);
+        assert!(!event.erase);
         assert_eq!(t.margins(), None);
     }
 
@@ -397,8 +446,8 @@ mod tests {
         let mut seq = b"\x1b[".to_vec();
         seq.extend(std::iter::repeat(b'1').take(64));
         seq.push(b'r');
-        let reset = t.scan(&seq);
-        assert!(!reset);
+        let event = t.scan(&seq);
+        assert!(!event.margins_reset);
         assert_eq!(t.margins(), None);
     }
 
@@ -406,13 +455,78 @@ mod tests {
     fn margin_tracker_invalid_range_ignored() {
         let mut t = MarginTracker::new(24);
         // top >= bottom: invalid, ignored.
-        let reset = t.scan(b"\x1b[20;3r");
-        assert!(!reset);
+        let event = t.scan(b"\x1b[20;3r");
+        assert!(!event.margins_reset);
         assert_eq!(t.margins(), None);
         // bottom > rows: invalid, ignored.
-        let reset = t.scan(b"\x1b[1;99r");
-        assert!(!reset);
+        let event = t.scan(b"\x1b[1;99r");
+        assert!(!event.margins_reset);
         assert_eq!(t.margins(), None);
+    }
+
+    // -- MarginTracker: Erase in Display (CSI ... J) detection --
+
+    #[test]
+    fn margin_tracker_full_erase_reports_erase() {
+        let mut t = MarginTracker::new(24);
+        let event = t.scan(b"\x1b[2J");
+        assert!(event.erase);
+        assert!(!event.margins_reset);
+    }
+
+    #[test]
+    fn margin_tracker_scrollback_erase_reports_erase() {
+        let mut t = MarginTracker::new(24);
+        let event = t.scan(b"\x1b[3J");
+        assert!(event.erase);
+    }
+
+    #[test]
+    fn margin_tracker_bare_erase_reports_erase() {
+        // Bare `CSI J` / `CSI 0J` ("cursor to end of screen") could
+        // plausibly reach the bottom row depending on cursor position --
+        // conservatively treated the same as a full erase.
+        let mut t = MarginTracker::new(24);
+        let event = t.scan(b"\x1b[J");
+        assert!(event.erase);
+        let mut t2 = MarginTracker::new(24);
+        let event2 = t2.scan(b"\x1b[0J");
+        assert!(event2.erase);
+    }
+
+    #[test]
+    fn margin_tracker_erase_under_active_sub_range_still_reports() {
+        // ED ignores DECSTBM margins per spec, so even a scoped scroll
+        // region shouldn't suppress the erase trigger.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[3;20r");
+        let event = t.scan(b"\x1b[2J");
+        assert!(event.erase);
+        // The sub-range itself must be unaffected by the erase.
+        assert_eq!(t.margins(), Some((3, 20)));
+    }
+
+    #[test]
+    fn margin_tracker_selective_erase_with_private_marker_still_reports() {
+        // DECSED (`CSI ? Ps J`) carries a private marker that disqualifies
+        // it as DECSTBM, but it must still trigger the erase heuristic.
+        let mut t = MarginTracker::new(24);
+        let event = t.scan(b"\x1b[?2J");
+        assert!(event.erase);
+    }
+
+    #[test]
+    fn margin_tracker_erase_split_at_every_byte_boundary() {
+        let seq = b"\x1b[2J";
+        for split in 0..=seq.len() {
+            let mut t = MarginTracker::new(24);
+            let event1 = t.scan(&seq[..split]);
+            let event2 = t.scan(&seq[split..]);
+            assert!(
+                event1.erase || event2.erase,
+                "split at {split} lost the erase trigger"
+            );
+        }
     }
 
     #[test]
@@ -447,7 +561,36 @@ mod tests {
         assert!(tracker.process(b"\x1b[3;20r").is_none());
         let change = tracker.process(b"\x1b[r").expect("reset should emit a change");
         assert!(change.margins_reset);
+        assert!(!change.erase_reset);
         assert!(!change.alt_screen);
+    }
+
+    #[test]
+    fn erase_in_display_emits_layout_change() {
+        // Regression test: `CSI 2J` used to be invisible to the layout-change
+        // detector, so a full-screen erase (which ignores DECSTBM margins
+        // and can wipe the client's reserved bottom row) would not trigger
+        // the same-round-trip self-heal that margin-reset/alt-screen flips
+        // get -- the client would have to wait on the slower idle/
+        // max-interval timers instead.
+        let mut tracker = ScreenTracker::new(24, 80);
+        let change = tracker
+            .process(b"\x1b[2J")
+            .expect("full erase should emit a layout change");
+        assert!(change.erase_reset);
+        assert!(!change.margins_reset);
+    }
+
+    #[test]
+    fn erase_in_display_under_sub_range_still_emits_layout_change() {
+        // Even with an active (and otherwise untouched) DECSTBM sub-range,
+        // ED must still trigger -- it ignores scroll margins per spec.
+        let mut tracker = ScreenTracker::new(24, 80);
+        assert!(tracker.process(b"\x1b[3;20r").is_none());
+        let change = tracker
+            .process(b"\x1b[2J")
+            .expect("erase under a sub-range should still emit a layout change");
+        assert!(change.erase_reset);
     }
 
     // -- Round-trip property (design doc section 6.2/12 item 10): feeding

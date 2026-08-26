@@ -2726,6 +2726,7 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     seq.extend_from_slice(text.as_bytes());
     seq.extend_from_slice(b"\x1b[0m\x1b8");
     let _ = write_locked(&ctx.stdout, &seq);
+    true
 }
 
 /// Which session a `Ctrl-b` switch chord asks for
@@ -3407,9 +3408,18 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
                     // `overdue` forces the write even if the text is
                     // unchanged -- see draw_status_bar's doc comment on why
-                    // the margin-defense guarantee needs that.
-                    draw_status_bar(&thread_status_ctx, overdue);
-                    last_draw = Instant::now();
+                    // the margin-defense guarantee needs that. Only reset
+                    // `last_draw` when a real write happened (`wrote`):
+                    // resetting it on every tick regardless -- even ticks
+                    // the dirty-check turned into a no-op -- would let the
+                    // idle-gap branch's frequent no-op "redraws" keep
+                    // `overdue` perpetually false, starving the very
+                    // self-heal guarantee this timer exists to provide (see
+                    // draw_status_bar's doc comment).
+                    let wrote = draw_status_bar(&thread_status_ctx, overdue);
+                    if wrote {
+                        last_draw = Instant::now();
+                    }
                     drawn_for_current_idle = true;
                 }
             }
