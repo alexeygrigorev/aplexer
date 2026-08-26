@@ -515,9 +515,30 @@ fn spawn_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
             r.exit = Some(exit.clone());
             r.error = error;
         });
-        runtime.output.finish(exit);
+        runtime.output.finish(exit.clone());
         if let Some(cg) = cg {
             cg.cleanup();
+        }
+        // A workload that exited genuinely cleanly -- phase Exited (not
+        // Failed), code 0, no signal, no OOM kill, no fatal I/O error --
+        // has nothing left worth debugging, so remove it automatically:
+        // matching how a tmux pane vanishes when its shell exits, the user
+        // shouldn't have to remember to run `a kill` on a session that ran
+        // fine and finished on its own. A non-clean exit (non-zero code,
+        // signal, OOM kill, or `Phase::Failed`) deliberately keeps the
+        // opposite behavior and stays in `a list`/`a status`/`a capture`:
+        // that is exactly the case someone would want to inspect
+        // afterwards, and the durable per-session record exists precisely
+        // to preserve that diagnostic value -- auto-removing it would
+        // destroy the thing it's for. `a kill` remains the manual cleanup
+        // path for those (see the "already terminal" branch of `cmd_kill`
+        // in src/bin/a.rs, which this mirrors).
+        let clean_exit =
+            fatal.is_none() && exit.code == Some(0) && exit.signal.is_none() && !exit.oom_killed;
+        if clean_exit {
+            if let Some(state_dir) = runtime.record_path.parent() {
+                let _ = fs::remove_dir_all(state_dir);
+            }
         }
         // The workload is gone and the final record/history are persisted;
         // a daemonless design must not leave a worker process (plus its
