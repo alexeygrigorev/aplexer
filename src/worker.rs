@@ -18,12 +18,26 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 enum OutputEvent {
     Data(Vec<u8>),
+    /// Worker-internal only (docs/terminal-state-design.md section 5.1);
+    /// `handle_attach`'s writer thread maps this to a `ServerEvent::Layout`
+    /// JSON frame for `want_screen` subscribers and drops it otherwise.
+    Layout(screen::LayoutChange),
     Exit(ExitInfo),
     Error(String),
 }
 
+/// What a newly-attaching client should be sent as its initial payload
+/// (design doc section 6.1/checklist item 4): the live screen snapshot, or
+/// the historical raw-tail replay old clients (and `--history-bytes`) still
+/// get.
+enum AttachPayload {
+    Screen,
+    Tail(Option<usize>),
+}
+
 struct HubInner {
     history: History,
+    screen: screen::ScreenTracker,
     subscribers: HashMap<u64, mpsc::Sender<OutputEvent>>,
     next_id: u64,
     final_exit: Option<ExitInfo>,
@@ -31,28 +45,61 @@ struct HubInner {
 
 struct OutputHub {
     inner: Mutex<HubInner>,
+    /// Where `finish` writes the final plain-text screen on exit (design
+    /// doc section 5.5) -- immutable, so no need to route it through the
+    /// lock.
+    screen_txt_path: std::path::PathBuf,
 }
 impl OutputHub {
-    fn new(history: History) -> Self {
+    fn new(history: History, rows: u16, cols: u16, screen_txt_path: std::path::PathBuf) -> Self {
         Self {
             inner: Mutex::new(HubInner {
                 history,
+                screen: screen::ScreenTracker::new(rows, cols),
                 subscribers: HashMap::new(),
                 next_id: 1,
                 final_exit: None,
             }),
+            screen_txt_path,
         }
     }
     fn append(&self, data: &[u8]) -> Result<()> {
         let mut inner = lock(&self.inner)?;
         inner.history.append(data)?;
+        let layout = inner.screen.process(data);
+        // Ordering matters and is automatic: both sends go through the same
+        // per-subscriber mpsc channel under the same lock hold, so a Layout
+        // event always arrives after the Data frame that caused it (design
+        // doc section 5.1).
         inner
             .subscribers
             .retain(|_, tx| tx.send(OutputEvent::Data(data.to_vec())).is_ok());
+        if let Some(change) = layout {
+            inner
+                .subscribers
+                .retain(|_, tx| tx.send(OutputEvent::Layout(change)).is_ok());
+        }
         Ok(())
     }
     fn snapshot(&self, max: Option<usize>) -> Result<Vec<u8>> {
         Ok(lock(&self.inner)?.history.snapshot(max))
+    }
+    /// The rendered current-screen snapshot (design doc section 6.2),
+    /// shared by attach's `AttachPayload::Screen` and
+    /// `Operation::CaptureScreen { plain: false }`.
+    fn screen_snapshot(&self) -> Result<Vec<u8>> {
+        Ok(lock(&self.inner)?.screen.snapshot())
+    }
+    /// Plain text of the current screen (design doc section 8), for
+    /// `Operation::CaptureScreen { plain: true }`.
+    fn screen_contents(&self) -> Result<String> {
+        Ok(lock(&self.inner)?.screen.contents())
+    }
+    /// Resizes the live screen model; called by `WorkerRuntime::resize`
+    /// before the PTY ioctl (design doc section 5.3).
+    fn set_size(&self, rows: u16, cols: u16) -> Result<()> {
+        lock(&self.inner)?.screen.set_size(rows, cols);
+        Ok(())
     }
     /// Persists any history bytes the debounced append path hasn't written
     /// yet; driven by a periodic thread so an idle session's tail doesn't
@@ -61,9 +108,15 @@ impl OutputHub {
     fn flush(&self) -> Result<()> {
         lock(&self.inner)?.history.flush()
     }
-    fn subscribe(&self, max: Option<usize>) -> Result<(u64, Vec<u8>, mpsc::Receiver<OutputEvent>)> {
+    fn subscribe(
+        &self,
+        payload: AttachPayload,
+    ) -> Result<(u64, Vec<u8>, mpsc::Receiver<OutputEvent>)> {
         let mut inner = lock(&self.inner)?;
-        let history = inner.history.snapshot(max);
+        let initial = match payload {
+            AttachPayload::Screen => inner.screen.snapshot(),
+            AttachPayload::Tail(max) => inner.history.snapshot(max),
+        };
         let id = inner.next_id;
         inner.next_id += 1;
         let (tx, rx) = mpsc::channel();
@@ -72,7 +125,7 @@ impl OutputHub {
         } else {
             inner.subscribers.insert(id, tx);
         }
-        Ok((id, history, rx))
+        Ok((id, initial, rx))
     }
     fn unsubscribe(&self, id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -84,6 +137,14 @@ impl OutputHub {
             inner.final_exit = Some(exit.clone());
             if let Err(error) = inner.history.flush() {
                 eprintln!("aplexer worker: flush history at exit: {error:#}");
+            }
+            // Cheap post-mortem "what was on screen when it died" fallback
+            // for `a capture --screen` on a dead session (design doc
+            // section 5.5) -- the live grid itself dies with the worker,
+            // this is the durable trace of it. Best-effort: a failure here
+            // must not stop the exit event from reaching subscribers.
+            if let Err(error) = fs::write(&self.screen_txt_path, inner.screen.contents()) {
+                eprintln!("aplexer worker: write screen.txt at exit: {error:#}");
             }
             for (_, tx) in inner.subscribers.drain() {
                 let _ = tx.send(OutputEvent::Exit(exit.clone()));
@@ -154,7 +215,14 @@ impl WorkerRuntime {
         file.flush()?;
         Ok(())
     }
+    /// Resizes the live screen model *before* the PTY ioctl (design doc
+    /// section 5.3): output already in flight at the old size is parsed at
+    /// the new one -- a transient tmux shares too -- but this ordering
+    /// means a subsequent attach's snapshot is never rendered against a
+    /// model that's still the wrong shape for the geometry the workload was
+    /// just told about.
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.output.set_size(rows, cols)?;
         let pty = lock(&self.pty_write)?;
         let file = pty.as_ref().ok_or_else(|| anyhow!("PTY is closed"))?;
         set_winsize(file.as_raw_fd(), rows.max(1), cols.max(1))
@@ -304,6 +372,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     atomic_write_json(&record_path, &record)?;
 
     let history = History::open(record.history_path.clone(), record.history_bytes)?;
+    let screen_txt_path = paths.screen_txt(id);
     let runtime = Arc::new(WorkerRuntime {
         record_path,
         runtime_session_dir: paths.runtime_session(id),
@@ -317,7 +386,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         }),
         cgroup: Mutex::new(cgroup),
         kill_gate: Mutex::new(()),
-        output: OutputHub::new(history),
+        output: OutputHub::new(history, rows, cols, screen_txt_path),
         active_connections: AtomicUsize::new(0),
         last_activity_ms: AtomicU64::new(0),
     });
@@ -663,7 +732,25 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
             write_json(&mut stream, &Response::ok(id, json!({"bytes":data.len()})))?;
             write_frame(&mut stream, FrameKind::Data, &data)?;
         }
-        Operation::Attach { history_bytes } => handle_attach(stream, runtime, id, history_bytes)?,
+        Operation::CaptureScreen { plain } => {
+            // Mirrors Operation::Capture's response+Data shape exactly
+            // (design doc section 8) -- just a different source for the
+            // bytes: the rendered current-screen snapshot, or its
+            // plain-text contents.
+            let data = if plain {
+                runtime.output.screen_contents()?.into_bytes()
+            } else {
+                runtime.output.screen_snapshot()?
+            };
+            write_json(&mut stream, &Response::ok(id, json!({"bytes":data.len()})))?;
+            write_frame(&mut stream, FrameKind::Data, &data)?;
+        }
+        Operation::Attach {
+            history_bytes,
+            want_screen,
+            rows,
+            cols,
+        } => handle_attach(stream, runtime, id, history_bytes, want_screen, rows, cols)?,
         Operation::Resize { rows, cols } => match runtime.resize(rows, cols) {
             Ok(()) => write_json(&mut stream, &Response::ok(id, json!({})))?,
             Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
@@ -687,9 +774,29 @@ fn handle_attach(
     mut reader: UnixStream,
     runtime: Arc<WorkerRuntime>,
     request_id: String,
-    max: Option<usize>,
+    history_bytes: Option<usize>,
+    want_screen: bool,
+    rows: Option<u16>,
+    cols: Option<u16>,
 ) -> Result<()> {
-    let (subscription, history, rx) = runtime.output.subscribe(max)?;
+    // Geometry-first (design doc section 6.1): resize the PTY and the
+    // screen model to the client's real terminal size *before* rendering
+    // the snapshot below, so there is no wrong-size frame followed by a
+    // SIGWINCH repaint. `WorkerRuntime::resize` itself resizes the model
+    // before the ioctl (section 5.3), so this one call gets both in the
+    // right order. Best-effort: a resize failure here (e.g. the PTY is
+    // already closing) must not block the attach -- the pre-existing
+    // client-side post-connect Resize control frame remains the fallback
+    // (section 6.3 step 7).
+    if let (Some(rows), Some(cols)) = (rows, cols) {
+        let _ = runtime.resize(rows, cols);
+    }
+    let payload = if want_screen {
+        AttachPayload::Screen
+    } else {
+        AttachPayload::Tail(history_bytes)
+    };
+    let (subscription, initial, rx) = runtime.output.subscribe(payload)?;
     let writer_stream = reader.try_clone()?;
     let writer = Arc::new(Mutex::new(writer_stream));
     {
@@ -698,10 +805,10 @@ fn handle_attach(
             &mut *out,
             &Response::ok(
                 request_id,
-                json!({"attached":true,"history_bytes":history.len()}),
+                json!({"attached":true,"history_bytes":initial.len(),"screen":want_screen}),
             ),
         )?;
-        write_frame(&mut *out, FrameKind::Data, &history)?;
+        write_frame(&mut *out, FrameKind::Data, &initial)?;
     }
     let output_writer = writer.clone();
     let output_runtime = runtime.clone();
@@ -712,6 +819,23 @@ fn handle_attach(
                 match event {
                     OutputEvent::Data(data) => {
                         write_frame(&mut *out, FrameKind::Data, &data)?;
+                        Ok(true)
+                    }
+                    OutputEvent::Layout(change) => {
+                        // Old clients' serde_json::from_slice::<ServerEvent>
+                        // would hard-fail on an unrecognized `event` tag --
+                        // only forward this to subscribers that opted in by
+                        // attaching with want_screen (design doc section
+                        // 6.3); drop it otherwise.
+                        if want_screen {
+                            write_json(
+                                &mut *out,
+                                &ServerEvent::Layout {
+                                    alt_screen: change.alt_screen,
+                                    margins_reset: change.margins_reset,
+                                },
+                            )?;
+                        }
                         Ok(true)
                     }
                     OutputEvent::Exit(exit) => {

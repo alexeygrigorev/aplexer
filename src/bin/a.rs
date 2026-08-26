@@ -174,6 +174,17 @@ struct CaptureArgs {
     bytes: Option<usize>,
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Capture the rendered current screen (docs/terminal-state-design.md
+    /// section 8) instead of raw history bytes -- a "richer PocketShell
+    /// preview" of what the session's screen actually looks like right now,
+    /// for a few hundred to a few thousand bytes, rather than an arbitrary
+    /// tail of the byte stream. Ignores --bytes.
+    #[arg(long)]
+    screen: bool,
+    /// With --screen, emit plain text (`ScreenTracker::contents()`) instead
+    /// of the paintable escape-sequence form.
+    #[arg(long, requires = "screen")]
+    plain: bool,
 }
 #[derive(Args)]
 struct KillArgs {
@@ -1016,26 +1027,52 @@ fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> 
 
 fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
-    let data = match rpc_capture(&record, args.bytes) {
-        Ok(data) => data,
-        // No live worker to ask -- capture still has a sensible fallback
-        // here (unlike attach/send), since a dead session's last-known
-        // output is still sitting in its persisted history file. Only when
-        // that ALSO comes up empty (e.g. the session never produced any
-        // output before exiting) is there truly nothing to show; in that
-        // case, give the same clear reason attach/send would rather than
-        // the raw filesystem error from the failed read.
-        Err(_) => match fs::read(&record.history_path) {
-            Ok(bytes) => {
-                let n = args.bytes.unwrap_or(bytes.len()).min(bytes.len());
-                bytes[bytes.len() - n..].to_vec()
-            }
-            Err(read_error) => {
+    let data = if args.screen {
+        match rpc_capture_screen(&record, args.plain) {
+            Ok(data) => data,
+            // Dead-session fallback (design doc section 5.5/8): screen.txt
+            // is the plain-text screen as it looked the moment the worker
+            // exited, written once by OutputHub::finish. Unlike the raw
+            // history fallback below, there is no paintable-form fallback
+            // for a dead session -- the live grid died with the worker, and
+            // only the plain text was preserved -- so --screen without
+            // --plain against a dead session still surfaces the "worker
+            // unavailable" error rather than silently downgrading to text.
+            Err(_) if args.plain => match fs::read(&paths.screen_txt(record.id)) {
+                Ok(bytes) => bytes,
+                Err(read_error) => {
+                    check_attachable(&record)?;
+                    return Err(read_error)
+                        .context("worker unavailable and persisted screen.txt cannot be read");
+                }
+            },
+            Err(error) => {
                 check_attachable(&record)?;
-                return Err(read_error)
-                    .context("worker unavailable and persisted history cannot be read");
+                return Err(error).context("worker unavailable");
             }
-        },
+        }
+    } else {
+        match rpc_capture(&record, args.bytes) {
+            Ok(data) => data,
+            // No live worker to ask -- capture still has a sensible fallback
+            // here (unlike attach/send), since a dead session's last-known
+            // output is still sitting in its persisted history file. Only when
+            // that ALSO comes up empty (e.g. the session never produced any
+            // output before exiting) is there truly nothing to show; in that
+            // case, give the same clear reason attach/send would rather than
+            // the raw filesystem error from the failed read.
+            Err(_) => match fs::read(&record.history_path) {
+                Ok(bytes) => {
+                    let n = args.bytes.unwrap_or(bytes.len()).min(bytes.len());
+                    bytes[bytes.len() - n..].to_vec()
+                }
+                Err(read_error) => {
+                    check_attachable(&record)?;
+                    return Err(read_error)
+                        .context("worker unavailable and persisted history cannot be read");
+                }
+            },
+        }
     };
     if let Some(path) = args.output {
         fs::write(&path, &data).with_context(|| format!("write {}", path.display()))?;
@@ -1918,6 +1955,25 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
     }
     Ok(frame.payload)
 }
+/// `a capture --screen [--plain]` (docs/terminal-state-design.md section 8):
+/// mirrors `rpc_capture`'s shape exactly, against `Operation::CaptureScreen`.
+fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
+    let mut stream = connect(record)?;
+    let request = Request::new(Operation::CaptureScreen { plain });
+    let id = request.request_id.clone();
+    write_json(&mut stream, &request)?;
+    let response: Response =
+        frame_json(read_frame(&mut stream)?.ok_or_else(|| anyhow!("missing response"))?)?;
+    if response.request_id != id {
+        bail!("response request id mismatch");
+    }
+    response.into_result()?;
+    let frame = read_frame(&mut stream)?.ok_or_else(|| anyhow!("missing capture data"))?;
+    if frame.kind != FrameKind::Data {
+        bail!("expected capture data");
+    }
+    Ok(frame.payload)
+}
 
 /// Default amount of history replayed on attach when the caller didn't ask
 /// for more via `--history-bytes`. The old default -- passing `None` through
@@ -2020,6 +2076,17 @@ fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermG
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
+    // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): if
+    // the session was on the alternate screen -- whether entered by a
+    // reattach snapshot (section 6.2 step 1) or by live workload output
+    // while attached -- detaching must return the *host* terminal to its
+    // primary screen, otherwise the user's real terminal is left stuck on
+    // the alt screen after detach. A no-op on a host already on the primary
+    // screen. This does not conflict with docs/scrollback-design.md section
+    // 4.1's "no alt-screen for aplexer's own UI" rule: aplexer still never
+    // *enters* the alt screen for itself; this only ever *exits* one that
+    // the workload's own live behavior put the host into.
+    //
     // `\x1b[?25h` (DECTCEM show cursor) is included unconditionally: a
     // full-screen TUI in the workload (htop, vim, an agent CLI's spinner,
     // ...) commonly hides the cursor with `\x1b[?25l` while it owns the
@@ -2030,7 +2097,7 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // happened to hide it. Showing an already-visible cursor is a no-op, so
     // this is safe to send regardless of what state the workload (or our
     // own status-bar redraw, which never hides the cursor) left it in.
-    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
+    let _ = write_locked(stdout, b"\x1b[?1049l\x1b[r\x1b[2J\x1b[H\x1b[?25h");
 }
 
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
@@ -2384,14 +2451,50 @@ fn resolve_switch_target(
     pick_switch_target(&groups, &current.workspace, current.id, target, last)
 }
 
+/// Result of `establish()`: the connected/subscribed stream, its initial
+/// payload (either a live-screen snapshot or a raw-tail replay -- see
+/// `screen`), and enough of the response to know which one it got.
+struct AttachHandshake {
+    reader: UnixStream,
+    initial: Vec<u8>,
+    /// The response's `"screen"` field: `Some(true)`/`Some(false)` from a
+    /// worker new enough to report it, `None` from an old worker whose
+    /// response predates the field entirely (docs/terminal-state-design.md
+    /// section 6.1's compatibility matrix) -- used to decide whether the
+    /// explicit post-connect Resize control send is still needed (section
+    /// 6.3 step 7).
+    screen: Option<bool>,
+}
+
 /// Extracted attach handshake (connect + `Operation::Attach` request +
-/// response check + initial history frame), used by both the initial
+/// response check + initial payload frame), used by both the initial
 /// attach and every in-process switch (docs/fast-session-switching-design.md
 /// section 3.1).
-fn establish(record: &SessionRecord, replay_bytes: Option<usize>) -> Result<(UnixStream, Vec<u8>)> {
+///
+/// `want_screen` requests the live-screen snapshot (docs/terminal-state-design.md
+/// section 6.1); `geometry`, when known (a real tty), is `(rows, cols)`
+/// already reserved-rows-adjusted by the caller -- sent so the worker can
+/// resize the PTY and its screen model *before* rendering the snapshot, so
+/// there is no wrong-size frame followed by a SIGWINCH repaint (section
+/// 6.3 step 1). An old worker's serde simply ignores these unknown request
+/// fields and falls back to today's raw-tail replay -- no worse than
+/// before.
+fn establish(
+    record: &SessionRecord,
+    replay_bytes: Option<usize>,
+    want_screen: bool,
+    geometry: Option<(u16, u16)>,
+) -> Result<AttachHandshake> {
     let mut reader = connect(record)?;
+    let (rows, cols) = match geometry {
+        Some((rows, cols)) => (Some(rows), Some(cols)),
+        None => (None, None),
+    };
     let request = Request::new(Operation::Attach {
         history_bytes: replay_bytes,
+        want_screen,
+        rows,
+        cols,
     });
     let id = request.request_id.clone();
     write_json(&mut reader, &request)?;
@@ -2400,12 +2503,17 @@ fn establish(record: &SessionRecord, replay_bytes: Option<usize>) -> Result<(Uni
     if response.request_id != id {
         bail!("response request id mismatch");
     }
-    response.into_result()?;
+    let result = response.into_result()?;
+    let screen = result.get("screen").and_then(|v| v.as_bool());
     let initial = read_frame(&mut reader)?.ok_or_else(|| anyhow!("missing history frame"))?;
     if initial.kind != FrameKind::Data {
         bail!("expected history data");
     }
-    Ok((reader, initial.payload))
+    Ok(AttachHandshake {
+        reader,
+        initial: initial.payload,
+        screen,
+    })
 }
 
 /// Default amount of history replayed on an in-process switch
@@ -2542,6 +2650,8 @@ fn perform_switch(
     paths: &Paths,
     target: SwitchTarget,
     replay_bytes: Option<usize>,
+    want_screen: bool,
+    term: &Arc<Mutex<TermGeom>>,
     shared_record: &Arc<Mutex<SessionRecord>>,
     last_session: &Arc<Mutex<Option<Uuid>>>,
     writer: &Arc<Mutex<UnixStream>>,
@@ -2559,8 +2669,21 @@ fn perform_switch(
     }
     check_attachable(&next)?;
     switch_in_progress.store(true, Ordering::Relaxed);
+    // Current terminal geometry (docs/fast-session-switching-design.md
+    // section 5.2 / docs/terminal-state-design.md section 10.2): passed
+    // into the Attach so the new session's snapshot renders at the right
+    // size immediately, rather than relying solely on the post-switch
+    // explicit Resize send below.
+    let geometry = term
+        .lock()
+        .ok()
+        .map(|g| *g)
+        .filter(|g| g.rows > 0)
+        .map(|g| (reserved_rows(g.rows), g.cols));
     let result = (|| -> Result<()> {
-        let (reader, history) = establish(&next, replay_bytes)?;
+        let handshake = establish(&next, replay_bytes, want_screen, geometry)?;
+        let reader = handshake.reader;
+        let history = handshake.initial;
         let writer_clone = reader.try_clone()?; // before mutating anything
         // Repoint every forwarding thread (input, resize) at B, then retire
         // A's stream. From this instant keystrokes land in B.
@@ -2611,11 +2734,29 @@ fn take_pending_switch(
 
 fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     check_attachable(record)?;
+    let explicit_history = history_bytes.is_some();
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
-    let (mut reader, initial_history) = establish(record, replay_bytes)?;
-    let stdout = Arc::new(Mutex::new(io::stdout()));
-    write_locked(&stdout, &initial_history)?;
     let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    // Geometry read up front (docs/terminal-state-design.md section 6.3
+    // step 1), not after the handshake: sent in the Attach request itself
+    // so the worker can resize the PTY and its screen model *before*
+    // rendering the snapshot below -- no wrong-size frame followed by a
+    // SIGWINCH repaint. `--history-bytes` is the explicit escape hatch back
+    // to the old raw-tail semantics (section 6.1); `want_screen` follows
+    // its absence.
+    let initial_geometry = if tty {
+        terminal_size(libc::STDIN_FILENO)
+    } else {
+        None
+    };
+    let handshake = establish(
+        record,
+        replay_bytes,
+        !explicit_history,
+        initial_geometry.map(|(rows, cols)| (reserved_rows(rows), cols)),
+    )?;
+    let mut reader = handshake.reader;
+    let stdout = Arc::new(Mutex::new(io::stdout()));
     let _raw = if tty {
         Some(RawMode::enter(libc::STDIN_FILENO)?)
     } else {
@@ -2631,9 +2772,6 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     } else {
         None
     };
-    if tty {
-        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches; Ctrl-b n/p/1-9/l switches]");
-    }
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
     let term = Arc::new(Mutex::new(TermGeom {
@@ -2645,18 +2783,6 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // status-bar thread to decide when it's a good moment to redraw (see
     // STATUS_BAR_IDLE_GAP's doc comment above).
     let last_activity = Arc::new(Mutex::new(Instant::now()));
-    if tty {
-        if let Some((rows, cols)) = terminal_size(libc::STDIN_FILENO) {
-            apply_terminal_layout(&stdout, &term, rows, cols);
-            send_control(
-                &writer,
-                &AttachControl::Resize {
-                    rows: reserved_rows(rows),
-                    cols,
-                },
-            )?;
-        }
-    }
 
     // -- Fast in-process session switching state (survives across
     //    switches, unlike `reader`/`writer`'s inner stream/`record`; see
@@ -2675,14 +2801,57 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         last_drawn: Arc::new(Mutex::new(None)),
     };
 
+    // Reservation asserted *first* (docs/terminal-state-design.md section
+    // 6.3 step 3): a workload sub-range margin the snapshot itself
+    // re-establishes below (numerically within rows 1..rows-1, since the
+    // workload PTY is one row shorter) lands after and wins, while a
+    // default-margin workload leaves this reservation standing.
+    if tty {
+        if let Some((rows, cols)) = initial_geometry {
+            apply_terminal_layout(&stdout, &term, rows, cols);
+        }
+    }
+    if tty {
+        // No banner into the output stream (section 6.3 step 6 / section
+        // 10.1 item c): printed here, before the snapshot write below, so
+        // the snapshot's own ED2 clear repaints over it -- this ordering
+        // (banner then snapshot, both after raw mode/layout are already in
+        // effect) is exactly the fix for the original corruption, where the
+        // banner landed inside a live TUI's input box. A real status-bar
+        // flash slot for this is future work (section 6.3 step 6).
+        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches; Ctrl-b n/p/1-9/l switches]");
+    }
+    write_locked(&stdout, &handshake.initial)?;
+    if tty {
+        draw_status_bar(&status_ctx, true); // the snapshot's ED2 blanked the bar row
+    }
+    // The explicit post-connect Resize control send is unnecessary when the
+    // Attach already carried geometry and a new-enough worker honored it
+    // (the "screen" key is present in the response either way, true or
+    // false); kept only for the old-worker fallback path, whose response
+    // predates the field (section 6.3 step 7).
+    if tty && handshake.screen.is_none() {
+        if let Some((rows, cols)) = initial_geometry {
+            send_control(
+                &writer,
+                &AttachControl::Resize {
+                    rows: reserved_rows(rows),
+                    cols,
+                },
+            )?;
+        }
+    }
+
     let input_writer = writer.clone();
     let input_active = active.clone();
     let input_paths = paths.clone();
+    let input_term = term.clone();
     let input_shared_record = shared_record.clone();
     let input_last_session = last_session.clone();
     let input_pending_switch = pending_switch.clone();
     let input_switch_in_progress = switch_in_progress.clone();
     let input_status_ctx = status_ctx.clone();
+    let input_want_screen = !explicit_history;
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
@@ -2738,6 +2907,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                             &input_paths,
                             target,
                             switch_replay_bytes,
+                            input_want_screen,
+                            &input_term,
                             &input_shared_record,
                             &input_last_session,
                             &input_writer,
@@ -2876,6 +3047,23 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         ServerEvent::Error { message } => {
                             eprintln!("[aplexer: {message}]");
                             break;
+                        }
+                        // The workload reset margins or flipped alt-screen
+                        // state (docs/terminal-state-design.md section 7):
+                        // re-assert the status-bar reservation and redraw
+                        // within one socket round-trip of the bytes that
+                        // caused it, instead of waiting on the idle-gap
+                        // timer. `draw_status_bar`'s own margin re-assert
+                        // (see its doc comment) is the reservation half of
+                        // this; the redraw is the other half. Only ever
+                        // received when this attach opted in via
+                        // `want_screen` (the worker gates it -- see
+                        // `handle_attach`), so this arm is unreachable on
+                        // the `--history-bytes` raw-tail path, but handling
+                        // it unconditionally keeps this match exhaustive and
+                        // correct if that ever changes.
+                        ServerEvent::Layout { .. } => {
+                            draw_status_bar(&status_ctx, true);
                         }
                     }
                 }

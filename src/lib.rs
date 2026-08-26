@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod messaging;
+pub mod screen;
 pub mod watch;
 pub mod worker;
 
@@ -98,6 +99,12 @@ impl Paths {
     }
     pub fn history(&self, id: Uuid) -> PathBuf {
         self.state_session(id).join("history.bin")
+    }
+    /// The dead-session fallback for `a capture --screen` (design doc
+    /// section 5.5) -- the plain-text screen as it looked the moment the
+    /// worker exited, written once by `OutputHub::finish`.
+    pub fn screen_txt(&self, id: Uuid) -> PathBuf {
+        self.state_session(id).join("screen.txt")
     }
     pub fn worker_lock(&self, id: Uuid) -> PathBuf {
         self.runtime_session(id).join("worker.lock")
@@ -1069,10 +1076,34 @@ pub enum Operation {
     Status,
     Send { bytes: usize },
     Capture { max_bytes: Option<usize> },
-    Attach { history_bytes: Option<usize> },
+    /// `history_bytes` keeps its original meaning (raw-tail replay size,
+    /// used when `want_screen` is false or an old worker doesn't understand
+    /// it). `want_screen`/`rows`/`cols` are additive fields (design doc
+    /// section 6.1): an old worker's serde simply ignores unknown fields
+    /// and falls back to today's raw-tail replay -- no worse than before --
+    /// and an old client never sends them, so `want_screen` defaulting to
+    /// `false` reproduces today's behavior exactly. `rows`/`cols`, when
+    /// given, are the client's real terminal geometry (already
+    /// reserved-rows-adjusted by the caller) so the worker can resize the
+    /// PTY and the screen model *before* rendering the snapshot -- no
+    /// wrong-size frame followed by a SIGWINCH repaint.
+    Attach {
+        history_bytes: Option<usize>,
+        #[serde(default)]
+        want_screen: bool,
+        #[serde(default)]
+        rows: Option<u16>,
+        #[serde(default)]
+        cols: Option<u16>,
+    },
     Resize { rows: u16, cols: u16 },
     Kill { signal: i32, grace_ms: u64 },
     Rename { workspace: PathBuf, tag: String },
+    /// `a capture --screen` (design doc section 8): the rendered current
+    /// screen (`plain: false`, same bytes `Attach`'s snapshot would carry)
+    /// or its plain-text contents (`plain: true`, `ScreenTracker::contents`)
+    /// -- "richer PocketShell previews" from spec.md section 17.
+    CaptureScreen { plain: bool },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -1116,6 +1147,18 @@ impl Response {
 pub enum ServerEvent {
     Exit { exit: ExitInfo },
     Error { message: String },
+    /// The workload did something that invalidates the client's DECSTBM
+    /// status-bar reservation: reset its scroll margins (RIS or a bare/
+    /// full-range `\x1b[r`), or flipped alternate-screen state (design doc
+    /// section 7). Sent **only** to subscribers that attached with
+    /// `want_screen: true` -- an old client's `serde_json::from_slice`
+    /// would hard-fail on an unrecognized `event` tag, so gating this on
+    /// the request flag (done at the worker's send site, not here) keeps
+    /// old clients safe (design doc section 6.3).
+    Layout {
+        alt_screen: bool,
+        margins_reset: bool,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
