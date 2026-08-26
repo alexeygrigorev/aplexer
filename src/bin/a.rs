@@ -329,7 +329,19 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
         });
     }
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&records)?);
+        // list/snapshot must stay cheap (spec.md 30: "milliseconds on tens
+        // of sessions"), so liveness here is the pid-existence check only
+        // (process_alive), never a socket round-trip per session -- that's
+        // what `a status` is for.
+        let enriched: Vec<Value> = records
+            .iter()
+            .map(|r| {
+                let mut value = serde_json::to_value(r).unwrap_or(Value::Null);
+                value["worker_alive"] = json!(r.worker_pid.map(process_alive).unwrap_or(false));
+                value
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
         return Ok(());
     }
     println!(
@@ -341,10 +353,11 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
             Some(p) => format!("{}/{}", r.engine, p),
             None => r.engine.clone(),
         };
+        let alive = r.worker_pid.map(process_alive).unwrap_or(false);
         println!(
             "{:<12} {:<10} {:<18} {:<16} {}",
             &r.id.to_string()[..12],
-            phase_name(&r.phase),
+            display_state(&r.phase, alive),
             r.tag,
             ep,
             r.workspace.display()
@@ -353,22 +366,46 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// A persisted `phase` of Starting/Running/Exiting only means the worker
+/// *said* it was in that phase the last time it wrote its record -- if the
+/// worker process has since died (e.g. SIGKILL, which gives it no chance to
+/// update the record), that phase is stale. `phase` and worker liveness are
+/// different facts (spec.md 20: "session worker alive" vs "workload alive"
+/// vs "agent semantic state" are different facts) so this only affects
+/// display, not the persisted phase itself.
+fn display_state(phase: &Phase, worker_alive: bool) -> &'static str {
+    if matches!(phase, Phase::Starting | Phase::Running | Phase::Exiting) && !worker_alive {
+        "broken"
+    } else {
+        phase_name(phase)
+    }
+}
+
 fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &target)?;
-    let raw = rpc_simple(&record, Operation::Status, None)
-        .unwrap_or_else(|_| serde_json::to_value(&record).unwrap_or(Value::Null));
+    let rpc_result = rpc_simple(&record, Operation::Status, None);
+    // A successful round-trip to the worker's own socket is stronger
+    // evidence of liveness than a pid-existence check (e.g. it also rules
+    // out a hung/unresponsive worker); fall back to the pid check only if
+    // the RPC itself failed, so `status` on a single session is worth the
+    // extra round-trip that `list` deliberately skips.
+    let rpc_reachable = rpc_result.is_ok();
+    let raw = rpc_result.unwrap_or_else(|_| serde_json::to_value(&record).unwrap_or(Value::Null));
     let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
     let cgroup_stats = raw.get("cgroup").cloned();
+    let worker_alive =
+        rpc_reachable || current.worker_pid.map(process_alive).unwrap_or(false);
     if json_output {
         let mut value = serde_json::to_value(&current)?;
         if let Some(stats) = cgroup_stats {
             value["cgroup"] = stats;
         }
+        value["worker_alive"] = json!(worker_alive);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
-        println!("state: {}", phase_name(&current.phase));
+        println!("state: {}", display_state(&current.phase, worker_alive));
         println!(
             "worker_pid: {}",
             current
