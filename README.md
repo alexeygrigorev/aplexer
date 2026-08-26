@@ -1,6 +1,13 @@
 # aplexer
 
-`aplexer` is a Linux-first, daemonless PTY session runtime. Each session is owned by an independent worker process, so a crash or resource failure in one session cannot take down a shared multiplexer daemon. The short `a` binary is the user-facing CLI; `aplexer` is the worker executable.
+`aplexer` is a Linux-first, **daemonless** persistent PTY session runtime. Every session is owned by its own independent worker process and cgroup, and exactly one worker owns its PTY — there is no shared multiplexer daemon whose crash or OOM kill takes down unrelated sessions with it. That's the failure mode aplexer exists to remove: with tmux, a single shared server dying under memory pressure can wipe out every session on the box. Aplexer's core invariant is that **one session may fail, OOM, or be killed without causing unrelated sessions to disappear.** The short `a` binary is the user-facing CLI; `aplexer` is the per-session worker executable.
+
+## Goals
+
+- **Standalone tmux / `tmuxctl` replacement.** Aplexer fills the same role as tmux (persistent, reattachable terminal sessions that survive your client disconnecting) but deliberately uses a different model — workspaces + tags + engines + profiles instead of flat global session names — described in [spec.md](spec.md) sections 1–2.
+- **Backing runtime for two sibling client projects** under `~/git`:
+  - [`../pocketshell`](../pocketshell) — a voice-first, tmux-native, agent-aware Android SSH client. It's meant to move off owning tmux session lifecycle / `tmuxctl` wrappers / agent engine discovery itself and instead become an aplexer client (see [spec.md](spec.md) section 22).
+  - [`../pocketshell-desktop`](../pocketshell-desktop) — a terminal-first, agent-aware SSH client built as a **VS Code fork** (like Cursor or Windsurf) — explicitly *not* a standalone Electron app. It's the desktop companion to PocketShell Android and integrates with tmux today; aplexer is intended to be its session runtime as well.
 
 ## Build
 
@@ -20,7 +27,7 @@ a attach --workspace "$PWD" --tag shell
 # Ctrl-] detaches without terminating the workload.
 ```
 
-The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`.
+The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, and `doctor`.
 
 ```bash
 a send --workspace "$PWD" --tag shell --enter 'printf "hello\\n"'
@@ -88,4 +95,6 @@ The Python package is intentionally thin: Rust remains authoritative for profile
 ./scripts/validate.sh
 ```
 
-See `VALIDATION.md` for the checks run when this source package was produced.
+## Full design doc
+
+See [spec.md](spec.md) (mirrored at [docs/SPEC.md](docs/SPEC.md)) for the complete architecture: identity model, session types, control protocol, machine API, event stream, and the PocketShell integration plan.
