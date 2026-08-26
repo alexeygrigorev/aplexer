@@ -190,7 +190,7 @@ fn run() -> Result<()> {
         Commands::List(args) | Commands::Snapshot(args) => cmd_list(&paths, args, cli.json),
         Commands::Attach(args) => {
             let record = resolve(&paths, &args.target)?;
-            attach(&record, args.history_bytes)
+            attach(&paths, &record, args.history_bytes)
         }
         Commands::Send(args) => cmd_send(&paths, args, cli.json),
         Commands::Capture(args) => cmd_capture(&paths, args, cli.json),
@@ -416,7 +416,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         // is the session's *storage capacity* (up to DEFAULT_HISTORY_BYTES =
         // 4MB), an unrelated setting from how much of it a fresh attach
         // should actually replay onto the screen.
-        attach(&ready, None)?;
+        attach(paths, &ready, None)?;
     }
     Ok(())
 }
@@ -606,7 +606,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
         let alive = existing.worker_pid.map(process_alive).unwrap_or(false);
         let terminal = matches!(existing.phase, Phase::Exited | Phase::Failed);
         if alive && !terminal {
-            return attach(&existing, None);
+            return attach(paths, &existing, None);
         }
         // A finished session falls through to cmd_start, which reclaims a
         // workspace+tag held by a terminal-phase, worker-dead session. A
@@ -637,7 +637,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
 
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
-    attach(&record, None)
+    attach(paths, &record, None)
 }
 
 /// Shared by the bare `a <N>` shortcut and by `resolve()` (so `a attach 1`,
@@ -1085,7 +1085,204 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
 /// cursor-position/clear escapes and renders close enough.
 const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 
-fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
+/// Physical terminal geometry as last observed by the resize-poll thread,
+/// shared with the status-bar thread so its redraws always target the
+/// current last row/width without a second ioctl.
+#[derive(Clone, Copy)]
+struct TermGeom {
+    rows: u16,
+    cols: u16,
+    /// Whether the bottom row is reserved for the status bar. False for
+    /// terminals too small to spare a row (see `reserved_rows`), in which
+    /// case the scroll region is left/reset to full-screen and the status
+    /// bar is simply not drawn.
+    reserved: bool,
+}
+
+/// The row count told to the SERVER: one less than the physical terminal
+/// when a status row is reserved, exactly like tmux tells the remote PTY its
+/// terminal is one row shorter than reality so its own output never
+/// overwrites the reserved line.
+fn reserved_rows(rows: u16) -> u16 {
+    if rows > 2 {
+        rows - 1
+    } else {
+        rows
+    }
+}
+
+/// Serializes a write behind the shared stdout lock so the main frame loop
+/// (writing PTY data) and the status-bar/layout threads (writing redraws)
+/// can never tear/interleave each other's output.
+fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()> {
+    let mut out = stdout
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// Sets (or, for a too-small terminal, clears) the DECSTBM scrolling region
+/// and records the resulting geometry for the status-bar thread. Wrapped in
+/// DEC save/restore cursor (`\x1b7`/`\x1b8`) because DECSTBM itself moves the
+/// cursor to the region's home position as a side effect on real terminals;
+/// saving immediately before and restoring immediately after -- with nothing
+/// else written in between -- keeps that jump invisible and leaves the
+/// shell's own cursor position undisturbed.
+fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermGeom>>, rows: u16, cols: u16) {
+    let reserved = rows > 2;
+    let mut seq = Vec::new();
+    seq.extend_from_slice(b"\x1b7");
+    if reserved {
+        seq.extend_from_slice(format!("\x1b[1;{}r", rows - 1).as_bytes());
+    } else {
+        seq.extend_from_slice(b"\x1b[r");
+    }
+    seq.extend_from_slice(b"\x1b8");
+    let _ = write_locked(stdout, &seq);
+    if let Ok(mut g) = term.lock() {
+        *g = TermGeom { rows, cols, reserved };
+    }
+}
+
+/// Undoes `apply_terminal_layout` and clears the screen, exactly like tmux
+/// does on detach (Ctrl-b d) -- otherwise whatever was last drawn (including
+/// the status bar) just sits in the user's terminal after attach() returns.
+/// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
+/// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
+fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
+    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H");
+}
+
+/// RAII guard that runs `reset_terminal` on every exit path out of attach()
+/// -- explicit Ctrl-] detach, the remote session exiting, a connection
+/// error, or an early `?` return -- so a new exit path added later can't
+/// forget the cleanup. Only constructed when stdin is a tty (mirrors
+/// `RawMode`, which it's dropped alongside).
+struct TerminalUiGuard {
+    stdout: Arc<Mutex<io::Stdout>>,
+}
+impl Drop for TerminalUiGuard {
+    fn drop(&mut self) {
+        reset_terminal(&self.stdout);
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KI: u64 = 1024;
+    const MI: u64 = KI * 1024;
+    const GI: u64 = MI * 1024;
+    if bytes >= GI {
+        format!("{:.1}G", bytes as f64 / GI as f64)
+    } else if bytes >= MI {
+        format!("{:.0}M", bytes as f64 / MI as f64)
+    } else if bytes >= KI {
+        format!("{:.0}K", bytes as f64 / KI as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// Live memory indicator from the session's cgroup, if it has one -- a
+/// small "useful for our application" touch given aplexer's whole reason
+/// for existing is resource-isolated agent sessions. Best-effort: any RPC
+/// failure (worker briefly unreachable, no cgroup configured) just omits
+/// the indicator rather than disrupting the status bar.
+fn memory_indicator(record: &SessionRecord) -> Option<String> {
+    let raw = rpc_simple(record, Operation::Status, None).ok()?;
+    let current = raw.get("cgroup")?.get("memory_current")?.as_u64()?;
+    let used = format_bytes(current);
+    Some(match record.limits.memory_bytes {
+        Some(max) => format!("{used}/{}", format_bytes(max)),
+        None => used,
+    })
+}
+
+/// `tag(state)` for every other session in the same workspace, mirroring how
+/// `a list`'s tree groups sessions by workspace (see `group_by_workspace`) --
+/// a live glance at what else is running here without detaching.
+fn sibling_summary(paths: &Paths, record: &SessionRecord) -> String {
+    let records = match list_records(paths) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let parts: Vec<String> = records
+        .into_iter()
+        .filter(|r| r.workspace == record.workspace && r.id != record.id)
+        .map(|r| {
+            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+            format!("{}({})", r.tag, display_state(&r.phase, alive))
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("siblings: {}", parts.join(" "))
+    }
+}
+
+/// Pads or truncates (by character, not byte, so multi-byte UTF-8 in a tag
+/// name can't split mid-codepoint) to exactly `cols` wide, so the reverse-
+/// video status bar spans the full terminal width like tmux's own.
+fn pad_or_truncate(text: &str, cols: usize) -> String {
+    let cols = cols.max(1);
+    let len = text.chars().count();
+    if len >= cols {
+        text.chars().take(cols).collect()
+    } else {
+        let mut s = text.to_string();
+        s.push_str(&" ".repeat(cols - len));
+        s
+    }
+}
+
+/// Compact, agent-first status-bar line: workspace, tag, engine/profile,
+/// live memory (if the session has a cgroup), and sibling sessions in the
+/// same workspace -- the aplexer analogue of tmux's window list, adapted for
+/// a per-session/per-tag model rather than tmux's single-server window set.
+fn status_bar_text(paths: &Paths, record: &SessionRecord, cols: usize) -> String {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let ws = display_workspace(&record.workspace, home.as_deref());
+    let ep = match &record.profile {
+        Some(p) => format!("{}/{}", record.engine, p),
+        None => record.engine.clone(),
+    };
+    let mut text = format!("{ws}:{} [{ep}]", record.tag);
+    if let Some(mem) = memory_indicator(record) {
+        text.push_str(&format!("  mem {mem}"));
+    }
+    let siblings = sibling_summary(paths, record);
+    if !siblings.is_empty() {
+        text.push_str("  |  ");
+        text.push_str(&siblings);
+    }
+    pad_or_truncate(&text, cols)
+}
+
+/// Redraws the reserved bottom row in place: save cursor, jump to the last
+/// row, clear it, draw the (reverse-video, full-width) status line, restore
+/// cursor -- so a redraw racing a keystroke never disturbs the shell's own
+/// cursor position. No-ops when the current terminal is too small to have a
+/// reserved row.
+fn draw_status_bar(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermGeom>>, paths: &Paths, record: &SessionRecord) {
+    let geom = match term.lock() {
+        Ok(g) => *g,
+        Err(_) => return,
+    };
+    if !geom.reserved {
+        return;
+    }
+    let text = status_bar_text(paths, record, geom.cols as usize);
+    let mut seq = Vec::new();
+    seq.extend_from_slice(b"\x1b7");
+    seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
+    seq.extend_from_slice(b"\x1b[2K\x1b[7m");
+    seq.extend_from_slice(text.as_bytes());
+    seq.extend_from_slice(b"\x1b[0m\x1b8");
+    let _ = write_locked(stdout, &seq);
+}
+
+fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     let mut reader = connect(record)?;
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
     let request = Request::new(Operation::Attach {
@@ -1103,11 +1300,21 @@ fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     if initial.kind != FrameKind::Data {
         bail!("expected history data");
     }
-    io::stdout().write_all(&initial.payload)?;
-    io::stdout().flush()?;
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    write_locked(&stdout, &initial.payload)?;
     let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let _raw = if tty {
         Some(RawMode::enter(libc::STDIN_FILENO)?)
+    } else {
+        None
+    };
+    // Constructed only for a tty, and dropped (LIFO, so before `_raw`
+    // restores cooked termios) on every exit from this point on -- see
+    // `TerminalUiGuard`'s doc comment for why this is the one cleanup path.
+    let _ui_guard = if tty {
+        Some(TerminalUiGuard {
+            stdout: stdout.clone(),
+        })
     } else {
         None
     };
@@ -1116,9 +1323,21 @@ fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     }
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
+    let term = Arc::new(Mutex::new(TermGeom {
+        rows: 0,
+        cols: 0,
+        reserved: false,
+    }));
     if tty {
         if let Some((rows, cols)) = terminal_size(libc::STDIN_FILENO) {
-            send_control(&writer, &AttachControl::Resize { rows, cols })?;
+            apply_terminal_layout(&stdout, &term, rows, cols);
+            send_control(
+                &writer,
+                &AttachControl::Resize {
+                    rows: reserved_rows(rows),
+                    cols,
+                },
+            )?;
         }
     }
     let input_writer = writer.clone();
@@ -1151,14 +1370,23 @@ fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     if tty {
         let resize_writer = writer.clone();
         let resize_active = active.clone();
+        let resize_stdout = stdout.clone();
+        let resize_term = term.clone();
         thread::spawn(move || {
             let mut last = None;
             while resize_active.load(Ordering::Relaxed) {
                 let size = terminal_size(libc::STDIN_FILENO);
                 if size != last {
                     if let Some((rows, cols)) = size {
-                        if send_control(&resize_writer, &AttachControl::Resize { rows, cols })
-                            .is_err()
+                        apply_terminal_layout(&resize_stdout, &resize_term, rows, cols);
+                        if send_control(
+                            &resize_writer,
+                            &AttachControl::Resize {
+                                rows: reserved_rows(rows),
+                                cols,
+                            },
+                        )
+                        .is_err()
                         {
                             break;
                         }
@@ -1166,6 +1394,17 @@ fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
                     last = size;
                 }
                 thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let status_stdout = stdout.clone();
+        let status_term = term.clone();
+        let status_active = active.clone();
+        let status_paths = paths.clone();
+        let status_record = record.clone();
+        thread::spawn(move || {
+            while status_active.load(Ordering::Relaxed) {
+                draw_status_bar(&status_stdout, &status_term, &status_paths, &status_record);
+                thread::sleep(Duration::from_millis(1500));
             }
         });
     }
@@ -1189,8 +1428,7 @@ fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
         };
         match frame.kind {
             FrameKind::Data => {
-                io::stdout().write_all(&frame.payload)?;
-                io::stdout().flush()?;
+                write_locked(&stdout, &frame.payload)?;
             }
             FrameKind::End => break,
             FrameKind::Json => {
