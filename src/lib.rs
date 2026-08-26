@@ -15,7 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -816,6 +816,13 @@ impl History {
 pub struct Cgroup {
     path: PathBuf,
     anchor_pid: u32,
+    /// Shared across clones: the anchor pid must be killed at most once.
+    /// After the first kill the pid is reaped (a background thread waits on
+    /// it) and may be recycled by the kernel for an unrelated process of
+    /// this user, so a second kill(anchor_pid, SIGKILL) -- e.g. from
+    /// Cgroup::cleanup at session end, hours after spawn_workload already
+    /// released the anchor -- could kill an innocent process.
+    anchor_released: std::sync::Arc<AtomicBool>,
     initial_oom_kill: u64,
 }
 impl Cgroup {
@@ -908,6 +915,7 @@ impl Cgroup {
         Ok(Some(Self {
             path,
             anchor_pid,
+            anchor_released: std::sync::Arc::new(AtomicBool::new(false)),
             initial_oom_kill,
         }))
     }
@@ -933,8 +941,10 @@ impl Cgroup {
     /// the cgroup, so the cgroup never goes empty (and gets garbage
     /// collected by systemd) before the real workload takes residence.
     pub fn release_anchor(&self) {
-        unsafe {
-            libc::kill(self.anchor_pid as i32, libc::SIGKILL);
+        if !self.anchor_released.swap(true, Ordering::SeqCst) {
+            unsafe {
+                libc::kill(self.anchor_pid as i32, libc::SIGKILL);
+            }
         }
     }
     pub fn signal_all(&self, signal: i32) -> Result<()> {
