@@ -3043,10 +3043,12 @@ mod switching_tests {
             command: vec![],
             cwd: PathBuf::from(workspace),
             env: Default::default(),
+            env_unset: Default::default(),
             limits: Default::default(),
             history_bytes: 0,
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_activity_ms: None,
             phase,
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
