@@ -27,7 +27,7 @@ a attach --workspace "$PWD" --tag shell
 # Ctrl-] detaches without terminating the workload.
 ```
 
-The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, and `doctor`.
+The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
 
 ```bash
 a send --workspace "$PWD" --tag shell --enter 'printf "hello\\n"'
@@ -154,6 +154,16 @@ When any limit is requested, the worker creates a per-session cgroup-v2 leaf and
 ## Durable lifecycle
 
 Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit. A worker keeps its socket alive after exit so reattach, status, and capture do not race record finalization.
+
+## Watching events
+
+```bash
+a watch --jsonl
+a watch --jsonl --workspace "$PWD"
+a watch --jsonl --all   # also include shell (non-agent) sessions
+```
+
+`a watch` is a client-side poller, not a server-push mechanism — it scans the same durable session records `a list` reads, on a timer, and emits one JSON line per detected change: session creation/exit/deletion, OOM kills, and a coarse `agent.state` (`running`/`waiting`) signal derived from PTY-output recency. By default it only watches agent sessions (`engine != "shell"`), matching how it's meant to be used. The event envelope is heru's `UnifiedEvent` schema; see spec.md section 19 for the event stream's design intent and [docs/pocketshell-integration-plan.md](docs/pocketshell-integration-plan.md) Part 2 for the full field-by-field mapping rationale. `src/watch.rs` has the implementation and its own reasoning for the poll interval, activity threshold, and startup-replay behavior.
 
 ## Python client
 
