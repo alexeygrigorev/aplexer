@@ -9,9 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -97,12 +98,18 @@ struct WorkloadState {
 
 struct WorkerRuntime {
     record_path: std::path::PathBuf,
+    runtime_session_dir: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
     record: Mutex<SessionRecord>,
     pty_write: Mutex<Option<File>>,
     workload: Mutex<WorkloadState>,
     cgroup: Mutex<Option<Cgroup>>,
     kill_gate: Mutex<()>,
     output: OutputHub,
+    /// Connections currently being served; the lifecycle thread drains this
+    /// (with a timeout) before exiting the worker so in-flight responses
+    /// (e.g. the reply to the `kill` that ended the workload) are not lost.
+    active_connections: AtomicUsize,
 }
 
 impl WorkerRuntime {
@@ -167,8 +174,14 @@ impl WorkerRuntime {
         } else if unsafe { libc::kill(-pgid, signal) } != 0 {
             return Err(io::Error::last_os_error()).context("signal process group");
         }
-        if grace_ms > 0 {
-            thread::sleep(Duration::from_millis(grace_ms));
+        // Poll instead of sleeping the whole grace period: once the workload
+        // is gone there is nothing to escalate to SIGKILL, and the response
+        // to this request should not be delayed (the worker exits shortly
+        // after the workload does, so a response stuck behind a long sleep
+        // could be lost entirely).
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        while lock(&self.workload)?.running && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
         }
         let still_running = lock(&self.workload)?.running;
         if still_running {
@@ -227,25 +240,16 @@ pub fn run_worker(id: Uuid) -> Result<()> {
 
     let cgroup = match Cgroup::create(id, &record.limits) {
         Ok(value) => value,
-        Err(error) => {
-            record.phase = Phase::Failed;
-            record.error = Some(format!("{error:#}"));
-            record.updated_at_ms = now_ms();
-            atomic_write_json(&record_path, &record)?;
-            return Err(error);
-        }
+        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
-    let (master_read, slave) = open_pty(24, 80)?;
+    let (master_read, slave) = match open_pty(24, 80) {
+        Ok(value) => value,
+        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
+    };
     let master_write = master_read.try_clone()?;
     let child = match spawn_workload(&record, master_read.as_raw_fd(), slave, cgroup.as_ref()) {
         Ok(child) => child,
-        Err(error) => {
-            record.phase = Phase::Failed;
-            record.error = Some(format!("{error:#}"));
-            record.updated_at_ms = now_ms();
-            atomic_write_json(&record_path, &record)?;
-            return Err(error);
-        }
+        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
     let pid = child.id();
     record.workload_pid = Some(pid);
@@ -257,6 +261,8 @@ pub fn run_worker(id: Uuid) -> Result<()> {
     let history = History::open(record.history_path.clone(), record.history_bytes)?;
     let runtime = Arc::new(WorkerRuntime {
         record_path,
+        runtime_session_dir: paths.runtime_session(id),
+        socket_path,
         record: Mutex::new(record),
         pty_write: Mutex::new(Some(master_write)),
         workload: Mutex::new(WorkloadState {
@@ -267,6 +273,7 @@ pub fn run_worker(id: Uuid) -> Result<()> {
         cgroup: Mutex::new(cgroup),
         kill_gate: Mutex::new(()),
         output: OutputHub::new(history),
+        active_connections: AtomicUsize::new(0),
     });
     let (life_tx, life_rx) = mpsc::channel();
     spawn_pty_reader(master_read, runtime.clone(), life_tx.clone());
@@ -277,10 +284,12 @@ pub fn run_worker(id: Uuid) -> Result<()> {
         match listener.accept() {
             Ok((stream, _)) => {
                 let runtime = runtime.clone();
+                runtime.active_connections.fetch_add(1, Ordering::SeqCst);
                 thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, runtime) {
+                    if let Err(error) = handle_connection(stream, runtime.clone()) {
                         eprintln!("aplexer connection: {error:#}");
                     }
+                    runtime.active_connections.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -462,7 +471,43 @@ fn spawn_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         if let Some(cg) = cg {
             cg.cleanup();
         }
+        // The workload is gone and the final record/history are persisted;
+        // a daemonless design must not leave a worker process (plus its
+        // socket and runtime dir) behind for every session that ever ran.
+        // Unlink the socket first so new clients fail fast and fall back to
+        // the persisted record/history, then give in-flight connections
+        // (the `kill` response, attach Exit events) a bounded window to
+        // drain before exiting the process.
+        let _ = fs::remove_file(&runtime.socket_path);
+        let drain_deadline = Instant::now() + Duration::from_secs(3);
+        while runtime.active_connections.load(Ordering::SeqCst) > 0
+            && Instant::now() < drain_deadline
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let _ = fs::remove_dir_all(&runtime.runtime_session_dir);
+        std::process::exit(0);
     });
+}
+
+fn fail_startup(
+    paths: &Paths,
+    id: Uuid,
+    record_path: &std::path::Path,
+    record: &mut SessionRecord,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    record.phase = Phase::Failed;
+    record.error = Some(format!("{error:#}"));
+    record.updated_at_ms = now_ms();
+    if let Err(write_error) = atomic_write_json(record_path, record) {
+        eprintln!("aplexer worker: persist failure record: {write_error:#}");
+    }
+    // A worker that failed to launch its workload must not leave its bound
+    // socket (and runtime dir) behind: a present-but-dead socket makes the
+    // session look temporarily unavailable instead of failed.
+    let _ = fs::remove_dir_all(paths.runtime_session(id));
+    error
 }
 
 fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Result<()> {

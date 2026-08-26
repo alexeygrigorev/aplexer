@@ -217,6 +217,22 @@ fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
 }
 
 fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
+    // `a attach 1`, `a status 1`, `a kill 1`, etc. should mean the same
+    // thing as the bare `a 1` shortcut, not just work for `attach`. Only
+    // kick in for selectors shorter than 8 characters, the minimum length
+    // resolve_record treats as a UUID prefix -- so this can never shadow a
+    // real UUID/UUID-prefix selector, and workspace counts realistically
+    // never reach 8 digits.
+    if target.workspace.is_none() && target.tag.is_none() {
+        if let Some(selector) = &target.selector {
+            let is_quick_index =
+                !selector.is_empty() && selector.len() < 8 && selector.bytes().all(|b| b.is_ascii_digit());
+            if is_quick_index {
+                let index: usize = selector.parse().unwrap_or(0);
+                return resolve_quick_index(paths, index, None);
+            }
+        }
+    }
     resolve_record(
         paths,
         target.selector.as_deref(),
@@ -480,23 +496,34 @@ fn group_by_workspace(records: Vec<SessionRecord>) -> Vec<(PathBuf, Vec<SessionR
 /// `a <N>` / `a <N> <M>` / `a <N> <tag>` -- attach by position in the same
 /// workspace tree `a list` prints, or by tag within a chosen workspace.
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
+    let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
+    attach(&record, None)
+}
+
+/// Shared by the bare `a <N>` shortcut and by `resolve()` (so `a attach 1`,
+/// `a status 1`, `a kill 1`, etc. all understand the same numbers `a list`
+/// prints, not just the no-subcommand form).
+fn resolve_quick_index(
+    paths: &Paths,
+    workspace_index: usize,
+    session: Option<&str>,
+) -> Result<SessionRecord> {
     let groups = group_by_workspace(list_records(paths)?);
     if groups.is_empty() {
         bail!("no sessions found (see `a start`)");
     }
-    if args.workspace_index < 1 || args.workspace_index > groups.len() {
+    if workspace_index < 1 || workspace_index > groups.len() {
         bail!(
-            "workspace index {} out of range: {} workspace(s) found (see `a list`)",
-            args.workspace_index,
+            "workspace index {workspace_index} out of range: {} workspace(s) found (see `a list`)",
             groups.len()
         );
     }
-    let (workspace, sessions) = &groups[args.workspace_index - 1];
+    let (workspace, sessions) = &groups[workspace_index - 1];
     if sessions.is_empty() {
         bail!("workspace {} has no sessions", workspace.display());
     }
-    let record = match args.session.as_deref() {
-        None => sessions[0].clone(),
+    match session {
+        None => Ok(sessions[0].clone()),
         Some(selector) if !selector.is_empty() && selector.bytes().all(|b| b.is_ascii_digit()) => {
             let index: usize = selector.parse().unwrap_or(0);
             if index < 1 || index > sessions.len() {
@@ -506,7 +533,7 @@ fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
                     sessions.len()
                 );
             }
-            sessions[index - 1].clone()
+            Ok(sessions[index - 1].clone())
         }
         Some(tag) => sessions
             .iter()
@@ -517,9 +544,8 @@ fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
                     "no session tagged {tag:?} in workspace {}",
                     workspace.display()
                 )
-            })?,
-    };
-    attach(&record, None)
+            }),
+    }
 }
 
 fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
@@ -642,14 +668,23 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
 fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
-    rpc_simple(
+    let rpc = rpc_simple(
         &record,
         Operation::Kill {
             signal,
             grace_ms: args.grace_ms,
         },
         None,
-    )?;
+    );
+    if let Err(error) = rpc {
+        // The worker exits once its workload is gone, so a terminal-phase
+        // session has no socket to talk to; killing something already dead
+        // is success, not an error.
+        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
+        if !(matches!(record.phase, Phase::Exited | Phase::Failed) && !worker_alive) {
+            return Err(error);
+        }
+    }
     if json_output {
         println!("{}", json!({"id":record.id,"signal":signal}));
     }
