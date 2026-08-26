@@ -823,9 +823,9 @@ fn peek_continuation(engine: &str, path: &Path) -> Option<String> {
     None
 }
 
-/// Claude Code: `~/.claude/projects/<encoded-cwd>/<session>.jsonl`, where
-/// `<encoded-cwd>` replaces every `/` with `-` (`agent_log.py::
-/// _encode_claude_cwd`). aplexer has no direct handle on the underlying
+/// Claude Code: `~/.claude/projects/<encoded-cwd>/<session>.jsonl`
+/// (or `$CLAUDE_CONFIG_DIR/projects/...` for profiles). Encoding matches
+/// PocketShell `AgentDetector.encodeClaudeCwd`: `/` and `.` both become `-`. aplexer has no direct handle on the underlying
 /// claude session id, only the aplexer session's own `cwd` and
 /// `created_at_ms` -- so this picks the most-recently-modified `*.jsonl`
 /// directly under that cwd's project directory whose mtime is not earlier
@@ -843,7 +843,7 @@ pub fn locate_claude_transcript(
         .get("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))?;
-    let encoded = cwd.display().to_string().replace('/', "-");
+    let encoded = encode_claude_cwd(&cwd.display().to_string());
     let dir = config_dir.join("projects").join(encoded);
     if !dir.is_dir() {
         return None;
@@ -924,6 +924,15 @@ fn grok_sessions_root(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".grok/sessions"))
+}
+
+fn encode_claude_cwd(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        "-".into()
+    } else {
+        trimmed.replace(['/', '.'], "-")
+    }
 }
 
 fn encode_grok_cwd(cwd: &str) -> String {
@@ -1448,6 +1457,15 @@ mod tests {
             },
         );
         assert_eq!(older.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn encode_claude_cwd_replaces_slash_and_dot() {
+        assert_eq!(
+            encode_claude_cwd("/data/tmp/.tmpBU2mbw"),
+            "-data-tmp--tmpBU2mbw"
+        );
+        assert_eq!(encode_claude_cwd("/tmp/aplexer-follow"), "-tmp-aplexer-follow");
     }
 
     #[test]

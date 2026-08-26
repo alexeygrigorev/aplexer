@@ -114,7 +114,7 @@ fn write_session(h: &Harness, id: &str, cwd: &Path, engine: &str) {
 }
 
 fn write_claude_log(h: &Harness, cwd: &Path, body: &str) -> PathBuf {
-    let encoded = cwd.display().to_string().replace('/', "-");
+    let encoded = cwd.display().to_string().replace(['/', '.'], "-");
     let dir = h.home.path().join(".claude/projects").join(encoded);
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("abc.jsonl");
