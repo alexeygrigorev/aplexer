@@ -5,9 +5,9 @@
 ## Goals
 
 - **Standalone tmux / `tmuxctl` replacement.** Aplexer fills the same role as tmux (persistent, reattachable terminal sessions that survive your client disconnecting) but deliberately uses a different model — workspaces + tags + engines + profiles instead of flat global session names — described in [spec.md](spec.md) sections 1–2.
-- **Backing runtime for two sibling client projects** under `~/git`:
-  - [`../pocketshell`](../pocketshell) — a voice-first, tmux-native, agent-aware Android SSH client. It's meant to move off owning tmux session lifecycle / `tmuxctl` wrappers / agent engine discovery itself and instead become an aplexer client (see [spec.md](spec.md) section 22).
-  - [`../pocketshell-desktop`](../pocketshell-desktop) — a terminal-first, agent-aware SSH client built as a **VS Code fork** (like Cursor or Windsurf) — explicitly *not* a standalone Electron app. It's the desktop companion to PocketShell Android and integrates with tmux today; aplexer is intended to be its session runtime as well.
+- **Backing runtime for two sibling client projects**, also cloned under `~/git`:
+  - [pocketshell](https://github.com/alexeygrigorev/pocketshell) — a voice-first, tmux-native, agent-aware Android SSH client. It's meant to move off owning tmux session lifecycle / `tmuxctl` wrappers / agent engine discovery itself and instead become an aplexer client (see [spec.md](spec.md) section 22).
+  - [pocketshell-electron](https://github.com/alexeygrigorev/pocketshell-electron) — a desktop **Electron** port of PocketShell (Vue 3 + Vite + `ssh2` + `xterm.js`), the keyboard-first desktop companion to PocketShell Android. It integrates with tmux today; aplexer is intended to be its session runtime as well. (Note: an earlier, unrelated desktop project, `pocketshell-desktop`, a VS Code fork, is now archived — this is the active one.)
 
 ## Build
 
