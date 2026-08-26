@@ -631,7 +631,19 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_send(paths: &Paths, args: SendArgs, json_output: bool) -> Result<()> {
+fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> {
+    // `a send --workspace W --tag T "text"` parses "text" into the flattened
+    // TargetArgs selector positional (clap fills positionals in declaration
+    // order), which then fails to resolve as a session -- or worse, silently
+    // matches one. When the target is already fully named by flags, a lone
+    // positional can only have been meant as the text.
+    if args.text.is_none()
+        && !args.stdin
+        && args.target.selector.is_some()
+        && (args.target.workspace.is_some() || args.target.tag.is_some())
+    {
+        args.text = args.target.selector.take();
+    }
     let record = resolve(paths, &args.target)?;
     let mut data = if args.stdin {
         let mut v = Vec::new();
