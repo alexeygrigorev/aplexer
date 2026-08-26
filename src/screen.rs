@@ -281,6 +281,12 @@ impl ScreenTracker {
         let rows = rows.max(1);
         let cols = cols.max(1);
         Self {
+            // Invariant: the third argument (scrollback rows) must stay 0.
+            // `ScreenTracker` is a current-screen-only cache, never a
+            // retained history buffer -- retaining scrollback here would
+            // expose it to resize-time reflow of that history, which is
+            // exactly the class of bug that garbles tmux scrollback (see
+            // module doc above and docs/scrollback-design.md sections 2-3).
             parser: vt100::Parser::new(rows, cols, 0),
             margins: MarginTracker::new(rows),
             alt_screen: false,
@@ -684,5 +690,61 @@ mod tests {
         let mut tracker = ScreenTracker::new(24, 80);
         tracker.process(b"hello there\r\n");
         assert!(tracker.contents().contains("hello there"));
+    }
+
+    // Regression test for the tmux scrollback-garbling bug class (see the
+    // module doc and docs/scrollback-design.md sections 2-3): that bug comes
+    // from re-flowing soft-wrapped lines across a resize of a grid that
+    // *retains* history. `ScreenTracker` has zero retained scrollback (the
+    // `0` in `Parser::new`, see the invariant comment on `ScreenTracker::new`)
+    // and this vt100 version's resize truncates/pads rows in place rather
+    // than rejoining/re-wrapping them, so a soft-wrapped line surviving a
+    // resize must come out as a clean per-row truncation, never transposed
+    // or shredded into one character per row.
+    #[test]
+    fn resize_does_not_transpose_soft_wrapped_line() {
+        let cols = 20u16;
+        let mut tracker = ScreenTracker::new(24, cols);
+        // A single logical line long enough to soft-wrap across 4 rows at
+        // 20 columns: distinct word-ish chunks so we can check relative
+        // order survives the resize.
+        let line = "AAAAAAAAAA-BBBBBBBBBB-CCCCCCCCCC-DDDDDDDDDD-EOL";
+        tracker.process(line.as_bytes());
+
+        // Resize to a different width -- this is where an implementation
+        // that reflowed a retained history grid could transpose/shred text.
+        tracker.set_size(24, 40);
+        tracker.process(b"");
+
+        let contents = tracker.contents();
+
+        // Clean per-row truncation/pad (as opposed to reflow) preserves
+        // every character's relative order, but a row boundary can still
+        // fall mid-chunk (the same way it could before the resize) -- that's
+        // wrapping, not corruption. So reconstruct the logical stream by
+        // trimming each row's trailing pad and concatenating rows with no
+        // separator; a transposition/shredding bug would scramble character
+        // order within this reconstruction, whereas clean truncation/pad
+        // reproduces the original line exactly.
+        let dewrapped: String = contents.lines().map(|l| l.trim_end()).collect();
+        assert!(
+            dewrapped.contains(line),
+            "resized screen does not reconstruct the original line in order -- \
+             possible transposition/shredding:\ngot: {dewrapped:?}\nwant substring: {line:?}"
+        );
+
+        // The pathological one-char-per-row shredding pattern: every
+        // non-empty row reduced to a single character. Detect it generically
+        // by checking that at least one row still holds more than one
+        // contiguous run of our text, rather than every populated row being
+        // exactly one character wide.
+        let shredded = contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| l.trim().chars().count() <= 1);
+        assert!(
+            !shredded,
+            "screen contents look shredded to one character per row:\n{contents}"
+        );
     }
 }

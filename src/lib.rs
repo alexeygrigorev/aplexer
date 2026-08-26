@@ -1251,6 +1251,13 @@ pub enum AttachControl {
 /// much of the tail.
 pub const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// A raw byte log -- no line/wrap-flag structure, and it must stay that way.
+/// If a future feature wants to render captured history at a specific width,
+/// implement it by replaying these bytes into a *fresh* `vt100::Parser`
+/// constructed at that width (re-parse from scratch), never by calling
+/// resize/`set_size` on a parser that already processed content at a
+/// different width -- re-parsing is deterministic, in-place reflow of a
+/// populated grid is exactly the class of bug that garbles tmux scrollback.
 pub struct History {
     path: PathBuf,
     cap: usize,
