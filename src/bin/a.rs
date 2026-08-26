@@ -53,6 +53,10 @@ enum Commands {
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
     QuickAttach(QuickAttachArgs),
+    /// `a - [engine [tag]] [command...]`, rewritten into this by main()
+    /// before argument parsing -- not a name a user types directly.
+    #[command(hide = true)]
+    QuickLaunch(QuickLaunchArgs),
 }
 
 #[derive(Args)]
@@ -62,6 +66,11 @@ struct QuickAttachArgs {
     /// 1-based index into that workspace's sessions (list order), or a
     /// literal tag. Defaults to that workspace's first session.
     session: Option<String>,
+}
+
+#[derive(Args)]
+struct QuickLaunchArgs {
+    rest: Vec<String>,
 }
 
 #[derive(Args)]
@@ -192,6 +201,7 @@ fn run() -> Result<()> {
         Commands::Profiles => cmd_profiles(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
+        Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
     }
 }
 
@@ -202,17 +212,28 @@ fn run() -> Result<()> {
 /// first argument is inspected, and only when it's non-empty and all
 /// digits -- none of `a`'s real subcommand names collide with that.
 fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
-    let is_quick_index = args
-        .get(1)
-        .map(|first| !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()))
-        .unwrap_or(false);
-    if !is_quick_index {
+    // (hidden subcommand name, how many leading args to drop before it --
+    // the "-" marker itself carries no information once rewritten, but a
+    // quick-attach index like "1" is itself the first real argument).
+    let rewrite = match args.get(1).map(String::as_str) {
+        // `a -` / `a - claude` / `a - claude review` / `a - <command...>`,
+        // the same "-" marks-current-directory idiom tmuxctl's `t` uses for
+        // create-or-attach, adapted to aplexer's engine/tag model in
+        // cmd_quick_launch.
+        Some("-") => Some(("quick-launch", 2)),
+        // `a <N>` / `a <N> <M>` / `a <N> <tag>` -- see rewrite doc below.
+        Some(first) if !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(("quick-attach", 1))
+        }
+        _ => None,
+    };
+    let Some((hidden_name, skip)) = rewrite else {
         return args;
-    }
+    };
     let mut rewritten = Vec::with_capacity(args.len() + 1);
     rewritten.push(args[0].clone());
-    rewritten.push("quick-attach".to_string());
-    rewritten.extend(args.into_iter().skip(1));
+    rewritten.push(hidden_name.to_string());
+    rewritten.extend(args.into_iter().skip(skip));
     rewritten
 }
 
@@ -514,6 +535,101 @@ fn group_by_workspace(records: Vec<SessionRecord>) -> Vec<(PathBuf, Vec<SessionR
 
 /// `a <N>` / `a <N> <M>` / `a <N> <tag>` -- attach by position in the same
 /// workspace tree `a list` prints, or by tag within a chosen workspace.
+/// `a -` and friends -- create-or-attach in the current directory, agent
+/// engines and tags used the same way spec.md's own worked examples do
+/// (workspace ~/git/pocketshell, tags main/review/issue-2294, engines
+/// claude/codex). Whether the words after "-" name an engine or are a
+/// literal command to run (mirroring tmuxctl's `t - <command>`) is decided
+/// against the real engine registry, not a fixed word list:
+///
+///   a -                  tag "main", default engine
+///   a - claude           tag "claude" (defaults to the engine name), engine claude
+///   a - claude review    tag "review", engine claude
+///   a - htop             tag "htop" (defaults to the command name), runs `htop` literally
+///
+/// Re-running the same shortcut reattaches to a live matching session
+/// instead of erroring, like tmuxctl's own create_or_attach.
+/// Default tag for a literal-command quick-launch: the command's own base
+/// name, normalized to the charset validate_tag accepts. Deliberately NOT
+/// "main" for every arbitrary command -- `a - htop` reusing the same tag as
+/// `a -`'s plain shell would silently reattach to that shell instead of
+/// ever running htop.
+fn command_tag(word: &str) -> String {
+    let base = Path::new(word)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(word);
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "cmd".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
+    let workspace = canonical_workspace(Path::new("."))?;
+    let config = Config::load(paths)?;
+    let (tag, engine, command): (String, Option<String>, Vec<OsString>) = match args.rest.as_slice()
+    {
+        [] => ("main".to_string(), None, vec![]),
+        [engine] if config.engines.contains_key(engine) => {
+            (engine.clone(), Some(engine.clone()), vec![])
+        }
+        [engine, tag] if config.engines.contains_key(engine) => {
+            (tag.clone(), Some(engine.clone()), vec![])
+        }
+        words => (
+            command_tag(&words[0]),
+            None,
+            words.iter().map(OsString::from).collect(),
+        ),
+    };
+    if let Some(existing) = list_records(paths)?
+        .into_iter()
+        .find(|r| r.workspace == workspace && r.tag == tag)
+    {
+        let alive = existing.worker_pid.map(process_alive).unwrap_or(false);
+        let terminal = matches!(existing.phase, Phase::Exited | Phase::Failed);
+        if alive && !terminal {
+            return attach(&existing, None);
+        }
+        // A finished session falls through to cmd_start, which reclaims a
+        // workspace+tag held by a terminal-phase, worker-dead session. A
+        // "broken" one (non-terminal phase, dead worker) keeps its claim
+        // there too -- it needs an explicit `a kill` first.
+    }
+    cmd_start(
+        paths,
+        StartArgs {
+            workspace: PathBuf::from("."),
+            tag,
+            engine,
+            profile: None,
+            cwd: None,
+            env: vec![],
+            memory: None,
+            pids: None,
+            cpu_quota_us: None,
+            cpu_period_us: 100_000,
+            history_bytes: None,
+            attach: true,
+            startup_timeout_ms: 10_000,
+            command,
+        },
+        false,
+    )
+}
+
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
     attach(&record, None)
