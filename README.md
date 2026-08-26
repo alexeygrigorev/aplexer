@@ -38,17 +38,61 @@ a kill --workspace "$PWD" --tag shell --signal TERM --grace-ms 2000
 
 Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them.
 
-## Engines and profiles
+## Engines, profiles, and shortcuts
 
-Configuration is TOML. Built-in engine entries are supplied for the login shell and common agent CLIs; user configuration overrides them.
+Configuration is one TOML file, `~/.config/aplexer/config.toml` (override with `APLEXER_CONFIG`). It declares three related things together, in the same place, so it's clear how they relate:
+
+- **`[engines.<id>]`** — how to launch an agent/shell/command: argv plus any env. `codex` is a plain engine entry — `a - codex` just runs `codex` with no profile.
+- **`[profiles.<id>]`** — an engine variant, usually a different config directory via that engine's env var (`CLAUDE_CONFIG_DIR` for claude, `CODEX_HOME` for codex) — an alternate account or provider.
+- **`[shortcuts.<id>]`** — a short mnemonic for `a - <id>` that resolves to an (engine, profile) pair. `coz` is a shortcut meaning "codex with the Z.AI profile" (`config_dir` `~/.zodex`) — a fast path onto exactly what `a start --engine codex --profile zodex` already does, distinct from the plain `codex` engine above.
+
+All three layer identically: aplexer ships built-in/auto-discovered defaults for each map, then your config file's `[engines.*]` / `[profiles.*]` / `[shortcuts.*]` tables extend it, and your file wins on any id collision.
+
+### Engines
+
+Built-ins (before any config file is read):
 
 ```toml
-version = 1
-default_engine = "shell"
-
 [engines.shell]
-command = ["/bin/bash", "-l"]
+command = ["$SHELL", "-l"]   # resolved from $SHELL at load time, "/bin/sh" as a last resort
 
+[engines.codex]
+command = ["codex"]
+
+[engines.claude]
+command = ["claude"]
+
+[engines.gemini]
+command = ["gemini"]
+
+[engines.grok]
+command = ["grok"]
+```
+
+Override or add one in your config file the same way, e.g. to suppress codex's update check:
+
+```toml
+[engines.codex]
+command = ["codex", "-c", "check_for_update_on_startup=false"]
+```
+
+### Profiles
+
+Only claude and codex currently support profiles. Zero-config auto-discovery (ported from PocketShell's `tools/pocketshell/src/pocketshell/profiles.py`, spec.md 9.2/23) scans the top level of `$HOME` for `~/.<name>` directories that: aren't the engine's own default dir (`~/.claude` / `~/.codex`), have a name containing a hint for that engine (claude: `claude`/`laude`; codex: `codex`/`odex` — catching swaps like `zlaude`), and carry a real marker file (claude: `.claude.json` or `settings.json`; codex: `config.toml` or `auth.json`). A match becomes a profile named after its own directory stem — never a humanized display name, since `[profiles.*]` is one flat namespace shared by every engine and two engines' same-sounding profiles (e.g. both called "zai") would otherwise clobber each other. On a machine with a Z.AI-routed codex account at `~/.zodex`, discovery derives the equivalent of:
+
+```toml
+# what discovery derives automatically from ~/.zodex -- shown for reference,
+# you don't need to write this yourself unless you want to override it
+[profiles.zodex]
+engine = "codex"
+
+[profiles.zodex.env]
+CODEX_HOME = "/home/alexey/.zodex"
+```
+
+Add your own, or override a discovered one, in your config file the same way:
+
+```toml
 [profiles.review]
 engine = "shell"
 args = []
@@ -62,7 +106,46 @@ memory_bytes = 2147483648
 pids = 256
 ```
 
-Inspect effective discovery with `a engines`, `a profiles`, and `a doctor`.
+Launch a profile explicitly with `a start --engine codex --profile zodex`, or from inside a workspace `a start --profile zodex` (the profile's own `engine` field fills in `--engine`).
+
+### Shortcuts
+
+Built-in defaults, resolving `a - <id>` to an (engine, profile) pair:
+
+```toml
+[shortcuts.cl]
+engine = "claude"
+
+[shortcuts.co]
+engine = "codex"
+
+[shortcuts.g]
+engine = "grok"
+
+[shortcuts.clz]
+engine = "claude"
+profile = "zlaude"
+
+[shortcuts.coz]
+engine = "codex"
+profile = "zodex"
+
+[shortcuts.cog]
+engine = "codex"
+profile = "godex"
+```
+
+So `a - codex` (a real engine id) runs plain codex tagged `codex`, while `a - coz` (a shortcut id) runs codex with the Z.AI profile tagged `coz` — same engine, different profile and tag, so the two sessions never collide. `a - coz review` uses the same engine+profile but tags the session `review` instead of `coz`. Word matching checks real engine ids first (so a real engine name always means exactly what it says), then shortcut ids, then falls back to running the words as a literal command — see the doc comment on `cmd_quick_launch` in `src/bin/a.rs` for the full precedence rationale.
+
+Add your own the same way:
+
+```toml
+[shortcuts.rev]
+engine = "codex"
+profile = "review"   # the [profiles.review] example above
+```
+
+Inspect effective discovery/resolution any time with `a engines`, `a profiles`, and `a doctor`.
 
 ## Resource isolation
 
