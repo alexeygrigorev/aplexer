@@ -235,3 +235,5 @@ See [spec.md](spec.md) (mirrored at [docs/SPEC.md](docs/SPEC.md)) for the comple
 For using aplexer on a remote host over a slow or flaky link (PocketShell on cellular), see [docs/low-bandwidth-remote-access-design.md](docs/low-bandwidth-remote-access-design.md) — what SSH compression already solves for free, status-bar/replay frugality, and reconnect/resume semantics (planning doc, not yet implemented).
 
 For switching between sessions without detaching (`Ctrl-b n`/`p`/`1-9`/`l` inside `a attach`, reusing the same numbering `a list` prints), see [docs/fast-session-switching-design.md](docs/fast-session-switching-design.md) — the in-process switch architecture, keybinding scheme, and failure handling (design doc, not yet implemented).
+
+For scrolling through a session's recent output without blocking input (tmux copy-mode's job, minus the input freeze), see [docs/scrollback-design.md](docs/scrollback-design.md) — why the host terminal's native scrollback is the mechanism, the status-bar hygiene invariants that keep it clean, and why a custom in-band scrollback view is rejected for v1 (design doc; mostly verification work).
