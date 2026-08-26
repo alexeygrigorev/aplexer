@@ -2953,6 +2953,174 @@ struct SwitchOutcome {
     history: Vec<u8>,
 }
 
+/// One button press/release reported by xterm's SGR extended mouse mode
+/// (`CSI ?1006h`, paired with `CSI ?1000h` click tracking) --
+/// docs/clickable-status-bar-design.md section 2. `col`/`row` are 1-based,
+/// matching the wire format, so callers subtract 1 to index into
+/// `BarRegion` column ranges or compare against `TermGeom.rows`.
+///
+/// **Not yet wired into `InputScanner`/`attach()`** -- see the design doc
+/// section 7 for why this is landing as a standalone, unit-tested primitive
+/// ahead of the riskier live-input-thread integration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseReport {
+    button: u32,
+    press: bool,
+    col: u16,
+    row: u16,
+}
+
+/// Result of attempting to parse an SGR mouse report off the front of a
+/// buffer: a real hit (with the byte length consumed), "not this at all"
+/// (any other byte sequence, including ordinary CSI sequences like arrow
+/// keys -- `ESC [ <` is not a prefix any keyboard-generated input or other
+/// terminal report uses, so this is an unambiguous, fast rejection), or
+/// "looks like the start of one but the buffer ends before `M`/`m`" -- the
+/// signal a live scanner needs to keep buffering across `read()` calls, the
+/// same role `pending_ctrl_b` plays for the one-byte `Ctrl-b` prefix.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseParse {
+    NotMouse,
+    Incomplete,
+    Complete(MouseReport, usize),
+}
+
+/// Pure parser for `ESC [ < Cb ; Cx ; Cy [Mm]` at the start of `buf`
+/// (docs/clickable-status-bar-design.md section 2/4.4). Never panics on
+/// malformed input; malformed-but-prefix-matching input that can't
+/// possibly resolve (non-digit where a number is expected, once the `<`
+/// has been seen) is reported `NotMouse` rather than `Incomplete`, so a
+/// caller doesn't buffer forever waiting for a `M`/`m` that will never
+/// come.
+#[allow(dead_code)]
+fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
+    const PREFIX: &[u8] = b"\x1b[<";
+    if buf.len() < PREFIX.len() {
+        if PREFIX.starts_with(buf) {
+            return MouseParse::Incomplete;
+        }
+        return MouseParse::NotMouse;
+    }
+    if &buf[..PREFIX.len()] != PREFIX {
+        return MouseParse::NotMouse;
+    }
+    // Three ';'-separated decimal fields, terminated by 'M' (press) or 'm'
+    // (release). Parse by scanning for the terminator rather than
+    // pre-splitting, so a genuinely truncated buffer (no terminator yet)
+    // is correctly reported Incomplete instead of NotMouse.
+    let rest = &buf[PREFIX.len()..];
+    let mut fields: [u32; 3] = [0; 3];
+    let mut field_idx = 0;
+    let mut cur: u32 = 0;
+    let mut have_digit = false;
+    for (i, &b) in rest.iter().enumerate() {
+        match b {
+            b'0'..=b'9' => {
+                have_digit = true;
+                cur = cur.saturating_mul(10).saturating_add((b - b'0') as u32);
+            }
+            b';' => {
+                if !have_digit || field_idx >= 2 {
+                    return MouseParse::NotMouse;
+                }
+                fields[field_idx] = cur;
+                field_idx += 1;
+                cur = 0;
+                have_digit = false;
+            }
+            b'M' | b'm' => {
+                if !have_digit || field_idx != 2 {
+                    return MouseParse::NotMouse;
+                }
+                fields[2] = cur;
+                let consumed = PREFIX.len() + i + 1;
+                let row = u16::try_from(fields[2]).unwrap_or(u16::MAX);
+                let col = u16::try_from(fields[1]).unwrap_or(u16::MAX);
+                return MouseParse::Complete(
+                    MouseReport {
+                        button: fields[0],
+                        press: b == b'M',
+                        col,
+                        row,
+                    },
+                    consumed,
+                );
+            }
+            _ => return MouseParse::NotMouse,
+        }
+    }
+    // Ran out of buffer with no terminator yet, but every byte seen so far
+    // was a valid digit/`;` -- genuinely incomplete, keep buffering.
+    MouseParse::Incomplete
+}
+
+/// A clickable span of the rendered status-bar line
+/// (docs/clickable-status-bar-design.md section 4.1), in 0-based character
+/// columns `[start, end)` -- the same units `pad_or_truncate` counts in, so
+/// a click's 1-based `Cx` maps in with a single `- 1`.
+///
+/// **Not yet wired into `draw_status_bar`** -- see the design doc section 7.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BarRegion {
+    cols: std::ops::Range<usize>,
+    action: BarClick,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BarClick {
+    /// Click a sibling's `{i}:{tag}` token: switch to it (`i` is exactly
+    /// the digit `Ctrl-b <i>` would send, `SwitchTarget::Index`).
+    Sibling(usize),
+    /// Click the cross-workspace picker indicator (design doc section 5.2).
+    WorkspacePicker,
+    /// Click a session while browsing another workspace's sibling list
+    /// (design doc section 5.2/5.3): jump straight to it by identity.
+    RemoteSession(Uuid),
+}
+
+/// Pure builder mirroring `workspace_summary`'s rendering
+/// (`{i}:{tag}[*][(state)]`, space-joined, `list_records` order) but also
+/// returning the column range each token occupies, for the status-bar
+/// click map (docs/clickable-status-bar-design.md section 4.2). `siblings`
+/// must already be filtered to one workspace and ordered the way
+/// `workspace_summary` expects; kept pure (no `Paths`/filesystem access)
+/// so it's testable without touching disk, the same split
+/// `pick_switch_target`/`resolve_switch_target` already use.
+///
+/// **Not yet called from `draw_status_bar`** -- see the design doc
+/// section 7; `workspace_summary` (the currently-live renderer) is
+/// untouched by this addition.
+#[allow(dead_code)]
+fn workspace_summary_regions(siblings: &[SessionRecord], current_id: Uuid) -> (String, Vec<BarRegion>) {
+    let mut text = String::new();
+    let mut regions = Vec::new();
+    for (i, r) in siblings.iter().enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let start = text.chars().count();
+        let alive = r.worker_pid.map(process_alive).unwrap_or(false);
+        let state = display_state(&r.phase, alive);
+        text.push_str(&format!("{}:{}", i + 1, r.tag));
+        if r.id == current_id {
+            text.push('*');
+        }
+        if state != "running" {
+            text.push_str(&format!("({state})"));
+        }
+        let end = text.chars().count();
+        regions.push(BarRegion {
+            cols: start..end,
+            action: BarClick::Sibling(i + 1),
+        });
+    }
+    (text, regions)
+}
+
 /// What one `InputScanner::scan` call decided to do with a chunk of raw
 /// stdin bytes; several may result from a single `read()` (e.g.
 /// `"a\x02n"` -> `Forward([b'a'])`, `Switch(Next)`).
@@ -3632,6 +3800,120 @@ mod switching_tests {
         assert_eq!(bytes(&actions), vec![0x02, b'0']);
     }
 
+    // -- parse_sgr_mouse (docs/clickable-status-bar-design.md section 2) --
+
+    #[test]
+    fn parse_sgr_mouse_left_click_press() {
+        let buf = b"\x1b[<0;10;5M";
+        match parse_sgr_mouse(buf) {
+            MouseParse::Complete(report, consumed) => {
+                assert_eq!(
+                    report,
+                    MouseReport {
+                        button: 0,
+                        press: true,
+                        col: 10,
+                        row: 5,
+                    }
+                );
+                assert_eq!(consumed, buf.len());
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sgr_mouse_release() {
+        let buf = b"\x1b[<0;10;5m";
+        match parse_sgr_mouse(buf) {
+            MouseParse::Complete(report, consumed) => {
+                assert!(!report.press);
+                assert_eq!(consumed, buf.len());
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sgr_mouse_large_coordinates_no_1006_overflow() {
+        // The entire point of SGR (?1006h) over legacy (?1000h alone) mode:
+        // no 223-column/row ceiling.
+        let buf = b"\x1b[<2;9999;500M";
+        match parse_sgr_mouse(buf) {
+            MouseParse::Complete(report, _) => {
+                assert_eq!(report.col, 9999);
+                assert_eq!(report.row, 500);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sgr_mouse_trailing_bytes_only_consumes_the_report() {
+        let buf = b"\x1b[<0;10;5Mrest-of-buffer";
+        match parse_sgr_mouse(buf) {
+            MouseParse::Complete(_, consumed) => assert_eq!(consumed, 10),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sgr_mouse_incomplete_at_every_prefix_length() {
+        let full = b"\x1b[<0;10;5M";
+        for split in 1..full.len() {
+            let partial = &full[..split];
+            assert_eq!(
+                parse_sgr_mouse(partial),
+                MouseParse::Incomplete,
+                "prefix of length {split} should be Incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sgr_mouse_rejects_ordinary_csi_sequences() {
+        // Arrow keys, cursor reports, colors, etc. -- none start with the
+        // `ESC [ <` mouse prefix, so these must be an immediate NotMouse,
+        // never treated as "keep buffering".
+        assert_eq!(parse_sgr_mouse(b"\x1b[A"), MouseParse::NotMouse); // up arrow
+        assert_eq!(parse_sgr_mouse(b"\x1b[31m"), MouseParse::NotMouse); // SGR color
+        assert_eq!(parse_sgr_mouse(b"hello"), MouseParse::NotMouse);
+    }
+
+    #[test]
+    fn parse_sgr_mouse_empty_buffer_is_incomplete_not_rejected() {
+        // Zero bytes seen yet can't be ruled out as the start of a mouse
+        // report -- a caller with nothing buffered should keep reading,
+        // not treat an empty read as "definitely not a mouse sequence".
+        assert_eq!(parse_sgr_mouse(b""), MouseParse::Incomplete);
+    }
+
+    #[test]
+    fn parse_sgr_mouse_malformed_after_prefix_is_not_mouse_not_incomplete() {
+        // A non-digit, non-';' byte right where a field is expected can
+        // never resolve into a valid report -- must not be reported
+        // Incomplete (that would make a caller buffer forever).
+        assert_eq!(parse_sgr_mouse(b"\x1b[<x;10;5M"), MouseParse::NotMouse);
+        assert_eq!(parse_sgr_mouse(b"\x1b[<0;;5M"), MouseParse::NotMouse);
+        assert_eq!(parse_sgr_mouse(b"\x1b[<0;10;5X"), MouseParse::NotMouse);
+    }
+
+    #[test]
+    fn parse_sgr_mouse_split_across_two_reads_reassembles() {
+        // Mirrors the Ctrl-b split-read tests above: a caller buffering
+        // bytes across scan() calls must see Incomplete on the first half
+        // and Complete once the second half is appended.
+        let full: &[u8] = b"\x1b[<0;10;5M";
+        let split = 5;
+        assert_eq!(parse_sgr_mouse(&full[..split]), MouseParse::Incomplete);
+        let mut buffered = full[..split].to_vec();
+        buffered.extend_from_slice(&full[split..]);
+        match parse_sgr_mouse(&buffered) {
+            MouseParse::Complete(_, consumed) => assert_eq!(consumed, full.len()),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
     fn mk_record(workspace: &str, tag: &str, phase: Phase) -> SessionRecord {
         let id = Uuid::new_v4();
         SessionRecord {
@@ -3678,6 +3960,69 @@ mod switching_tests {
             (PathBuf::from(ws_a), vec![a1, a2, a3]),
             (PathBuf::from(ws_b), vec![b1]),
         ]
+    }
+
+    // -- workspace_summary_regions (docs/clickable-status-bar-design.md
+    // section 4.2) --
+
+    #[test]
+    fn summary_regions_matches_workspace_summary_text() {
+        let groups = sample_groups();
+        let siblings = &groups[0].1; // main, review, dead(Exited)
+        let current = siblings[0].id;
+        let (text, regions) = workspace_summary_regions(siblings, current);
+        assert_eq!(text, "1:main* 2:review 3:dead(exited)");
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].action, BarClick::Sibling(1));
+        assert_eq!(regions[1].action, BarClick::Sibling(2));
+        assert_eq!(regions[2].action, BarClick::Sibling(3));
+    }
+
+    #[test]
+    fn summary_regions_column_ranges_slice_out_the_right_token() {
+        let groups = sample_groups();
+        let siblings = &groups[0].1;
+        let current = siblings[0].id;
+        let (text, regions) = workspace_summary_regions(siblings, current);
+        let chars: Vec<char> = text.chars().collect();
+        for region in &regions {
+            let slice: String = chars[region.cols.clone()].iter().collect();
+            match region.action {
+                BarClick::Sibling(1) => assert_eq!(slice, "1:main*"),
+                BarClick::Sibling(2) => assert_eq!(slice, "2:review"),
+                BarClick::Sibling(3) => assert_eq!(slice, "3:dead(exited)"),
+                _ => panic!("unexpected region {region:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn summary_regions_unicode_tag_uses_char_offsets_not_byte_offsets() {
+        // A multi-byte tag must not desync the column map -- offsets are
+        // char counts (matching pad_or_truncate), not byte counts.
+        let a = mk_record("/ws/u", "café", Phase::Running);
+        let b = mk_record("/ws/u", "b", Phase::Running);
+        let current = a.id;
+        let siblings = vec![a, b];
+        let (text, regions) = workspace_summary_regions(&siblings, current);
+        assert_eq!(text, "1:café* 2:b");
+        let chars: Vec<char> = text.chars().collect();
+        let second: String = chars[regions[1].cols.clone()].iter().collect();
+        assert_eq!(second, "2:b");
+    }
+
+    #[test]
+    fn summary_regions_single_session_still_renders_one_region() {
+        // Unlike workspace_summary (which returns "" for a lone session,
+        // since there's nothing to switch *to*), the pure builder here
+        // doesn't special-case count -- callers decide whether to show the
+        // segment at all, same as workspace_summary's caller does today.
+        let a = mk_record("/ws/solo", "only", Phase::Running);
+        let current = a.id;
+        let siblings = vec![a];
+        let (text, regions) = workspace_summary_regions(&siblings, current);
+        assert_eq!(text, "1:only*");
+        assert_eq!(regions.len(), 1);
     }
 
     #[test]
