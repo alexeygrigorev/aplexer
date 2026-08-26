@@ -1,6 +1,7 @@
 // Live integration test: start real agent CLIs in skip-permissions mode,
-// give them a task that needs tools (not ping/pong), and `a transcript
-// --follow` each session until tool events and a final answer appear.
+// resolve each session with `a whoami` (the same APLEXER_SESSION_ID a
+// process inside the session sees), give them a task that needs tools,
+// and `a transcript --follow` until tool events and a final answer appear.
 //
 // This talks to grok / claude (zlaude if present) / codex over the network
 // and takes a minute or two, so it is #[ignore] and is not part of
@@ -35,7 +36,7 @@ struct Harness {
     state_dir: TempDir,
     workspace: TempDir,
     config_file: PathBuf,
-    tags: Vec<String>,
+    session_ids: Vec<String>,
 }
 
 impl Harness {
@@ -49,7 +50,7 @@ impl Harness {
             state_dir,
             workspace,
             config_file,
-            tags: Vec::new(),
+            session_ids: Vec::new(),
         }
     }
 
@@ -61,6 +62,26 @@ impl Harness {
         cmd.env_remove("APLEXER_SESSION_ID");
         enrich_path(&mut cmd);
         cmd
+    }
+
+    /// `a` as if it were running inside the session: `APLEXER_SESSION_ID` is
+    /// what `a whoami` and bare `a transcript` key off.
+    fn command_inside(&self, session_id: &str) -> Command {
+        let mut cmd = self.command();
+        cmd.env("APLEXER_SESSION_ID", session_id);
+        cmd
+    }
+
+    fn whoami(&self, session_id: &str) -> Value {
+        let mut cmd = self.command_inside(session_id);
+        cmd.args(["--json", "whoami"]);
+        let output = run_with_timeout(cmd, Duration::from_secs(5));
+        assert!(
+            output.status.success(),
+            "a whoami failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("whoami json")
     }
 
     fn run(&self, args: &[&str], timeout: Duration) -> std::process::Output {
@@ -86,71 +107,33 @@ impl Harness {
         self.workspace.path().to_str().expect("utf8 workspace")
     }
 
-    fn send_enter(&self, tag: &str, text: &str) {
+    fn send_enter(&self, session_id: &str, text: &str) {
         self.run_ok(
-            &[
-                "send",
-                "--workspace",
-                self.workspace(),
-                "--tag",
-                tag,
-                "--enter",
-                text,
-            ],
+            &["send", session_id, "--enter", text],
             Duration::from_secs(5),
         );
         // Codex/Claude TUIs submit on CR, not LF.
-        self.run_ok(
-            &[
-                "send",
-                "--workspace",
-                self.workspace(),
-                "--tag",
-                tag,
-                "--hex",
-                "0d",
-            ],
-            Duration::from_secs(5),
-        );
+        self.run_ok(&["send", session_id, "--hex", "0d"], Duration::from_secs(5));
     }
 
-    fn confirm_trust(&self, tag: &str) {
-        let _ = self.run(
-            &[
-                "send",
-                "--workspace",
-                self.workspace(),
-                "--tag",
-                tag,
-                "--hex",
-                "0d",
-            ],
-            Duration::from_secs(5),
-        );
+    fn confirm_trust(&self, session_id: &str) {
+        let _ = self.run(&["send", session_id, "--hex", "0d"], Duration::from_secs(5));
     }
 
-    fn transcript_events(&self, tag: &str) -> Vec<Value> {
-        let output = self.run(
-            &[
-                "--json",
-                "transcript",
-                "--workspace",
-                self.workspace(),
-                "--tag",
-                tag,
-            ],
-            Duration::from_secs(15),
-        );
+    fn transcript_events(&self, session_id: &str) -> Vec<Value> {
+        let mut cmd = self.command_inside(session_id);
+        cmd.args(["--json", "transcript"]);
+        let output = run_with_timeout(cmd, Duration::from_secs(15));
         if !output.status.success() {
             return Vec::new();
         }
         parse_jsonl(&String::from_utf8_lossy(&output.stdout))
     }
 
-    fn dump_agent(&self, tag: &str) {
-        let events = self.transcript_events(tag);
+    fn dump_agent(&self, session_id: &str) {
+        let events = self.transcript_events(session_id);
         eprintln!(
-            "dump {tag}: {} events kinds={:?}",
+            "dump {session_id}: {} events kinds={:?}",
             events.len(),
             events
                 .iter()
@@ -158,33 +141,21 @@ impl Harness {
                 .collect::<Vec<_>>()
         );
         let cap = self.run(
-            &[
-                "capture",
-                "--workspace",
-                self.workspace(),
-                "--tag",
-                tag,
-                "--bytes",
-                "2500",
-            ],
+            &["capture", session_id, "--bytes", "2500"],
             Duration::from_secs(5),
         );
         let mut screen = String::from_utf8_lossy(&cap.stdout).into_owned();
         screen.retain(|c| c == '\n' || c == ' ' || (' '..='~').contains(&c));
         let tail = screen.chars().rev().take(600).collect::<String>();
         let tail: String = tail.chars().rev().collect();
-        eprintln!("capture {tag} tail: {tail}");
+        eprintln!("capture {session_id} tail: {tail}");
     }
 
-    fn spawn_follow(&self, tag: &str, after: u64) -> Follow {
-        let mut cmd = self.command();
+    fn spawn_follow(&self, session_id: &str, after: u64) -> Follow {
+        let mut cmd = self.command_inside(session_id);
         cmd.args([
             "--json",
             "transcript",
-            "--workspace",
-            self.workspace(),
-            "--tag",
-            tag,
             "--after",
             &after.to_string(),
             "--follow",
@@ -211,11 +182,8 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        for tag in &self.tags {
-            let _ = self.run(
-                &["kill", "--workspace", self.workspace(), "--tag", tag],
-                Duration::from_secs(8),
-            );
+        for id in &self.session_ids {
+            let _ = self.run(&["kill", id], Duration::from_secs(8));
         }
     }
 }
@@ -391,6 +359,7 @@ fn transcript_follow_live_agents() {
     let mut h = Harness::new();
     seed_workspace(h.workspace.path());
     let ws = h.workspace().to_string();
+    let mut ids: BTreeMap<&str, String> = BTreeMap::new();
 
     for agent in &agents {
         let mut args = vec![
@@ -412,6 +381,14 @@ fn transcript_follow_live_agents() {
         }
         let stdout = h.run_ok(&args, Duration::from_secs(40));
         let record: Value = serde_json::from_str(&stdout).expect("start json");
+        let id = record["id"]
+            .as_str()
+            .expect("start json id")
+            .to_string();
+        let me = h.whoami(&id);
+        assert_eq!(me["id"].as_str(), Some(id.as_str()), "whoami id");
+        assert_eq!(me["engine"].as_str(), Some(agent.engine), "whoami engine");
+        assert_eq!(me["tag"].as_str(), Some(agent.tag), "whoami tag");
         let command: Vec<&str> = record["command"]
             .as_array()
             .unwrap()
@@ -425,23 +402,24 @@ fn transcript_follow_live_agents() {
             "{} should start in skip-permissions mode, got {command:?}",
             agent.engine
         );
-        h.tags.push(agent.tag.to_string());
         eprintln!(
-            "started {} tag={} cmd={command:?}",
-            agent.engine, agent.tag
+            "whoami {} -> {} tag={} engine={}",
+            agent.tag, id, me["tag"], me["engine"]
         );
+        h.session_ids.push(id.clone());
+        ids.insert(agent.tag, id);
     }
 
     thread::sleep(Duration::from_secs(6));
     for _ in 0..3 {
         for agent in &agents {
-            h.confirm_trust(agent.tag);
+            h.confirm_trust(&ids[agent.tag]);
         }
         thread::sleep(Duration::from_secs(3));
     }
 
     for agent in &agents {
-        h.send_enter(agent.tag, TASK);
+        h.send_enter(&ids[agent.tag], TASK);
         eprintln!("sent task to {}", agent.tag);
     }
 
@@ -454,7 +432,7 @@ fn transcript_follow_live_agents() {
             if ready.contains_key(agent.tag) {
                 continue;
             }
-            let events = h.transcript_events(agent.tag);
+            let events = h.transcript_events(&ids[agent.tag]);
             if events.is_empty() {
                 continue;
             }
@@ -481,7 +459,7 @@ fn transcript_follow_live_agents() {
             for agent in &agents {
                 if !ready.contains_key(agent.tag) {
                     eprintln!("resending task to {}", agent.tag);
-                    h.send_enter(agent.tag, TASK);
+                    h.send_enter(&ids[agent.tag], TASK);
                 }
             }
             resent = true;
@@ -493,7 +471,7 @@ fn transcript_follow_live_agents() {
     if ready.len() != agents.len() {
         for agent in &agents {
             if !ready.contains_key(agent.tag) {
-                h.dump_agent(agent.tag);
+                h.dump_agent(&ids[agent.tag]);
             }
         }
         panic!(
@@ -512,11 +490,11 @@ fn transcript_follow_live_agents() {
     let mut follows: BTreeMap<&str, Follow> = BTreeMap::new();
     for agent in &agents {
         let after = last_sequence(ready.get(agent.tag).unwrap());
-        follows.insert(agent.tag, h.spawn_follow(agent.tag, after));
+        follows.insert(agent.tag, h.spawn_follow(&ids[agent.tag], after));
     }
     thread::sleep(Duration::from_millis(500));
     for agent in &agents {
-        h.send_enter(agent.tag, FOLLOW_PROMPT);
+        h.send_enter(&ids[agent.tag], FOLLOW_PROMPT);
     }
 
     let follow_deadline = Instant::now() + Duration::from_secs(45);
