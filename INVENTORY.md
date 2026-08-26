@@ -1,0 +1,47 @@
+# Source inventory
+
+```text
+.pytest_cache/.gitignore	37 bytes
+.pytest_cache/CACHEDIR.TAG	191 bytes
+.pytest_cache/README.md	302 bytes
+.pytest_cache/v/cache/lastfailed	82 bytes
+.pytest_cache/v/cache/nodeids	2 bytes
+Cargo.toml	630 bytes
+DELIVERY.md	655 bytes
+FALLBACK_STATUS.txt	90 bytes
+IMPLEMENTATION.md	1785 bytes
+INVENTORY.md	28 bytes
+PYTHON_VALIDATION.txt	221 bytes
+README.md	3227 bytes
+STAGING_REPORT.txt	143 bytes
+VALIDATION.md	2728 bytes
+docs/SPEC.md	37102 bytes
+examples/config.toml	205 bytes
+python/.pytest_cache/.gitignore	37 bytes
+python/.pytest_cache/CACHEDIR.TAG	191 bytes
+python/.pytest_cache/README.md	302 bytes
+python/.pytest_cache/v/cache/nodeids	106 bytes
+python/aplexer/__init__.py	140 bytes
+python/aplexer/__pycache__/__init__.cpython-313.pyc	288 bytes
+python/aplexer/__pycache__/client.cpython-313.pyc	11498 bytes
+python/aplexer/__pycache__/models.cpython-313.pyc	2821 bytes
+python/aplexer/__pycache__/protocol.cpython-313.pyc	2976 bytes
+python/aplexer/client.py	6548 bytes
+python/aplexer/models.py	1437 bytes
+python/aplexer/protocol.py	1654 bytes
+python/pyproject.toml	312 bytes
+python/tests/__pycache__/test_models.cpython-313-pytest-9.0.2.pyc	2171 bytes
+python/tests/__pycache__/test_models.cpython-313.pyc	722 bytes
+python/tests/__pycache__/test_protocol.cpython-313-pytest-9.0.2.pyc	2549 bytes
+python/tests/__pycache__/test_protocol.cpython-313.pyc	1052 bytes
+python/tests/test_models.py	429 bytes
+python/tests/test_protocol.py	486 bytes
+schemas/rpc-v1.schema.json	511 bytes
+schemas/session-v1.schema.json	1932 bytes
+scripts/package.sh	1038 bytes
+scripts/validate.sh	736 bytes
+src/bin/a.rs	21108 bytes
+src/bin/aplexer.rs	427 bytes
+src/lib.rs	30086 bytes
+src/worker.rs	18428 bytes
+```

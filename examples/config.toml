@@ -1,0 +1,13 @@
+version = 1
+default_engine = "shell"
+
+[engines.shell]
+command = ["/bin/bash", "-l"]
+
+[profiles.large]
+engine = "shell"
+history_bytes = 8388608
+
+[profiles.large.limits]
+memory_bytes = 2147483648
+pids = 256

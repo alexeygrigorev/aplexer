@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aplexer.local/schema/session-v1.json",
+  "title": "aplexer session record v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "workspace",
+    "tag",
+    "engine",
+    "command",
+    "cwd",
+    "limits",
+    "history_bytes",
+    "created_at_ms",
+    "updated_at_ms",
+    "phase",
+    "socket_path",
+    "history_path"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "tag": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "engine": {
+      "type": "string"
+    },
+    "profile": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "limits": {
+      "type": "object"
+    },
+    "history_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at_ms": {
+      "type": "integer"
+    },
+    "updated_at_ms": {
+      "type": "integer"
+    },
+    "phase": {
+      "enum": [
+        "starting",
+        "running",
+        "exiting",
+        "exited",
+        "failed"
+      ]
+    },
+    "worker_pid": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "workload_pid": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "socket_path": {
+      "type": "string"
+    },
+    "history_path": {
+      "type": "string"
+    },
+    "exit": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

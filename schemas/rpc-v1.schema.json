@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "aplexer RPC envelope v1",
+  "type": "object",
+  "required": [
+    "version",
+    "request_id",
+    "op"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "op": {
+      "enum": [
+        "ping",
+        "status",
+        "send",
+        "capture",
+        "attach",
+        "resize",
+        "kill",
+        "rename"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

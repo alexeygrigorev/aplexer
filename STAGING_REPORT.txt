@@ -1,0 +1,8 @@
+aplexer staging report
+generated_utc=2026-08-26T12:32Z
+source_root=NONE
+source_copy=missing
+spec_copy=ok
+
+[inventory]
+docs/SPEC.md	37102 bytes
