@@ -109,6 +109,11 @@ struct StartArgs {
     attach: bool,
     #[arg(long, default_value_t = 10_000)]
     startup_timeout_ms: u64,
+    /// Keep the engine's confirmation/sandbox prompts. Default is to append
+    /// the engine's skip-permissions argv (`--dangerously-bypass-approvals-
+    /// and-sandbox` / `--dangerously-skip-permissions` / `--always-approve`).
+    #[arg(long)]
+    no_skip_permissions: bool,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
 }
@@ -472,7 +477,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         .map(|v| os_to_utf8(v, "command argument"))
         .collect::<Result<Vec<_>>>()?;
     let config = Config::load(paths)?;
-    let launch = config.resolve(
+    let mut launch = config.resolve(
         direct,
         args.engine.as_deref(),
         args.profile.as_deref(),
@@ -482,6 +487,14 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         &limits,
         args.history_bytes,
     )?;
+    // Extra `-- argv` is the caller's full command; don't also append the
+    // skip-permissions flags (they may already be in it, or deliberately
+    // omitted). Engine/profile launches skip permissions by default.
+    if args.command.is_empty() && !args.no_skip_permissions {
+        launch
+            .command
+            .extend(launch.skip_permissions_argv.iter().cloned());
+    }
     if !command_exists(&launch.command) {
         bail!(
             "command is not executable or was not found in PATH: {}",
@@ -888,6 +901,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             history_bytes: None,
             attach: true,
             startup_timeout_ms: 10_000,
+            no_skip_permissions: false,
             command,
         },
         false,

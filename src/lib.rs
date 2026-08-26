@@ -960,10 +960,9 @@ pub struct ResolvedLaunch {
     /// tries to inject one).
     pub env_unset: Vec<String>,
     /// Argv to append to `command` when skip-permissions is requested (see
-    /// `EngineConfig::skip_permissions_argv`); not auto-appended to
-    /// `command` here -- `a start` never appends it (unchanged existing
-    /// behavior), and `a launch-spec`/`a launch-exec` append it themselves
-    /// unless `--no-skip-permissions` is given.
+    /// `EngineConfig::skip_permissions_argv`). `a start` appends this by
+    /// default (unless `--no-skip-permissions` or an explicit `-- argv`);
+    /// `a launch-spec`/`a launch-exec` do the same.
     pub skip_permissions_argv: Vec<String>,
     pub limits: Limits,
     pub history_bytes: usize,
