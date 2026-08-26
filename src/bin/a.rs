@@ -708,18 +708,86 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         None,
     );
     if let Err(error) = rpc {
+        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
+        if worker_alive {
+            return Err(error);
+        }
         // The worker exits once its workload is gone, so a terminal-phase
         // session has no socket to talk to; killing something already dead
-        // is success, not an error.
-        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
-        if !(matches!(record.phase, Phase::Exited | Phase::Failed) && !worker_alive) {
-            return Err(error);
+        // is success, not an error. A *broken* session (non-terminal phase,
+        // dead worker) is the harder case: its workload may have survived
+        // the worker (anything ignoring SIGHUP does), and the dead worker
+        // can neither kill it nor record its exit -- without this fallback
+        // such a workload is unkillable through the CLI and the session
+        // unreclaimable forever. The client is the only actor left, so it
+        // signals the workload's process group itself and retires the
+        // record.
+        if !matches!(record.phase, Phase::Exited | Phase::Failed) {
+            kill_broken_workload(&record, signal, args.grace_ms)?;
+            let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+            let mut current = read_record(&paths.record(record.id)).unwrap_or(record.clone());
+            current.phase = Phase::Failed;
+            current.error = Some(
+                "worker died without recording workload exit; workload killed by `a kill`"
+                    .into(),
+            );
+            current.updated_at_ms = now_ms();
+            atomic_write_json(&paths.record(record.id), &current)?;
+            let _ = fs::remove_dir_all(paths.runtime_session(record.id));
         }
     }
     if json_output {
         println!("{}", json!({"id":record.id,"signal":signal}));
     }
     Ok(())
+}
+
+/// Signals a broken session's surviving workload process group directly.
+/// The recorded workload pid could in principle have been recycled since
+/// the worker died, so before signalling anything the pid's identity is
+/// verified against the APLEXER_SESSION_ID environment variable the worker
+/// stamped into the workload at spawn; on any mismatch this fails closed.
+fn kill_broken_workload(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
+    let Some(pid) = record.workload_pid else {
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        return Ok(());
+    }
+    if !workload_identity_matches(pid, record.id) {
+        bail!(
+            "session {} is broken (worker dead) and pid {} no longer looks like its workload; \
+             refusing to signal it",
+            record.id,
+            pid
+        );
+    }
+    let pgid = pid as i32;
+    if unsafe { libc::kill(-pgid, signal) } != 0 {
+        return Err(io::Error::last_os_error()).context("signal workload process group");
+    }
+    if signal != libc::SIGKILL {
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        while process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if process_alive(pid) && workload_identity_matches(pid, record.id) {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workload_identity_matches(pid: u32, id: Uuid) -> bool {
+    let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let needle = format!("APLEXER_SESSION_ID={id}");
+    environ
+        .split(|b| *b == 0)
+        .any(|entry| entry == needle.as_bytes())
 }
 
 fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
