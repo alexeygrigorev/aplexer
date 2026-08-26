@@ -54,6 +54,13 @@ impl OutputHub {
     fn snapshot(&self, max: Option<usize>) -> Result<Vec<u8>> {
         Ok(lock(&self.inner)?.history.snapshot(max))
     }
+    /// Persists any history bytes the debounced append path hasn't written
+    /// yet; driven by a periodic thread so an idle session's tail doesn't
+    /// stay memory-only indefinitely, and called on finish for the final
+    /// state.
+    fn flush(&self) -> Result<()> {
+        lock(&self.inner)?.history.flush()
+    }
     fn subscribe(&self, max: Option<usize>) -> Result<(u64, Vec<u8>, mpsc::Receiver<OutputEvent>)> {
         let mut inner = lock(&self.inner)?;
         let history = inner.history.snapshot(max);
@@ -75,6 +82,9 @@ impl OutputHub {
     fn finish(&self, exit: ExitInfo) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.final_exit = Some(exit.clone());
+            if let Err(error) = inner.history.flush() {
+                eprintln!("aplexer worker: flush history at exit: {error:#}");
+            }
             for (_, tx) in inner.subscribers.drain() {
                 let _ = tx.send(OutputEvent::Exit(exit.clone()));
             }
@@ -276,6 +286,17 @@ pub fn run_worker(id: Uuid) -> Result<()> {
         active_connections: AtomicUsize::new(0),
     });
     let (life_tx, life_rx) = mpsc::channel();
+    {
+        // Debounced history persistence (see History::append) needs a
+        // periodic sweep so output followed by silence still reaches disk.
+        let runtime = runtime.clone();
+        thread::spawn(move || loop {
+            thread::sleep(HISTORY_FLUSH_INTERVAL);
+            if let Err(error) = runtime.output.flush() {
+                eprintln!("aplexer worker: flush history: {error:#}");
+            }
+        });
+    }
     spawn_pty_reader(master_read, runtime.clone(), life_tx.clone());
     spawn_child_waiter(child, life_tx);
     spawn_lifecycle(runtime.clone(), life_rx);
