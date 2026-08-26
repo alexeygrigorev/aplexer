@@ -82,8 +82,17 @@ pub fn message_paths(paths: &Paths, canonical_workspace: &Path) -> MessagePaths 
 
 /// Creates the workspace mailbox's directories (`0700`, spec.md 26) and its
 /// reverse-lookup `workspace.json` if missing, idempotently.
+///
+/// `ensure_private_dir` only chmods the exact path it's given, not any
+/// parent directories `fs::create_dir_all` had to create along the way --
+/// `${state_root}/messages/` itself would otherwise be created world/group-
+/// readable (whatever the process umask gives `create_dir_all`) the first
+/// time any workspace's mailbox is touched, since `Paths::ensure()` never
+/// creates it up front. So the shared `messages/` root is chmod'd
+/// explicitly here, before the per-workspace subdirectories.
 pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<MessagePaths> {
     let mp = message_paths(paths, canonical_workspace);
+    ensure_private_dir(&paths.state_root.join("messages"))?;
     ensure_private_dir(&mp.workspace_dir)?;
     ensure_private_dir(&mp.msgs_dir)?;
     ensure_private_dir(&mp.cursors_dir)?;
