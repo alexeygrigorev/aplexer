@@ -365,6 +365,26 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(worker_log));
+    if args.attach {
+        // We're about to attach right after the worker comes up (`a start
+        // --attach` / `a -`), so this client's terminal size is already
+        // known -- pass it through so the worker opens the workload's PTY
+        // at its real, final (reserved-row-adjusted) size from the start,
+        // instead of the 24x80 default that would otherwise be corrected a
+        // moment later by attach()'s own resize. See `run_worker`'s
+        // `initial_size` doc comment in src/worker.rs for the race this
+        // closes. A non-tty stdin (piped/scripted use) has no size to
+        // offer, so the worker falls back to its own default in that case,
+        // same as a detached start.
+        let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if let Some((rows, cols)) = tty.then(|| terminal_size(libc::STDIN_FILENO)).flatten() {
+            command
+                .arg("--rows")
+                .arg(reserved_rows(rows).to_string())
+                .arg("--cols")
+                .arg(cols.to_string());
+        }
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
