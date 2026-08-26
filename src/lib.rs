@@ -605,6 +605,17 @@ impl Config {
                 env: BTreeMap::new(),
             },
         );
+        // PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
+        // ::builtin_manifests) that aplexer's engine set was missing --
+        // required for aplexer to become authoritative for pocketshell's
+        // engine registry (pocketshell-integration-plan.md 0.1).
+        config.engines.insert(
+            "opencode".into(),
+            EngineConfig {
+                command: vec!["opencode".into()],
+                env: BTreeMap::new(),
+            },
+        );
         // Auto-discovered profiles (spec.md 9.2/23) go in as defaults before
         // the user's file is merged, exactly like the built-in engines above
         // -- an explicit `[profiles.<id>]` entry in the user's config still
