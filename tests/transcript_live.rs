@@ -256,11 +256,13 @@ fn agents_to_run() -> Vec<Agent> {
             profile: None,
         });
     }
-    if command_on_path("claude") {
+    if command_on_path("claude") && zlaude_available() {
+        // Default Anthropic Claude is often out of usage; this test uses the
+        // Z.AI-routed zlaude profile (`CLAUDE_CONFIG_DIR=~/.zlaude`).
         out.push(Agent {
             tag: "zsp",
             engine: "claude",
-            profile: zlaude_available().then_some("zlaude"),
+            profile: Some("zlaude"),
         });
     }
     if command_on_path("codex") {
@@ -389,6 +391,9 @@ fn transcript_follow_live_agents() {
         assert_eq!(me["id"].as_str(), Some(id.as_str()), "whoami id");
         assert_eq!(me["engine"].as_str(), Some(agent.engine), "whoami engine");
         assert_eq!(me["tag"].as_str(), Some(agent.tag), "whoami tag");
+        if let Some(profile) = agent.profile {
+            assert_eq!(me["profile"].as_str(), Some(profile), "whoami profile");
+        }
         let command: Vec<&str> = record["command"]
             .as_array()
             .unwrap()
