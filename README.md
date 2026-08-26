@@ -27,6 +27,25 @@ install -m 0755 target/release/a target/release/aplexer ~/.local/bin/
 
 Rust 1.78 or newer is recommended. Runtime state defaults to `$XDG_RUNTIME_DIR/aplexer`; durable records and bounded output history default to `$XDG_STATE_HOME/aplexer` (or `~/.local/state/aplexer`). Override these with `APLEXER_RUNTIME_DIR`, `APLEXER_STATE_DIR`, and `APLEXER_CONFIG`.
 
+## Shell completions
+
+`a completions <shell>` prints a completion script for `a`'s subcommands and flags to stdout (via [`clap_complete`](https://docs.rs/clap_complete)), covering `bash`, `zsh`, `fish`, `elvish`, and `powershell`. Install it once and open a new shell:
+
+```bash
+# bash (per-user; requires the bash-completion package to auto-load it)
+mkdir -p ~/.local/share/bash-completion/completions
+a completions bash > ~/.local/share/bash-completion/completions/a
+
+# zsh
+mkdir -p ~/.zfunc
+a completions zsh > ~/.zfunc/_a
+# then, before `compinit` in ~/.zshrc:
+#   fpath+=(~/.zfunc)
+
+# fish (auto-loaded, no extra config needed)
+a completions fish > ~/.config/fish/completions/a.fish
+```
+
 ## First session
 
 ```bash

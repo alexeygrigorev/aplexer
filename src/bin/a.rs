@@ -1,13 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use aplexer::messaging::*;
 use aplexer::*;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -38,25 +39,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start a new session (workspace + tag + engine/profile) and its worker.
     Start(StartArgs),
+    /// List sessions grouped by workspace.
     #[command(alias = "ls")]
     List(ListArgs),
+    /// Same as `list`, but always machine-readable (see also `list --json`).
     Snapshot(ListArgs),
+    /// Attach to a session's live PTY (Ctrl-] or Ctrl-b d to detach).
     Attach(AttachArgs),
+    /// Send input to a session without attaching.
     Send(SendArgs),
+    /// Print a session's captured output/scrollback.
     Capture(CaptureArgs),
+    /// Show a session's phase, exit info, and liveness.
     Status(TargetArgs),
+    /// Signal a session's workload and clean up its records.
     Kill(KillArgs),
+    /// Change a session's tag.
     Rename(RenameArgs),
+    /// List configured/discovered engines.
     Engines,
+    /// List configured profiles.
     Profiles,
+    /// Resolve engine/profile/env for a launch and print it (no session
+    /// created) -- internal integration point for pocketshell's launcher
+    /// shim, not meant for interactive use, so hidden from `a --help`.
+    #[command(hide = true)]
     LaunchSpec(LaunchArgs),
+    /// Resolve engine/profile/env for a launch and exec it (no session
+    /// created) -- internal integration point for pocketshell's launcher
+    /// shim, not meant for interactive use, so hidden from `a --help`.
+    #[command(hide = true)]
     LaunchExec(LaunchArgs),
+    /// Check aplexer's environment/config for problems.
     Doctor,
+    /// Print the current session's identity (workspace/tag/engine/profile).
     Whoami,
+    /// Send or read messages between sibling agent sessions.
     Message(MessageArgs),
+    /// Stream session lifecycle events.
     Watch(WatchArgs),
+    /// Read/follow a session's conversation transcript.
     Transcript(TranscriptArgs),
+    /// Print a shell completion script for `a` to stdout.
+    Completions(CompletionsArgs),
+    /// Print the attach-mode keyboard shortcuts (Ctrl-b prefix, detach).
+    Hotkeys,
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
@@ -79,6 +108,12 @@ struct QuickAttachArgs {
 #[derive(Args)]
 struct QuickLaunchArgs {
     rest: Vec<String>,
+}
+
+#[derive(Args)]
+struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    shell: Shell,
 }
 
 #[derive(Args)]
@@ -410,6 +445,8 @@ fn run() -> Result<()> {
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::Watch(args) => cmd_watch(&paths, args),
         Commands::Transcript(args) => cmd_transcript(&paths, args, cli.json),
+        Commands::Completions(args) => cmd_completions(args),
+        Commands::Hotkeys => cmd_hotkeys(),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
     }
@@ -1528,6 +1565,37 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     if !ok {
         bail!("one or more doctor checks failed");
     }
+    Ok(())
+}
+
+/// `a completions <shell>` -- writes the clap_complete-generated script for
+/// the given shell to stdout, completing for the `a` binary name itself
+/// (from `#[command(name = "a")]` on `Cli` above, not the `aplexer` package
+/// name), so callers just redirect it into whatever path their shell's
+/// completion loader scans.
+fn cmd_completions(args: CompletionsArgs) -> Result<()> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(args.shell, &mut cmd, name, &mut io::stdout());
+    Ok(())
+}
+
+/// `a hotkeys` -- a lookup command for the attach-mode Ctrl-b chords, kept in
+/// sync by hand with the startup banner (`"[aplexer attached; ...]"`, printed
+/// where `attach()` enters raw mode) and the `SwitchTarget` match arms in the
+/// attach loop's byte scanner -- there is one authoritative keymap, this just
+/// prints it somewhere you can look it up without already being attached.
+fn cmd_hotkeys() -> Result<()> {
+    println!("Attach-mode hotkeys (press Ctrl-b, then one of these):");
+    println!();
+    println!("  n / p    next / previous session in this workspace");
+    println!("  N / P    next / previous session, across all workspaces");
+    println!("  1-9      jump to that number from the status bar");
+    println!("  l        toggle back to the last session you were on");
+    println!("  d        detach (same as Ctrl-])");
+    println!();
+    println!("Detach directly:  Ctrl-]");
+    println!("Any other key after Ctrl-b is forwarded through untouched.");
     Ok(())
 }
 
