@@ -1214,7 +1214,17 @@ fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermG
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
-    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H");
+    // `\x1b[?25h` (DECTCEM show cursor) is included unconditionally: a
+    // full-screen TUI in the workload (htop, vim, an agent CLI's spinner,
+    // ...) commonly hides the cursor with `\x1b[?25l` while it owns the
+    // screen and relies on its own exit path to show it again -- but that
+    // exit path runs on the *workload's* side, and detaching doesn't wait
+    // for or depend on it. Without this, a detach can leave the user's real
+    // terminal with an invisible cursor after the workload's last draw
+    // happened to hide it. Showing an already-visible cursor is a no-op, so
+    // this is safe to send regardless of what state the workload (or our
+    // own status-bar redraw, which never hides the cursor) left it in.
+    let _ = write_locked(stdout, b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
 }
 
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
