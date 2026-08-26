@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use aplexer::messaging::*;
 use aplexer::*;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -49,6 +50,7 @@ enum Commands {
     Engines,
     Profiles,
     Doctor,
+    Message(MessageArgs),
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
@@ -171,6 +173,118 @@ struct RenameArgs {
     tag: Option<String>,
 }
 
+// -- Inter-agent messaging (docs/inter-agent-messaging-design.md, section 7) --
+
+#[derive(Args)]
+struct MessageArgs {
+    #[command(subcommand)]
+    command: MessageCommand,
+}
+
+#[derive(Subcommand)]
+enum MessageCommand {
+    /// Send a message to a tag, a broadcast, or an engine filter.
+    Send(MessageSendArgs),
+    /// Reply to a received message (threads via reply_to).
+    Reply(MessageReplyArgs),
+    /// List unread messages addressed to the calling session.
+    Inbox(MessageInboxArgs),
+    /// Show the whole workspace conversation, in id (time) order.
+    Log(MessageLogArgs),
+    /// Show one message by id.
+    Show(MessageShowArgs),
+    /// Acknowledge messages so they stop appearing in `inbox`.
+    Ack(MessageAckArgs),
+    /// Prune expired/over-cap messages from a workspace mailbox.
+    Gc(MessageGcArgs),
+}
+
+/// Flags shared by `send` and `reply` for choosing/framing pane delivery
+/// (design doc section 6.2).
+#[derive(Args)]
+struct PaneDeliveryArgs {
+    #[arg(long, help = "Inject as terminal input into the target's PTY instead of the durable inbox")]
+    pane: bool,
+    #[arg(long = "or-inbox", help = "If --pane delivery fails, fall back to an inbox send instead of erroring")]
+    or_inbox: bool,
+    #[arg(long, help = "With --pane: suppress the '[aplexer message from ...]' frame and trailing return")]
+    raw: bool,
+}
+
+#[derive(Args)]
+struct MessageSendArgs {
+    #[arg(long, value_name = "TAG", help = "Send to one session, addressed by tag")]
+    to: Option<String>,
+    #[arg(long, help = "Broadcast to every other session in the workspace")]
+    all: bool,
+    #[arg(long = "to-engine", value_name = "ENGINE", help = "Broadcast to sessions of one engine")]
+    to_engine: Option<String>,
+    #[arg(long, help = "Allow sending to a tag that has never existed in this workspace")]
+    queue: bool,
+    #[arg(long, default_value = "note", help = "note (default) | handoff | reply | any string")]
+    kind: String,
+    #[arg(long, value_name = "JSON", help = "Opaque structured payload")]
+    data: Option<String>,
+    #[command(flatten)]
+    pane_delivery: PaneDeliveryArgs,
+    #[arg(long, value_name = "TAG", help = "Sender identity override (default: APLEXER_TAG or anonymous)")]
+    from: Option<String>,
+    #[arg(value_name = "TEXT")]
+    text: String,
+}
+
+#[derive(Args)]
+struct MessageReplyArgs {
+    #[arg(value_name = "MESSAGE_ID")]
+    message_id: Uuid,
+    #[command(flatten)]
+    pane_delivery: PaneDeliveryArgs,
+    #[arg(long, value_name = "TAG")]
+    from: Option<String>,
+    #[arg(long, value_name = "JSON")]
+    data: Option<String>,
+    #[arg(long, value_name = "KIND", help = "Defaults to \"reply\"")]
+    kind: Option<String>,
+    #[arg(value_name = "TEXT")]
+    text: String,
+}
+
+#[derive(Args)]
+struct MessageInboxArgs {
+    #[arg(long, help = "Unread messages only (this is also the default with no flag)")]
+    new: bool,
+    #[arg(long, value_name = "TAG", help = "Consumer identity override (default: APLEXER_SESSION_ID)")]
+    from: Option<String>,
+}
+
+#[derive(Args)]
+struct MessageLogArgs {
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct MessageShowArgs {
+    #[arg(value_name = "MESSAGE_ID")]
+    message_id: Uuid,
+}
+
+#[derive(Args)]
+struct MessageAckArgs {
+    #[arg(value_name = "MESSAGE_ID")]
+    message_ids: Vec<Uuid>,
+    #[arg(long, help = "Ack every currently-unread message addressed to this consumer")]
+    all: bool,
+    #[arg(long, value_name = "TAG")]
+    from: Option<String>,
+}
+
+#[derive(Args)]
+struct MessageGcArgs {
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<PathBuf>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("a: {error:#}");
@@ -200,6 +314,7 @@ fn run() -> Result<()> {
         Commands::Engines => cmd_engines(&paths, cli.json),
         Commands::Profiles => cmd_profiles(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
+        Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
     }
@@ -1072,6 +1187,380 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::Exited => "exited",
         Phase::Failed => "failed",
     }
+}
+
+// -- Inter-agent messaging (docs/inter-agent-messaging-design.md) --
+
+/// Workspace for `send`/`reply`/`inbox`/`ack`/`show`, which take no
+/// `--workspace` flag (design doc section 7): `$APLEXER_WORKSPACE`, else
+/// cwd. `log`/`gc` accept an explicit override, passed as `explicit`.
+fn resolve_message_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return canonical_workspace(p);
+    }
+    if let Ok(v) = env::var("APLEXER_WORKSPACE") {
+        if !v.is_empty() {
+            return canonical_workspace(Path::new(&v));
+        }
+    }
+    canonical_workspace(Path::new("."))
+}
+
+/// Resolves the `--to`/`--all`/`--to-engine` triple into a `Recipient`,
+/// applying the typo guard of design doc section 2.3: a tag that has never
+/// existed in this workspace is rejected with the list of known tags unless
+/// `--queue` is passed. Broadcast/engine forms always succeed.
+fn build_recipient(
+    paths: &Paths,
+    workspace: &Path,
+    to: Option<&str>,
+    all: bool,
+    to_engine: Option<&str>,
+    queue: bool,
+) -> Result<Recipient> {
+    let chosen = [to.is_some(), all, to_engine.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if chosen == 0 {
+        bail!("specify exactly one of --to TAG, --all, or --to-engine ENGINE");
+    }
+    if chosen > 1 {
+        bail!("--to, --all, and --to-engine are mutually exclusive");
+    }
+    if let Some(tag) = to {
+        let existing = list_records(paths)?
+            .into_iter()
+            .find(|r| r.workspace == workspace && r.tag == tag);
+        if existing.is_none() && !queue {
+            let known = known_tags(paths, workspace);
+            let hint = if known.is_empty() {
+                "no session has ever run in this workspace".to_string()
+            } else {
+                format!("known tags: {}", known.join(", "))
+            };
+            bail!(
+                "no session tagged {tag:?} has ever existed in this workspace ({hint}); pass \
+                 --queue to park a message for a session that will be created later"
+            );
+        }
+        return Ok(Recipient::Tag {
+            tag: tag.to_string(),
+            session_id: existing.map(|r| r.id),
+        });
+    }
+    if all {
+        return Ok(Recipient::Broadcast { broadcast: true });
+    }
+    Ok(Recipient::Engine {
+        engine: to_engine.unwrap().to_string(),
+    })
+}
+
+/// Pane delivery (design doc section 6.2): reuses `a send`'s own PTY-write
+/// RPC path (`Operation::Send`, `rpc_send` below) -- the client resolves the
+/// target session and connects to its worker socket directly, exactly like
+/// `a send <target> <text>` does today. No new server-side RPC operation.
+fn deliver_pane(paths: &Paths, workspace: &Path, tag: &str, from_tag: Option<&str>, body: &str, raw: bool) -> Result<()> {
+    if body.as_bytes().len() > MAX_BODY_BYTES {
+        bail!("message body exceeds the {MAX_BODY_BYTES}-byte cap");
+    }
+    let record = list_records(paths)?
+        .into_iter()
+        .find(|r| r.workspace == workspace && r.tag == tag)
+        .ok_or_else(|| anyhow!("no session tagged {tag:?} in this workspace"))?;
+    let alive = record.worker_pid.map(process_alive).unwrap_or(false);
+    if !alive {
+        bail!("session {tag:?} is not running; pane delivery requires a live target");
+    }
+    let framed = if raw {
+        body.as_bytes().to_vec()
+    } else {
+        let sender = from_tag.unwrap_or("external");
+        format!("[aplexer message from {sender}] {body}\r").into_bytes()
+    };
+    rpc_send(&record, &framed).with_context(|| format!("inject into session {tag:?}'s PTY"))
+}
+
+fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
+    raw.map(|s| serde_json::from_str::<Value>(s).context("--data must be valid JSON"))
+        .transpose()
+}
+
+/// Shared send/reply tail: attempts `--pane` delivery if requested (falling
+/// back to inbox on failure iff `--or-inbox`), then always writes the
+/// message to the durable mailbox -- pane-delivered messages are recorded
+/// too (with `delivery: pane`, pre-acked for the recipient) so the mailbox
+/// stays a complete account of inter-agent traffic (design doc section 6.2).
+fn finish_send(
+    paths: &Paths,
+    workspace: &Path,
+    mut envelope: MessageEnvelope,
+    pane: &PaneDeliveryArgs,
+) -> Result<MessageEnvelope> {
+    if pane.pane {
+        let Recipient::Tag { tag, .. } = &envelope.to else {
+            bail!("--pane requires a single --to TAG target: no pane broadcast");
+        };
+        let tag = tag.clone();
+        match deliver_pane(paths, workspace, &tag, envelope.from.tag.as_deref(), &envelope.body, pane.raw) {
+            Ok(()) => envelope.delivery = Delivery::Pane,
+            Err(e) => {
+                if pane.or_inbox {
+                    eprintln!("a: pane delivery failed ({e:#}); falling back to inbox");
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    write_message(paths, &envelope)?;
+    if envelope.delivery == Delivery::Pane {
+        if let Recipient::Tag { session_id: Some(sid), .. } = &envelope.to {
+            // Best-effort: a pane message is already delivered by
+            // definition, so a failure to also pre-ack it here is a
+            // cosmetic mailbox-record issue, not a delivery failure
+            // (design doc section 6.2).
+            let _ = ack_messages(paths, workspace, *sid, &[envelope.id]);
+        }
+    }
+    let _ = maybe_gc(paths, workspace);
+    Ok(envelope)
+}
+
+fn print_message_line(m: &MessageEnvelope) {
+    let sender = m
+        .from
+        .tag
+        .clone()
+        .unwrap_or_else(|| if m.from.external { "external".into() } else { "?".into() });
+    let to_desc = match &m.to {
+        Recipient::Tag { tag, .. } => format!("to:{tag}"),
+        Recipient::Broadcast { .. } => "to:*".to_string(),
+        Recipient::Engine { engine } => format!("to:engine:{engine}"),
+    };
+    let delivery = match m.delivery {
+        Delivery::Inbox => "",
+        Delivery::Pane => " [pane]",
+    };
+    let first_line = m.body.lines().next().unwrap_or("");
+    println!("{}  [{}] {sender} -> {to_desc}{delivery}  {first_line}", m.id, m.kind);
+}
+
+fn print_message_details(m: &MessageEnvelope) {
+    println!("id: {}", m.id);
+    println!("workspace: {}", m.workspace.display());
+    println!("created_at: {}", m.created_at);
+    let sender = m
+        .from
+        .tag
+        .clone()
+        .unwrap_or_else(|| if m.from.external { "(external)".into() } else { "(unknown)".into() });
+    println!(
+        "from: {sender}{}",
+        m.from
+            .engine
+            .as_deref()
+            .map(|e| format!(" [{e}]"))
+            .unwrap_or_default()
+    );
+    match &m.to {
+        Recipient::Tag { tag, .. } => println!("to: {tag}"),
+        Recipient::Broadcast { .. } => println!("to: * (broadcast)"),
+        Recipient::Engine { engine } => println!("to: engine:{engine}"),
+    }
+    println!("kind: {}", m.kind);
+    if let Some(r) = m.reply_to {
+        println!("reply_to: {r}");
+    }
+    println!(
+        "delivery: {}",
+        match m.delivery {
+            Delivery::Inbox => "inbox",
+            Delivery::Pane => "pane",
+        }
+    );
+    println!("---");
+    println!("{}", m.body);
+    if let Some(d) = &m.data {
+        println!("---");
+        println!("data: {d}");
+    }
+}
+
+fn cmd_message(paths: &Paths, args: MessageArgs, json_output: bool) -> Result<()> {
+    match args.command {
+        MessageCommand::Send(a) => cmd_message_send(paths, a, json_output),
+        MessageCommand::Reply(a) => cmd_message_reply(paths, a, json_output),
+        MessageCommand::Inbox(a) => cmd_message_inbox(paths, a, json_output),
+        MessageCommand::Log(a) => cmd_message_log(paths, a, json_output),
+        MessageCommand::Show(a) => cmd_message_show(paths, a, json_output),
+        MessageCommand::Ack(a) => cmd_message_ack(paths, a, json_output),
+        MessageCommand::Gc(a) => cmd_message_gc(paths, a, json_output),
+    }
+}
+
+fn cmd_message_send(paths: &Paths, args: MessageSendArgs, json_output: bool) -> Result<()> {
+    if args.pane_delivery.pane && (args.all || args.to_engine.is_some()) {
+        bail!("--pane cannot be combined with --all or --to-engine: no pane broadcast");
+    }
+    if args.pane_delivery.pane && args.to.is_none() {
+        bail!("--pane requires --to TAG");
+    }
+    check_body_size(&args.text)?;
+    let workspace = resolve_message_workspace(None)?;
+    let data = parse_data_arg(args.data.as_deref())?;
+    let from = resolve_sender(paths, &workspace, args.from.as_deref())?;
+    let to = build_recipient(paths, &workspace, args.to.as_deref(), args.all, args.to_engine.as_deref(), args.queue)?;
+    let envelope = MessageEnvelope {
+        schema_version: MESSAGE_SCHEMA_VERSION,
+        id: Uuid::now_v7(),
+        workspace: workspace.clone(),
+        created_at: now_secs(),
+        from,
+        to,
+        kind: args.kind,
+        reply_to: None,
+        body: args.text,
+        data,
+        delivery: Delivery::Inbox,
+    };
+    let envelope = finish_send(paths, &workspace, envelope, &args.pane_delivery)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!("{}", envelope.id);
+    }
+    Ok(())
+}
+
+fn cmd_message_reply(paths: &Paths, args: MessageReplyArgs, json_output: bool) -> Result<()> {
+    check_body_size(&args.text)?;
+    let workspace = resolve_message_workspace(None)?;
+    let original = read_message(paths, &workspace, args.message_id)
+        .with_context(|| format!("no such message {}", args.message_id))?;
+    let to_tag = original.from.tag.clone().ok_or_else(|| {
+        anyhow!("original message {} was sent anonymously (no sender tag); reply with `a message send --to <tag>` instead", args.message_id)
+    })?;
+    let data = parse_data_arg(args.data.as_deref())?;
+    let from = resolve_sender(paths, &workspace, args.from.as_deref())?;
+    let target = list_records(paths)?
+        .into_iter()
+        .find(|r| r.workspace == workspace && r.tag == to_tag);
+    let to = Recipient::Tag {
+        tag: to_tag,
+        session_id: target.map(|r| r.id).or(original.from.session_id),
+    };
+    let envelope = MessageEnvelope {
+        schema_version: MESSAGE_SCHEMA_VERSION,
+        id: Uuid::now_v7(),
+        workspace: workspace.clone(),
+        created_at: now_secs(),
+        from,
+        to,
+        kind: args.kind.unwrap_or_else(|| "reply".to_string()),
+        reply_to: Some(original.id),
+        body: args.text,
+        data,
+        delivery: Delivery::Inbox,
+    };
+    let envelope = finish_send(paths, &workspace, envelope, &args.pane_delivery)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!("{}", envelope.id);
+    }
+    Ok(())
+}
+
+fn cmd_message_inbox(paths: &Paths, args: MessageInboxArgs, json_output: bool) -> Result<()> {
+    let _ = args.new; // `--new` is accepted for CLI-surface compatibility; unread is already the default (design doc section 7).
+    let workspace = resolve_message_workspace(None)?;
+    let (consumer_id, consumer_tag, consumer_engine) = resolve_consumer(paths, &workspace, args.from.as_deref())?;
+    let _ = maybe_gc(paths, &workspace);
+    let cursor = read_cursor(paths, &workspace, consumer_id)?;
+    let messages: Vec<MessageEnvelope> = list_messages(paths, &workspace)?
+        .into_iter()
+        .filter(|m| addressed_to(m, consumer_id, &consumer_tag, &consumer_engine))
+        .filter(|m| !cursor.is_acked(m.id))
+        .collect();
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&messages)?);
+    } else if messages.is_empty() {
+        println!("no unread messages");
+    } else {
+        for m in &messages {
+            print_message_line(m);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_message_log(paths: &Paths, args: MessageLogArgs, json_output: bool) -> Result<()> {
+    let workspace = resolve_message_workspace(args.workspace.as_deref())?;
+    let _ = maybe_gc(paths, &workspace);
+    let messages = list_messages(paths, &workspace)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&messages)?);
+    } else if messages.is_empty() {
+        println!("no messages");
+    } else {
+        for m in &messages {
+            print_message_line(m);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_message_show(paths: &Paths, args: MessageShowArgs, json_output: bool) -> Result<()> {
+    let workspace = resolve_message_workspace(None)?;
+    let message = read_message(paths, &workspace, args.message_id)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&message)?);
+    } else {
+        print_message_details(&message);
+    }
+    Ok(())
+}
+
+fn cmd_message_ack(paths: &Paths, args: MessageAckArgs, json_output: bool) -> Result<()> {
+    if args.all && !args.message_ids.is_empty() {
+        bail!("cannot combine --all with explicit message ids");
+    }
+    if !args.all && args.message_ids.is_empty() {
+        bail!("specify at least one message id, or --all");
+    }
+    let workspace = resolve_message_workspace(None)?;
+    let (consumer_id, consumer_tag, consumer_engine) = resolve_consumer(paths, &workspace, args.from.as_deref())?;
+    let ids: Vec<Uuid> = if args.all {
+        let cursor = read_cursor(paths, &workspace, consumer_id)?;
+        list_messages(paths, &workspace)?
+            .into_iter()
+            .filter(|m| addressed_to(m, consumer_id, &consumer_tag, &consumer_engine))
+            .filter(|m| !cursor.is_acked(m.id))
+            .map(|m| m.id)
+            .collect()
+    } else {
+        args.message_ids
+    };
+    ack_messages(paths, &workspace, consumer_id, &ids)?;
+    if json_output {
+        println!("{}", json!({"acked": ids}));
+    } else {
+        println!("acked {} message(s)", ids.len());
+    }
+    Ok(())
+}
+
+fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Result<()> {
+    let workspace = resolve_message_workspace(args.workspace.as_deref())?;
+    let report = gc_workspace(paths, &workspace)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("removed {} message(s), {} remaining", report.removed, report.remaining);
+    }
+    Ok(())
 }
 
 fn connect(record: &SessionRecord) -> Result<UnixStream> {
