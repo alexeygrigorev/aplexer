@@ -401,6 +401,18 @@ fn spawn_workload(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Provider-key safety strip (pocketshell-integration-plan.md 0.2): the
+    // workload must not inherit these vars from the WORKER's own process
+    // environment either, not just avoid getting them freshly set above --
+    // `Command` starts from a clone of this process's environment, so an
+    // ambient `ANTHROPIC_API_KEY` etc in the worker's own env would
+    // otherwise leak straight into the spawned agent. Removed last, after
+    // `.envs(&record.env)`, so the strip always wins even over a profile
+    // that (deliberately or not) tries to set one of these names --
+    // matches pocketshell's own `agents.py::build_env` ordering.
+    for name in &record.env_unset {
+        command.env_remove(name);
+    }
     unsafe {
         command.pre_exec(move || {
             libc::close(master_fd);

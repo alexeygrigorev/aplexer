@@ -475,6 +475,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         command: launch.command,
         cwd: canonical_workspace(&launch.cwd).unwrap_or(launch.cwd),
         env: launch.env,
+        env_unset: launch.env_unset,
         limits: launch.limits,
         history_bytes: launch.history_bytes,
         created_at_ms: now,
