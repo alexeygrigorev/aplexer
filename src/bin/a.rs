@@ -898,6 +898,20 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             current.updated_at_ms = now_ms();
             atomic_write_json(&paths.record(record.id), &current)?;
             let _ = fs::remove_dir_all(paths.runtime_session(record.id));
+        } else {
+            // Already terminal with a dead worker: there's nothing left to
+            // signal. `a kill` is the only command a user would think to
+            // reach for to clean up a finished session, so treat this as
+            // "remove it" rather than a silent no-op -- otherwise it lingers
+            // in `a list` forever with no way to get rid of it. Take the
+            // registry lock the same way `cmd_start`'s superseding logic
+            // does, to avoid racing a concurrent `a start` that might be
+            // reclaiming the same workspace+tag at the same moment.
+            let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+            fs::remove_dir_all(paths.state_session(record.id))
+                .with_context(|| format!("remove finished session {}", record.id))?;
+            let _ = fs::remove_dir_all(paths.runtime_session(record.id));
+            eprintln!("a: removed {} session {}", phase_name(&record.phase), record.id);
         }
     }
     if json_output {
