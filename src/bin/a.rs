@@ -411,7 +411,12 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         println!("{}", ready.selector());
     }
     if args.attach {
-        attach(&ready, Some(ready.history_bytes))?;
+        // `None` here means "use attach()'s small default replay", not
+        // "replay the whole configured history buffer" -- ready.history_bytes
+        // is the session's *storage capacity* (up to DEFAULT_HISTORY_BYTES =
+        // 4MB), an unrelated setting from how much of it a fresh attach
+        // should actually replay onto the screen.
+        attach(&ready, None)?;
     }
     Ok(())
 }
@@ -1067,9 +1072,25 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
     Ok(frame.payload)
 }
 
+/// Default amount of history replayed on attach when the caller didn't ask
+/// for more via `--history-bytes`. The old default -- passing `None` through
+/// to the server, which `History::snapshot` treats as "the whole buffer" --
+/// meant every attach replayed up to the session's entire configured
+/// history capacity (DEFAULT_HISTORY_BYTES = 4MB), which looks like the
+/// session "rewinding" through its whole scrollback instead of showing
+/// anything resembling the current screen. There's no real terminal
+/// emulator here (spec.md's v1 non-goal), so this can only approximate
+/// "current state" by replaying a short tail of raw bytes -- in practice
+/// that tail still usually contains the shell/TUI's own recent
+/// cursor-position/clear escapes and renders close enough.
+const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
+
 fn attach(record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     let mut reader = connect(record)?;
-    let request = Request::new(Operation::Attach { history_bytes });
+    let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
+    let request = Request::new(Operation::Attach {
+        history_bytes: replay_bytes,
+    });
     let id = request.request_id.clone();
     write_json(&mut reader, &request)?;
     let response: Response =
