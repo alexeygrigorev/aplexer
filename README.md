@@ -66,7 +66,7 @@ Built-ins (before any config file is read):
 command = ["$SHELL", "-l"]   # resolved from $SHELL at load time, "/bin/sh" as a last resort
 
 [engines.codex]
-command = ["codex"]
+command = ["codex", "-c", "check_for_update_on_startup=false"]
 
 [engines.claude]
 command = ["claude"]
@@ -78,12 +78,7 @@ command = ["gemini"]
 command = ["grok"]
 ```
 
-Override or add one in your config file the same way, e.g. to suppress codex's update check:
-
-```toml
-[engines.codex]
-command = ["codex", "-c", "check_for_update_on_startup=false"]
-```
+Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703).
 
 ### Profiles
 

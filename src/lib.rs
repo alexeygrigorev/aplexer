@@ -785,7 +785,11 @@ impl Config {
         config.engines.insert(
             "codex".into(),
             EngineConfig {
-                command: vec!["codex".into()],
+                command: vec![
+                    "codex".into(),
+                    "-c".into(),
+                    "check_for_update_on_startup=false".into(),
+                ],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
                 // ported from pocketshell engines.py's codex LaunchSpec
