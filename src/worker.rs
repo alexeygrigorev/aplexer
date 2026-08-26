@@ -482,10 +482,13 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
     let id = request.request_id.clone();
     match request.operation {
         Operation::Ping => write_json(&mut stream, &Response::ok(id, json!({"pong":true})))?,
-        Operation::Status => write_json(
-            &mut stream,
-            &Response::ok(id, serde_json::to_value(runtime.record()?)?),
-        )?,
+        Operation::Status => {
+            let mut value = serde_json::to_value(runtime.record()?)?;
+            if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
+                value["cgroup"] = cgroup.stats();
+            }
+            write_json(&mut stream, &Response::ok(id, value))?;
+        }
         Operation::Send { bytes } => {
             let next = read_frame(&mut stream)?.ok_or_else(|| anyhow!("missing data frame"))?;
             if next.kind != FrameKind::Data || next.payload.len() != bytes {

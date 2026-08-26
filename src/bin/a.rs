@@ -355,9 +355,16 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
 
 fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &target)?;
-    let current = rpc_status(&record).unwrap_or(record);
+    let raw = rpc_simple(&record, Operation::Status, None)
+        .unwrap_or_else(|_| serde_json::to_value(&record).unwrap_or(Value::Null));
+    let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
+    let cgroup_stats = raw.get("cgroup").cloned();
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&current)?);
+        let mut value = serde_json::to_value(&current)?;
+        if let Some(stats) = cgroup_stats {
+            value["cgroup"] = stats;
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
@@ -390,6 +397,9 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
                 "exit: code={:?} signal={:?} oom_killed={}",
                 exit.code, exit.signal, exit.oom_killed
             );
+        }
+        if let Some(stats) = cgroup_stats {
+            println!("cgroup: {stats}");
         }
         if let Some(error) = current.error {
             println!("error: {error}");
@@ -591,10 +601,6 @@ fn phase_name(phase: &Phase) -> &'static str {
 fn connect(record: &SessionRecord) -> Result<UnixStream> {
     UnixStream::connect(&record.socket_path)
         .with_context(|| format!("connect {}", record.socket_path.display()))
-}
-fn rpc_status(record: &SessionRecord) -> Result<SessionRecord> {
-    let value = rpc_simple(record, Operation::Status, None)?;
-    Ok(serde_json::from_value(value)?)
 }
 fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
     let mut stream = connect(record)?;

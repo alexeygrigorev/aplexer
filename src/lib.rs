@@ -930,6 +930,28 @@ impl Cgroup {
         read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0)
             > self.initial_oom_kill
     }
+    /// Live telemetry for a still-running cgroup. A workload's own OOM kill
+    /// only shows up in the session record's `exit` field once the tracked
+    /// PTY-owning process itself exits -- a subprocess it launched can be
+    /// OOM-killed by the kernel while the shell survives, which is common
+    /// and otherwise invisible. `a status` surfaces this live instead of
+    /// only at session exit.
+    pub fn stats(&self) -> serde_json::Value {
+        let read_value = |name: &str| -> Option<u64> {
+            fs::read_to_string(self.path.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        };
+        let oom_kill_total = read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0);
+        serde_json::json!({
+            "memory_current": read_value("memory.current"),
+            "memory_peak": read_value("memory.peak"),
+            "memory_swap_current": read_value("memory.swap.current"),
+            "oom_kill_count": oom_kill_total,
+            "oom_kill_count_since_start": oom_kill_total.saturating_sub(self.initial_oom_kill),
+            "populated": self.populated(),
+        })
+    }
     pub fn cleanup(&self) {
         self.release_anchor();
         let _ = fs::remove_dir(&self.path);
