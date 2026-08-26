@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aplexer"
+version = "0.1.0"
+description = "Prebuilt CLI binaries for aplexer, the daemonless PTY session runtime"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Terminals",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/alexeygrigorev/aplexer"
+Repository = "https://github.com/alexeygrigorev/aplexer"
+Issues = "https://github.com/alexeygrigorev/aplexer/issues"
+
+[project.scripts]
+aplexer = "aplexer_cli._main:main_aplexer"
+a = "aplexer_cli._main:main_a"
+
+[tool.setuptools.packages.find]
+include = ["aplexer_cli*"]
+
+[tool.setuptools.package-data]
+aplexer_cli = ["bin/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
