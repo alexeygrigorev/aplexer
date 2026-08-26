@@ -819,6 +819,13 @@ impl Cgroup {
             .arg("Delegate=yes");
         if let Some(value) = limits.memory_bytes {
             command.arg("-p").arg(format!("MemoryMax={value}"));
+            // Without a swap cap, hitting MemoryMax doesn't OOM-kill the
+            // workload -- it swaps unboundedly instead, which both defeats
+            // the purpose of a memory limit and risks host-wide I/O
+            // pressure that *would* leak into unrelated sessions. A
+            // memory-limited session gets no swap; a configurable swap
+            // allowance is not yet exposed by the CLI.
+            command.arg("-p").arg("MemorySwapMax=0");
         }
         if let Some(value) = limits.pids {
             command.arg("-p").arg(format!("TasksMax={value}"));
