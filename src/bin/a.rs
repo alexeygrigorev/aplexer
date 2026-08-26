@@ -725,34 +725,97 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     // Group by workspace as a compact tree -- spec.md's own presentation of
     // the model (sections 2 and 22.1) is a workspace tree with tags
     // underneath, not a flat table repeating the workspace on every row.
-    // `a <N>` quick-attach (see cmd_quick_attach) numbers workspaces and
-    // sessions using this exact same grouping, so what a user sees here is
-    // what those numbers mean.
+    // `a <N>` quick-attach (see cmd_quick_attach/resolve_quick_index) numbers
+    // workspaces and sessions using this exact same grouping, so the
+    // `[N]`/session-index prefixes printed below are not decoration -- they
+    // are the literal numbers `a <N>` and `a <N> <M>` resolve against.
     let by_workspace = group_by_workspace(records);
     let home = env::var_os("HOME").map(PathBuf::from);
-    for (workspace, group) in &by_workspace {
-        println!(
-            "{} ({})",
-            display_workspace(workspace, home.as_deref()),
-            running_summary(group)
-        );
+    let color = color_enabled();
+    for (workspace_index, (workspace, group)) in by_workspace.iter().enumerate() {
+        if workspace_index > 0 {
+            println!();
+        }
+        let (running, total) = running_count(group);
+        let (dot, dot_color) = workspace_glyph(running, total);
+        let badge = paint(color, &format!("{ANSI_BOLD}{ANSI_CYAN}"), &format!("[{}]", workspace_index + 1));
+        let name = paint(color, ANSI_BOLD, &display_workspace(workspace, home.as_deref()));
+        let summary = paint(color, dot_color, &format!("{dot} {}", running_summary(group)));
+        println!("{badge} {name} ({summary})");
         let last = group.len().saturating_sub(1);
         for (i, r) in group.iter().enumerate() {
-            let connector = if i == last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251c}\u{2500}\u{2500}" };
+            let connector_raw = if i == last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251c}\u{2500}\u{2500}" };
+            let connector = paint(color, ANSI_GRAY, connector_raw);
+            let idx = paint(color, ANSI_DIM, &format!("{:>2}", i + 1));
+            let tag = paint(color, ANSI_BOLD, &format!("{:<14}", r.tag));
             let ep = match &r.profile {
                 Some(p) => format!("{}/{}", r.engine, p),
                 None => r.engine.clone(),
             };
+            let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
             let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-            println!(
-                "{connector} {:<14} {:<16} {}",
-                r.tag,
-                ep,
-                display_state(&r.phase, alive),
-            );
+            let state = display_state(&r.phase, alive);
+            let (sdot, scolor) = state_glyph(state);
+            let state = paint(color, scolor, &format!("{sdot} {state}"));
+            println!("{connector} {idx}  {tag} {ep} {state}");
         }
     }
+    if !by_workspace.is_empty() {
+        println!();
+        println!("{}", paint(color, ANSI_DIM, "Attach: a <workspace#> [session#|tag]"));
+        println!(
+            "{}",
+            paint(color, ANSI_DIM, "e.g. a 3 2, a 3 zsp, or a 3 for its first session")
+        );
+    }
     Ok(())
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GRAY: &str = "\x1b[90m";
+
+/// Colors only when stdout is a real terminal and the user hasn't opted out
+/// via `NO_COLOR` (https://no-color.org) -- `a list | grep foo` or similar
+/// piping must never see escape codes.
+fn color_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+/// Wraps already-padded plain text in `code`/reset -- callers must pad
+/// widths (`{:<14}` etc.) on the plain string BEFORE calling this, since
+/// padding a string that already contains escape codes counts the invisible
+/// bytes toward the width and breaks column alignment.
+fn paint(enabled: bool, code: &str, text: &str) -> String {
+    if enabled {
+        format!("{code}{text}{ANSI_RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
+fn state_glyph(state: &str) -> (&'static str, &'static str) {
+    match state {
+        "running" => ("\u{25CF}", ANSI_GREEN),
+        "starting" | "exiting" => ("\u{25D0}", ANSI_YELLOW),
+        "failed" | "broken" => ("\u{2717}", ANSI_RED),
+        _ => ("\u{25CB}", ANSI_GRAY), // "exited"
+    }
+}
+
+fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str) {
+    if running == total {
+        ("\u{25CF}", ANSI_GREEN)
+    } else if running == 0 {
+        ("\u{25CB}", ANSI_GRAY)
+    } else {
+        ("\u{25D0}", ANSI_YELLOW)
+    }
 }
 
 /// A persisted `phase` of Starting/Running/Exiting only means the worker
@@ -785,7 +848,7 @@ fn display_workspace(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-fn running_summary(group: &[SessionRecord]) -> String {
+fn running_count(group: &[SessionRecord]) -> (usize, usize) {
     let running = group
         .iter()
         .filter(|r| {
@@ -793,7 +856,11 @@ fn running_summary(group: &[SessionRecord]) -> String {
             display_state(&r.phase, alive) == "running"
         })
         .count();
-    let total = group.len();
+    (running, group.len())
+}
+
+fn running_summary(group: &[SessionRecord]) -> String {
+    let (running, total) = running_count(group);
     if running == total {
         format!("running {running}")
     } else if running == 0 {
