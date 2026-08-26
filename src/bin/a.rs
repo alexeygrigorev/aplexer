@@ -56,6 +56,8 @@ enum Commands {
     Whoami,
     Message(MessageArgs),
     Watch(WatchArgs),
+    Exec(ExecArgs),
+    Transcript(TranscriptArgs),
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
@@ -197,6 +199,53 @@ struct WatchArgs {
     all: bool,
     #[arg(long, value_name = "PATH")]
     workspace: Option<PathBuf>,
+}
+
+/// `a exec` -- headless one-shot agent invocation (docs: `src/
+/// agent_events.rs` module doc comment). Not a persistent session: no
+/// workspace/tag, no worker, no PTY -- see `--engine`'s doc comment on why
+/// this can't just reuse `a start`.
+#[derive(Args)]
+struct ExecArgs {
+    /// Which agent CLI to invoke headlessly. Only engines with a documented
+    /// non-interactive structured-output mode are supported (see
+    /// `agent_events::build_headless_argv`).
+    #[arg(long, value_name = "claude|codex|grok")]
+    engine: String,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Resume a prior engine-native session/thread id (NOT an aplexer
+    /// session id). Plain explicit-id resume only -- heru's "continue the
+    /// latest session" sentinel is deferred (see the module's doc comment
+    /// in src/agent_events.rs / this feature's commit history).
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(value_name = "PROMPT")]
+    prompt: String,
+}
+
+/// `a transcript` -- reads a running or finished aplexer session's
+/// UNDERLYING engine's own native, persisted conversation log (the file the
+/// agent CLI already writes during an ordinary interactive session), not a
+/// special headless invocation. Complementary to `a exec`: see
+/// src/agent_events.rs's module doc comment for the full distinction.
+#[derive(Args)]
+struct TranscriptArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    /// Only the last N (post `--kind` filtering) parsed events -- pagination
+    /// for "show me the last 5 messages" style reads instead of always
+    /// dumping the whole transcript.
+    #[arg(long, value_name = "N")]
+    last: Option<usize>,
+    /// Filter to one UnifiedEvent kind (message|tool_call|tool_result|
+    /// error|usage) before applying --last.
+    #[arg(long)]
+    kind: Option<String>,
 }
 
 #[derive(Args)]
@@ -355,6 +404,8 @@ fn run() -> Result<()> {
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::Watch(args) => cmd_watch(&paths, args),
+        Commands::Exec(args) => cmd_exec(&paths, args, cli.json),
+        Commands::Transcript(args) => cmd_transcript(&paths, args, cli.json),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
     }
@@ -1457,6 +1508,105 @@ fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
         .map(canonical_workspace)
         .transpose()?;
     aplexer::watch::run(paths, args.all, workspace.as_deref())
+}
+
+/// `a exec --engine <claude|codex|grok> [--profile P] [--cwd D]
+/// [--resume ID] [--model M] "<prompt>"` -- headless one-shot invocation,
+/// streaming normalized `UnifiedEvent` JSONL (with `--json`) or a compact
+/// human rendering (without it, matching `a launch-spec`'s dual-mode
+/// convention) as the agent runs, then exits. See src/agent_events.rs's
+/// module doc comment for the full design (why no PTY, what's ported from
+/// heru, what's deferred).
+///
+/// Reuses `Config::resolve` for the base command/profile env/env_unset --
+/// same infra `a launch-spec`/`a launch-exec` build on -- then layers the
+/// engine's own headless/structured-output flags on top via
+/// `agent_events::build_headless_argv` (a genuinely different argv shape
+/// from the engine's normal interactive launch command).
+fn cmd_exec(paths: &Paths, args: ExecArgs, json_output: bool) -> Result<()> {
+    let config = Config::load(paths)?;
+    let workspace = canonical_workspace(Path::new("."))?;
+    let launch = config.resolve(
+        Vec::new(),
+        Some(args.engine.as_str()),
+        args.profile.as_deref(),
+        &workspace,
+        args.cwd.as_deref(),
+        &BTreeMap::new(),
+        &Limits::default(),
+        None,
+    )?;
+    let argv = aplexer::agent_events::build_headless_argv(
+        &launch.engine,
+        &launch.command,
+        &args.prompt,
+        args.resume.as_deref(),
+        args.model.as_deref(),
+    )?;
+    let cwd = canonical_workspace(&launch.cwd).unwrap_or(launch.cwd);
+    let exit_code = aplexer::agent_events::run_exec(
+        &launch.engine,
+        &argv,
+        &cwd,
+        &launch.env,
+        &launch.env_unset,
+        json_output,
+    )?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// `a transcript [SESSION] [--last N] [--kind K]` -- reads an aplexer
+/// session's UNDERLYING engine's own native, persisted conversation log
+/// (claude/codex only in this pass; see src/agent_events.rs). Complementary
+/// to `a exec`: this needs no special launch mode at all, since the file
+/// already exists because the agent ran (or is running) normally under
+/// `a start`/`a attach`.
+fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Result<()> {
+    let record = resolve(paths, &args.target)?;
+    let path = match record.engine.as_str() {
+        "claude" => aplexer::agent_events::locate_claude_transcript(&record.cwd, record.created_at_ms),
+        "codex" => aplexer::agent_events::locate_codex_transcript(&record.cwd, record.created_at_ms),
+        other => bail!(
+            "a transcript supports claude and codex only (got engine {other}); \
+             grok/opencode native-transcript support is deferred, see the a-exec-and-transcript commit"
+        ),
+    }
+    .ok_or_else(|| {
+        anyhow!(
+            "no {} transcript found for session {} (cwd {}); the agent may not have written anything yet",
+            record.engine,
+            record.id,
+            record.cwd.display()
+        )
+    })?;
+    let mut events = aplexer::agent_events::read_transcript_events(&record.engine, &path)?;
+    if let Some(kind) = &args.kind {
+        events.retain(|e| e.kind == kind);
+    }
+    if let Some(n) = args.last {
+        if events.len() > n {
+            events = events.split_off(events.len() - n);
+        }
+    }
+    if json_output {
+        for event in &events {
+            println!("{}", serde_json::to_string(event)?);
+        }
+    } else {
+        println!(
+            "transcript: {} ({} events, engine {})",
+            path.display(),
+            events.len(),
+            record.engine
+        );
+        for event in &events {
+            println!("{}", aplexer::agent_events::render_human(event));
+        }
+    }
+    Ok(())
 }
 
 fn path_check(name: &str, path: &Path) -> Value {
