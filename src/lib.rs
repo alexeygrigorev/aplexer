@@ -428,6 +428,13 @@ pub struct EngineConfig {
     /// / `_ordered_env_unset_union`).
     #[serde(default)]
     pub env_unset: Vec<String>,
+    /// Argv appended after `command` when skip-permissions is requested
+    /// (ported from PocketShell's `LaunchSpec.skip_permissions_argv` /
+    /// `engines.py::builtin_manifests`). Empty means the engine has no such
+    /// flag (e.g. `opencode`, `shell`) -- permissions are config-driven or
+    /// not applicable.
+    #[serde(default)]
+    pub skip_permissions_argv: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProfileConfig {
@@ -698,6 +705,7 @@ impl Config {
                 command: vec![shell, "-l".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                skip_permissions_argv: Vec::new(),
             },
         );
         config.engines.insert(
@@ -706,6 +714,8 @@ impl Config {
                 command: vec!["codex".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                // ported from pocketshell engines.py's codex LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             },
         );
         config.engines.insert(
@@ -714,6 +724,8 @@ impl Config {
                 command: vec!["claude".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                // ported from pocketshell engines.py's claude LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
             },
         );
         config.engines.insert(
@@ -722,6 +734,10 @@ impl Config {
                 command: vec!["gemini".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                // no pocketshell source for a gemini skip-permissions flag
+                // (gemini is an aplexer-only extra, not in pocketshell's
+                // built-in manifest) -- left empty.
+                skip_permissions_argv: Vec::new(),
             },
         );
         config.engines.insert(
@@ -730,6 +746,8 @@ impl Config {
                 command: vec!["grok".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                // ported from pocketshell engines.py's grok LaunchSpec
+                skip_permissions_argv: vec!["--always-approve".into()],
             },
         );
         // PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
@@ -742,6 +760,9 @@ impl Config {
                 command: vec!["opencode".into()],
                 env: BTreeMap::new(),
                 env_unset: Vec::new(),
+                // opencode has no skip-permissions flag in pocketshell's
+                // manifest -- permissions are config-driven (opencode.json).
+                skip_permissions_argv: Vec::new(),
             },
         );
         // Auto-discovered profiles (spec.md 9.2/23) go in as defaults before
@@ -904,6 +925,7 @@ impl Config {
             cwd: launch_cwd,
             env: merged_env,
             env_unset,
+            skip_permissions_argv: engine.skip_permissions_argv.clone(),
             limits: merged_limits,
             history_bytes: history_bytes
                 .or_else(|| profile.and_then(|p| p.history_bytes))
@@ -926,6 +948,12 @@ pub struct ResolvedLaunch {
     /// the provider-key strip runs last so it beats even a profile that
     /// tries to inject one).
     pub env_unset: Vec<String>,
+    /// Argv to append to `command` when skip-permissions is requested (see
+    /// `EngineConfig::skip_permissions_argv`); not auto-appended to
+    /// `command` here -- `a start` never appends it (unchanged existing
+    /// behavior), and `a launch-spec`/`a launch-exec` append it themselves
+    /// unless `--no-skip-permissions` is given.
+    pub skip_permissions_argv: Vec<String>,
     pub limits: Limits,
     pub history_bytes: usize,
 }
@@ -1600,6 +1628,7 @@ mod tests {
                 // deliberately includes a name already in the forced list
                 // (to exercise dedup) plus one new name.
                 env_unset: vec!["ANTHROPIC_API_KEY".into(), "MY_CUSTOM_VAR".into()],
+                skip_permissions_argv: Vec::new(),
             },
         );
         let launch = config
@@ -1631,6 +1660,37 @@ mod tests {
             launch.env_unset.len(),
             PROVIDER_ENV_UNSET_VARS.len() + 1,
             "union must be exactly the forced list plus the one new custom name"
+        );
+    }
+    #[test]
+    fn skip_permissions_argv_ported_values() {
+        let config = Config {
+            engines: BTreeMap::from([(
+                "claude".to_string(),
+                EngineConfig {
+                    command: vec!["claude".into()],
+                    env: BTreeMap::new(),
+                    env_unset: Vec::new(),
+                    skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
+                },
+            )]),
+            ..Config::default()
+        };
+        let launch = config
+            .resolve(
+                Vec::new(),
+                Some("claude"),
+                None,
+                Path::new("/tmp"),
+                None,
+                &BTreeMap::new(),
+                &Limits::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            launch.skip_permissions_argv,
+            vec!["--dangerously-skip-permissions".to_string()]
         );
     }
 }
