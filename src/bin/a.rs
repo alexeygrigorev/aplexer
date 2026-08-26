@@ -1382,7 +1382,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         None
     };
     if tty {
-        eprintln!("[aplexer attached; Ctrl-] detaches]");
+        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches]");
     }
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
@@ -1408,24 +1408,74 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
-        while input_active.load(Ordering::Relaxed) {
+        // Ctrl-b (0x02) immediately followed by `d` (0x64) detaches, same as
+        // Ctrl-] -- tmux's actual default prefix-key detach binding, added
+        // so tmux muscle memory works here too. This state has to survive
+        // across separate read() calls (not just within one buffer): Ctrl-b
+        // can legitimately arrive as the very last byte of one read and `d`
+        // as the first byte of the next.
+        //
+        // Design choice: real tmux turns Ctrl-b into a standing "prefix"
+        // that consumes the next keystroke as a command (or no-ops/bells if
+        // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
+        // has no such command-prefix system and isn't growing one just for
+        // this, so the simplest reasonable behavior is used instead: Ctrl-b
+        // followed by `d` detaches; Ctrl-b followed by anything else is not
+        // a prefix at all -- both bytes are forwarded through as ordinary
+        // input, so a program that wants a literal Ctrl-b (some editors and
+        // REPLs use it) isn't broken by this feature when the user doesn't
+        // follow it with `d`.
+        let mut pending_ctrl_b = false;
+        'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            if tty {
-                if let Some(pos) = buffer[..n].iter().position(|b| *b == 0x1d) {
-                    if pos > 0 {
-                        let _ = send_data(&input_writer, &buffer[..pos]);
+            if !tty {
+                if send_data(&input_writer, &buffer[..n]).is_err() {
+                    break;
+                }
+                continue;
+            }
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0;
+            while i < n {
+                let byte = buffer[i];
+                if pending_ctrl_b {
+                    pending_ctrl_b = false;
+                    if byte == b'd' {
+                        if !out.is_empty() {
+                            let _ = send_data(&input_writer, &out);
+                        }
+                        let _ = send_control(&input_writer, &AttachControl::Detach);
+                        input_active.store(false, Ordering::Relaxed);
+                        break 'outer;
+                    }
+                    // Not a detach: forward the withheld Ctrl-b and then
+                    // reprocess this byte normally (it might itself be
+                    // Ctrl-] or a fresh Ctrl-b).
+                    out.push(0x02);
+                    continue;
+                }
+                if byte == 0x1d {
+                    if !out.is_empty() {
+                        let _ = send_data(&input_writer, &out);
                     }
                     let _ = send_control(&input_writer, &AttachControl::Detach);
                     input_active.store(false, Ordering::Relaxed);
-                    break;
+                    break 'outer;
                 }
+                if byte == 0x02 {
+                    pending_ctrl_b = true;
+                    i += 1;
+                    continue;
+                }
+                out.push(byte);
+                i += 1;
             }
-            if send_data(&input_writer, &buffer[..n]).is_err() {
+            if !out.is_empty() && send_data(&input_writer, &out).is_err() {
                 break;
             }
         }
