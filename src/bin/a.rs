@@ -49,6 +49,7 @@ enum Commands {
     Engines,
     Profiles,
     Doctor,
+    Whoami,
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
     #[command(hide = true)]
@@ -199,6 +200,7 @@ fn run() -> Result<()> {
         Commands::Rename(args) => cmd_rename(&paths, args, cli.json),
         Commands::Engines => cmd_engines(&paths, cli.json),
         Commands::Profiles => cmd_profiles(&paths, cli.json),
+        Commands::Whoami => cmd_whoami(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::QuickAttach(args) => cmd_quick_attach(&paths, args),
         Commands::QuickLaunch(args) => cmd_quick_launch(&paths, args),
@@ -1018,6 +1020,44 @@ fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
                 p.engine.as_deref().unwrap_or("(default)")
             );
         }
+    }
+    Ok(())
+}
+
+/// `a whoami` -- lets an agent or script running INSIDE a session (or a
+/// human at its prompt) ask "am I in an aplexer session, and if so which
+/// one" without hand-parsing environment variables. Every workload already
+/// has APLEXER_SESSION_ID/WORKSPACE/TAG injected (see spawn_workload in
+/// worker.rs) -- this just resolves the id against the session's persisted
+/// record for the fuller picture (engine, profile, phase) and gives a
+/// stable, scriptable "nothing/non-zero if not inside one" contract, the
+/// same shape `$TMUX` serves for tmux but structured instead of a bare path.
+fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
+    let Some(id_text) = env::var_os("APLEXER_SESSION_ID").and_then(|v| v.into_string().ok())
+    else {
+        // Deliberately silent on stdout either way -- a script doing
+        // `id=$(a whoami --json)` should see empty output and rely on the
+        // exit code, not have to filter out a "not in a session" sentence.
+        if !json_output {
+            eprintln!("not inside an aplexer session");
+        }
+        std::process::exit(1);
+    };
+    let id: Uuid = id_text
+        .parse()
+        .with_context(|| format!("APLEXER_SESSION_ID {id_text:?} is not a valid UUID"))?;
+    let record = read_record(&paths.record(id))
+        .with_context(|| format!("session {id} (from APLEXER_SESSION_ID) has no persisted record"))?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        println!("id: {}", record.id);
+        println!("selector: {}", record.selector());
+        println!("engine: {}", record.engine);
+        if let Some(profile) = &record.profile {
+            println!("profile: {profile}");
+        }
+        println!("state: {}", phase_name(&record.phase));
     }
     Ok(())
 }
