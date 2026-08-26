@@ -436,6 +436,16 @@ pub struct EngineConfig {
     #[serde(default)]
     pub skip_permissions_argv: Vec<String>,
 }
+impl EngineConfig {
+    /// The forced provider-key union this engine's launches will actually
+    /// get (see `Config::resolve`'s doc comment) -- exposed so `a engines
+    /// --json` (pocketshell-integration-plan.md 0.5) can report it without
+    /// needing a full `Config::resolve` call (which requires a
+    /// workspace/cwd that a plain engine listing has no reason to invent).
+    pub fn resolved_env_unset(&self) -> Vec<String> {
+        ordered_env_unset_union(&self.env_unset)
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProfileConfig {
     #[serde(default)]

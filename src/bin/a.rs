@@ -1182,7 +1182,26 @@ fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> 
 
 fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
     let config = Config::load(paths)?;
-    let values=config.engines.iter().map(|(name,e)|json!({"name":name,"command":e.command,"available":command_exists(&e.command)})).collect::<Vec<_>>();
+    // Shape stays lean (name/command/available) rather than growing to match
+    // pocketshell's fuller EngineManifest (label/family/provider_mark are
+    // presentation concerns aplexer has no reason to own) -- the one
+    // addition is env_unset, exposed as the actual resolved list (not just
+    // a count) now that 0.2 makes it meaningful
+    // (pocketshell-integration-plan.md 0.5).
+    let values = config
+        .engines
+        .iter()
+        .map(|(name, e)| {
+            let env_unset = e.resolved_env_unset();
+            json!({
+                "name": name,
+                "command": e.command,
+                "available": command_exists(&e.command),
+                "env_unset_count": env_unset.len(),
+                "env_unset": env_unset,
+            })
+        })
+        .collect::<Vec<_>>();
     if json_output {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
