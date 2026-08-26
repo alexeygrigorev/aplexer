@@ -550,6 +550,7 @@ mod tests {
             command: vec!["claude".into()],
             cwd: "/tmp".into(),
             env: Default::default(),
+            env_unset: Default::default(),
             limits: Default::default(),
             history_bytes: 0,
             created_at_ms: 0,

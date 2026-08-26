@@ -3,6 +3,7 @@ use aplexer::messaging::*;
 use aplexer::*;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -49,6 +50,8 @@ enum Commands {
     Rename(RenameArgs),
     Engines,
     Profiles,
+    LaunchSpec(LaunchArgs),
+    LaunchExec(LaunchArgs),
     Doctor,
     Whoami,
     Message(MessageArgs),
@@ -107,6 +110,22 @@ struct StartArgs {
     startup_timeout_ms: u64,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
+}
+
+#[derive(Args)]
+struct LaunchArgs {
+    #[arg(long)]
+    engine: Option<String>,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Suppress the engine's `skip_permissions_argv` (see `EngineConfig`) --
+    /// the phone/desktop send this to opt OUT; skip-permissions argv is
+    /// appended by default (matches pocketshell's own
+    /// `--skip-permissions/--no-skip-permissions` default=True).
+    #[arg(long)]
+    no_skip_permissions: bool,
 }
 
 #[derive(Args, Clone)]
@@ -330,6 +349,8 @@ fn run() -> Result<()> {
         Commands::Rename(args) => cmd_rename(&paths, args, cli.json),
         Commands::Engines => cmd_engines(&paths, cli.json),
         Commands::Profiles => cmd_profiles(&paths, cli.json),
+        Commands::LaunchSpec(args) => cmd_launch_spec(&paths, args, cli.json),
+        Commands::LaunchExec(args) => cmd_launch_exec(&paths, args),
         Commands::Whoami => cmd_whoami(&paths, cli.json),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
@@ -475,6 +496,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         command: launch.command,
         cwd: canonical_workspace(&launch.cwd).unwrap_or(launch.cwd),
         env: launch.env,
+        env_unset: launch.env_unset,
         limits: launch.limits,
         history_bytes: launch.history_bytes,
         created_at_ms: now,
@@ -1160,7 +1182,26 @@ fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> 
 
 fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
     let config = Config::load(paths)?;
-    let values=config.engines.iter().map(|(name,e)|json!({"name":name,"command":e.command,"available":command_exists(&e.command)})).collect::<Vec<_>>();
+    // Shape stays lean (name/command/available) rather than growing to match
+    // pocketshell's fuller EngineManifest (label/family/provider_mark are
+    // presentation concerns aplexer has no reason to own) -- the one
+    // addition is env_unset, exposed as the actual resolved list (not just
+    // a count) now that 0.2 makes it meaningful
+    // (pocketshell-integration-plan.md 0.5).
+    let values = config
+        .engines
+        .iter()
+        .map(|(name, e)| {
+            let env_unset = e.resolved_env_unset();
+            json!({
+                "name": name,
+                "command": e.command,
+                "available": command_exists(&e.command),
+                "env_unset_count": env_unset.len(),
+                "env_unset": env_unset,
+            })
+        })
+        .collect::<Vec<_>>();
     if json_output {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
@@ -1202,6 +1243,132 @@ fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolution result shared by `a launch-spec` and `a launch-exec` -- both
+/// wrap the exact same `Config::resolve` that `a start` uses
+/// (pocketshell-integration-plan.md 0.3/0.4); they differ only in what they
+/// do with it (print JSON vs execvpe). Neither creates a session or spawns
+/// a worker -- pure resolution/preview.
+struct LaunchPreview {
+    engine: String,
+    profile: Option<String>,
+    argv: Vec<String>,
+    env_set: BTreeMap<String, String>,
+    env_unset: Vec<String>,
+    cwd: PathBuf,
+}
+
+fn build_launch_preview(paths: &Paths, args: &LaunchArgs) -> Result<LaunchPreview> {
+    let config = Config::load(paths)?;
+    // launch-spec/launch-exec intentionally have no --workspace flag (only
+    // --cwd, matching the plan doc's exact flag list) -- the process's own
+    // current directory is only a fallback for Config::resolve's cwd
+    // default when neither --cwd nor a selected profile supplies one; a
+    // future pocketshell shim always passes --cwd explicitly (its --dir).
+    let workspace = canonical_workspace(Path::new("."))?;
+    let launch = config.resolve(
+        Vec::new(),
+        args.engine.as_deref(),
+        args.profile.as_deref(),
+        &workspace,
+        args.cwd.as_deref(),
+        &BTreeMap::new(),
+        &Limits::default(),
+        None,
+    )?;
+    // The DEFAULT includes the engine's skip-permissions argv appended;
+    // --no-skip-permissions opts OUT (matches pocketshell's own
+    // `--skip-permissions/--no-skip-permissions` default=True). `a start`
+    // never does this -- unlike env_unset, skip-permissions argv is a
+    // launch-spec/launch-exec-only behavior, not forced onto every session.
+    let mut argv = launch.command.clone();
+    if !args.no_skip_permissions {
+        argv.extend(launch.skip_permissions_argv.clone());
+    }
+    let cwd = canonical_workspace(&launch.cwd).unwrap_or(launch.cwd);
+    Ok(LaunchPreview {
+        engine: launch.engine,
+        profile: launch.profile,
+        argv,
+        env_set: launch.env,
+        env_unset: launch.env_unset,
+        cwd,
+    })
+}
+
+/// `a launch-spec [--engine E] [--profile P] [--no-skip-permissions]
+/// [--cwd D] --json` (pocketshell-integration-plan.md 0.3) -- prints the
+/// resolved `{engine, profile, argv, env_set, env_unset, cwd}` without
+/// creating a session or spawning anything.
+fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result<()> {
+    let preview = build_launch_preview(paths, &args)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "engine": preview.engine,
+                "profile": preview.profile,
+                "argv": preview.argv,
+                "env_set": preview.env_set,
+                "env_unset": preview.env_unset,
+                "cwd": preview.cwd,
+            }))?
+        );
+    } else {
+        println!("engine: {}", preview.engine);
+        if let Some(p) = &preview.profile {
+            println!("profile: {p}");
+        }
+        println!("cwd: {}", preview.cwd.display());
+        println!(
+            "argv: {}",
+            preview
+                .argv
+                .iter()
+                .map(|s| shell_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (k, v) in &preview.env_set {
+            println!("env set:   {k}={v}");
+        }
+        println!(
+            "env unset: {} vars ({})",
+            preview.env_unset.len(),
+            preview.env_unset.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// `a launch-exec [same flags as launch-spec]`
+/// (pocketshell-integration-plan.md 0.4) -- the `execvpe` variant of
+/// `launch-spec`: same resolution, but replaces this process with the
+/// resolved command instead of printing it. The resolved `env_unset` is
+/// applied (via `env_remove`) AFTER `env_set`, so the provider-key strip
+/// always wins even over an explicitly-set value -- same ordering worker.rs's
+/// spawn_workload uses. Drop-in exec-step target for a future pocketshell
+/// `agents.py::launch_agent` shim.
+fn cmd_launch_exec(paths: &Paths, args: LaunchArgs) -> Result<()> {
+    let preview = build_launch_preview(paths, &args)?;
+    let program = preview
+        .argv
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("resolved launch has an empty argv"))?;
+    let mut command = Command::new(&program);
+    command
+        .args(&preview.argv[1..])
+        .current_dir(&preview.cwd)
+        .envs(&preview.env_set);
+    for name in &preview.env_unset {
+        command.env_remove(name);
+    }
+    // CommandExt::exec() only returns on failure (it replaces this process
+    // on success), so reaching this line is always an error.
+    let error = command.exec();
+    Err(error).with_context(|| format!("exec {program}"))
 }
 
 /// `a whoami` -- lets an agent or script running INSIDE a session (or a

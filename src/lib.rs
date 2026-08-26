@@ -213,6 +213,12 @@ pub struct SessionRecord {
     pub cwd: PathBuf,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Vars the worker must strip from the spawned workload's environment
+    /// (see `ResolvedLaunch::env_unset`; `#[serde(default)]` so records
+    /// written before this field existed still parse, as an empty list --
+    /// no retroactive unsetting for already-running/old sessions).
+    #[serde(default)]
+    pub env_unset: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
     pub history_bytes: usize,
@@ -413,6 +419,32 @@ pub struct EngineConfig {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Additional vars to unset at spawn time, on top of the forced
+    /// `PROVIDER_ENV_UNSET_VARS` union computed in `Config::resolve` -- a
+    /// user-configured engine in `~/.config/aplexer/config.toml` can only
+    /// ADD to that union, never opt out of it (see `Config::resolve` doc
+    /// comment for why this is load-bearing, ported from PocketShell's
+    /// `tools/pocketshell/src/pocketshell/engines.py::LaunchSpec.env_unset`
+    /// / `_ordered_env_unset_union`).
+    #[serde(default)]
+    pub env_unset: Vec<String>,
+    /// Argv appended after `command` when skip-permissions is requested
+    /// (ported from PocketShell's `LaunchSpec.skip_permissions_argv` /
+    /// `engines.py::builtin_manifests`). Empty means the engine has no such
+    /// flag (e.g. `opencode`, `shell`) -- permissions are config-driven or
+    /// not applicable.
+    #[serde(default)]
+    pub skip_permissions_argv: Vec<String>,
+}
+impl EngineConfig {
+    /// The forced provider-key union this engine's launches will actually
+    /// get (see `Config::resolve`'s doc comment) -- exposed so `a engines
+    /// --json` (pocketshell-integration-plan.md 0.5) can report it without
+    /// needing a full `Config::resolve` call (which requires a
+    /// workspace/cwd that a plain engine listing has no reason to invent).
+    pub fn resolved_env_unset(&self) -> Vec<String> {
+        ordered_env_unset_union(&self.env_unset)
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProfileConfig {
@@ -564,6 +596,113 @@ fn discover_profiles() -> BTreeMap<String, ProfileConfig> {
     out
 }
 
+/// Provider API-key-style env vars unset for every agent-engine launch, so
+/// the agent falls back to its subscription auth instead of a per-token env
+/// key. Ported verbatim (same order) from PocketShell's
+/// `tools/pocketshell/src/pocketshell/engines.py::PROVIDER_ENV_UNSET_VARS`
+/// (maintainer decision, pocketshell issue #703 -- subscription billing
+/// across the board for codex/claude/opencode). `Config::resolve` unions
+/// this with each engine's own `EngineConfig.env_unset`; the union is
+/// forced (see that function's doc comment) -- a user config can only add
+/// to this list, never remove from it.
+const PROVIDER_ENV_UNSET_VARS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GROQ_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_API_KEY",
+    "VERTEX_LOCATION",
+    "VERTEX_AI_PROJECT",
+    "DEEPSEEK_API_KEY",
+    "XAI_API_KEY",
+    "FIREWORKS_API_KEY",
+    "CEREBRAS_API_KEY",
+    "OPENROUTER_API_KEY",
+    "TOGETHER_API_KEY",
+    "TOGETHER_AI_API_KEY",
+    "AZURE_API_KEY",
+    "AZURE_RESOURCE_NAME",
+    "AZURE_COGNITIVE_SERVICES_RESOURCE_NAME",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_GATEWAY_ID",
+    "CLOUDFLARE_API_KEY",
+    "HUGGING_FACE_API_KEY",
+    "HF_TOKEN",
+    "HF_API_TOKEN",
+    "MOONSHOT_API_KEY",
+    "MOONSHOTAI_API_KEY",
+    "MINIMAX_API_KEY",
+    "NEBIUS_API_KEY",
+    "DEEPINFRA_API_KEY",
+    "BASETEN_API_KEY",
+    "VENICE_API_KEY",
+    "SCALEWAY_API_KEY",
+    "OVH_API_KEY",
+    "CORTECS_API_KEY",
+    "IONET_API_KEY",
+    "VERCEL_API_KEY",
+    "ZENMUX_API_KEY",
+    "ZAI_API_KEY",
+    "HELICONE_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENCODE_ZEN_API_KEY",
+    "GITLAB_TOKEN",
+    "GITLAB_INSTANCE_URL",
+    "GITLAB_AI_GATEWAY_URL",
+    "GITLAB_OAUTH_CLIENT_ID",
+    "AICORE_SERVICE_KEY",
+    "AICORE_DEPLOYMENT_ID",
+    "AICORE_RESOURCE_GROUP",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "LMSTUDIO_API_KEY",
+    "OLLAMA_API_KEY",
+    "302AI_API_KEY",
+    "FIRMWARE_API_KEY",
+    "2AI_API_KEY",
+    "GEMINI_API_KEY",
+];
+
+/// Union `PROVIDER_ENV_UNSET_VARS` with an engine's own `env_unset`
+/// additions, preserving first-seen order and dropping blanks -- ports
+/// `engines.py::_ordered_env_unset_union`. The forced list always comes
+/// first and is always present in the result; callers cannot construct a
+/// smaller list by only passing `extra`.
+fn ordered_env_unset_union(extra: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for name in PROVIDER_ENV_UNSET_VARS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra.iter().cloned())
+    {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn load(paths: &Paths) -> Result<Self> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -575,6 +714,8 @@ impl Config {
             EngineConfig {
                 command: vec![shell, "-l".into()],
                 env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                skip_permissions_argv: Vec::new(),
             },
         );
         config.engines.insert(
@@ -582,6 +723,9 @@ impl Config {
             EngineConfig {
                 command: vec!["codex".into()],
                 env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's codex LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             },
         );
         config.engines.insert(
@@ -589,6 +733,9 @@ impl Config {
             EngineConfig {
                 command: vec!["claude".into()],
                 env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's claude LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
             },
         );
         config.engines.insert(
@@ -596,6 +743,11 @@ impl Config {
             EngineConfig {
                 command: vec!["gemini".into()],
                 env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // no pocketshell source for a gemini skip-permissions flag
+                // (gemini is an aplexer-only extra, not in pocketshell's
+                // built-in manifest) -- left empty.
+                skip_permissions_argv: Vec::new(),
             },
         );
         config.engines.insert(
@@ -603,6 +755,24 @@ impl Config {
             EngineConfig {
                 command: vec!["grok".into()],
                 env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's grok LaunchSpec
+                skip_permissions_argv: vec!["--always-approve".into()],
+            },
+        );
+        // PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
+        // ::builtin_manifests) that aplexer's engine set was missing --
+        // required for aplexer to become authoritative for pocketshell's
+        // engine registry (pocketshell-integration-plan.md 0.1).
+        config.engines.insert(
+            "opencode".into(),
+            EngineConfig {
+                command: vec!["opencode".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // opencode has no skip-permissions flag in pocketshell's
+                // manifest -- permissions are config-driven (opencode.json).
+                skip_permissions_argv: Vec::new(),
             },
         );
         // Auto-discovered profiles (spec.md 9.2/23) go in as defaults before
@@ -748,12 +918,24 @@ impl Config {
             .map(Path::to_path_buf)
             .or_else(|| profile.and_then(|p| p.cwd.clone()))
             .unwrap_or_else(|| workspace.to_path_buf());
+        // Forced provider-key union (pocketshell-integration-plan.md 1.4/0.2):
+        // `PROVIDER_ENV_UNSET_VARS` always comes first and is always
+        // present, regardless of what `engine.env_unset` (sourced from
+        // `~/.config/aplexer/config.toml`, possibly a fully user-defined
+        // custom engine) contains -- a custom engine can only ADD names to
+        // this list, never remove or replace it. Callers (`a start`, and
+        // later `a launch-spec`/`a launch-exec`) are expected to actually
+        // apply this list at spawn time (see worker.rs's spawn_workload),
+        // not just report it.
+        let env_unset = ordered_env_unset_union(&engine.env_unset);
         Ok(ResolvedLaunch {
             engine: selected_engine,
             profile: selected_profile,
             command,
             cwd: launch_cwd,
             env: merged_env,
+            env_unset,
+            skip_permissions_argv: engine.skip_permissions_argv.clone(),
             limits: merged_limits,
             history_bytes: history_bytes
                 .or_else(|| profile.and_then(|p| p.history_bytes))
@@ -769,6 +951,19 @@ pub struct ResolvedLaunch {
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Forced union of `PROVIDER_ENV_UNSET_VARS` with the engine's own
+    /// `env_unset` -- vars that must be absent from the spawned workload's
+    /// environment, applied AFTER `env` at spawn time (an unset always wins
+    /// over a set, matching pocketshell's `agents.py::build_env` ordering:
+    /// the provider-key strip runs last so it beats even a profile that
+    /// tries to inject one).
+    pub env_unset: Vec<String>,
+    /// Argv to append to `command` when skip-permissions is requested (see
+    /// `EngineConfig::skip_permissions_argv`); not auto-appended to
+    /// `command` here -- `a start` never appends it (unchanged existing
+    /// behavior), and `a launch-spec`/`a launch-exec` append it themselves
+    /// unless `--no-skip-permissions` is given.
+    pub skip_permissions_argv: Vec<String>,
     pub limits: Limits,
     pub history_bytes: usize,
 }
@@ -1427,5 +1622,85 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);
+    }
+    /// The load-bearing property from pocketshell-integration-plan.md 0.2: a
+    /// custom engine's own (smaller/different) `env_unset` can only ADD to
+    /// the forced provider-key union, never replace or shrink it.
+    #[test]
+    fn env_unset_union_is_forced() {
+        let mut config = Config::default();
+        config.default_engine = Some("custom".into());
+        config.engines.insert(
+            "custom".into(),
+            EngineConfig {
+                command: vec!["true".into()],
+                env: BTreeMap::new(),
+                // deliberately includes a name already in the forced list
+                // (to exercise dedup) plus one new name.
+                env_unset: vec!["ANTHROPIC_API_KEY".into(), "MY_CUSTOM_VAR".into()],
+                skip_permissions_argv: Vec::new(),
+            },
+        );
+        let launch = config
+            .resolve(
+                Vec::new(),
+                None,
+                None,
+                Path::new("/tmp"),
+                None,
+                &BTreeMap::new(),
+                &Limits::default(),
+                None,
+            )
+            .unwrap();
+        for name in PROVIDER_ENV_UNSET_VARS {
+            assert!(
+                launch.env_unset.iter().any(|v| v == name),
+                "forced provider var {name} missing from env_unset"
+            );
+        }
+        assert!(launch.env_unset.iter().any(|v| v == "MY_CUSTOM_VAR"));
+        let count = launch
+            .env_unset
+            .iter()
+            .filter(|v| v.as_str() == "ANTHROPIC_API_KEY")
+            .count();
+        assert_eq!(count, 1, "ANTHROPIC_API_KEY must not be duplicated");
+        assert_eq!(
+            launch.env_unset.len(),
+            PROVIDER_ENV_UNSET_VARS.len() + 1,
+            "union must be exactly the forced list plus the one new custom name"
+        );
+    }
+    #[test]
+    fn skip_permissions_argv_ported_values() {
+        let config = Config {
+            engines: BTreeMap::from([(
+                "claude".to_string(),
+                EngineConfig {
+                    command: vec!["claude".into()],
+                    env: BTreeMap::new(),
+                    env_unset: Vec::new(),
+                    skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
+                },
+            )]),
+            ..Config::default()
+        };
+        let launch = config
+            .resolve(
+                Vec::new(),
+                Some("claude"),
+                None,
+                Path::new("/tmp"),
+                None,
+                &BTreeMap::new(),
+                &Limits::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            launch.skip_permissions_argv,
+            vec!["--dangerously-skip-permissions".to_string()]
+        );
     }
 }
