@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+pub mod messaging;
 pub mod worker;
 
 use anyhow::{anyhow, bail, Context, Result};
