@@ -282,10 +282,29 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == args.tag)
     {
-        bail!(
-            "workspace+tag already belongs to session {}; rename it or choose a different tag",
+        // A session that reached a terminal phase and whose worker is gone
+        // is finished: starting anew on the same workspace+tag supersedes
+        // it (there is no other way to reclaim the tag -- the v1 CLI has no
+        // remove command). A live session, or a "broken" one (non-terminal
+        // phase, dead worker) whose workload may still be running, keeps
+        // its claim and start still refuses.
+        let worker_alive = existing.worker_pid.map(process_alive).unwrap_or(false);
+        let finished =
+            matches!(existing.phase, Phase::Exited | Phase::Failed) && !worker_alive;
+        if !finished {
+            bail!(
+                "workspace+tag already belongs to session {}; rename it or choose a different tag",
+                existing.id
+            );
+        }
+        eprintln!(
+            "a: superseding {} session {}",
+            phase_name(&existing.phase),
             existing.id
         );
+        fs::remove_dir_all(paths.state_session(existing.id))
+            .with_context(|| format!("remove superseded session {}", existing.id))?;
+        let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
     }
     let id = Uuid::new_v4();
     ensure_private_dir(&paths.state_session(id))?;
