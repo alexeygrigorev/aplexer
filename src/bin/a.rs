@@ -811,6 +811,7 @@ fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> 
         args.text = args.target.selector.take();
     }
     let record = resolve(paths, &args.target)?;
+    check_attachable(&record)?;
     let mut data = if args.stdin {
         let mut v = Vec::new();
         io::stdin().read_to_end(&mut v)?;
@@ -842,12 +843,24 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
     let record = resolve(paths, &args.target)?;
     let data = match rpc_capture(&record, args.bytes) {
         Ok(data) => data,
-        Err(_) => {
-            let bytes = fs::read(&record.history_path)
-                .context("worker unavailable and persisted history cannot be read")?;
-            let n = args.bytes.unwrap_or(bytes.len()).min(bytes.len());
-            bytes[bytes.len() - n..].to_vec()
-        }
+        // No live worker to ask -- capture still has a sensible fallback
+        // here (unlike attach/send), since a dead session's last-known
+        // output is still sitting in its persisted history file. Only when
+        // that ALSO comes up empty (e.g. the session never produced any
+        // output before exiting) is there truly nothing to show; in that
+        // case, give the same clear reason attach/send would rather than
+        // the raw filesystem error from the failed read.
+        Err(_) => match fs::read(&record.history_path) {
+            Ok(bytes) => {
+                let n = args.bytes.unwrap_or(bytes.len()).min(bytes.len());
+                bytes[bytes.len() - n..].to_vec()
+            }
+            Err(read_error) => {
+                check_attachable(&record)?;
+                return Err(read_error)
+                    .context("worker unavailable and persisted history cannot be read");
+            }
+        },
     };
     if let Some(path) = args.output {
         fs::write(&path, &data).with_context(|| format!("write {}", path.display()))?;
@@ -900,6 +913,20 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             current.updated_at_ms = now_ms();
             atomic_write_json(&paths.record(record.id), &current)?;
             let _ = fs::remove_dir_all(paths.runtime_session(record.id));
+        } else {
+            // Already terminal with a dead worker: there's nothing left to
+            // signal. `a kill` is the only command a user would think to
+            // reach for to clean up a finished session, so treat this as
+            // "remove it" rather than a silent no-op -- otherwise it lingers
+            // in `a list` forever with no way to get rid of it. Take the
+            // registry lock the same way `cmd_start`'s superseding logic
+            // does, to avoid racing a concurrent `a start` that might be
+            // reclaiming the same workspace+tag at the same moment.
+            let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+            fs::remove_dir_all(paths.state_session(record.id))
+                .with_context(|| format!("remove finished session {}", record.id))?;
+            let _ = fs::remove_dir_all(paths.runtime_session(record.id));
+            eprintln!("a: removed {} session {}", phase_name(&record.phase), record.id);
         }
     }
     if json_output {
@@ -1112,6 +1139,35 @@ fn phase_name(phase: &Phase) -> &'static str {
         Phase::Exited => "exited",
         Phase::Failed => "failed",
     }
+}
+
+/// Attach/send/capture have no sensible action against a session with no
+/// live worker other than saying so plainly -- left to `connect()`, a
+/// terminal-phase session (worker gone, socket removed on its way out) or a
+/// broken one (worker dead, socket simply not listening) both surface as a
+/// bare `UnixStream::connect` OS error, e.g. "No such file or directory",
+/// which reads like a bug rather than "this session is done". `a kill` is
+/// deliberately exempt: for a terminal-phase session it now has a real
+/// action to take (removing the state, see cmd_kill), and it already
+/// handles the broken case itself via `kill_broken_workload`.
+fn check_attachable(record: &SessionRecord) -> Result<()> {
+    if matches!(record.phase, Phase::Exited | Phase::Failed) {
+        bail!(
+            "session {} has already exited (see `a status {}` for details); run `a kill {}` to remove it",
+            record.id,
+            record.id,
+            record.id
+        );
+    }
+    let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
+    if !worker_alive {
+        bail!(
+            "session {}'s worker is not running (state: {}); run `a status` for details, `a kill` to reclaim it",
+            record.id,
+            display_state(&record.phase, worker_alive)
+        );
+    }
+    Ok(())
 }
 
 fn connect(record: &SessionRecord) -> Result<UnixStream> {
@@ -1366,6 +1422,7 @@ fn draw_status_bar(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermGeom>>,
 }
 
 fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
+    check_attachable(record)?;
     let mut reader = connect(record)?;
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
     let request = Request::new(Operation::Attach {
