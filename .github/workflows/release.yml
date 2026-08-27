@@ -86,32 +86,6 @@ jobs:
             asset_name: linux-arm64
             use_cross: true
 
-          - name: darwin-amd64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            asset_name: darwin-amd64
-            use_cross: false
-            skip_verify: true
-
-          - name: darwin-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            asset_name: darwin-arm64
-            use_cross: false
-
-          - name: windows-amd64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset_name: windows-amd64
-            use_cross: false
-
-          - name: windows-arm64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-            asset_name: windows-arm64
-            use_cross: false
-            skip_verify: true
-
     steps:
       - uses: actions/checkout@v4
 
