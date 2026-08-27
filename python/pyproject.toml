@@ -1,16 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
-name = "aplexer-client"
+name = "aplexer"
 version = "0.1.0"
-description = "Thin client for the aplexer PTY session runtime"
-requires-python = ">=3.10"
+description = "Python bindings for the aplexer PTY session runtime"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 
-[tool.setuptools]
-packages = ["aplexer"]
+[tool.maturin]
+manifest-path = "../Cargo.toml"
+python-source = "."
+module-name = "aplexer._native"
+features = ["python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

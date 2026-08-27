@@ -510,177 +510,41 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
 }
 
 fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
-    validate_tag(&args.tag)?;
-    let workspace = canonical_workspace(&args.workspace)?;
     let env = parse_env(&args.env)?;
-    let limits = Limits {
-        memory_bytes: args.memory.as_deref().map(parse_byte_size).transpose()?,
-        pids: args.pids,
-        cpu_quota_us: args.cpu_quota_us,
-        cpu_period_us: args.cpu_quota_us.map(|_| args.cpu_period_us),
-    };
-    let direct = args
+    let command = args
         .command
         .iter()
         .map(|v| os_to_utf8(v, "command argument"))
         .collect::<Result<Vec<_>>>()?;
-    let config = Config::load(paths)?;
-    let mut launch = config.resolve(
-        direct,
-        args.engine.as_deref(),
-        args.profile.as_deref(),
-        &workspace,
-        args.cwd.as_deref(),
-        &env,
-        &limits,
-        args.history_bytes,
-    )?;
-    // Extra `-- argv` is the caller's full command; don't also append the
-    // skip-permissions flags (they may already be in it, or deliberately
-    // omitted). Engine/profile launches skip permissions by default.
-    if args.command.is_empty() && !args.no_skip_permissions {
-        launch
-            .command
-            .extend(launch.skip_permissions_argv.iter().cloned());
-    }
-    if !command_exists(&launch.command) {
-        bail!(
-            "command is not executable or was not found in PATH: {}",
-            launch
-                .command
-                .first()
-                .map(String::as_str)
-                .unwrap_or("<empty>")
-        );
-    }
-    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
-    if let Some(existing) = list_records(paths)?
-        .into_iter()
-        .find(|r| r.workspace == workspace && r.tag == args.tag)
-    {
-        // A session that reached a terminal phase and whose worker is gone
-        // is finished: starting anew on the same workspace+tag supersedes
-        // it (there is no other way to reclaim the tag -- the v1 CLI has no
-        // remove command). A live session, or a "broken" one (non-terminal
-        // phase, dead worker) whose workload may still be running, keeps
-        // its claim and start still refuses.
-        let worker_alive = existing.worker_pid.map(process_alive).unwrap_or(false);
-        let finished =
-            matches!(existing.phase, Phase::Exited | Phase::Failed) && !worker_alive;
-        if !finished {
-            bail!(
-                "workspace+tag already belongs to session {}; rename it or choose a different tag",
-                existing.id
-            );
-        }
-        eprintln!(
-            "a: superseding {} session {}",
-            phase_name(&existing.phase),
-            existing.id
-        );
-        fs::remove_dir_all(paths.state_session(existing.id))
-            .with_context(|| format!("remove superseded session {}", existing.id))?;
-        let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
-    }
-    let id = Uuid::new_v4();
-    ensure_private_dir(&paths.state_session(id))?;
-    ensure_private_dir(&paths.runtime_session(id))?;
-    let now = now_ms();
-    let record = SessionRecord {
-        schema_version: SCHEMA_VERSION,
-        id,
-        workspace: workspace.clone(),
-        tag: args.tag,
-        engine: launch.engine,
-        profile: launch.profile,
-        command: launch.command,
-        cwd: canonical_workspace(&launch.cwd).unwrap_or(launch.cwd),
-        env: launch.env,
-        env_unset: launch.env_unset,
-        limits: launch.limits,
-        history_bytes: launch.history_bytes,
-        created_at_ms: now,
-        updated_at_ms: now,
-        last_activity_ms: None,
-        phase: Phase::Starting,
-        worker_pid: None,
-        workload_pid: None,
-        socket_path: paths.socket(id),
-        history_path: paths.history(id),
-        exit: None,
-        error: None,
-    };
-    atomic_write_json(&paths.record(id), &record)?;
-    let worker = worker_executable()?;
-    let worker_log = File::create(paths.state_session(id).join("worker.log"))
-        .context("create worker log")?;
-    let mut command = Command::new(&worker);
-    command
-        .arg("worker")
-        .arg("--id")
-        .arg(id.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(worker_log));
+    let mut worker_rows = None;
+    let mut worker_cols = None;
     if args.attach {
-        // We're about to attach right after the worker comes up (`a start
-        // --attach` / `a -`), so this client's terminal size is already
-        // known -- pass it through so the worker opens the workload's PTY
-        // at its real, final (reserved-row-adjusted) size from the start,
-        // instead of the 24x80 default that would otherwise be corrected a
-        // moment later by attach()'s own resize. See `run_worker`'s
-        // `initial_size` doc comment in src/worker.rs for the race this
-        // closes. A non-tty stdin (piped/scripted use) has no size to
-        // offer, so the worker falls back to its own default in that case,
-        // same as a detached start.
         let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
         if let Some((rows, cols)) = tty.then(|| terminal_size(libc::STDIN_FILENO)).flatten() {
-            command
-                .arg("--rows")
-                .arg(reserved_rows(rows).to_string())
-                .arg("--cols")
-                .arg(cols.to_string());
+            worker_rows = Some(reserved_rows(rows));
+            worker_cols = Some(cols);
         }
     }
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn worker {}", worker.display()))?;
-    let deadline = Instant::now() + Duration::from_millis(args.startup_timeout_ms);
-    let ready = loop {
-        if let Ok(current) = read_record(&paths.record(id)) {
-            match current.phase {
-                Phase::Running | Phase::Exiting | Phase::Exited if current.socket_path.exists() => {
-                    break current
-                }
-                Phase::Failed => bail!(
-                    "worker startup failed: {}",
-                    current.error.unwrap_or_else(|| "unknown error".into())
-                ),
-                _ => {}
-            }
-        }
-        if let Some(status) = child.try_wait()? {
-            bail!("worker exited during startup: {status}");
-        }
-        if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
-            }
-            bail!(
-                "worker did not become ready within {} ms",
-                args.startup_timeout_ms
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
+    let req = aplexer::api::StartRequest {
+        workspace: args.workspace,
+        tag: args.tag,
+        engine: args.engine,
+        profile: args.profile,
+        cwd: args.cwd,
+        env,
+        command,
+        memory: args.memory,
+        pids: args.pids,
+        cpu_quota_us: args.cpu_quota_us,
+        cpu_period_us: args.cpu_period_us,
+        history_bytes: args.history_bytes,
+        no_skip_permissions: args.no_skip_permissions,
+        startup_timeout_ms: args.startup_timeout_ms,
+        worker_rows,
+        worker_cols,
+        python: None,
     };
+    let ready = aplexer::api::start_session(paths, &req)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&ready)?);
     } else {
@@ -699,28 +563,19 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
 }
 
 fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&aplexer::api::snapshot_json(paths, args.running)?)?
+        );
+        return Ok(());
+    }
     let mut records = list_records(paths)?;
     if args.running {
         records.retain(|r| {
             matches!(r.phase, Phase::Starting | Phase::Running | Phase::Exiting)
                 && r.worker_pid.map(process_alive).unwrap_or(false)
         });
-    }
-    if json_output {
-        // list/snapshot must stay cheap (spec.md 30: "milliseconds on tens
-        // of sessions"), so liveness here is the pid-existence check only
-        // (process_alive), never a socket round-trip per session -- that's
-        // what `a status` is for.
-        let enriched: Vec<Value> = records
-            .iter()
-            .map(|r| {
-                let mut value = serde_json::to_value(r).unwrap_or(Value::Null);
-                value["worker_alive"] = json!(r.worker_pid.map(process_alive).unwrap_or(false));
-                value
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&enriched)?);
-        return Ok(());
     }
     // Group by workspace as a compact tree -- spec.md's own presentation of
     // the model (sections 2 and 22.1) is a workspace tree with tags
@@ -1460,27 +1315,8 @@ fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> 
 }
 
 fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
-    let config = Config::load(paths)?;
-    // Shape stays lean (name/command/available) rather than growing to match
-    // pocketshell's fuller EngineManifest (label/family/provider_mark are
-    // presentation concerns aplexer has no reason to own) -- the one
-    // addition is env_unset, exposed as the actual resolved list (not just
-    // a count) now that 0.2 makes it meaningful
-    // (pocketshell-integration-plan.md 0.5).
-    let values = config
-        .engines
-        .iter()
-        .map(|(name, e)| {
-            let env_unset = e.resolved_env_unset();
-            json!({
-                "name": name,
-                "command": e.command,
-                "available": command_exists(&e.command),
-                "env_unset_count": env_unset.len(),
-                "env_unset": env_unset,
-            })
-        })
-        .collect::<Vec<_>>();
+    let values = aplexer::api::engines_json(paths)?;
+    let values = values.as_array().cloned().unwrap_or_default();
     if json_output {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
@@ -1507,13 +1343,15 @@ fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
 }
 
 fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
-    let config = Config::load(paths)?;
+    let profiles = aplexer::api::profiles_json(paths)?;
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&config.profiles)?);
-    } else if config.profiles.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&profiles)?);
+    } else if profiles.as_object().map(|o| o.is_empty()).unwrap_or(true) {
         println!("no configured profiles");
     } else {
-        for (name, p) in config.profiles {
+        let config_profiles: BTreeMap<String, aplexer::ProfileConfig> =
+            serde_json::from_value(profiles)?;
+        for (name, p) in config_profiles {
             println!(
                 "{:<20} engine={}",
                 name,

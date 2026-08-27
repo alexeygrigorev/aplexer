@@ -1,10 +1,14 @@
 #![cfg(target_os = "linux")]
 
 pub mod agent_events;
+pub mod api;
 pub mod messaging;
 pub mod screen;
 pub mod watch;
 pub mod worker;
+
+#[cfg(feature = "python")]
+mod python;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
