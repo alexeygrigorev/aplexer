@@ -272,7 +272,10 @@ fn whoami_inside_session_survives_cleared_env() {
         "send",
         &id,
         "--enter",
-        "env -u APLEXER_SESSION_ID a whoami; echo WHOAMI_DONE",
+        // Keep the completion marker out of the echoed input line; otherwise
+        // capture() can mistake the command itself for its output and the
+        // following kill races the whoami subprocess.
+        "env -u APLEXER_SESSION_ID a whoami; printf 'WHOAMI_'; printf 'DONE\\n'",
     ]);
     h.run_ok(&["send", &id, "--hex", "0d"]);
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
