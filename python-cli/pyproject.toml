@@ -5,17 +5,70 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aplexer"
 version = "0.1.1"
-description = "Prebuilt CLI binaries for aplexer, the daemonless PTY session runtime"
+description = "Linux-native, agent-aware terminal multiplexer with persistent, isolated PTY sessions"
+readme = { text = '''
+# aplexer
+
+`aplexer` is a Linux-native, agent-aware terminal multiplexer for running
+coding agents and shells in persistent, independently isolated PTY sessions.
+It is designed as a daemonless, agent-first alternative to tmux: sessions
+are addressed by workspace, tag, engine, and profile, while each session has
+its own worker, socket, terminal history, and optional resource limits.
+
+## Install
+
+```bash
+python -m pip install aplexer
+```
+
+The package provides the user-facing `a` command and the `aplexer` worker
+executable. Start a tagged session, list sessions by workspace, and attach to
+one with:
+
+```bash
+a start --workspace "$PWD" --tag shell -- /bin/bash -l
+a list
+a attach --workspace "$PWD" --tag shell
+```
+
+While attached, `Ctrl-1` through `Ctrl-9` jump directly to the corresponding
+session in the current workspace. Existing `Ctrl-b` shortcuts remain
+available, and `Ctrl-]` detaches without terminating the workload.
+
+## Highlights
+
+- Persistent sessions that survive a disconnected client.
+- Workspace and tag addressing with engine/profile metadata.
+- Per-session PTY workers and optional cgroup-v2 resource isolation.
+- Byte-preserving send/capture, durable transcripts, and lifecycle watching.
+- `a whoami` plus durable or direct-to-pane inter-agent messaging.
+- In-process Python bindings are available separately from the CLI package.
+
+## Links
+
+- [Documentation and usage guide](https://github.com/alexeygrigorev/aplexer#readme)
+- [Source repository](https://github.com/alexeygrigorev/aplexer)
+- [Issue tracker](https://github.com/alexeygrigorev/aplexer/issues)
+- [Release notes](https://github.com/alexeygrigorev/aplexer/releases)
+- [Python client bindings](https://pypi.org/project/aplexer-client/)
+''', content-type = "text/markdown" }
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
+keywords = [
+    "agent",
+    "terminal",
+    "multiplexer",
+    "pty",
+    "tmux",
+    "claude",
+    "codex",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
-    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: Terminals",
@@ -25,7 +78,9 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/alexeygrigorev/aplexer"
 Repository = "https://github.com/alexeygrigorev/aplexer"
+Documentation = "https://github.com/alexeygrigorev/aplexer#readme"
 Issues = "https://github.com/alexeygrigorev/aplexer/issues"
+Changelog = "https://github.com/alexeygrigorev/aplexer/releases"
 
 [project.scripts]
 aplexer = "aplexer_cli._main:main_aplexer"
