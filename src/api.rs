@@ -119,6 +119,8 @@ pub struct StartRequest {
     /// When set, spawn the worker as `python -m aplexer worker --id …`
     /// (Python bindings). Otherwise spawn the `aplexer` worker binary.
     pub python: Option<PathBuf>,
+    /// Require a worker placement that survives `systemctl --user exit`.
+    pub isolated: bool,
 }
 
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
@@ -204,7 +206,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     atomic_write_json(&paths.record(id), &record)?;
     let worker_log = File::create(paths.state_session(id).join("worker.log"))
         .context("create worker log")?;
-    let mut command = worker_command(id, req.python.as_deref())?;
+    let mut command = worker_command(id, req.python.as_deref(), req.isolated)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -255,7 +257,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
 }
 
-fn worker_command(id: Uuid, python: Option<&Path>) -> Result<Command> {
+fn worker_command(id: Uuid, python: Option<&Path>, isolated: bool) -> Result<Command> {
     if let Some(python) = python {
         let mut command = Command::new(python);
         command.args([
@@ -265,9 +267,19 @@ fn worker_command(id: Uuid, python: Option<&Path>) -> Result<Command> {
             "--id",
             &id.to_string(),
         ]);
-        return Ok(command);
+        return finish_worker_command(command, isolated);
     }
     let mut command = Command::new(worker_executable()?);
     command.arg("worker").arg("--id").arg(id.to_string());
+    finish_worker_command(command, isolated)
+}
+
+fn finish_worker_command(command: Command, isolated: bool) -> Result<Command> {
+    if isolated {
+        bail!(
+            "isolated worker placement is not implemented; \
+             resource-limited sessions currently share user@.service's lifecycle"
+        );
+    }
     Ok(command)
 }

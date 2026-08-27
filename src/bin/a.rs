@@ -56,6 +56,8 @@ enum Commands {
     Status(TargetArgs),
     /// Signal a session's workload and clean up its records.
     Kill(KillArgs),
+    /// Remove dead, unreclaimable session records and their durable history.
+    Prune,
     /// Change a session's tag.
     Rename(RenameArgs),
     /// List configured/discovered engines.
@@ -149,6 +151,10 @@ struct StartArgs {
     /// and-sandbox` / `--dangerously-skip-permissions` / `--always-approve`).
     #[arg(long)]
     no_skip_permissions: bool,
+    /// Fail instead of starting the worker in a placement that shares the
+    /// user service manager's lifecycle. Not implemented yet.
+    #[arg(long)]
+    isolated: bool,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
 }
@@ -435,6 +441,7 @@ fn run() -> Result<()> {
         Commands::Capture(args) => cmd_capture(&paths, args, cli.json),
         Commands::Status(target) => cmd_status(&paths, target, cli.json),
         Commands::Kill(args) => cmd_kill(&paths, args, cli.json),
+        Commands::Prune => cmd_prune(&paths, cli.json),
         Commands::Rename(args) => cmd_rename(&paths, args, cli.json),
         Commands::Engines => cmd_engines(&paths, cli.json),
         Commands::Profiles => cmd_profiles(&paths, cli.json),
@@ -539,6 +546,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         cpu_period_us: args.cpu_period_us,
         history_bytes: args.history_bytes,
         no_skip_permissions: args.no_skip_permissions,
+        isolated: args.isolated,
         startup_timeout_ms: args.startup_timeout_ms,
         worker_rows,
         worker_cols,
@@ -872,6 +880,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             attach: true,
             startup_timeout_ms: 10_000,
             no_skip_permissions: false,
+            isolated: false,
             command,
         },
         false,
@@ -881,6 +890,54 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
     attach(paths, &record, None)
+}
+
+fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
+    let records = list_records(paths)?;
+    let mut removed = Vec::new();
+    let mut retained_count = 0usize;
+    for record in records {
+        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
+        let workload_alive = record.workload_pid.map(process_alive).unwrap_or(false);
+        let terminal = matches!(record.phase, Phase::Exited | Phase::Failed);
+        let missing_socket = worker_alive && !record.socket_path.exists();
+        let prunable =
+            !workload_alive && (!worker_alive || missing_socket) && (terminal || missing_socket);
+        if !prunable {
+            retained_count += 1;
+            continue;
+        }
+        if missing_socket {
+            if let Some(pid) = record.worker_pid {
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error).context("force-kill unreachable worker while pruning");
+                    }
+                }
+            }
+        }
+        remove_session_state(paths, record.id)
+            .with_context(|| format!("remove stale session {}", record.id))?;
+        removed.push(record.id);
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "removed": removed,
+                "retained_count": retained_count,
+            }))?
+        );
+    } else if removed.is_empty() {
+        println!("no dead sessions to prune");
+    } else {
+        for id in &removed {
+            println!("removed {id}");
+        }
+        println!("removed {} session(s)", removed.len());
+    }
+    Ok(())
 }
 
 /// Shared by the bare `a <N>` shortcut and by `resolve()` (so `a attach 1`,

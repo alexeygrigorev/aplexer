@@ -3,4 +3,5 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
+python/aplexer/_native.abi3.so
 /.claude/worktrees/
