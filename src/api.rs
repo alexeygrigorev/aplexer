@@ -21,8 +21,6 @@ use crate::{
     FileLock, Limits, Paths, Phase, SCHEMA_VERSION, SessionRecord,
 };
 
-const SSH_HOST: &str = "127.0.0.1";
-
 pub fn engines_json(paths: &Paths) -> Result<Value> {
     let config = Config::load(paths)?;
     let values = config
@@ -121,9 +119,6 @@ pub struct StartRequest {
     /// When set, spawn the worker as `python -m aplexer worker --id …`
     /// (Python bindings). Otherwise spawn the `aplexer` worker binary.
     pub python: Option<PathBuf>,
-    /// Launch the worker through a loopback SSH login scope when `a` is
-    /// already running over SSH, keeping it outside `user@.service`.
-    pub isolated: bool,
 }
 
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
@@ -209,7 +204,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     atomic_write_json(&paths.record(id), &record)?;
     let worker_log = File::create(paths.state_session(id).join("worker.log"))
         .context("create worker log")?;
-    let mut command = worker_command(id, req.python.as_deref(), req.isolated)?;
+    let mut command = worker_command(id, req.python.as_deref())?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -260,77 +255,19 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
 }
 
-fn worker_command(id: Uuid, python: Option<&Path>, isolated: bool) -> Result<Command> {
-    let mut worker = if let Some(python) = python {
+fn worker_command(id: Uuid, python: Option<&Path>) -> Result<Command> {
+    if let Some(python) = python {
         let mut command = Command::new(python);
-        command.args(["-m", "aplexer", "worker"]);
-        command
-    } else {
-        let mut command = Command::new(worker_executable()?);
-        command.arg("worker");
-        command
-    };
-    worker.arg("--id").arg(id.to_string());
-    if !isolated {
-        return Ok(worker);
+        command.args([
+            "-m",
+            "aplexer",
+            "worker",
+            "--id",
+            &id.to_string(),
+        ]);
+        return Ok(command);
     }
-
-    let program = worker.get_program().to_string_lossy().into_owned();
-    let mut argv = vec![program];
-    argv.extend(worker.get_args().map(|arg| arg.to_string_lossy().into_owned()));
-    let runtime_root = std::env::var_os("APLEXER_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("aplexer"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is required for isolated workers"))?;
-    let state_root = std::env::var_os("APLEXER_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_STATE_HOME").map(|dir| PathBuf::from(dir).join("aplexer"))
-        })
-        .or_else(|| home_state_root())
-        .ok_or_else(|| anyhow::anyhow!("cannot determine state directory for isolated worker"))?;
-    let config_file = std::env::var_os("APLEXER_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(|dir| PathBuf::from(dir).join("aplexer/config.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME").map(|dir| PathBuf::from(dir).join(".config/aplexer/config.toml"))
-        });
-    let mut remote = vec![
-        format!("APLEXER_RUNTIME_DIR={}", shell_quote(&runtime_root.to_string_lossy())),
-        format!("APLEXER_STATE_DIR={}", shell_quote(&state_root.to_string_lossy())),
-    ];
-    if let Some(path) = &config_file {
-        remote.push(format!("APLEXER_CONFIG={}", shell_quote(&path.to_string_lossy())));
-    }
-    remote.extend(argv.iter().map(|arg| shell_quote(arg)));
-
-    let mut command = Command::new("ssh");
-    command
-        .args(["-o", "BatchMode=yes"])
-        .args(["-o", "ConnectTimeout=3"])
-        .args(["-o", "ControlMaster=auto"])
-        .args(["-o", "ControlPersist=5"])
-        .args(["-o", "ControlPath=/tmp/aplexer-ssh-%C"])
-        .args(["-o", "StrictHostKeyChecking=no"])
-        .args(["-o", "UserKnownHostsFile=/dev/null"])
-        .arg("-T")
-        .arg(SSH_HOST)
-        .arg(remote.join(" "));
+    let mut command = Command::new(worker_executable()?);
+    command.arg("worker").arg("--id").arg(id.to_string());
     Ok(command)
-}
-
-fn home_state_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|dir| PathBuf::from(dir).join(".local/state/aplexer"))
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./:-".contains(&b)) {
-        return value.to_owned();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
 }

@@ -104,7 +104,6 @@ fn start(
         worker_rows: None,
         worker_cols: None,
         python: python.map(PathBuf::from),
-        isolated: false,
     };
     let record = api::start_session(&paths().map_err(py_err)?, &req).map_err(py_err)?;
     serde_json::to_string(&record)
