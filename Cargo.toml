@@ -1,6 +1,6 @@
 [package]
 name = "aplexer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.78"
 description = "Daemonless, durable PTY session workers for Linux"

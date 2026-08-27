@@ -11,4 +11,4 @@ an already-running aplexer worker. The two are meant to be installed
 together when a Python program embeds aplexer end to end.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
