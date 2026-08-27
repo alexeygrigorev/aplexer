@@ -52,7 +52,7 @@ a completions fish > ~/.config/fish/completions/a.fish
 a start --workspace "$PWD" --tag shell -- /bin/bash -l
 a list
 a attach --workspace "$PWD" --tag shell
-# Ctrl-] detaches without terminating the workload.
+# Ctrl-b d detaches without terminating the workload.
 ```
 
 The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.

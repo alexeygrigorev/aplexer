@@ -33,7 +33,7 @@ a attach --workspace "$PWD" --tag shell
 
 While attached, `Ctrl-1` through `Ctrl-9` jump directly to the corresponding
 session in the current workspace. Existing `Ctrl-b` shortcuts remain
-available, and `Ctrl-]` detaches without terminating the workload.
+available, and `Ctrl-b d` detaches without terminating the workload.
 
 ## Highlights
 

@@ -46,7 +46,7 @@ enum Commands {
     List(ListArgs),
     /// Same as `list`, but always machine-readable (see also `list --json`).
     Snapshot(ListArgs),
-    /// Attach to a session's live PTY (Ctrl-] or Ctrl-b d to detach).
+    /// Attach to a session's live PTY (Ctrl-b d to detach).
     Attach(AttachArgs),
     /// Send input to a session without attaching.
     Send(SendArgs),
@@ -1583,9 +1583,8 @@ fn cmd_hotkeys() -> Result<()> {
     println!("  Ctrl-1..9 jump to that number from the status bar");
     println!("  1-9      jump to that number after Ctrl-b");
     println!("  l        toggle back to the last session you were on");
-    println!("  d        detach (same as Ctrl-])");
+    println!("  d        detach");
     println!();
-    println!("Detach directly:  Ctrl-]");
     println!("Any other key after Ctrl-b is forwarded through untouched.");
     Ok(())
 }
@@ -2287,7 +2286,7 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
 }
 
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
-/// -- explicit Ctrl-] detach, the remote session exiting, a connection
+/// -- explicit Ctrl-b d detach, the remote session exiting, a connection
 /// error, or an early `?` return -- so a new exit path added later can't
 /// forget the cleanup. Only constructed when stdin is a tty (mirrors
 /// `RawMode`, which it's dropped alongside).
@@ -2967,7 +2966,7 @@ fn workspace_summary_regions(siblings: &[SessionRecord], current_id: Uuid) -> (S
 enum InputAction {
     /// Ordinary input for the currently attached session.
     Forward(Vec<u8>),
-    /// `Ctrl-]` or `Ctrl-b d`.
+    /// `Ctrl-b d`.
     Detach,
     /// `Ctrl-b n/p/N/P/l/1-9` or direct `Ctrl-1`..`Ctrl-9`.
     Switch(SwitchTarget),
@@ -2987,8 +2986,8 @@ struct InputScanner {
 
 impl InputScanner {
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
-    /// existing `Ctrl-]`/`Ctrl-b d` semantics preserved exactly; `n p N P l
-    /// 1-9` newly consumed after a pending `Ctrl-b`; direct `Ctrl-1`..`9`
+    /// `Ctrl-b d` detaches; `n p N P l 1-9`
+    /// are consumed after a pending `Ctrl-b`; direct `Ctrl-1`..`9`
     /// shortcuts are consumed on their own. Anything else pending is "not a
     /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
     /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
@@ -3026,17 +3025,10 @@ impl InputScanner {
                     continue;
                 }
                 // Not a bound chord: forward the withheld Ctrl-b and
-                // reprocess this byte normally (it might itself be Ctrl-]
-                // or a fresh Ctrl-b) -- do not advance `i`.
+                // reprocess this byte normally (it might itself be a fresh
+                // Ctrl-b) -- do not advance `i`.
                 out.push(0x02);
                 continue;
-            }
-            if byte == 0x1d {
-                if !out.is_empty() {
-                    actions.push(InputAction::Forward(std::mem::take(&mut out)));
-                }
-                actions.push(InputAction::Detach);
-                return actions;
             }
             if byte == 0x02 {
                 self.pending_ctrl_b = true;
@@ -3248,7 +3240,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // effect) is exactly the fix for the original corruption, where the
         // banner landed inside a live TUI's input box. A real status-bar
         // flash slot for this is future work (section 6.3 step 6).
-        eprintln!("[aplexer attached; Ctrl-] or Ctrl-b d detaches; Ctrl-1..9 or Ctrl-b n/p/1-9/l switches]");
+        eprintln!("[aplexer attached; Ctrl-b d detaches; Ctrl-1..9 or Ctrl-b n/p/1-9/l switches]");
     }
     write_locked(&stdout, &handshake.initial)?;
     if tty {
@@ -3284,7 +3276,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
-        // Ctrl-b (0x02) prefix state machine -- Ctrl-] and Ctrl-b d detach,
+        // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
         // Ctrl-b n/p/N/P/l/1-9 and direct Ctrl-1..9 switch sessions,
         // anything else pending is not a real prefix (both bytes forward to
         // the workload). See
@@ -3669,15 +3661,13 @@ mod switching_tests {
     }
 
     #[test]
-    fn scan_ctrl_bracket_discards_rest() {
+    fn scan_ctrl_bracket_forwards_rest() {
         let mut s = InputScanner::default();
         let actions = s.scan(&[b'a', 0x1d, b'b', b'c']);
-        assert_eq!(actions.len(), 2);
         match &actions[0] {
-            InputAction::Forward(b) => assert_eq!(b, &[b'a']),
+            InputAction::Forward(b) => assert_eq!(b, &[b'a', 0x1d, b'b', b'c']),
             _ => panic!("expected Forward"),
         }
-        assert!(matches!(&actions[1], InputAction::Detach));
     }
 
     #[test]
