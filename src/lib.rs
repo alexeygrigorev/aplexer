@@ -1656,7 +1656,10 @@ pub fn open_pty(rows: u16, cols: u16) -> Result<(File, File)> {
         cleanup_master();
         return Err(e).context("unlockpt");
     }
-    let mut name = vec![0i8; 256];
+    // `libc::c_char` is unsigned on some Linux architectures (including
+    // aarch64), so keep the buffer's element type aligned with libc rather
+    // than assuming x86_64's signed `char`.
+    let mut name = vec![0 as libc::c_char; 256];
     if unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) } != 0 {
         let e = io::Error::last_os_error();
         cleanup_master();
