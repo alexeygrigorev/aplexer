@@ -164,7 +164,6 @@ impl OutputHub {
 #[derive(Debug)]
 struct WorkloadState {
     running: bool,
-    pid: u32,
     pgid: i32,
 }
 
@@ -382,7 +381,6 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         pty_write: Mutex::new(Some(master_write)),
         workload: Mutex::new(WorkloadState {
             running: true,
-            pid,
             pgid: pid as i32,
         }),
         cgroup: Mutex::new(cgroup),

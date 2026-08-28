@@ -327,6 +327,28 @@ impl SessionRecord {
     pub fn selector(&self) -> String {
         format!("{}:{}", self.workspace.display(), self.tag)
     }
+
+    /// Whether the worker process is present in `/proc`. This is a cheap,
+    /// pessimistic check: callers with a live worker socket may use a
+    /// successful RPC as stronger evidence.
+    pub fn worker_alive(&self) -> bool {
+        self.worker_pid.map(process_alive).unwrap_or(false)
+    }
+
+    /// Whether the worker's lifetime phase is still active according to its
+    /// persisted record. A dead worker makes this record stale, not exited.
+    pub fn worker_phase_active(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Starting | Phase::Running | Phase::Exiting
+        )
+    }
+
+    /// The normal terminal state for this record: an explicitly recorded
+    /// terminal phase and no worker process left to finalize anything.
+    pub fn worker_finished(&self) -> bool {
+        matches!(self.phase, Phase::Exited | Phase::Failed) && !self.worker_alive()
+    }
 }
 
 pub fn read_record(path: &Path) -> Result<SessionRecord> {
@@ -1407,25 +1429,24 @@ impl Cgroup {
         thread::spawn(move || {
             let _ = anchor.wait();
         });
+        let release_on_failure = |anchor_pid: u32| {
+            unsafe {
+                libc::kill(anchor_pid as libc::pid_t, libc::SIGKILL);
+            }
+        };
         let path = match wait_for_scope_cgroup(&unit, Duration::from_secs(5)) {
             Ok(path) => path,
             Err(error) => {
-                unsafe {
-                    libc::kill(anchor_pid as i32, libc::SIGKILL);
-                }
+                release_on_failure(anchor_pid);
                 return Err(error.context("limits fail closed"));
             }
         };
         if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
-            unsafe {
-                libc::kill(anchor_pid as i32, libc::SIGKILL);
-            }
+            release_on_failure(anchor_pid);
             bail!("systemd did not delegate the memory controller; limits fail closed");
         }
         if limits.pids.is_some() && !path.join("pids.max").exists() {
-            unsafe {
-                libc::kill(anchor_pid as i32, libc::SIGKILL);
-            }
+            release_on_failure(anchor_pid);
             bail!("systemd did not delegate the pids controller; limits fail closed");
         }
         let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::{
     atomic_write_json, canonical_workspace, command_exists, ensure_private_dir, list_records,
-    parse_byte_size, process_alive, read_record, validate_tag, worker_executable, Config,
-    FileLock, Limits, Paths, Phase, SCHEMA_VERSION, SessionRecord,
+    parse_byte_size, read_record, validate_tag, worker_executable, Config, FileLock, Limits, Paths,
+    Phase, SCHEMA_VERSION, SessionRecord,
 };
 
 pub fn engines_json(paths: &Paths) -> Result<Value> {
@@ -82,19 +82,14 @@ pub fn launch_spec_json(
 pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
     let mut records = list_records(paths)?;
     if running {
-        records.retain(|r| {
-            matches!(r.phase, Phase::Starting | Phase::Running | Phase::Exiting)
-                && r.worker_pid.map(process_alive).unwrap_or(false)
-        });
+        records.retain(|r| r.worker_phase_active() && r.worker_alive());
     }
-    let enriched: Vec<Value> = records
-        .iter()
-        .map(|r| {
-            let mut value = serde_json::to_value(r).unwrap_or(Value::Null);
-            value["worker_alive"] = json!(r.worker_pid.map(process_alive).unwrap_or(false));
-            value
-        })
-        .collect();
+    let mut enriched = Vec::with_capacity(records.len());
+    for record in &records {
+        let mut value = serde_json::to_value(record)?;
+        value["worker_alive"] = json!(record.worker_alive());
+        enriched.push(value);
+    }
     Ok(Value::Array(enriched))
 }
 
@@ -119,13 +114,12 @@ pub struct StartRequest {
     /// When set, spawn the worker as `python -m aplexer worker --id …`
     /// (Python bindings). Otherwise spawn the `aplexer` worker binary.
     pub python: Option<PathBuf>,
-    /// Require a worker placement that survives `systemctl --user exit`.
-    pub isolated: bool,
 }
 
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     validate_tag(&req.tag)?;
     let workspace = canonical_workspace(&req.workspace)?;
+    let id = Uuid::new_v4();
     let limits = Limits {
         memory_bytes: req.memory.as_deref().map(parse_byte_size).transpose()?,
         pids: req.pids,
@@ -155,17 +149,16 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 .command
                 .first()
                 .map(String::as_str)
-                .unwrap_or("<empty>")
+            .unwrap_or("<empty>")
         );
     }
+    worker_command(id, req.python.as_deref())?;
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     if let Some(existing) = list_records(paths)?
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == req.tag)
     {
-        let worker_alive = existing.worker_pid.map(process_alive).unwrap_or(false);
-        let finished = matches!(existing.phase, Phase::Exited | Phase::Failed) && !worker_alive;
-        if !finished {
+        if !existing.worker_finished() {
             bail!(
                 "workspace+tag already belongs to session {}; rename it or choose a different tag",
                 existing.id
@@ -175,7 +168,6 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             .with_context(|| format!("remove superseded session {}", existing.id))?;
         let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
     }
-    let id = Uuid::new_v4();
     ensure_private_dir(&paths.state_session(id))?;
     ensure_private_dir(&paths.runtime_session(id))?;
     let now = crate::now_ms();
@@ -187,7 +179,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         engine: launch.engine,
         profile: launch.profile,
         command: launch.command,
-        cwd: canonical_workspace(&launch.cwd).unwrap_or(launch.cwd),
+        cwd: launch.cwd,
         env: launch.env,
         env_unset: launch.env_unset,
         limits: launch.limits,
@@ -206,7 +198,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     atomic_write_json(&paths.record(id), &record)?;
     let worker_log = File::create(paths.state_session(id).join("worker.log"))
         .context("create worker log")?;
-    let mut command = worker_command(id, req.python.as_deref(), req.isolated)?;
+    let mut command = worker_command(id, req.python.as_deref())?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -257,7 +249,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
 }
 
-fn worker_command(id: Uuid, python: Option<&Path>, isolated: bool) -> Result<Command> {
+fn worker_command(id: Uuid, python: Option<&Path>) -> Result<Command> {
     if let Some(python) = python {
         let mut command = Command::new(python);
         command.args([
@@ -267,19 +259,9 @@ fn worker_command(id: Uuid, python: Option<&Path>, isolated: bool) -> Result<Com
             "--id",
             &id.to_string(),
         ]);
-        return finish_worker_command(command, isolated);
+        return Ok(command);
     }
     let mut command = Command::new(worker_executable()?);
     command.arg("worker").arg("--id").arg(id.to_string());
-    finish_worker_command(command, isolated)
-}
-
-fn finish_worker_command(command: Command, isolated: bool) -> Result<Command> {
-    if isolated {
-        bail!(
-            "isolated worker placement is not implemented; \
-             resource-limited sessions currently share user@.service's lifecycle"
-        );
-    }
     Ok(command)
 }

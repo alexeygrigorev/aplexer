@@ -7,12 +7,12 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -151,10 +151,6 @@ struct StartArgs {
     /// and-sandbox` / `--dangerously-skip-permissions` / `--always-approve`).
     #[arg(long)]
     no_skip_permissions: bool,
-    /// Fail instead of starting the worker in a placement that shares the
-    /// user service manager's lifecycle. Not implemented yet.
-    #[arg(long)]
-    isolated: bool,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
 }
@@ -546,7 +542,6 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         cpu_period_us: args.cpu_period_us,
         history_bytes: args.history_bytes,
         no_skip_permissions: args.no_skip_permissions,
-        isolated: args.isolated,
         startup_timeout_ms: args.startup_timeout_ms,
         worker_rows,
         worker_cols,
@@ -580,10 +575,7 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     }
     let mut records = list_records(paths)?;
     if args.running {
-        records.retain(|r| {
-            matches!(r.phase, Phase::Starting | Phase::Running | Phase::Exiting)
-                && r.worker_pid.map(process_alive).unwrap_or(false)
-        });
+        records.retain(|r| r.worker_phase_active() && r.worker_alive());
     }
     // Group by workspace as a compact tree -- spec.md's own presentation of
     // the model (sections 2 and 22.1) is a workspace tree with tags
@@ -616,8 +608,7 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
                 None => r.engine.clone(),
             };
             let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
-            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-            let state = display_state(&r.phase, alive);
+            let state = display_state(&r.phase, r.worker_alive());
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));
             println!("{connector} {idx}  {tag} {ep} {state}");
@@ -714,10 +705,7 @@ fn display_workspace(path: &Path, home: Option<&Path>) -> String {
 fn running_count(group: &[SessionRecord]) -> (usize, usize) {
     let running = group
         .iter()
-        .filter(|r| {
-            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-            display_state(&r.phase, alive) == "running"
-        })
+        .filter(|r| display_state(&r.phase, r.worker_alive()) == "running")
         .count();
     (running, group.len())
 }
@@ -853,9 +841,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == tag)
     {
-        let alive = existing.worker_pid.map(process_alive).unwrap_or(false);
-        let terminal = matches!(existing.phase, Phase::Exited | Phase::Failed);
-        if alive && !terminal {
+        if existing.worker_phase_active() && existing.worker_alive() {
             return attach(paths, &existing, None);
         }
         // A finished session falls through to cmd_start, which reclaims a
@@ -880,7 +866,6 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             attach: true,
             startup_timeout_ms: 10_000,
             no_skip_permissions: false,
-            isolated: false,
             command,
         },
         false,
@@ -897,25 +882,10 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
     let mut removed = Vec::new();
     let mut retained_count = 0usize;
     for record in records {
-        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
         let workload_alive = record.workload_pid.map(process_alive).unwrap_or(false);
-        let terminal = matches!(record.phase, Phase::Exited | Phase::Failed);
-        let missing_socket = worker_alive && !record.socket_path.exists();
-        let prunable =
-            !workload_alive && (!worker_alive || missing_socket) && (terminal || missing_socket);
-        if !prunable {
+        if workload_alive || !record.worker_finished() {
             retained_count += 1;
             continue;
-        }
-        if missing_socket {
-            if let Some(pid) = record.worker_pid {
-                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(error).context("force-kill unreachable worker while pruning");
-                    }
-                }
-            }
         }
         remove_session_state(paths, record.id)
             .with_context(|| format!("remove stale session {}", record.id))?;
@@ -1008,8 +978,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         .get("foreground_command")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let worker_alive =
-        rpc_reachable || current.worker_pid.map(process_alive).unwrap_or(false);
+    let worker_alive = rpc_reachable || current.worker_alive();
     if json_output {
         let mut value = serde_json::to_value(&current)?;
         if let Some(stats) = cgroup_stats {
@@ -1196,6 +1165,22 @@ fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// A worker pid may still exist even though its control socket is gone.
+/// Only this one rare case counts as "force-cleanable": a live, reachable
+/// worker can also fail an RPC, but then it must not be signalled directly.
+/// ESRCH is success because the process may exit between checks.
+fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
+    if let Some(pid) = record.worker_pid {
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("force-kill unreachable worker");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
@@ -1208,45 +1193,15 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         None,
     );
     if let Err(error) = rpc {
-        let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
-        // A worker whose pid is still in the process table but whose
-        // control socket is gone (see check_attachable's third case) is
-        // unreachable, not "alive" from the CLI's perspective: it can't be
-        // asked to kill its workload or record an exit, so refusing to
-        // touch the record here (as the branch below does for a genuinely
-        // reachable worker) would leave the session stuck forever with no
-        // way to reclaim it. This is deliberately narrower than "rpc
-        // failed while worker_alive": a live, reachable worker can also
-        // fail an individual RPC (e.g. transient busy/EPIPE), and that case
-        // must keep hitting the `return Err(error)` below unchanged -- only
-        // a missing socket file is unambiguous proof the worker cannot be
-        // listening at all.
+        let worker_alive = record.worker_alive();
+        // Only a missing socket file proves an alive worker is unreachable.
+        // A mere RPC failure can be transient, so it still returns below.
         let socket_missing = worker_alive && !record.socket_path.exists();
         if worker_alive && !socket_missing {
             return Err(error);
         }
         if socket_missing {
-            // The worker is unreachable through its normal control
-            // protocol -- there's no socket to ask it to signal its
-            // workload or record its own exit -- so there's nothing left
-            // to negotiate with. Rather than leaving worker_pid untouched
-            // and asking the user to `kill -9` it themselves (confusing,
-            // and requires a manual follow-up step), just SIGKILL it
-            // directly and remove the record in one step: the same
-            // end state a normal, reachable `a kill` would reach anyway.
-            // A graceful SIGTERM+grace-period dance doesn't apply here --
-            // this worker is already uncontrollable via its normal
-            // protocol, so there's no "ask nicely first" to attempt.
-            // ESRCH (it's already gone by the time we get here) is
-            // success, not an error.
-            if let Some(pid) = record.worker_pid {
-                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
-                    let err = io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(err).context("force-kill unreachable worker");
-                    }
-                }
-            }
+            force_kill_stale_worker(&record)?;
             remove_session_state(paths, record.id)
                 .with_context(|| format!("remove stale session {}", record.id))?;
             eprintln!(
@@ -1259,37 +1214,10 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
-        // The worker exits once its workload is gone, so a terminal-phase
-        // session has no socket to talk to; killing something already dead
-        // is success, not an error. A *broken* session (non-terminal phase,
-        // dead worker) is the harder case: its workload may have survived
-        // the worker (anything ignoring SIGHUP does), and the dead worker
-        // can neither kill it nor record its exit -- without this fallback
-        // such a workload is unkillable through the CLI and the session
-        // unreclaimable forever. The client is the only actor left, so it
-        // signals the workload's process group itself and retires the
-        // record.
-        if !matches!(record.phase, Phase::Exited | Phase::Failed) {
+        if !record.worker_finished() {
             kill_broken_workload(&record, signal, args.grace_ms)?;
-            let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
-            let mut current = read_record(&paths.record(record.id)).unwrap_or(record.clone());
-            current.phase = Phase::Failed;
-            current.error = Some(
-                "worker died without recording workload exit; workload killed by `a kill`"
-                    .into(),
-            );
-            current.updated_at_ms = now_ms();
-            atomic_write_json(&paths.record(record.id), &current)?;
-            let _ = fs::remove_dir_all(paths.runtime_session(record.id));
+            mark_broken_workload_killed(paths, &record)?;
         } else {
-            // Already terminal with a dead worker: there's nothing left to
-            // signal. `a kill` is the only command a user would think to
-            // reach for to clean up a finished session, so treat this as
-            // "remove it" rather than a silent no-op -- otherwise it lingers
-            // in `a list` forever with no way to get rid of it. Take the
-            // registry lock the same way `cmd_start`'s superseding logic
-            // does, to avoid racing a concurrent `a start` that might be
-            // reclaiming the same workspace+tag at the same moment.
             remove_session_state(paths, record.id)
                 .with_context(|| format!("remove finished session {}", record.id))?;
             eprintln!("a: removed {} session {}", phase_name(&record.phase), record.id);
@@ -1298,6 +1226,19 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", json!({"id":record.id,"signal":signal}));
     }
+    Ok(())
+}
+
+/// Record that the client killed an orphaned workload after its worker died.
+fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<()> {
+    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    let mut current = read_record(&paths.record(record.id)).unwrap_or_else(|_| record.clone());
+    current.phase = Phase::Failed;
+    current.error =
+        Some("worker died without recording workload exit; workload killed by `a kill`".into());
+    current.updated_at_ms = now_ms();
+    atomic_write_json(&paths.record(record.id), &current)?;
+    let _ = fs::remove_dir_all(paths.runtime_session(record.id));
     Ok(())
 }
 
@@ -1760,7 +1701,7 @@ fn check_attachable(record: &SessionRecord) -> Result<()> {
             record.id
         );
     }
-    let worker_alive = record.worker_pid.map(process_alive).unwrap_or(false);
+    let worker_alive = record.worker_alive();
     if !worker_alive {
         bail!(
             "session {}'s worker is not running (state: {}); run `a status` for details, `a kill` to reclaim it",
@@ -1863,7 +1804,7 @@ fn deliver_pane(paths: &Paths, workspace: &Path, tag: &str, from_tag: Option<&st
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == tag)
         .ok_or_else(|| anyhow!("no session tagged {tag:?} in this workspace"))?;
-    let alive = record.worker_pid.map(process_alive).unwrap_or(false);
+    let alive = record.worker_alive();
     if !alive {
         bail!("session {tag:?} is not running; pane delivery requires a live target");
     }
@@ -2460,8 +2401,7 @@ fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-            let state = display_state(&r.phase, alive);
+            let state = display_state(&r.phase, r.worker_alive());
             let mut part = format!("{}:{}", i + 1, r.tag);
             if r.id == record.id {
                 part.push('*');
@@ -2999,8 +2939,7 @@ fn workspace_summary_regions(siblings: &[SessionRecord], current_id: Uuid) -> (S
             text.push(' ');
         }
         let start = text.chars().count();
-        let alive = r.worker_pid.map(process_alive).unwrap_or(false);
-        let state = display_state(&r.phase, alive);
+        let state = display_state(&r.phase, r.worker_alive());
         text.push_str(&format!("{}:{}", i + 1, r.tag));
         if r.id == current_id {
             text.push('*');
