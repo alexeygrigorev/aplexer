@@ -547,6 +547,10 @@ impl EngineConfig {
 pub struct ProfileConfig {
     #[serde(default)]
     pub engine: Option<String>,
+    /// Override just the engine's executable (argv[0]); engine default
+    /// arguments and skip-permissions argv still apply.
+    #[serde(default)]
+    pub executable: Option<String>,
     #[serde(default)]
     pub command: Option<Vec<String>>,
     #[serde(default)]
@@ -985,7 +989,15 @@ impl Config {
         } else if let Some(cmd) = profile.and_then(|p| p.command.clone()) {
             cmd
         } else {
-            engine.command.clone()
+            let mut argv = engine.command.clone();
+            if let Some(exec) = profile.and_then(|p| p.executable.clone()) {
+                if argv.is_empty() {
+                    argv.push(exec);
+                } else {
+                    argv[0] = exec;
+                }
+            }
+            argv
         };
         if command.is_empty() {
             bail!("engine {selected_engine} has no command");
