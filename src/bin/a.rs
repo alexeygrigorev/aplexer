@@ -1841,9 +1841,25 @@ fn finish_send(
             }
         }
     }
-    write_message(paths, &envelope)?;
-    if envelope.delivery == Delivery::Pane {
-        if let Recipient::Tag { session_id: Some(sid), .. } = &envelope.to {
+    let recorded = match write_message(paths, &envelope) {
+        Ok(()) => true,
+        Err(error) if envelope.delivery == Delivery::Pane => {
+            // PTY injection is the pane-delivery commit point. Reporting
+            // total failure here invites a retry that injects the same
+            // message twice; the missing mailbox copy is only a warning.
+            eprintln!(
+                "a: pane delivery succeeded, but recording it in the mailbox failed: {error:#}"
+            );
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    if recorded && envelope.delivery == Delivery::Pane {
+        if let Recipient::Tag {
+            session_id: Some(sid),
+            ..
+        } = &envelope.to
+        {
             // Best-effort: a pane message is already delivered by
             // definition, so a failure to also pre-ack it here is a
             // cosmetic mailbox-record issue, not a delivery failure
@@ -1851,7 +1867,9 @@ fn finish_send(
             let _ = ack_messages(paths, workspace, *sid, &[envelope.id]);
         }
     }
-    let _ = maybe_gc(paths, workspace);
+    if recorded {
+        let _ = maybe_gc(paths, workspace);
+    }
     Ok(envelope)
 }
 
