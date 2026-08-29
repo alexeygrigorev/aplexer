@@ -177,7 +177,10 @@ fn wait_for_marker(harness: &Harness, id: &str, marker: &str) {
 fn wait_for_screen_marker(harness: &Harness, id: &str, marker: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let output = harness.run(&["capture", id, "--screen", "--plain"], Duration::from_secs(5));
+        let output = harness.run(
+            &["capture", id, "--screen", "--plain"],
+            Duration::from_secs(5),
+        );
         let captured = String::from_utf8_lossy(&output.stdout);
         if captured.contains(marker) {
             return;
@@ -248,7 +251,11 @@ fn raw_attach(
     let data_frame = read_frame(&mut stream)
         .expect("read initial data frame")
         .expect("initial data frame present");
-    assert_eq!(data_frame.kind, FrameKind::Data, "expected initial Data frame");
+    assert_eq!(
+        data_frame.kind,
+        FrameKind::Data,
+        "expected initial Data frame"
+    );
     (stream, body, data_frame.payload)
 }
 
@@ -505,8 +512,14 @@ fn attach_round_trip_latency() {
         }
     }
 
-    harness.run_ok(&["kill", &plain_id, "--signal", "KILL"], Duration::from_secs(5));
-    harness.run_ok(&["kill", &busy_id, "--signal", "KILL"], Duration::from_secs(5));
+    harness.run_ok(
+        &["kill", &plain_id, "--signal", "KILL"],
+        Duration::from_secs(5),
+    );
+    harness.run_ok(
+        &["kill", &busy_id, "--signal", "KILL"],
+        Duration::from_secs(5),
+    );
 }
 
 // ---------------------------------------------------------------------------
