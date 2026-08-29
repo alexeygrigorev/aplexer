@@ -6,9 +6,10 @@ console scripts, so ``uvx aplexer`` (or ``pip install aplexer``) works
 without a Rust toolchain.
 
 This is a different PyPI project from ``aplexer-client`` (import name
-``aplexer``), which is a pure-Python socket client library that talks to
-an already-running aplexer worker. The two are meant to be installed
-together when a Python program embeds aplexer end to end.
+``aplexer``), which provides an in-process Python API backed by the compiled
+Rust library through PyO3. The two distributions can be installed together:
+``aplexer`` supplies the CLI executables, while ``aplexer-client`` supplies
+the embeddable bindings.
 """
 
 __version__ = "0.1.1"

@@ -1,11 +1,10 @@
 # PocketShell integration plan and heru event-format alignment
 
 Status: planning document, originally written 2026-08-26 against a spec-only snapshot of this
-repo; **refreshed 2026-08-26 against commit `69774f3`**, by which point the Rust implementation
-is real and substantial. Every claim below about aplexer's CLI surface was re-verified by
-building `./target/release/a` at that commit and reading `src/bin/a.rs` / `src/lib.rs` — not
-carried over from the spec. The Part 1 analysis of what the PocketShell Android app does today
-was spot-checked against its source on the same date (that repo has not moved) and still holds.
+repo and refreshed again **2026-08-30 against the current integrated implementation**. The
+aplexer-side inventory below distinguishes shipped behavior from remaining PocketShell product
+and rollout decisions. The Part 1 analysis of what the PocketShell Android and Electron apps do
+is still based on their 2026-08-26 source snapshots; it was not re-audited in this update.
 
 **Two large corrections in this refresh** beyond the aplexer-side update:
 
@@ -19,10 +18,13 @@ was spot-checked against its source on the same date (that repo has not moved) a
    description referred to the dead repo and is wrong for the live one. Section 1.2 is rewritten
    from scratch against pocketshell-electron; every downstream desktop conclusion changed —
    mostly for the better (the panes/splits conflict and the mirrored-backend risk both dissolve).
-2. Two concurrent aplexer efforts landed mid-refresh: the **inter-agent messaging channel is now
-   implemented** (`a message send/reply/inbox/log/show/ack/gc`), and
-   `docs/low-bandwidth-remote-access-design.md` **exists** and is folded into the Phase B
-   discussion below. `a watch` (any form) is still **not** implemented.
+2. The **inter-agent messaging channel is implemented**
+   (`a message send/reply/inbox/log/show/ack/gc`), and
+   `docs/low-bandwidth-remote-access-design.md` is folded into the Phase B discussion below.
+   Since the previous refresh, the former engine/launch prerequisites have also shipped:
+   `opencode`, forced provider-key `env_unset`, skip-permissions argv, hidden
+   `launch-spec`/`launch-exec` integration commands, `a watch --jsonl`, and in-process PyO3
+   methods for engines, profiles, launch resolution, snapshots, and starts.
 
 Sources:
 
@@ -102,7 +104,7 @@ create/list, and launch construction through remote `pocketshell` invocations �
 Phase A swaps out underneath. It inherits an aplexer-backed registry the same day Android does,
 with near-zero desktop changes.
 
-### 1.3 What aplexer actually provides today (verified at `69774f3`)
+### 1.3 What aplexer actually provides today (verified 2026-08-30)
 
 The original version of this document said "the aplexer repo currently contains only spec.md".
 That is no longer remotely true. Verified against the built binary and source:
@@ -112,9 +114,10 @@ That is no longer remotely true. Verified against the built binary and source:
 - `a start` — `--workspace/--tag/--engine/--profile/--cwd/--env KEY=VALUE/--memory/--pids/
   --cpu-quota-us/--history-bytes/--attach/-- <command>`, `--json`. Reclaims a workspace+tag held
   by a finished session; refuses live/broken claims.
-- `a list` / `a snapshot` (aliases of the same listing; `--running`, `--json`). JSON is the full
-  `SessionRecord` per session enriched with `worker_alive`; human output is a workspace-grouped
-  tree. Cheap by design (pid checks only, no per-session socket round-trips).
+- `a list` / `a snapshot` (aliases of the same listing; `--running`, `--json`). JSON is the
+  public `SessionRecord` per session (launch environment redacted to config-directory metadata)
+  enriched with `worker_alive`; human output is a workspace-grouped tree. Cheap by design (pid
+  checks only, no per-session socket round-trips).
 - `a attach` — with a tmux-style reserved status-bar row (live cgroup memory indicator),
   history-tail replay (32KB default, `--history-bytes` to override), detach on `Ctrl-]` or
   `Ctrl-b d`, clean terminal reset on detach.
@@ -124,8 +127,9 @@ That is no longer remotely true. Verified against the built binary and source:
   workload with `/proc/<pid>/environ` identity verification; **removes** finished sessions'
   state), `a rename`, `a doctor`.
 - `a engines` / `a profiles` (`--json`). Built-in engines: **`shell` (default), `claude`,
-  `codex`, `gemini`, `grok`** — note: *no `opencode`*, and `gemini` is new relative to both the
-  spec's and PocketShell's lists. Profile auto-discovery is a real port of PocketShell's
+  `codex`, `gemini`, `grok`, `opencode`**. `a engines --json` reports the command,
+  availability, and the effective forced `env_unset` set/count. Profile auto-discovery is a real
+  port of PocketShell's
   `profiles.py` (claude/codex only, `~/.<name>` sibling dirs, marker files + name hints,
   conservative, never reads inside config dirs); discovered profiles carry
   `CLAUDE_CONFIG_DIR`/`CODEX_HOME` env. User TOML config layers over built-ins
@@ -142,23 +146,35 @@ That is no longer remotely true. Verified against the built binary and source:
   direct pane-injection mode, per `docs/inter-agent-messaging-design.md` (v1 scope: pull-based
   inbox; no push notifications, no cross-host bridging). Session-to-session, not
   client-to-host — additive to this plan rather than on its critical path.
-- Python client package (`python/aplexer/`): `list/resolve/start/status/send/capture/kill/
-  rename` — subprocess for `start`, direct Unix-socket RPC for the rest. No `engines`/`profiles`
-  methods yet.
+- Hidden PocketShell integration commands `a launch-spec` and `a launch-exec`. Both use the same
+  `Config::resolve` path as `a start`, append each engine's skip-permissions argv by default,
+  expose/apply `env_set` plus the non-optional provider-key `env_unset` union, and accept
+  `--no-skip-permissions`.
+- `a watch --jsonl` lifecycle streaming, agent-only by default with `--all` and workspace
+  filters. It emits heru-shaped `UnifiedEvent` JSONL with per-stream `sequence` and
+  `generation`; it is a polling live tail, not a durable replay log.
+- `a transcript` / `--follow`: parses supported engines' native conversation logs into the same
+  `UnifiedEvent` envelope, separately from the lifecycle stream.
+- Python client distribution `aplexer-client` (import name `aplexer`): an in-process PyO3 API,
+  not a socket/subprocess wrapper. It currently exposes `engines()`, `profiles()`,
+  `launch_spec()`, `snapshot()`/`list()`, and `start()`.
 - Per-session worker processes, cgroup-v2 memory/pids/cpu limits with OOM detection, durable
   session records, destructive isolation integration tests (`tests/oom_isolation.rs`).
 - Session identity is **UUIDv4** (`Uuid::new_v4` in `cmd_start`), not the ULID the original
   version of this document assumed.
 
-**Not implemented (also verified — absence of the subcommand in the binary and source):**
+**Still absent or deliberately limited:**
 
-- `a watch` in any form. `--jsonl` and the heru envelope (Part 2) remain design-only; SPEC.md
-  still lists `a watch --jsonl` under future work, and the low-bandwidth design doc (§7 item 8)
-  explicitly declines to accelerate it for bandwidth reasons.
-- `a launch-exec` / `a launch-spec` — still absent from both SPEC.md §16 and the code.
-- Any `env_unset` / provider-key-stripping concept. `EngineConfig` is `{command, env}` — env is
-  additive only.
-- A snapshot `generation` counter (Part 2's `metadata.generation` is contingent on building one).
+- No `a state-report`-style hook ingestion endpoint. `a watch` derives coarse activity state from
+  process/phase/output recency; it does not ingest PocketShell's exact hook-written semantic
+  state.
+- No durable/global snapshot generation. `a watch`'s `sequence` and `generation` counters start
+  over for each stream, so reconnecting clients must take a fresh snapshot rather than compare a
+  new stream to a global cursor.
+- `a watch` has JSONL only and no replay/`--since` cursor. Cross-SSH reconnect, backoff, and
+  snapshot handoff remain integration decisions.
+- Config migration from PocketShell YAML and the PocketShell-side adapter/rollout have not been
+  implemented in this repo.
 
 Also landed since the original doc: `docs/low-bandwidth-remote-access-design.md`, which
 analyzes PocketShell's mobile/SSH usage pattern directly. Its conclusions relevant here:
@@ -173,20 +189,21 @@ small, mostly-independent work that should be built alongside — not before —
 
 The original Phase 0 list, item by item:
 
-| Original blocker | Status at `69774f3` |
+| Original blocker | Status on 2026-08-30 |
 | --- | --- |
-| `a engines --json` | **Partially resolved.** Exists, but the shape is minimal: `[{name, command, available}]`. PocketShell's `EngineManifest` additionally carries `family, harness, label, provider_mark, launch{argv, skip_permissions_argv, env_unset, ...}, usage_provider, enabled`. Either aplexer's shape grows, or (recommended, see 1.5) pocketshell keeps a thin adapter that overlays its UI/metadata fields on aplexer's authoritative `{name, command, available}` core. Vocabulary mismatch: aplexer lacks `opencode` (pocketshell built-in) and adds `gemini` + `shell` (harmless extras). |
-| Provider-key `env_unset` forced union | **Not done, and now demonstrably a real gap** — the implemented `Config::resolve` merges env additively and never unsets anything. Launch delegation (A3 below) must not ship without this. |
-| `a profiles --json` | **Materially resolved.** Discovery is genuinely ported from `profiles.py` (same markers, hints, conservatism). Shape differences to adapt in the Python shim: aplexer's namespace is flat, keyed by directory stem (`"zlaude"`, `"godex"`) rather than per-engine `Profile.name`; there is no `default` flag (aplexer deliberately emits no profile for an engine's own default dir); the listing includes each profile's `env` map (benign today — values are config-dir paths, not secrets — but pocketshell's "never expose env in listings" rule should be re-asserted before any secret-bearing profile env exists). |
-| Launch-resolution command (`a launch-spec --json` / `a launch-exec`) | **Still missing — but it changed category.** It was a spec/design gap; it is now a small implementation task: `Config::resolve` in `src/lib.rs` already computes exactly the needed `ResolvedLaunch {engine, profile, command, cwd, env, limits, history_bytes}` — a `launch-spec` subcommand is a thin JSON-printing wrapper over it, and `launch-exec` an `execvpe` over the same. What `resolve` does **not** yet model: an `env_unset` list (above) and a skip-permissions argv variant (`LaunchSpec.skip_permissions_argv` / the phone's `--no-skip-permissions` flag). Both must be added for A3. |
+| `a engines --json` | **Resolved at the aplexer layer.** It lists `shell`, `codex`, `claude`, `gemini`, `grok`, and `opencode`, including availability plus effective `env_unset` names/counts. PocketShell's richer `EngineManifest` still carries presentation and policy fields (`family`, `label`, `provider_mark`, `usage_provider`, `enabled`). The recommended integration remains a thin PocketShell overlay rather than moving UI metadata into aplexer; that ownership boundary is a product decision, not a missing runtime capability. |
+| Provider-key `env_unset` forced union | **Resolved.** `EngineConfig.env_unset` is merged with aplexer's provider-key list during `Config::resolve`, so custom engine config may add removals but cannot opt out of the safeguard. |
+| `a profiles --json` | **Materially resolved.** Discovery is ported from `profiles.py` (same markers, hints, conservatism). Shape differences to adapt in the Python shim remain: aplexer's namespace is flat and keyed by directory stem (`"zlaude"`, `"godex"`) rather than per-engine `Profile.name`, and there is no `default` flag. Public profile/session JSON now filters environment metadata to recognized config-directory variables rather than exposing arbitrary launch environment. |
+| Launch-resolution command (`a launch-spec --json` / `a launch-exec`) | **Resolved.** Both hidden integration commands use `Config::resolve`, return/apply `env_set` and `env_unset`, select `skip_permissions_argv` by default, and accept `--no-skip-permissions`. The in-process Python client exposes the same resolver as `launch_spec()`. |
 | Config migration `~/.config/pocketshell/{engines,profiles}.yaml` → aplexer TOML | Not done; but the target shape is no longer speculative (`EngineConfig`/`ProfileConfig`/`ShortcutConfig` in `src/lib.rs`). Small documentation-plus-converter task. |
-| Python `aplexer` package (was "nice-to-have") | **Exists** (`python/aplexer/`). Lacks `engines()`/`profiles()` methods; subprocess JSON remains fine for Phase A. |
+| Python `aplexer-client` package (import `aplexer`; was "nice-to-have") | **Resolved for Phase A's aplexer-facing operations.** It is an in-process PyO3 binding, not a socket client, and exposes `engines()`, `profiles()`, `launch_spec()`, `snapshot()`/`list()`, and `start()`. It intentionally does not yet mirror every CLI operation. |
 
 New capabilities that change the Phase B calculus (they were all "missing aplexer piece" rows in
 the original table): the PTY runtime, workers, workspace/tag identity, cgroup/OOM isolation,
 `snapshot --json`, `attach`, `send`, `capture` **all exist and work now**. Phase B's remaining
-blockers have shrunk to: `a watch --jsonl`, an agent-state ingestion path, and remote/SSH
-validation — the desktop panes question that the original doc called Phase B's biggest product
+blockers have shrunk to: an agent-state ingestion path and remote/SSH reconnect and snapshot-
+handoff validation. `a watch --jsonl` is now available; the desktop panes question that the
+original doc called Phase B's biggest product
 conflict has **dissolved** with the move to pocketshell-electron, which has no split/pane UI at
 all (see 1.2). `a whoami` is a genuine new enabler here: an agent hook
 running inside an aplexer session can self-identify without parsing env vars, which is exactly
@@ -210,18 +227,19 @@ real local binary: *the SSH-remoteness tension largely dissolves at this seam*, 
 transport is unchanged. The tension only returns in Phase B (long-lived `watch` channels over
 SSH).
 
-#### Phase 0 — aplexer prerequisites (this repo, Rust)
+#### Phase 0 — aplexer prerequisites (complete; integration decisions remain)
 
-No longer "build aplexer"; now a short punch list:
+The original runtime punch list is complete. Two integration tasks remain outside that runtime
+work:
 
-| Step | Size | Notes |
+| Step | Status | Notes |
 | --- | --- | --- |
-| 0.1 Add `opencode` built-in engine | trivial | one `config.engines.insert` in `Config::load` (`src/lib.rs`); without it aplexer cannot be authoritative for pocketshell's engine set |
-| 0.2 Add `env_unset` to `EngineConfig` + forced-union provider-key list | small–medium | port `PROVIDER_ENV_UNSET_VARS` (~110 names) from `engines.py`; the forced union (custom engines cannot opt out) is the load-bearing property — spec §8.2 under-specifies it |
-| 0.3 `a launch-spec [--engine E] [--profile P] [--no-skip-permissions] [--cwd D] --json` | small | wraps `Config::resolve`; prints `{argv, env_set, env_unset, cwd, engine, profile}`; requires 0.2 and a skip-permissions argv notion (new field on `EngineConfig` or per-engine convention) |
-| 0.4 `a launch-exec ...` (execvpe variant of 0.3) | small | drop-in replacement target for `agents.py::launch_agent`'s exec step; `a.rs` already imports `CommandExt` |
-| 0.5 Engines JSON enrichment decision | decision + small | recommended: keep aplexer's shape lean (`name/command/available`, plus `env_unset` count once 0.2 lands) and let pocketshell overlay UI metadata (`label`, `provider_mark`, `family`) — those are presentation concerns aplexer has no reason to own |
-| 0.6 `engines.yaml`/`profiles.yaml` → TOML mapping doc or one-shot converter | small | shapes are near-isomorphic; the profile-namespace flattening (per-engine name → dir-stem id) is the only lossy step |
+| 0.1 `opencode` built-in engine | **Complete** | Included in `a engines --json` alongside aplexer's other built-ins. |
+| 0.2 `env_unset` + forced-union provider-key list | **Complete** | Enforced during resolution for built-in and custom engines. |
+| 0.3 `a launch-spec ... --json` | **Complete** | Hidden integration command; includes resolved argv, cwd, `env_set`, and `env_unset`. |
+| 0.4 `a launch-exec ...` | **Complete** | Hidden integration command using the same resolution path. |
+| 0.5 Engines JSON ownership | **Product/integration decision** | Recommended: keep aplexer's shape runtime-focused and let PocketShell overlay UI metadata (`label`, `provider_mark`, `family`). |
+| 0.6 YAML → TOML migration | **Remaining integration work** | Shapes are near-isomorphic; flat aplexer profile ids are the principal user-visible migration issue. |
 
 #### Phase A — aplexer owns engines/profiles/launch; tmux still hosts terminals
 
@@ -234,12 +252,14 @@ while output shapes are preserved):
   `a engines --json` for the authoritative `{name, command, available}` core, overlaying its own
   label/family/provider-mark metadata; `daemon.py` TTL caches sit on top unchanged. Size: medium
   (shape adapter + keeping `~/.config/pocketshell/engines.yaml` overrides working during the
-  transition). Do after A1 validates the subprocess-JSON seam. Depends on aplexer 0.1, 0.5.
+  transition). Do after A1 validates the integration seam. The aplexer inventory prerequisite
+  is complete; choosing the 0.5 metadata ownership boundary remains.
 - **A3 — launch delegation.** `agents.py::launch_agent` becomes a shim that either `exec`s
   `a launch-exec ...` or applies `a launch-spec --json` before its own `execvpe`. Keep writing
   `@ps_agent_kind`/`@ps_agent_profile` tmux options — the Kotlin readers depend on them. Size:
-  medium; risk: highest in Phase A (it is the actual launch path; the provider-key safeguard
-  must hold). Blocked on aplexer 0.2/0.3/0.4 — **do not start until those land**.
+  medium; risk: highest in Phase A (it is the actual launch path). The aplexer prerequisites
+  are complete; remaining work is the PocketShell shim, compatibility tests, and a gradual
+  rollout with a kill switch.
 - **A4 — desktop follow-through (much smaller than originally planned).** The original A4 —
   extracting a hardcoded engine enum and adding profiles to a VS Code fork — is obsolete: the
   Electron app already probes engine availability from `pocketshell agent --help` and already
@@ -263,11 +283,11 @@ the original:
 
 - Android: add an aplexer session source next to the tmux one. `FolderListGateway` merges
   `a snapshot --json` (via SSH exec) into the folder tree; attach becomes an SSH PTY channel
-  running `a attach <selector>` instead of the `-CC` client; live updates come from a long-lived
-  SSH exec channel running `a watch --jsonl` (once built) — SPEC.md explicitly blesses
-  interactive polling of `snapshot` as the interim, so a **polling-based Phase B pilot is now
-  technically possible before `watch` exists**, though not recommended before Phase A validates
-  the seam. `tmuxctl create-detached --mem` caps are subsumed by aplexer's native cgroups;
+  running `a attach <selector>` instead of the `-CC` client; live updates can now come from a
+  long-lived SSH exec channel running the shipped `a watch --jsonl`. Adaptive polling of
+  `snapshot` remains a useful fallback. Remote reconnect/backoff and the transition from a fresh
+  snapshot to a new per-stream watch cursor still need integration testing. `tmuxctl
+  create-detached --mem` caps are subsumed by aplexer's native cgroups;
   name-derivation/collision code is bypassed — workspace+tag is authoritative.
 - Android agent state: the hook-written `@ps_agent_state` mechanism needs an aplexer ingestion
   equivalent (e.g. `a state-report`, with `a whoami` as the hook-side addressing primitive) —
@@ -318,14 +338,14 @@ whenever `a` is absent or errors, and validates the exact seam every later step 
 "aplexer as authoritative registry, consumed over subprocess JSON by the host CLI on the same
 host". The SSH question does not arise: the host CLI and aplexer are co-located by construction.
 
-### 1.7 What is still genuinely blocked / not worth starting yet
+### 1.7 What remains genuinely open / should be sequenced carefully
 
-- **A3 launch delegation** — blocked on aplexer 0.2 (`env_unset` + forced provider-key union),
-  0.3/0.4 (`launch-spec`/`launch-exec`), and a skip-permissions argv model. Shipping it without
-  0.2 would silently drop PocketShell's provider-key safeguard: a hard no.
-- **Phase B live UX** — blocked on `a watch --jsonl`, which (verified) does not exist. Part 2
-  remains the design for it. A polling pilot against `a snapshot --json` is possible but
-  premature before the Phase A seam is validated in production use.
+- **A3 launch delegation** — no longer blocked on aplexer. It remains the highest-risk Phase A
+  integration because it changes the actual provider launch path; land the PocketShell shim
+  behind compatibility tests, shadow comparisons, and a kill switch.
+- **Phase B live UX** — `a watch --jsonl` now exists. What remains is PocketShell client wiring,
+  SSH reconnect/backoff, and a reliable fresh-snapshot-to-new-stream handoff because watch
+  sequence/generation counters are not durable cursors.
 - **Agent-state ingestion** — no `a state-report`-style push endpoint exists; spec §20 still
   lists only derivation. `a whoami` provides the hook-side identity half; the ingestion verb and
   storage are undesigned. Prerequisite for Phase B reaching Android's current state-badge UX.
@@ -345,13 +365,11 @@ host". The SSH question does not arise: the host CLI and aplexer are co-located 
 
 ## Part 2 — Common event format: adopting heru's `UnifiedEvent`
 
-Status note (2026-08-26 refresh): `a watch` — with or without `--jsonl` — is **still not
-implemented** (verified against the binary at `69774f3`); everything below remains the design
-the implementation should follow, not a description of shipped behavior. Two corrections made in
-this refresh against the now-real implementation: aplexer session ids are **UUIDv4**, not ULIDs;
-and aplexer's actual engine set is `shell/claude/codex/gemini/grok` (no `opencode` yet). A third
-caveat: the snapshot `generation` counter referenced below does not exist yet either — it must
-be built alongside `watch`.
+Status note (2026-08-30 refresh): `a watch --jsonl` is implemented using Option 1 below, and
+`a transcript` emits conversation events in the same envelope for supported native logs. This
+part now documents the shipped mapping plus its remaining limitations. Aplexer session ids are
+UUIDv4; the built-in engine set is `shell/claude/codex/gemini/grok/opencode`. Watch `sequence`
+and `metadata.generation` counters are local to each invocation, not durable snapshot cursors.
 
 ### 2.1 What heru's format actually is (found, not inferred)
 
@@ -392,17 +410,17 @@ stage reports, **not** part of the JSONL stream; `RuntimeEngineContinuation`; an
 ### 2.2 The honest structural mismatch
 
 heru's stream is a **per-run, conversation-level** event stream from a *headless* agent
-invocation (`heru codex "<prompt>"`): messages, tool calls, usage. Aplexer's sketched stream
-(spec §19) is a **host-level session-lifecycle** stream for *interactive, long-lived* TUI
-sessions: created/activity/state/oom/exited/deleted. These are different layers. Aplexer will
-emit **none** of heru's conversation kinds, and heru has **no** lifecycle kinds. So "same format"
+invocation (`heru codex "<prompt>"`): messages, tool calls, usage. Aplexer's watch stream is a
+**host-level session-lifecycle** stream for *interactive, long-lived* TUI sessions:
+created/state/oom/exited/deleted. These are different layers. The watch stream emits none of
+heru's conversation kinds, and heru has no lifecycle kinds. So "same format"
 can honestly mean: **aplexer adopts heru's envelope (field names, types, serialization, transport
 conventions) and expresses its lifecycle events inside it** — it cannot mean event-type-level
 identity today.
 
 Two ways to fit lifecycle events into the closed `kind` literal:
 
-- **Option 1 (recommended, default below):** map onto existing kinds — `"status"` for normal
+- **Option 1 (implemented):** map onto existing kinds — `"status"` for normal
   lifecycle transitions, `"error"` for failure ones — with the precise aplexer event name in
   `metadata.event`. Requires **no heru change**; every line is schema-valid `UnifiedEvent` and
   existing heru consumers can at least parse and display it.
@@ -416,17 +434,14 @@ Two ways to fit lifecycle events into the closed `kind` literal:
 - JSONL, one `UnifiedEvent` object per line; omit-null serialization.
 - `timestamp`: ISO-8601 UTC with second precision (replacing spec §19's sketched epoch ints,
   e.g. `"at":1787739912` → `"timestamp":"2026-08-26T12:00:00+00:00"`).
-- `sequence`: zero-based monotonically increasing counter **per `a watch` stream** — this
-  satisfies spec §19's gap-detection requirement, but note the semantic shift from heru
-  (per-run) to aplexer (per-stream); document it in aplexer's schema notes. Additionally carry
-  the global snapshot `generation` in `metadata.generation` so clients can fall back to
-  `a snapshot --json` coherently (the generation counter itself is not yet implemented; build it
-  with `watch`).
-- `engine`: the session's aplexer engine id (today: `claude`, `codex`, `gemini`, `grok`) for
-  agent sessions. It is a plain `str` in the model (not a literal), so aplexer ids that heru
-  doesn't ship adapters for (`gemini`, `grok`) are wire-legal. For `shell`/process sessions
-  there is no agent engine — proposal: `"aplexer"` as the emitting-component value (decision
-  flagged below).
+- `sequence`: zero-based monotonically increasing counter **per `a watch` stream**. The
+  `metadata.generation` value is likewise a per-stream polling-cycle counter. Neither survives
+  reconnect, so clients must establish a fresh `a snapshot --json` baseline before consuming a
+  new stream; adding a durable/global cursor is a separate product and protocol decision.
+- `engine`: the session's aplexer engine id (`claude`, `codex`, `gemini`, `grok`, `opencode`,
+  or `shell`). It is a plain `str` in the model (not a literal), so aplexer ids that heru
+  doesn't ship adapters for (`grok`) are wire-legal. With `a watch --all`, shell sessions use
+  the shipped `"shell"` value rather than a synthetic emitting-component name.
 - `continuation_id`: **reserved** for the engine-native session id (what `--resume` takes), if
   aplexer ever learns it. The aplexer session UUID is *not* a continuation id — it goes in
   `metadata.session_id`. Conflating these would be the tempting-but-wrong mapping.
@@ -440,45 +455,44 @@ Two ways to fit lifecycle events into the closed `kind` literal:
 ### 2.4 Event-by-event mapping
 
 Common fields on every aplexer-emitted event: `engine`, `sequence`, `timestamp`, `raw`, and
-`metadata` containing at least `{event, session_id, workspace, tag, generation}` (+ `profile`,
-`session_kind` where meaningful; key is `session_kind`, not `kind`, to avoid colliding with the
-envelope's `kind`).
+`metadata` containing at least `{event, session_id, workspace, tag, generation}`. A
+`session.created` event additionally carries `profile` when selected and `session_kind`; it is
+only emitted for sessions created after watch starts, not for the initial baseline.
 
 | aplexer event (spec §19) | heru `kind` | field mapping | notes / gaps |
 | --- | --- | --- | --- |
-| `session.created` | `status` | `metadata.event="session.created"`; `metadata`: `session_id`, `workspace`, `tag`, `profile`, `session_kind` (`agent`/`shell`/`process`); `content` = human summary (e.g. `"created pocketshell:review (codex/zodex)"`) | heru has no workspace/tag/profile/session-kind concepts at all — metadata-only |
-| `session.activity` | `status` | `metadata.event="session.activity"`; `timestamp` = activity time (replaces sketched `at`) | high-frequency; consider coalescing before emit — heru streams have no rate conventions |
-| `agent.state` | `status` | `metadata.event="agent.state"`, `metadata.state` = spec §20 vocab (`starting/running/waiting/idle/exited/oom/error/unknown`); `content` = state string for display | heru has **no** agent-semantic-state field. Its `SubagentStatus` (`created/running/completed/failed/blocked/interrupted`) is a different vocabulary for a different concept (pipeline subagents) — do not conflate; keep aplexer's vocabulary, in `metadata`. Note the implemented runtime's *phase* vocabulary is `starting/running/exiting/exited/failed` (plus derived `broken`) — phases are worker lifecycle, not agent semantic state; keep them distinct when `watch` is built |
-| `session.oom` | `error` | `error` = human reason (e.g. `"workload killed: cgroup memory limit"`); `metadata.event="session.oom"`; flatten `ResourceLimitEvent`-shaped scalars into `metadata` (`resource="memory"`, `memory_mb`, `observed_signal`) and/or nest the full shape in `raw` | `ResourceLimitEvent` is heru's normalized shape for exactly this, but it is not a stream event there — reusing its *field names* inside `metadata`/`raw` is alignment, not compliance. The implemented runtime already records `exit.oom_killed` per session, so the data source exists |
-| `session.exited` | `status` (normal exit) | `metadata.event="session.exited"`, `metadata.reason` (`exit`/`signal`/`killed`), `metadata.exit_code` | judgment call: abnormal exits could be `kind:"error"` instead; recommend `status` always, reserving `error` for `oom`/internal errors, so the `event`→`kind` mapping stays deterministic |
+| `session.created` | `status` | `metadata.event="session.created"`; `metadata`: `session_id`, `workspace`, `tag`, `profile`, `session_kind` (`agent`/`shell`); `content` = human summary (e.g. `"created pocketshell:review (codex/zodex)"`) | heru has no workspace/tag/profile/session-kind concepts at all — metadata-only |
+| `agent.state` | `status` | `metadata.event="agent.state"`, `metadata.state`; `content` = state string for display | Currently a coarse phase/output-recency proxy producing `starting`, `running`, `waiting`, `exited`, `oom`, or `error`; it cannot distinguish semantic waiting from a quiet long-running operation. The broader spec values `idle` and `unknown` are not emitted. Hook-driven semantic state remains future work. |
+| `session.oom` | `error` | `error="workload killed: cgroup memory limit"`; `metadata.event="session.oom"`, `metadata.resource="memory"`; the native exit detail remains in the adjacent `session.exited` event | `ResourceLimitEvent` is heru's normalized shape for this, but it is not a stream event there. The current mapping reuses only its resource vocabulary. |
+| `session.exited` | `status` | `metadata.event="session.exited"`, `metadata.reason` (`exit`/`signal`/`killed`), optional `metadata.exit_code` | Implemented as `status` for both normal and abnormal exit; OOM additionally emits the preceding `error` event. |
 | `session.deleted` | `status` | `metadata.event="session.deleted"`, `metadata.session_id` | no heru analogue; pure metadata event. Now has a real trigger in the implementation: `a kill` removes finished sessions' state |
+
+The earlier proposal also named `session.activity`; it is **not emitted**. PTY activity is
+coalesced into `agent.state` changes by a 3-second recency heuristic, avoiding a high-rate event
+stream. Adding raw activity events would be a protocol/product decision, not a prerequisite for
+the current PocketShell integration.
 
 Example lines:
 
 ```json
-{"kind":"status","engine":"codex","sequence":0,"timestamp":"2026-08-26T12:00:00+00:00","content":"created pocketshell:review (codex/zodex)","raw":{"type":"session.created","id":"019d..."},"metadata":{"event":"session.created","session_id":"019d...","workspace":"/home/alexey/git/pocketshell","tag":"review","profile":"zodex","session_kind":"agent","generation":1842}}
-{"kind":"status","engine":"codex","sequence":1,"timestamp":"2026-08-26T12:05:11+00:00","content":"waiting","raw":{"type":"agent.state","id":"019d...","state":"waiting"},"metadata":{"event":"agent.state","session_id":"019d...","state":"waiting","generation":1843}}
-{"kind":"error","engine":"claude","sequence":2,"timestamp":"2026-08-26T12:09:40+00:00","error":"workload killed: cgroup memory limit","raw":{"type":"session.oom","id":"019e..."},"metadata":{"event":"session.oom","session_id":"019e...","resource":"memory","generation":1844}}
+{"kind":"status","engine":"codex","sequence":0,"timestamp":"2026-08-30T12:00:00+00:00","content":"created /home/alexey/git/pocketshell:review (codex/zodex)","raw":{"type":"session.created","id":"550e8400-e29b-41d4-a716-446655440000"},"metadata":{"event":"session.created","session_id":"550e8400-e29b-41d4-a716-446655440000","workspace":"/home/alexey/git/pocketshell","tag":"review","profile":"zodex","session_kind":"agent","generation":1}}
+{"kind":"status","engine":"codex","sequence":1,"timestamp":"2026-08-30T12:05:11+00:00","content":"waiting","raw":{"type":"agent.state","id":"550e8400-e29b-41d4-a716-446655440000","state":"waiting"},"metadata":{"event":"agent.state","session_id":"550e8400-e29b-41d4-a716-446655440000","workspace":"/home/alexey/git/pocketshell","tag":"review","state":"waiting","generation":2}}
 ```
 
 ### 2.5 What deliberately does not map
 
-- **heru's conversation kinds** (`message`, `tool_call`, `tool_result`, `usage`,
-  `continuation`): aplexer emits none. Both clients currently parse agent transcript JSONL
-  themselves (Android `shared/core-agents/` parsers; desktop `src/agents/conversation/parsers/`).
-  A *future* aplexer feature could tail transcripts and emit true heru conversation events per
-  session — that would make the "one common format" vision real end-to-end — but spec §27 lists
-  agent conversation storage as a v1 non-goal. Flagged as an open direction, not planned here.
-  (The transcript-parsing duplication the original doc cited lives in Android's
-  `shared/core-agents/` parsers and the archived VS Code fork; the Electron app currently
-  renders the raw terminal only and parses no transcripts.)
+- **Conversation and lifecycle are separate streams.** `a watch` deliberately emits only
+  lifecycle `status`/`error` events. The shipped `a transcript [--follow]` command separately
+  parses Claude, Codex, and Grok native logs into conversation `UnifiedEvent`s. Gemini and
+  OpenCode transcript adapters do not exist, and PocketShell still has to decide whether and how
+  to consume this second stream.
 - **Transport**: heru = stdout of a finite run; aplexer = long-lived `a watch --jsonl` (over an
   SSH channel for PocketShell). Envelope reuse only; run-lifecycle assumptions (e.g. heru's
   final `continuation` event) do not transfer.
 - **Engine vocabularies** overlap but differ: heru ships `codex, claude, copilot, gemini,
-  opencode, goz`; aplexer today ships `shell, claude, codex, gemini, grok` (no `opencode` yet —
-  Phase 0 step 0.1 adds it). Wire-legal (plain `str`) but documentation/tooling that hard-codes
-  heru's list will not know `grok`.
+  opencode, goz`; aplexer ships `shell, claude, codex, gemini, grok, opencode`. Wire-legal
+  (plain `str`), but documentation/tooling that hard-codes heru's list will not know `grok` or
+  the shell lifecycle source.
 - `role`, `tool_*`, `usage_delta` are meaningless for lifecycle events and are simply omitted
   (which omit-null serialization makes natural).
 
@@ -486,11 +500,10 @@ Example lines:
 
 ## Open questions / risks
 
-1. **Launch-resolution command** (`a launch-exec` / `a launch-spec --json`): no longer a spec
-   design gap — `Config::resolve` computes the needed structure — but it is still unbuilt, and
-   the *hard part* moved: modeling `env_unset` (with the forced provider-key union) and a
-   skip-permissions argv variant, neither of which the implemented config schema has. A3 is
-   blocked on this, and only A3.
+1. **Launch-delegation rollout:** `a launch-exec`, `a launch-spec --json`, `env_unset`, and the
+   skip-permissions argv variant are shipped. The remaining risk is integration behavior:
+   preserve PocketShell's tmux metadata, compare native and delegated launch specs, define the
+   fallback when aplexer is absent/older, and roll out behind a kill switch.
 2. **Agent-state ingestion:** PocketShell's working mechanism is agent hooks pushing state
    (`tmux set-option @ps_agent_state`). Spec §20 only lists derivation (process/output/logs).
    Aplexer likely needs a push endpoint (e.g. `a state-report waiting`, callable from
@@ -515,12 +528,13 @@ Example lines:
    Kotlin pickers eventually surface.
 6. **SSH/remote model:** aplexer is a local per-user runtime with no daemon; PocketShell is
    inherently remote. Phase A is unaffected (host CLI and aplexer are co-located). For Phase B:
-   `watch` reconnect/gap semantics, snapshot latency without a daemon (spec §15.1 defers a
+   watch reconnect/gap semantics, snapshot latency without a daemon (spec §15.1 defers a
    control process pending profiling), and battery cost of a persistent channel on Android are
    unvalidated. `docs/low-bandwidth-remote-access-design.md` (landed) now covers the
    bandwidth/battery half of this: payload size is a non-issue, poll cadence is the cost, and
-   `watch`-over-one-idle-channel is the endgame; `watch` reconnect/gap semantics remain the
-   open design item.
+   watch-over-one-idle-channel is the endgame. The shipped watch has invocation-local counters
+   and no replay cursor, so reconnect must take a fresh snapshot; whether a durable cursor is
+   needed remains an open protocol decision.
 7. **Session identity migration:** both clients (Android's DB/notification plumbing, the
    Electron app's `sessionName.ts`/`sessionNameParts.ts` and per-tab client pool) key on tmux
    session *names*; aplexer keys on workspace:tag + UUID.
@@ -530,17 +544,17 @@ Example lines:
 8. **Non-migrating features need homes:** `jobs.py` recurring pings (built on `tmuxctl`), cards
    push feed, `usage`/`quse` — out of aplexer scope by spec §27; their tmux dependence outlives
    Phase C unless separately rehomed.
-9. **Provider-key safeguard semantics:** now a verified implementation gap, not just a spec
-   under-specification — the shipped `EngineConfig`/`Config::resolve` have no unset concept at
-   all. When adding it (Phase 0 step 0.2), make the forced union non-optional by construction so
-   a declarative TOML override cannot accidentally disable it.
+9. **Provider-key safeguard ownership:** the forced `env_unset` union is implemented and custom
+   config cannot opt out. The remaining maintenance decision is which project owns the
+   provider-key inventory and how drift against PocketShell's list is detected as providers add
+   new credentials.
 10. **Desktop helper-version pinning:** pocketshell-electron pins its launch-line construction
     against captured `pocketshell agent <kind> --help` fixtures and probes helper capabilities
     at runtime (it documents living with helper 0.4.44 vs newer). When Phase A changes what the
     helper emits (engine lists, profile JSON), the desktop's fixtures and probes must be
     exercised against the new helper version — cheap, but easy to forget. (Replaces the
     original mirrored-backend risk, which died with the archived VS Code fork.)
-11. **Listing hygiene:** `a profiles --json` and `a list --json` include full `env` maps.
-    Harmless today (config-dir paths), but PocketShell's rule was "never expose env/secrets in
-    listings" — decide whether aplexer adopts that rule before profiles or `--env` values ever
-    carry secrets.
+11. **Listing hygiene:** public profile/session JSON now derives metadata through an allowlist of
+    recognized config-directory variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`)
+    rather than exposing the full launch environment. Preserve this allowlist boundary whenever
+    new engines or profile metadata are added; expanding it is a security-sensitive review.
