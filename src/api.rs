@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::{
     atomic_write_json, canonical_workspace, command_exists, ensure_private_dir, list_records,
-    parse_byte_size, read_record, validate_tag, worker_executable, Config, FileLock, Limits, Paths,
-    Phase, SCHEMA_VERSION, SessionRecord,
+    parse_byte_size, public_session_record, read_record, redacted_env, session_metadata_env,
+    validate_tag, worker_executable, Config, FileLock, Limits, Paths, Phase, SessionRecord,
+    SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -49,8 +50,11 @@ pub fn engines_json(paths: &Paths) -> Result<Value> {
 }
 
 pub fn profiles_json(paths: &Paths) -> Result<Value> {
-    let config = Config::load(paths)?;
-    Ok(serde_json::to_value(&config.profiles)?)
+    let mut profiles = Config::load(paths)?.profiles;
+    for profile in profiles.values_mut() {
+        profile.env = redacted_env(&profile.env);
+    }
+    Ok(serde_json::to_value(profiles)?)
 }
 
 pub fn launch_spec_json(
@@ -81,7 +85,7 @@ pub fn launch_spec_json(
         "engine": launch.engine,
         "profile": launch.profile,
         "argv": argv,
-        "env_set": launch.env,
+        "env_set": redacted_env(&launch.env),
         "env_unset": launch.env_unset,
         "cwd": cwd,
     }))
@@ -94,7 +98,7 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
     }
     let mut enriched = Vec::with_capacity(records.len());
     for record in &records {
-        let mut value = serde_json::to_value(record)?;
+        let mut value = serde_json::to_value(public_session_record(record))?;
         value["worker_alive"] = json!(record.worker_alive());
         enriched.push(value);
     }
@@ -194,7 +198,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         profile: launch.profile,
         command: launch.command,
         cwd: launch.cwd,
-        env: BTreeMap::new(),
+        env: session_metadata_env(&launch.env),
         env_unset: launch.env_unset,
         limits: launch.limits,
         history_bytes: launch.history_bytes,

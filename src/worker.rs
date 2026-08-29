@@ -396,8 +396,9 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         Err(error) => return Err(error).context("read private launch environment"),
     };
     let _ = fs::remove_file(&launch_environment_path);
-    // Migrate a legacy record before exposing any further worker state.
-    record.env.clear();
+    // Migrate a legacy record before exposing any further worker state,
+    // retaining only non-secret roots needed for transcript discovery.
+    record.env = session_metadata_env(&record.env);
     let _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;
 
@@ -775,7 +776,7 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
     match request.operation {
         Operation::Ping => write_json(&mut stream, &Response::ok(id, json!({"pong":true})))?,
         Operation::Status => {
-            let mut value = serde_json::to_value(runtime.record()?)?;
+            let mut value = serde_json::to_value(public_session_record(&runtime.record()?))?;
             if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
                 value["cgroup"] = cgroup.stats();
             }

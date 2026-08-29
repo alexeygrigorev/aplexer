@@ -386,6 +386,30 @@ pub struct SessionRecord {
     pub error: Option<String>,
 }
 
+/// Environment entries that are session metadata rather than launch
+/// secrets. Transcript discovery needs these profile-specific roots after
+/// the worker exits; every other launch value remains one-shot/private.
+const SESSION_METADATA_ENV_KEYS: &[&str] = &["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"];
+
+pub fn session_metadata_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(key, _)| SESSION_METADATA_ENV_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+pub fn public_session_record(record: &SessionRecord) -> SessionRecord {
+    let mut public = record.clone();
+    public.env = session_metadata_env(&public.env);
+    public
+}
+
+pub fn redacted_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.keys()
+        .map(|key| (key.clone(), "<redacted>".to_string()))
+        .collect()
+}
+
 impl SessionRecord {
     pub fn selector(&self) -> String {
         format!("{}:{}", self.workspace.display(), self.tag)
@@ -2202,6 +2226,22 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn session_metadata_keeps_only_transcript_roots() {
+        let env = BTreeMap::from([
+            ("CODEX_HOME".to_string(), "/profiles/codex".to_string()),
+            ("API_TOKEN".to_string(), "secret".to_string()),
+        ]);
+        assert_eq!(
+            session_metadata_env(&env),
+            BTreeMap::from([("CODEX_HOME".to_string(), "/profiles/codex".to_string())])
+        );
+        assert_eq!(
+            redacted_env(&env).get("API_TOKEN").map(String::as_str),
+            Some("<redacted>")
+        );
     }
     /// The load-bearing property from pocketshell-integration-plan.md 0.2: a
     /// custom engine's own (smaller/different) `env_unset` can only ADD to
