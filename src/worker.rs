@@ -621,7 +621,7 @@ impl WorkerRuntime {
     /// sessions use the worker's subreaper descendant tree.
     fn workload_populated(&self) -> Result<bool> {
         if let Some(cgroup) = lock(&self.cgroup)?.as_ref() {
-            return Ok(cgroup.populated());
+            return cgroup.populated();
         }
         Ok(!descendant_pids(std::process::id())?.is_empty())
     }

@@ -1901,8 +1901,8 @@ impl Cgroup {
             self.signal_all(libc::SIGKILL)
         }
     }
-    pub fn populated(&self) -> bool {
-        read_counter(&self.path.join("cgroup.events"), "populated").unwrap_or(0) != 0
+    pub fn populated(&self) -> Result<bool> {
+        Ok(read_counter(&self.path.join("cgroup.events"), "populated")? != 0)
     }
     pub fn oom_killed(&self) -> bool {
         read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0)
@@ -1928,7 +1928,9 @@ impl Cgroup {
             "memory_swap_current": read_value("memory.swap.current"),
             "oom_kill_count": oom_kill_total,
             "oom_kill_count_since_start": oom_kill_total.saturating_sub(self.initial_oom_kill),
-            "populated": self.populated(),
+            // Status telemetry is explicitly best-effort; lifecycle and kill
+            // paths call `populated` directly and propagate every error.
+            "populated": self.populated().ok(),
         })
     }
     pub fn cleanup(&self) {
@@ -1971,10 +1973,15 @@ fn read_counter(path: &Path, key: &str) -> Result<u64> {
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() == Some(key) {
-            return Ok(parts.next().unwrap_or("0").parse()?);
+            let value = parts
+                .next()
+                .ok_or_else(|| anyhow!("counter {key} in {} has no value", path.display()))?;
+            return value
+                .parse()
+                .with_context(|| format!("parse counter {key} in {}", path.display()));
         }
     }
-    Ok(0)
+    bail!("counter {key} not found in {}", path.display())
 }
 
 pub fn parse_byte_size(raw: &str) -> Result<u64> {
@@ -2400,6 +2407,20 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cgroup_counter_read_errors_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("cgroup.events");
+
+        assert!(read_counter(&events, "populated").is_err());
+        fs::write(&events, "frozen 0\n").unwrap();
+        assert!(read_counter(&events, "populated").is_err());
+        fs::write(&events, "populated nope\n").unwrap();
+        assert!(read_counter(&events, "populated").is_err());
+        fs::write(&events, "populated 1\n").unwrap();
+        assert_eq!(read_counter(&events, "populated").unwrap(), 1);
     }
 
     #[test]
