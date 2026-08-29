@@ -304,7 +304,9 @@ fn worker_kill_isolation() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("session {b}'s worker_alive never went false after SIGKILL; last status:\n{stdout}");
+            panic!(
+                "session {b}'s worker_alive never went false after SIGKILL; last status:\n{stdout}"
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }

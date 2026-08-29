@@ -330,31 +330,59 @@ enum MessageCommand {
 /// (design doc section 6.2).
 #[derive(Args)]
 struct PaneDeliveryArgs {
-    #[arg(long, help = "Inject as terminal input into the target's PTY instead of the durable inbox")]
+    #[arg(
+        long,
+        help = "Inject as terminal input into the target's PTY instead of the durable inbox"
+    )]
     pane: bool,
-    #[arg(long = "or-inbox", help = "If --pane delivery fails, fall back to an inbox send instead of erroring")]
+    #[arg(
+        long = "or-inbox",
+        help = "If --pane delivery fails, fall back to an inbox send instead of erroring"
+    )]
     or_inbox: bool,
-    #[arg(long, help = "With --pane: suppress the '[aplexer message from ...]' frame and trailing return")]
+    #[arg(
+        long,
+        help = "With --pane: suppress the '[aplexer message from ...]' frame and trailing return"
+    )]
     raw: bool,
 }
 
 #[derive(Args)]
 struct MessageSendArgs {
-    #[arg(long, value_name = "TAG", help = "Send to one session, addressed by tag")]
+    #[arg(
+        long,
+        value_name = "TAG",
+        help = "Send to one session, addressed by tag"
+    )]
     to: Option<String>,
     #[arg(long, help = "Broadcast to every other session in the workspace")]
     all: bool,
-    #[arg(long = "to-engine", value_name = "ENGINE", help = "Broadcast to sessions of one engine")]
+    #[arg(
+        long = "to-engine",
+        value_name = "ENGINE",
+        help = "Broadcast to sessions of one engine"
+    )]
     to_engine: Option<String>,
-    #[arg(long, help = "Allow sending to a tag that has never existed in this workspace")]
+    #[arg(
+        long,
+        help = "Allow sending to a tag that has never existed in this workspace"
+    )]
     queue: bool,
-    #[arg(long, default_value = "note", help = "note (default) | handoff | reply | any string")]
+    #[arg(
+        long,
+        default_value = "note",
+        help = "note (default) | handoff | reply | any string"
+    )]
     kind: String,
     #[arg(long, value_name = "JSON", help = "Opaque structured payload")]
     data: Option<String>,
     #[command(flatten)]
     pane_delivery: PaneDeliveryArgs,
-    #[arg(long, value_name = "TAG", help = "Sender identity override (default: APLEXER_TAG or anonymous)")]
+    #[arg(
+        long,
+        value_name = "TAG",
+        help = "Sender identity override (default: APLEXER_TAG or anonymous)"
+    )]
     from: Option<String>,
     #[arg(value_name = "TEXT")]
     text: String,
@@ -378,9 +406,16 @@ struct MessageReplyArgs {
 
 #[derive(Args)]
 struct MessageInboxArgs {
-    #[arg(long, help = "Unread messages only (this is also the default with no flag)")]
+    #[arg(
+        long,
+        help = "Unread messages only (this is also the default with no flag)"
+    )]
     new: bool,
-    #[arg(long, value_name = "TAG", help = "Consumer identity override (default: APLEXER_SESSION_ID)")]
+    #[arg(
+        long,
+        value_name = "TAG",
+        help = "Consumer identity override (default: APLEXER_SESSION_ID)"
+    )]
     from: Option<String>,
 }
 
@@ -400,7 +435,10 @@ struct MessageShowArgs {
 struct MessageAckArgs {
     #[arg(value_name = "MESSAGE_ID")]
     message_ids: Vec<Uuid>,
-    #[arg(long, help = "Ack every currently-unread message addressed to this consumer")]
+    #[arg(
+        long,
+        help = "Ack every currently-unread message addressed to this consumer"
+    )]
     all: bool,
     #[arg(long, value_name = "TAG")]
     from: Option<String>,
@@ -425,7 +463,9 @@ fn run() -> Result<()> {
     let paths = Paths::discover()?;
     // Bare `a` with no subcommand defaults to `a list`, matching how tmux
     // and similar tools default to a listing rather than printing usage.
-    let command = cli.command.unwrap_or(Commands::List(ListArgs { running: false }));
+    let command = cli
+        .command
+        .unwrap_or(Commands::List(ListArgs { running: false }));
     match command {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
         Commands::List(args) | Commands::Snapshot(args) => cmd_list(&paths, args, cli.json),
@@ -496,8 +536,9 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
     // never reach 8 digits.
     if target.workspace.is_none() && target.tag.is_none() {
         if let Some(selector) = &target.selector {
-            let is_quick_index =
-                !selector.is_empty() && selector.len() < 8 && selector.bytes().all(|b| b.is_ascii_digit());
+            let is_quick_index = !selector.is_empty()
+                && selector.len() < 8
+                && selector.bytes().all(|b| b.is_ascii_digit());
             if is_quick_index {
                 let index: usize = selector.parse().unwrap_or(0);
                 return resolve_quick_index(paths, index, None);
@@ -593,13 +634,29 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
         }
         let (running, total) = running_count(group);
         let (dot, dot_color) = workspace_glyph(running, total);
-        let badge = paint(color, &format!("{ANSI_BOLD}{ANSI_CYAN}"), &format!("[{}]", workspace_index + 1));
-        let name = paint(color, ANSI_BOLD, &display_workspace(workspace, home.as_deref()));
-        let summary = paint(color, dot_color, &format!("{dot} {}", running_summary(group)));
+        let badge = paint(
+            color,
+            &format!("{ANSI_BOLD}{ANSI_CYAN}"),
+            &format!("[{}]", workspace_index + 1),
+        );
+        let name = paint(
+            color,
+            ANSI_BOLD,
+            &display_workspace(workspace, home.as_deref()),
+        );
+        let summary = paint(
+            color,
+            dot_color,
+            &format!("{dot} {}", running_summary(group)),
+        );
         println!("{badge} {name} ({summary})");
         let last = group.len().saturating_sub(1);
         for (i, r) in group.iter().enumerate() {
-            let connector_raw = if i == last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251c}\u{2500}\u{2500}" };
+            let connector_raw = if i == last {
+                "\u{2514}\u{2500}\u{2500}"
+            } else {
+                "\u{251c}\u{2500}\u{2500}"
+            };
             let connector = paint(color, ANSI_GRAY, connector_raw);
             let idx = paint(color, ANSI_DIM, &format!("{:>2}", i + 1));
             let tag = paint(color, ANSI_BOLD, &format!("{:<14}", r.tag));
@@ -616,10 +673,17 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     }
     if !by_workspace.is_empty() {
         println!();
-        println!("{}", paint(color, ANSI_DIM, "Attach: a <workspace#> [session#|tag]"));
         println!(
             "{}",
-            paint(color, ANSI_DIM, "e.g. a 3 2, a 3 zsp, or a 3 for its first session")
+            paint(color, ANSI_DIM, "Attach: a <workspace#> [session#|tag]")
+        );
+        println!(
+            "{}",
+            paint(
+                color,
+                ANSI_DIM,
+                "e.g. a 3 2, a 3 zsp, or a 3 for its first session"
+            )
         );
     }
     Ok(())
@@ -1126,9 +1190,7 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
             // case, give the same clear reason attach/send would rather than
             // the raw filesystem error from the failed read.
             Err(_) => match read_history_tail(&record.history_path, args.bytes) {
-                Ok(bytes) => {
-                    bytes
-                }
+                Ok(bytes) => bytes,
                 Err(read_error) => {
                     check_attachable(&record)?;
                     return Err(read_error)
@@ -1237,7 +1299,11 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         } else {
             remove_session_state(paths, record.id)
                 .with_context(|| format!("remove finished session {}", record.id))?;
-            eprintln!("a: removed {} session {}", phase_name(&record.phase), record.id);
+            eprintln!(
+                "a: removed {} session {}",
+                phase_name(&record.phase),
+                record.id
+            );
         }
     }
     if json_output {
@@ -1514,8 +1580,9 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         }
         std::process::exit(1);
     };
-    let record = read_record(&paths.record(id))
-        .with_context(|| format!("session {id} (from APLEXER_SESSION_ID) has no persisted record"))?;
+    let record = read_record(&paths.record(id)).with_context(|| {
+        format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
+    })?;
     if json_output {
         println!(
             "{}",
@@ -1630,11 +1697,7 @@ fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Res
     let located = aplexer::agent_events::resolve_transcript(&record, &bind_path)?;
     let path = located.path;
     if !json_output && !args.follow {
-        println!(
-            "transcript: {} (engine {})",
-            path.display(),
-            record.engine
-        );
+        println!("transcript: {} (engine {})", path.display(), record.engine);
     }
     aplexer::agent_events::run_transcript(
         &record,
@@ -1858,7 +1921,14 @@ fn finish_send(
             bail!("--pane requires a single --to TAG target: no pane broadcast");
         };
         let tag = tag.clone();
-        match deliver_pane(paths, workspace, &tag, envelope.from.tag.as_deref(), &envelope.body, pane.raw) {
+        match deliver_pane(
+            paths,
+            workspace,
+            &tag,
+            envelope.from.tag.as_deref(),
+            &envelope.body,
+            pane.raw,
+        ) {
             Ok(()) => envelope.delivery = Delivery::Pane,
             Err(e) => {
                 if pane.or_inbox {
@@ -1902,11 +1972,13 @@ fn finish_send(
 }
 
 fn print_message_line(m: &MessageEnvelope) {
-    let sender = m
-        .from
-        .tag
-        .clone()
-        .unwrap_or_else(|| if m.from.external { "external".into() } else { "?".into() });
+    let sender = m.from.tag.clone().unwrap_or_else(|| {
+        if m.from.external {
+            "external".into()
+        } else {
+            "?".into()
+        }
+    });
     let to_desc = match &m.to {
         Recipient::Tag { tag, .. } => format!("to:{tag}"),
         Recipient::Broadcast { .. } => "to:*".to_string(),
@@ -1917,18 +1989,23 @@ fn print_message_line(m: &MessageEnvelope) {
         Delivery::Pane => " [pane]",
     };
     let first_line = m.body.lines().next().unwrap_or("");
-    println!("{}  [{}] {sender} -> {to_desc}{delivery}  {first_line}", m.id, m.kind);
+    println!(
+        "{}  [{}] {sender} -> {to_desc}{delivery}  {first_line}",
+        m.id, m.kind
+    );
 }
 
 fn print_message_details(m: &MessageEnvelope) {
     println!("id: {}", m.id);
     println!("workspace: {}", m.workspace.display());
     println!("created_at: {}", m.created_at);
-    let sender = m
-        .from
-        .tag
-        .clone()
-        .unwrap_or_else(|| if m.from.external { "(external)".into() } else { "(unknown)".into() });
+    let sender = m.from.tag.clone().unwrap_or_else(|| {
+        if m.from.external {
+            "(external)".into()
+        } else {
+            "(unknown)".into()
+        }
+    });
     println!(
         "from: {sender}{}",
         m.from
@@ -1984,7 +2061,14 @@ fn cmd_message_send(paths: &Paths, args: MessageSendArgs, json_output: bool) -> 
     let workspace = resolve_message_workspace(None)?;
     let data = parse_data_arg(args.data.as_deref())?;
     let from = resolve_sender(paths, &workspace, args.from.as_deref())?;
-    let to = build_recipient(paths, &workspace, args.to.as_deref(), args.all, args.to_engine.as_deref(), args.queue)?;
+    let to = build_recipient(
+        paths,
+        &workspace,
+        args.to.as_deref(),
+        args.all,
+        args.to_engine.as_deref(),
+        args.queue,
+    )?;
     let envelope = MessageEnvelope {
         schema_version: MESSAGE_SCHEMA_VERSION,
         id: Uuid::now_v7(),
@@ -2049,7 +2133,8 @@ fn cmd_message_reply(paths: &Paths, args: MessageReplyArgs, json_output: bool) -
 fn cmd_message_inbox(paths: &Paths, args: MessageInboxArgs, json_output: bool) -> Result<()> {
     let _ = args.new; // `--new` is accepted for CLI-surface compatibility; unread is already the default (design doc section 7).
     let workspace = resolve_message_workspace(None)?;
-    let (consumer_id, consumer_tag, consumer_engine) = resolve_consumer(paths, &workspace, args.from.as_deref())?;
+    let (consumer_id, consumer_tag, consumer_engine) =
+        resolve_consumer(paths, &workspace, args.from.as_deref())?;
     let _ = maybe_gc(paths, &workspace);
     let cursor = read_cursor(paths, &workspace, consumer_id)?;
     let messages: Vec<MessageEnvelope> = list_messages(paths, &workspace)?
@@ -2104,7 +2189,8 @@ fn cmd_message_ack(paths: &Paths, args: MessageAckArgs, json_output: bool) -> Re
         bail!("specify at least one message id, or --all");
     }
     let workspace = resolve_message_workspace(None)?;
-    let (consumer_id, consumer_tag, consumer_engine) = resolve_consumer(paths, &workspace, args.from.as_deref())?;
+    let (consumer_id, consumer_tag, consumer_engine) =
+        resolve_consumer(paths, &workspace, args.from.as_deref())?;
     let ids: Vec<Uuid> = if args.all {
         let cursor = read_cursor(paths, &workspace, consumer_id)?;
         list_messages(paths, &workspace)?
@@ -2131,7 +2217,10 @@ fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Resu
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("removed {} message(s), {} remaining", report.removed, report.remaining);
+        println!(
+            "removed {} message(s), {} remaining",
+            report.removed, report.remaining
+        );
     }
     Ok(())
 }
@@ -2275,7 +2364,12 @@ fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()>
 /// saving immediately before and restoring immediately after -- with nothing
 /// else written in between -- keeps that jump invisible and leaves the
 /// shell's own cursor position undisturbed.
-fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermGeom>>, rows: u16, cols: u16) {
+fn apply_terminal_layout(
+    stdout: &Arc<Mutex<io::Stdout>>,
+    term: &Arc<Mutex<TermGeom>>,
+    rows: u16,
+    cols: u16,
+) {
     let reserved = rows > 2;
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b7");
@@ -2287,7 +2381,11 @@ fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermG
     seq.extend_from_slice(b"\x1b8");
     let _ = write_locked(stdout, &seq);
     if let Ok(mut g) = term.lock() {
-        *g = TermGeom { rows, cols, reserved };
+        *g = TermGeom {
+            rows,
+            cols,
+            reserved,
+        };
     }
 }
 
@@ -2563,7 +2661,11 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
             *flash = None;
         }
     }
-    let record = ctx.record.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let record = ctx
+        .record
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let home = env::var_os("HOME").map(PathBuf::from);
     let ws = display_workspace(&record.workspace, home.as_deref());
     let mut ep = match &record.profile {
@@ -2571,7 +2673,10 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         None => record.engine.clone(),
     };
     let raw = live_status(&record);
-    if let Some(fg) = raw.as_ref().and_then(|raw| foreground_override(&record, raw)) {
+    if let Some(fg) = raw
+        .as_ref()
+        .and_then(|raw| foreground_override(&record, raw))
+    {
         ep.push_str(&format!(" -> {fg}"));
     }
     let mut text = format!("{ws}:{} [{ep}]", record.tag);
@@ -2658,7 +2763,10 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
         .margins();
     let text = status_bar_text(ctx, geom.cols as usize);
     {
-        let mut last = ctx.last_drawn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut last = ctx
+            .last_drawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let key = (text.clone(), geom.rows, geom.cols, workload_margins);
         if !force && last.as_ref() == Some(&key) {
             return false;
@@ -3073,7 +3181,10 @@ enum BarClick {
 /// section 7; `workspace_summary` (the currently-live renderer) is
 /// untouched by this addition.
 #[allow(dead_code)]
-fn workspace_summary_regions(siblings: &[SessionRecord], current_id: Uuid) -> (String, Vec<BarRegion>) {
+fn workspace_summary_regions(
+    siblings: &[SessionRecord],
+    current_id: Uuid,
+) -> (String, Vec<BarRegion>) {
     let mut text = String::new();
     let mut regions = Vec::new();
     for (i, r) in siblings.iter().enumerate() {
@@ -3245,13 +3356,15 @@ fn perform_switch(
         let reader = handshake.reader;
         let history = handshake.initial;
         let writer_clone = reader.try_clone()?; // before mutating anything
-        // Repoint every forwarding thread (input, resize) at B, then retire
-        // A's stream. From this instant keystrokes land in B.
+                                                // Repoint every forwarding thread (input, resize) at B, then retire
+                                                // A's stream. From this instant keystrokes land in B.
         let old = {
             let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
             std::mem::replace(&mut *w, writer_clone)
         };
-        *pending_switch.lock().unwrap_or_else(PoisonError::into_inner) = Some(SwitchOutcome {
+        *pending_switch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(SwitchOutcome {
             record: next.clone(),
             reader,
             history,
@@ -3282,7 +3395,11 @@ fn take_pending_switch(
 ) -> Option<SwitchOutcome> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
-        if let Some(o) = pending.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        if let Some(o) = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             return Some(o);
         }
         if !in_progress.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -4118,11 +4235,11 @@ mod switching_tests {
         let groups = sample_groups();
         let a1 = groups[0].1[0].id;
         let a2 = groups[0].1[1].id;
-        let next = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Next, None)
-            .unwrap();
+        let next =
+            pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Next, None).unwrap();
         assert_eq!(next.id, a2); // dead a3 skipped
-        let prev = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Prev, None)
-            .unwrap();
+        let prev =
+            pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Prev, None).unwrap();
         assert_eq!(prev.id, a2); // wraps backward past dead a3 too
     }
 
@@ -4130,8 +4247,14 @@ mod switching_tests {
     fn index_returns_dead_session_without_skipping() {
         let groups = sample_groups();
         let a1 = groups[0].1[0].id;
-        let dead = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Index(3), None)
-            .unwrap();
+        let dead = pick_switch_target(
+            &groups,
+            Path::new("/ws/a"),
+            a1,
+            SwitchTarget::Index(3),
+            None,
+        )
+        .unwrap();
         assert_eq!(dead.phase, Phase::Exited);
     }
 
@@ -4139,8 +4262,14 @@ mod switching_tests {
     fn index_out_of_range_errors() {
         let groups = sample_groups();
         let a1 = groups[0].1[0].id;
-        let err = pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Index(9), None)
-            .unwrap_err();
+        let err = pick_switch_target(
+            &groups,
+            Path::new("/ws/a"),
+            a1,
+            SwitchTarget::Index(9),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no session 9"));
     }
 
@@ -4203,9 +4332,14 @@ mod switching_tests {
         let groups = sample_groups();
         let a1 = groups[0].1[0].id;
         let a2 = groups[0].1[1].id;
-        let found =
-            pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Last, Some(a2))
-                .unwrap();
+        let found = pick_switch_target(
+            &groups,
+            Path::new("/ws/a"),
+            a1,
+            SwitchTarget::Last,
+            Some(a2),
+        )
+        .unwrap();
         assert_eq!(found.id, a2);
     }
 
@@ -4498,7 +4632,11 @@ mod switching_tests {
                 state_root: PathBuf::from("/nonexistent-aplexer-test-state"),
                 config_file: PathBuf::from("/nonexistent-aplexer-test-state/config.toml"),
             },
-            record: Arc::new(Mutex::new(mk_record("/ws/status-bar-test", "t", Phase::Running))),
+            record: Arc::new(Mutex::new(mk_record(
+                "/ws/status-bar-test",
+                "t",
+                Phase::Running,
+            ))),
             flash: Arc::new(Mutex::new(None)),
             last_drawn: Arc::new(Mutex::new(None)),
             workload_margins: Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(23))),
@@ -4714,7 +4852,10 @@ mod switching_tests {
         let ctx = status_ctx_for_test(true);
         // Nothing drawn yet: even a non-forced call must actually write
         // (there's no `last_drawn` to compare against).
-        assert!(draw_status_bar(&ctx, false), "first draw must be a real write");
+        assert!(
+            draw_status_bar(&ctx, false),
+            "first draw must be a real write"
+        );
         // Same record/geometry, so the rendered text is unchanged: a
         // non-forced call must be a dirty-check no-op, not a real write --
         // this is exactly the case the timer-starvation bug got wrong by

@@ -306,7 +306,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 .command
                 .first()
                 .map(String::as_str)
-            .unwrap_or("<empty>")
+                .unwrap_or("<empty>")
         );
     }
     worker_command(id, req.python.as_deref())?;
@@ -454,13 +454,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
 fn worker_command(id: Uuid, python: Option<&Path>) -> Result<Command> {
     if let Some(python) = python {
         let mut command = Command::new(python);
-        command.args([
-            "-m",
-            "aplexer",
-            "worker",
-            "--id",
-            &id.to_string(),
-        ]);
+        command.args(["-m", "aplexer", "worker", "--id", &id.to_string()]);
         return Ok(command);
     }
     let mut command = Command::new(worker_executable()?);

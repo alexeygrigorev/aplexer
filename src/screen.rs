@@ -605,7 +605,11 @@ mod tests {
                 !event1.margins_reset && !event2.margins_reset,
                 "split at {split} reported a spurious reset"
             );
-            assert_eq!(t.margins(), Some((3, 20)), "split at {split} lost the margin");
+            assert_eq!(
+                t.margins(),
+                Some((3, 20)),
+                "split at {split} lost the margin"
+            );
         }
     }
 
@@ -1123,7 +1127,9 @@ mod tests {
     fn margin_reset_emits_layout_change() {
         let mut tracker = ScreenTracker::new(24, 80);
         assert!(tracker.process(b"\x1b[3;20r").is_none());
-        let change = tracker.process(b"\x1b[r").expect("reset should emit a change");
+        let change = tracker
+            .process(b"\x1b[r")
+            .expect("reset should emit a change");
         assert!(change.margins_reset);
         assert!(!change.erase_reset);
         assert!(!change.alt_screen);
@@ -1171,7 +1177,11 @@ mod tests {
 
         let screen_a = a.parser.screen();
         let screen_b = b.screen();
-        assert_eq!(screen_a.contents(), screen_b.contents(), "contents mismatch");
+        assert_eq!(
+            screen_a.contents(),
+            screen_b.contents(),
+            "contents mismatch"
+        );
         assert_eq!(
             screen_a.cursor_position(),
             screen_b.cursor_position(),
@@ -1206,7 +1216,9 @@ mod tests {
         stream.extend_from_slice(b"\x1b[?1049h"); // enter alt screen
         stream.extend_from_slice(b"\x1b[?2004h"); // bracketed paste on
         stream.extend_from_slice(b"\x1b[2J\x1b[H");
-        stream.extend_from_slice(b"\x1b[1;36m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\x1b[0m\r\n");
+        stream.extend_from_slice(
+            b"\x1b[1;36m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\x1b[0m\r\n",
+        );
         stream.extend_from_slice(b"\x1b[32mAsk Codex to do anything\x1b[0m\r\n");
         stream.extend_from_slice(b"\x1b[7m status: idle \x1b[0m\r\n");
         stream.extend_from_slice(b"\x1b[10;5H");
@@ -1240,7 +1252,10 @@ mod tests {
         let mut b = vt100::Parser::new(30, 100, 0);
         b.process(&snapshot);
         assert_eq!(tracker.contents(), b.screen().contents());
-        assert_eq!(tracker.parser.screen().cursor_position(), b.screen().cursor_position());
+        assert_eq!(
+            tracker.parser.screen().cursor_position(),
+            b.screen().cursor_position()
+        );
     }
 
     /// Regression test for the scroll region being silently dropped from the

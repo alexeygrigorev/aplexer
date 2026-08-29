@@ -164,7 +164,10 @@ fn int_meta(map: &mut BTreeMap<String, Value>, key: &str, v: &Value) {
 /// Full-message lines (`assistant`/`user`/`result`/`system`/`error`) are
 /// not wrapped and pass through unchanged.
 fn claude_unwrap(payload: &Value) -> &Value {
-    payload.get("event").filter(|e| e.is_object()).unwrap_or(payload)
+    payload
+        .get("event")
+        .filter(|e| e.is_object())
+        .unwrap_or(payload)
 }
 
 fn claude_final_messages(payload: &Value) -> Vec<String> {
@@ -278,29 +281,27 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
             e.tool_output = Some(tool_output);
             out.push(e);
         }
-        Some("user") => {
-            match unwrapped.get("message").and_then(|m| m.get("content")) {
-                Some(Value::String(s)) if !s.is_empty() => {
-                    out.push(claude_user_text_event(engine, s));
-                }
-                Some(Value::Array(blocks)) => {
-                    for block in blocks {
-                        match block.get("type").and_then(|t| t.as_str()) {
-                            Some("tool_result") => out.push(claude_tool_result_event(engine, block)),
-                            Some("text") => {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        out.push(claude_user_text_event(engine, text));
-                                    }
+        Some("user") => match unwrapped.get("message").and_then(|m| m.get("content")) {
+            Some(Value::String(s)) if !s.is_empty() => {
+                out.push(claude_user_text_event(engine, s));
+            }
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("tool_result") => out.push(claude_tool_result_event(engine, block)),
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    out.push(claude_user_text_event(engine, text));
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
-        }
+            _ => {}
+        },
         Some("assistant") => {
             for message in claude_final_messages(unwrapped) {
                 let mut e = ev("message");
@@ -598,7 +599,11 @@ fn grok_native_continuation(payload: &Value) -> Option<String> {
 
 fn grok_row_timestamp(payload: &Value) -> String {
     if let Some(n) = payload.get("timestamp").and_then(|t| t.as_i64()) {
-        let ms = if n < 10_000_000_000 { (n as u64) * 1000 } else { n as u64 };
+        let ms = if n < 10_000_000_000 {
+            (n as u64) * 1000
+        } else {
+            n as u64
+        };
         return iso8601_utc(ms);
     }
     if let Some(n) = payload
@@ -628,20 +633,28 @@ fn wire_format_for(engine: &str) -> Result<WireFormat> {
         "claude" => Ok(WireFormat::Claude),
         "codex" => Ok(WireFormat::CodexNative),
         "grok" => Ok(WireFormat::Grok),
-        other => bail!(
-            "a transcript supports claude, codex, and grok only (got engine {other})"
-        ),
+        other => bail!("a transcript supports claude, codex, and grok only (got engine {other})"),
     }
 }
 
-fn translate(format: WireFormat, engine: &str, payload: &Value) -> (Vec<UnifiedEvent>, Option<String>) {
+fn translate(
+    format: WireFormat,
+    engine: &str,
+    payload: &Value,
+) -> (Vec<UnifiedEvent>, Option<String>) {
     match format {
         WireFormat::Claude => (
             claude_wire_events(engine, payload),
             claude_wire_continuation(payload),
         ),
-        WireFormat::CodexNative => (codex_native_events(payload), codex_native_continuation(payload)),
-        WireFormat::Grok => (grok_native_events(payload), grok_native_continuation(payload)),
+        WireFormat::CodexNative => (
+            codex_native_events(payload),
+            codex_native_continuation(payload),
+        ),
+        WireFormat::Grok => (
+            grok_native_events(payload),
+            grok_native_continuation(payload),
+        ),
     }
 }
 
@@ -923,7 +936,11 @@ pub fn locate_grok_transcript(
 }
 
 fn grok_sessions_root(env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    if let Some(home) = env.get("GROK_HOME").cloned().or_else(|| std::env::var("GROK_HOME").ok()) {
+    if let Some(home) = env
+        .get("GROK_HOME")
+        .cloned()
+        .or_else(|| std::env::var("GROK_HOME").ok())
+    {
         return Some(PathBuf::from(home).join("sessions"));
     }
     let home = std::env::var_os("HOME")?;
@@ -1085,8 +1102,8 @@ impl NativeLogReader {
         record: &SessionRecord,
         consume_tail: bool,
     ) -> Result<Vec<UnifiedEvent>> {
-        let mut file = File::open(&self.path)
-            .with_context(|| format!("read {}", self.path.display()))?;
+        let mut file =
+            File::open(&self.path).with_context(|| format!("read {}", self.path.display()))?;
         let len = file.metadata()?.len();
         if len < self.byte_offset {
             self.reset();
@@ -1330,11 +1347,13 @@ mod tests {
 
     #[test]
     fn claude_continuation_from_system_init() {
-        let payload: Value = serde_json::from_str(
-            r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#,
-        )
-        .unwrap();
-        assert_eq!(claude_wire_continuation(&payload).as_deref(), Some("abc-123"));
+        let payload: Value =
+            serde_json::from_str(r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#)
+                .unwrap();
+        assert_eq!(
+            claude_wire_continuation(&payload).as_deref(),
+            Some("abc-123")
+        );
     }
 
     #[test]
@@ -1445,7 +1464,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(last.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            last.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
 
         let after = paginate(
             events.clone(),
@@ -1455,7 +1477,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(after.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            after.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
 
         let older = paginate(
             events,
@@ -1466,7 +1491,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(older.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            older.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]
@@ -1475,7 +1503,10 @@ mod tests {
             encode_claude_cwd("/data/tmp/.tmpBU2mbw"),
             "-data-tmp--tmpBU2mbw"
         );
-        assert_eq!(encode_claude_cwd("/tmp/aplexer-follow"), "-tmp-aplexer-follow");
+        assert_eq!(
+            encode_claude_cwd("/tmp/aplexer-follow"),
+            "-tmp-aplexer-follow"
+        );
     }
 
     #[test]
@@ -1539,7 +1570,10 @@ mod tests {
     fn max_line_bytes_emits_truncation_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sess.jsonl");
-        let huge = format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#, "x".repeat(200));
+        let huge = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(200)
+        );
         std::fs::write(&path, format!("{huge}\n")).unwrap();
         let record = dummy_record("claude");
         let mut reader = NativeLogReader::open("claude", &path, Some(50)).unwrap();

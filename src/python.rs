@@ -192,7 +192,9 @@ fn start(
 
 #[pyfunction]
 fn run_worker(id: &str) -> PyResult<()> {
-    let id: Uuid = id.parse().map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let id: Uuid = id
+        .parse()
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     crate::worker::run_worker(id, None).map_err(py_err)
 }
 

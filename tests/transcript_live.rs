@@ -289,9 +289,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::process::Output
         Ok(Ok(output)) => output,
         Ok(Err(error)) => panic!("wait failed: {error}"),
         Err(_) => {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             panic!("command (pid {pid}) did not finish within {timeout:?}");
         }
     }
@@ -324,20 +322,15 @@ fn last_sequence(events: &[Value]) -> u64 {
 }
 
 fn has_task_progress(events: &[Value]) -> bool {
-    let kinds: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e["kind"].as_str())
-        .collect();
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
     let saw_user = events.iter().any(|e| {
-        e["kind"] == "message"
-            && e["role"] == "user"
-            && event_text(e).contains("report.md")
+        e["kind"] == "message" && e["role"] == "user" && event_text(e).contains("report.md")
     });
-    let saw_tool = kinds.iter().any(|k| *k == "tool_call" || *k == "tool_result");
+    let saw_tool = kinds
+        .iter()
+        .any(|k| *k == "tool_call" || *k == "tool_result");
     let saw_answer = events.iter().any(|e| {
-        e["kind"] == "message"
-            && e["role"] == "assistant"
-            && event_text(e).contains("12")
+        e["kind"] == "message" && e["role"] == "assistant" && event_text(e).contains("12")
     });
     saw_user && saw_tool && saw_answer
 }
@@ -383,10 +376,7 @@ fn transcript_follow_live_agents() {
         }
         let stdout = h.run_ok(&args, Duration::from_secs(40));
         let record: Value = serde_json::from_str(&stdout).expect("start json");
-        let id = record["id"]
-            .as_str()
-            .expect("start json id")
-            .to_string();
+        let id = record["id"].as_str().expect("start json id").to_string();
         let me = h.whoami(&id);
         assert_eq!(me["id"].as_str(), Some(id.as_str()), "whoami id");
         assert_eq!(me["engine"].as_str(), Some(agent.engine), "whoami engine");
@@ -401,9 +391,9 @@ fn transcript_follow_live_agents() {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(
-            command.iter().any(|a| a.contains("skip")
-                || a.contains("bypass")
-                || *a == "--always-approve"),
+            command
+                .iter()
+                .any(|a| a.contains("skip") || a.contains("bypass") || *a == "--always-approve"),
             "{} should start in skip-permissions mode, got {command:?}",
             agent.engine
         );
@@ -516,7 +506,11 @@ fn transcript_follow_live_agents() {
                     && event_text(e).contains(FOLLOW_MARK)
             });
             if saw {
-                eprintln!("{} follow saw {FOLLOW_MARK} ({} new events)", agent.tag, events.len());
+                eprintln!(
+                    "{} follow saw {FOLLOW_MARK} ({} new events)",
+                    agent.tag,
+                    events.len()
+                );
                 followed.insert(agent.tag, true);
             }
         }

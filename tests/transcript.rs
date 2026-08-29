@@ -227,7 +227,11 @@ fn transcript_last_and_whoami() {
         .join("sessions")
         .join(id)
         .join("transcript.json");
-    assert!(bind.is_file(), "expected bind sidecar at {}", bind.display());
+    assert!(
+        bind.is_file(),
+        "expected bind sidecar at {}",
+        bind.display()
+    );
 }
 
 #[test]

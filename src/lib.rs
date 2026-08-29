@@ -1546,8 +1546,12 @@ impl Request {
 pub enum Operation {
     Ping,
     Status,
-    Send { bytes: usize },
-    Capture { max_bytes: Option<usize> },
+    Send {
+        bytes: usize,
+    },
+    Capture {
+        max_bytes: Option<usize>,
+    },
     /// `history_bytes` keeps its original meaning (raw-tail replay size,
     /// used when `want_screen` is false or an old worker doesn't understand
     /// it). `want_screen`/`rows`/`cols` are additive fields (design doc
@@ -1568,14 +1572,25 @@ pub enum Operation {
         #[serde(default)]
         cols: Option<u16>,
     },
-    Resize { rows: u16, cols: u16 },
-    Kill { signal: i32, grace_ms: u64 },
-    Rename { workspace: PathBuf, tag: String },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    Kill {
+        signal: i32,
+        grace_ms: u64,
+    },
+    Rename {
+        workspace: PathBuf,
+        tag: String,
+    },
     /// `a capture --screen` (design doc section 8): the rendered current
     /// screen (`plain: false`, same bytes `Attach`'s snapshot would carry)
     /// or its plain-text contents (`plain: true`, `ScreenTracker::contents`)
     /// -- "richer PocketShell previews" from spec.md section 17.
-    CaptureScreen { plain: bool },
+    CaptureScreen {
+        plain: bool,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -1617,8 +1632,12 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ServerEvent {
-    Exit { exit: ExitInfo },
-    Error { message: String },
+    Exit {
+        exit: ExitInfo,
+    },
+    Error {
+        message: String,
+    },
     /// The workload did something that invalidates the client's DECSTBM
     /// status-bar reservation: reset its scroll margins (RIS or a bare/
     /// full-range `\x1b[r`), flipped alternate-screen state, or issued an
@@ -1808,10 +1827,8 @@ impl Cgroup {
         thread::spawn(move || {
             let _ = anchor.wait();
         });
-        let release_on_failure = |anchor_pid: u32| {
-            unsafe {
-                libc::kill(anchor_pid as libc::pid_t, libc::SIGKILL);
-            }
+        let release_on_failure = |anchor_pid: u32| unsafe {
+            libc::kill(anchor_pid as libc::pid_t, libc::SIGKILL);
         };
         let path = match wait_for_scope_cgroup(&unit, Duration::from_secs(5)) {
             Ok(path) => path,
@@ -1903,7 +1920,8 @@ impl Cgroup {
                 .ok()
                 .and_then(|text| text.trim().parse().ok())
         };
-        let oom_kill_total = read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0);
+        let oom_kill_total =
+            read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0);
         serde_json::json!({
             "memory_current": read_value("memory.current"),
             "memory_peak": read_value("memory.peak"),
