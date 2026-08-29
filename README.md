@@ -57,14 +57,17 @@ a attach --workspace "$PWD" --tag shell
 
 The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
 
+**Reattach repaints the live screen, tmux-style.** The worker feeds every PTY byte through a terminal-state model continuously — attached or not — so `a attach` renders *the screen as it is right now* (cursor position, colors, alternate screen, bracketed paste and mouse modes, scroll margins) rather than replaying a tail of raw byte history. Reattaching to a running full-screen agent TUI puts it back exactly where the agent thinks it is, instead of leaving a stale cursor and a half-drawn frame, and the payload is a few hundred bytes to a few KB instead of a fixed 32 KB. `a attach --history-bytes N` is the escape hatch back to the old raw-tail replay (byte-exact scripted consumers, or seeding your terminal's native scrollback). See [docs/terminal-state-design.md](docs/terminal-state-design.md).
+
 ```bash
 a send --workspace "$PWD" --tag shell --enter 'printf "hello\\n"'
 a capture --workspace "$PWD" --tag shell
+a capture --workspace "$PWD" --tag shell --screen --plain   # current screen as text
 a status --workspace "$PWD" --tag shell
 a kill --workspace "$PWD" --tag shell --signal TERM --grace-ms 2000
 ```
 
-Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them.
+Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them. `capture --screen` asks for the live screen instead of the byte history: as paintable escape sequences by default, or as plain text with `--plain`.
 
 ## Engines, profiles, and shortcuts
 
@@ -176,7 +179,7 @@ When any limit is requested, the worker creates a per-session cgroup-v2 leaf and
 
 ## Durable lifecycle
 
-Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit. A worker keeps its socket alive after exit so reattach, status, and capture do not race record finalization.
+Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. A worker keeps its socket alive after exit so reattach, status, and capture do not race record finalization.
 
 ## Watching events
 
@@ -268,8 +271,8 @@ See [spec.md](spec.md) (mirrored at [docs/SPEC.md](docs/SPEC.md)) for the comple
 
 For using aplexer on a remote host over a slow or flaky link (PocketShell on cellular), see [docs/low-bandwidth-remote-access-design.md](docs/low-bandwidth-remote-access-design.md) — what SSH compression already solves for free, status-bar/replay frugality, and reconnect/resume semantics (planning doc, not yet implemented).
 
-For switching between sessions without detaching (`Ctrl-b n`/`p`/`1-9`/`l` inside `a attach`, reusing the same numbering `a list` prints), see [docs/fast-session-switching-design.md](docs/fast-session-switching-design.md) — the in-process switch architecture, keybinding scheme, and failure handling (design doc, not yet implemented).
+For switching between sessions without detaching (`Ctrl-b n`/`p`/`1-9`/`l` inside `a attach`, reusing the same numbering `a list` prints), see [docs/fast-session-switching-design.md](docs/fast-session-switching-design.md) — the in-process switch architecture, keybinding scheme, and failure handling.
 
 For scrolling through a session's recent output without blocking input (tmux copy-mode's job, minus the input freeze), see [docs/scrollback-design.md](docs/scrollback-design.md) — why the host terminal's native scrollback is the mechanism, the status-bar hygiene invariants that keep it clean, and why a custom in-band scrollback view is rejected for v1 (design doc; mostly verification work).
 
-For correct, instant reattach — the worker maintaining a live tmux-style terminal-state model (via the `vt100` crate) and repainting the current screen instead of replaying raw byte history — see [docs/terminal-state-design.md](docs/terminal-state-design.md), which supersedes spec.md §17/§27's "no terminal emulator state" non-goal and fixes the reproduced reattach corruption of full-screen agent TUIs (design doc, not yet implemented).
+For correct, instant reattach — the worker maintaining a live tmux-style terminal-state model (via the `vt100` crate) and repainting the current screen instead of replaying raw byte history — see [docs/terminal-state-design.md](docs/terminal-state-design.md), which supersedes spec.md §17/§27's "no terminal emulator state" non-goal and fixes the reproduced reattach corruption of full-screen agent TUIs (implemented; see [Reattach repaints the live screen](#first-session) above).

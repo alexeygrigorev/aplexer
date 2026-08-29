@@ -1,7 +1,12 @@
 # Server-side terminal state: correct reattach via a live screen model
 
-Status: design, ready to implement. All function/line references are against
-commit `961ebac`. This is the aplexer equivalent of tmux's per-pane virtual
+Status: **implemented** (worker/protocol/client in `58fe950`, merged in
+`0a34738`; erase-trigger and scrollback-invariant follow-ups in `e8dd853`
+and `3a59d4e`). Checklist items 1-14 are done and verified end to end — see
+section 12 for the per-item outcomes recorded against the shipped code. All
+function/line references are against the design-time commit `961ebac` and
+have drifted since; the module/function names are still accurate.
+This is the aplexer equivalent of tmux's per-pane virtual
 terminal: the worker feeds every PTY byte through a terminal-state parser
 (the `vt100` crate) and keeps a live screen model, continuously, attached or
 not; reattach renders the *current screen* to the new client instead of
@@ -283,9 +288,88 @@ serving `a capture` (§8). This also caps model memory at the two-grid cost
 `ScreenTracker::set_size`) **before** the `set_winsize` ioctl. Output
 already in flight when a resize lands is parsed at the new size — a
 transient tmux shares; the workload's SIGWINCH-triggered repaint heals it
-within one frame. `MarginTracker` resets to full-screen margins on resize
+within one frame. ~~`MarginTracker` resets to full-screen margins on resize
 (xterm resets margins on resize; matching that is the least-surprise
-approximation).
+approximation).~~
+
+**Correction, from implementation (this sentence was wrong).** Resetting
+margins on resize makes `MarginTracker` disagree with the `vt100` grid
+standing next to it, and `snapshot()` pairs the grid's `state_formatted()`
+with *the tracker's* margins — so the two must agree or the snapshot lies.
+Measured against vt100 0.16.2 (`grid.rs::set_size`, lines 66–99),
+`Screen::set_size` **keeps** the scroll region and re-fits it with three
+rules, in this order:
+
+1. a **bottom-anchored** region — one whose bottom edge sits on the old
+   screen's last row — follows the screen, in *both* directions: `(3,23)` at
+   23 rows becomes `(3,39)` at 39 rows;
+2. a bottom past the new end is clamped to it, top preserved: `(5,23)` at 20
+   rows becomes `(5,20)`;
+3. a top that no longer fits below the clamped bottom degenerates to
+   full-screen: `(21,23)` at 10 rows.
+
+A region that still fits is untouched: `(5,15)` at 23 rows stays `(5,15)`.
+`MarginTracker::set_rows` follows all three exactly, with no exemption: after
+any sequence of resizes the region it *tracks* is what the real grid holds.
+Checked against the real crate by
+`margin_tracker_resize_matches_real_vt100_set_size` (case-by-case),
+`margin_tracker_resize_divergence_from_vt100_is_only_the_degenerate_row`
+(an exhaustive sweep of every sub-range at 2–24 rows resized to 1–30) and
+`margin_tracker_tracked_region_matches_vt100_across_two_resizes` (every
+sub-range at 2–14 rows through two consecutive resizes to 1–18, 147,420
+cases), all reading vt100's region back out through DECOM rather than
+assuming it.
+
+**Second correction, from review (the paragraph this replaces was wrong).**
+That paragraph said the tracker had one deliberate divergence — when a clamp
+collapses the region onto a single row (`top == bottom`, only reachable as
+`top == bottom == rows`), vt100 keeps the degenerate region and the tracker
+dropped it to full-screen — and called it inconsequential *by construction*,
+because "a one-row region is not expressible as a DECSTBM at all and
+`snapshot()` could not re-emit it". The premise is true; the conclusion does
+not follow. It reasons only about what can be emitted at that instant and
+says nothing about what the region becomes at the *next* resize — and a
+collapsed region is bottom-anchored by construction (`bottom == rows`), so
+rule 1 grows it back with the screen. Dropping it made the loss **sticky**:
+`\x1b[8;9r` at 20 rows, shrunk to 8 and re-grown to 24, is `(8,24)` in the
+grid and was full-screen in the tracker, permanently. A two-step sweep found
+4,823 of 147,420 resize pairs reporting a region that disagreed with vt100
+about a perfectly ordinary, expressible sub-range. Real-world severity was
+low — most TUIs re-emit DECSTBM on SIGWINCH, which heals it — but the
+reasoning was wrong, not merely conservative, and this is the second time in
+this effort that a comment overclaimed a limitation as inconsequential.
+
+The tracker therefore keeps the degenerate region as `Some((rows, rows))` and
+filters it out at the single emission-facing accessor,
+`MarginTracker::margins()`, whose `None` both emission sites
+(`ScreenTracker::snapshot` and `draw_status_bar`) already read as "no
+sub-range, leave the client's own reservation in force". The only remaining
+difference from vt100 anywhere is therefore what is *reported* while the
+region is degenerate — an emission decision rather than lost state, and no
+longer sticky. Pinned by
+`margin_tracker_regrows_a_region_a_shrink_collapsed_onto_one_row` (the case
+above, differentially against the real crate) plus the two sweeps, which
+assert the tracked region with no exemption and the reported one with exactly
+that emission exemption.
+
+Rule 1 was missed on the first pass. It matters for the most ordinary TUI
+layout there is — fixed header rows, everything below scrolls — whose region
+*is* bottom-anchored, so any enlargement (window maximize, on-screen
+keyboard hiding, a pane unsplit) made the tracker and the grid disagree and
+put a stale region into the next snapshot. Covered behaviourally by
+`round_trip_preserves_a_bottom_anchored_region_when_the_screen_grows`.
+
+The xterm rule looked harmless because it seemed to apply only on a real
+terminal resize, where the workload repaints anyway. It does not: **every
+attach resizes the PTY by one row** to reserve the status-bar row (§6.3
+step 1), so with the reset in place a workload holding a scroll region lost
+it from the snapshot on *every single attach*, while the workload itself
+kept line-feeding at the bottom of the region it still believed in. The host
+terminal then walked the cursor past the region and painted over the fixed
+rows below it. Reproduced end to end and covered by
+`round_trip_preserves_scroll_region_across_resize`, whose oracle has to be
+behavioural — immediately after the resize the live and restored screens are
+identical, and they only diverge once the workload next scrolls.
 
 ### 5.4 `MarginTracker` — the one thing vt100 doesn't expose
 
@@ -374,6 +458,12 @@ In order:
    Skipped when margins are default — the common case — leaving the
    client's own reservation region (§7) in force.
 
+   Two implementation notes, each of which independently defeated step 3
+   until fixed (see §5.3's correction and §7's): the tracker must still
+   *hold* the region at snapshot time (it did not, across the resize every
+   attach performs), and the client must not overwrite the restored region
+   afterwards (its status bar did, on the very next redraw).
+
 Property: feeding the snapshot to a fresh, same-sized virtual terminal
 must reproduce `contents()`, `cursor_position()`, `alternate_screen()`,
 and the input-mode flags of the live one. That is directly testable with a
@@ -437,12 +527,31 @@ comment at src/bin/a.rs:1768 names the missing terminal-state tracking as
 the reason it exists). With the worker parsing every byte, the triggers
 become *observed events* instead of guesses:
 
-- **Workload emits `\x1b[r` or RIS** — the only sequences that widen the
-  host's scroll region onto the bar row (a workload sub-range DECSTBM is
-  numerically confined to rows 1..rows−1 and cannot touch the bar).
-  `MarginTracker` reports `margins_reset`; client re-asserts the
-  reservation and redraws the bar, within one socket round-trip of the
-  bytes that caused it.
+- **Workload emits `\x1b[r` or RIS** — the sequences that widen the host's
+  scroll region back onto the bar row. `MarginTracker` reports
+  `margins_reset`; client re-asserts the reservation and redraws the bar,
+  within one socket round-trip of the bytes that caused it.
+
+  **What "re-asserts the reservation" has to mean, from implementation.**
+  Not, as the client originally did, writing `\x1b[1;{rows-1}r`
+  unconditionally on every bar redraw. That very sequence is what a
+  workload's own sub-range has to survive, and it did not: the bar destroyed
+  the region within one redraw cycle, including the one the snapshot had
+  just restored. So the client runs the same `MarginTracker` over the bytes
+  it writes (including the snapshot, whose trailing DECSTBM is how it learns
+  the region at attach time) and re-asserts whichever region is actually
+  current — its own only when the workload is on full-screen margins. The
+  scan costs ~1 GB/s, i.e. nothing next to the terminal write it
+  accompanies.
+
+  **Correction, measured.** An earlier version of this section (and the code
+  comments that quoted it) justified that by claiming a workload sub-range
+  "is numerically confined to rows 1..rows−1 and cannot touch the bar". That
+  is false, and §7.1 below records what actually happens. The justification
+  that survives is weaker but still decisive: re-asserting the workload's
+  region is the *lesser* exposure. Clobbering it corrupts every frame a
+  margin-using TUI draws; keeping it leaves one narrow, self-healing way for
+  the bar row to be written over.
 - **Alt-screen enter/exit** (`ScreenTracker` compares
   `alternate_screen()` across `process`) — margins are formally preserved
   across 1049 on xterm, but emulator variance exists and TUIs commonly
@@ -461,6 +570,32 @@ That is deliberately out of this design's v1 — it changes the client from
 a passthrough into a renderer and belongs with the PocketShell framed-attach
 work. The interim defensive re-assert patch (§10.1 item b) covers the
 residue meanwhile.
+
+### 7.1 Known limitation: a sub-range does not protect the reserved row
+
+Open, deliberately not fixed in v1. DECSTBM constrains scrolling *inside*
+the region, not cursor motion outside it, so while the client is
+re-asserting a workload's sub-range the reserved bottom row is exposed in a
+way it is not under the client's own `1;{rows-1}`:
+
+| host region in force | workload at row 23 emits `\n` | result |
+| --- | --- | --- |
+| `1;23` (client's own) | rows 1–23 scroll | cursor stays on row 23, row 24 untouched |
+| `5;15` (workload's) | row 23 is outside the region, and for the host terminal row 24 is just the screen bottom | cursor lands on row 24 and writes there |
+
+Measured against a real `vt100::Parser` at the client's geometry, and pinned
+by `workload_line_feed_can_still_reach_the_reserved_row_under_a_sub_range`
+in src/bin/a.rs. Reaching it needs the workload's cursor on its own last row
+— which is *outside* its own region — plus a line feed; the bar text is
+repainted on the next redraw (≤450 ms idle, ≤3 s forced), but the workload's
+cursor is left one row below where its own screen model believes it is.
+
+Not fixable by choosing a different region to re-assert: the two demands
+(scroll the workload's rows correctly, and stop its cursor at row `rows-1`)
+cannot both be expressed as one DECSTBM. Closing it means the client
+emulating the workload's stream well enough to clamp cursor motion — the
+same full client-side composition §10.2's v2 needs for the ED2 residue
+above, and the same place that fix belongs.
 
 ## 8. What happens to `History` / `a capture`
 
@@ -618,6 +753,16 @@ plus tests.
    reverted to edition 2021, but `vte` 0.15 must also pass — if it does
    not, either bump `rust-version` or pin `vt100 = "=0.15.2"` and add the
    then-missing pieces of §6.2 by hand; record the outcome here).
+
+   **Outcome: no bump and no pin needed on account of this dependency.**
+   `vt100` 0.16.2 and its whole subtree (`vte` 0.15.0, `itoa`,
+   `unicode-width`, `arrayvec`, `bitflags`, `memchr`) compile cleanly under
+   `cargo +1.78.0 check` in isolation; every crate in it declares an MSRV of
+   1.70 or lower. Note, separately and *not* caused by this design:
+   `cargo +1.78.0 check --all-targets` on the whole workspace now fails on
+   `clap` 4.6.6 ("feature `edition2024` is required"), so aplexer's declared
+   `rust-version = "1.78"` is already inaccurate for reasons unrelated to
+   the screen model — worth fixing, but as its own dependency-hygiene task.
 2. **`MarginTracker`** (new module, `src/screen.rs`): the §5.4 state
    machine. Pure function over bytes + internal state; unit-test with
    sequences split at every byte boundary (`"\x1b"`+`"[3;20r"`, RIS,
@@ -626,7 +771,8 @@ plus tests.
 3. **`ScreenTracker`** (same module): §5.1 API. `process` = parser.process
    + margins.scan + alt-flip detection → `Option<LayoutChange>`;
    `snapshot()` = §6.2 composition; `contents()`; `set_size` (parser
-   `Screen::set_size` + margin reset).
+   `Screen::set_size` + `MarginTracker::set_rows`, which re-fits the region
+   the same way the grid does rather than resetting it — §5.3's correction).
 4. **`HubInner`/`OutputHub`** (src/worker.rs:25-100): add
    `screen: ScreenTracker` (constructed with `run_worker`'s initial size —
    plumb `(rows, cols)` into `OutputHub::new`); feed it in `append` and
@@ -678,11 +824,56 @@ plus tests.
     content is present and the frame is a fresh snapshot, not history
     bytes. Old-client compat: attach with `want_screen: false` and assert
     raw-tail bytes.
+
+    **Extended, follow-up round.** The raw-socket attach above deliberately
+    skips `a attach`'s tty machinery — which is also where every piece of
+    client-side scroll-region handling lives (`isatty` gates all of it), so
+    none of it was covered: the snapshot scan, the per-Data-frame scan, the
+    resize thread's seeding, the switch reset and the switch's re-scan could
+    each be deleted with the suite still green. `tests/screen_snapshot.rs`
+    now also spawns the real `a attach` on a PTY (`aplexer::open_pty`),
+    captures every byte it writes and replays them through a
+    `vt100::Parser` standing in for the user's terminal, so the assertions
+    are about what the terminal ends up holding — read back with DECOM, and
+    cross-checked against the worker's own `a capture --screen --plain`.
+    Four tests: the region survives the attach and the first second
+    (`attach_keeps_the_workload_scroll_region_alive_on_the_host_terminal`),
+    a region set live is picked up
+    (`attach_learns_a_scroll_region_the_workload_sets_while_attached`), a
+    session switch drops the old session's region and learns the new one's
+    (`switching_sessions_drops_the_previous_sessions_scroll_region`), and a
+    bottom-anchored region follows a terminal enlargement through the real
+    resize path -- `TIOCSWINSZ` on the pty master, with the host model
+    resized at the same point a real terminal would be
+    (`growing_the_terminal_grows_a_bottom_anchored_workload_region`, §5.3
+    rule 1). Each of the five client-side call sites was verified to be
+    killed by at least one of them, by deleting it and re-running.
 12. **Benchmark gate**: the existing throughput concern — run a
     high-volume workload (`seq 1 2000000` or `yes | head -c 100M`)
     through a session before/after the change and compare wall time; the
     §9 expectation is a low-single-digit-percent difference. If it exceeds
     ~10%, profile before shipping (the append lock hold is the suspect).
+
+    **Outcome: gate passes.** Measured against an otherwise-identical
+    worker with `inner.screen.process(data)` removed from `OutputHub::append`,
+    with the two arms run as two concurrently-live sessions and reps strictly
+    alternating between them (this de-trending matters — a naive
+    block-A-then-block-B run on a loaded box produced a spurious +20%):
+
+    | workload | tracking | no tracking | delta (paired median) |
+    |---|---|---|---|
+    | `seq 1 2000000` (~17 MB), n=20 | 1.060 s median | 1.058 s median | **-0.5%** |
+    | `yes \| head -c 50000000` (~100 MB through the PTY), n=12 | 12.005 s median | 11.542 s median | **+4.0%** |
+
+    Isolated parse cost on the same box (release, 24×80, 32 KB chunks):
+    73.1 MB/s on the `seq` stream, 42.2 MB/s on the scroll-heavy `yes`
+    stream, and `state_formatted()` in 15-24 µs producing 99-1791 bytes —
+    all consistent with §3.3/§9. The `seq` arm shows no measurable delta
+    because the PTY line discipline, not the worker's read loop, is that
+    workload's bottleneck, so the parse fits in existing headroom; the
+    scroll-heavy arm is where the model actually costs something, and it
+    lands inside the §9 expectation. No profiling of the append lock hold
+    was needed.
 13. **README**: two-line design-doc pointer (done alongside this doc);
     update the attach section's reattach description ("reattach repaints
     the live screen, tmux-style").
@@ -690,9 +881,56 @@ plus tests.
     SIGWINCH-repaint-on-reconnect path (a) and retarget the defensive
     re-assert (b)'s trigger to the Layout event, keeping its helper and
     the slow periodic fallback; banner relocation (c) stays.
+
+    **Outcome: done.** (a) No SIGWINCH-repaint-on-reconnect path exists in
+    the merged result — the sibling worktree branches named in §10.1 are all
+    ancestors of `main`, and neither it nor
+    docs/low-bandwidth-remote-access-design.md §3's `--repaint` wiggle was
+    ever built, so there was nothing to delete. (b) `ServerEvent::Layout` now
+    drives the re-assert (`attach()`'s frame loop), while
+    `STATUS_BAR_IDLE_GAP`/`STATUS_BAR_MAX_INTERVAL` stay as the slow
+    fallback for the ED2-blanking residue §7 documents. (c) The banner is
+    still an `eprintln!`, but is now emitted *before* the snapshot write, so
+    the snapshot's ED2 repaints over it — §6.3 step 6's accepted interim
+    until a status-bar flash slot exists.
 15. **Upstream PRs** (parallel, non-blocking): vt100 `scroll_region()`
     getter (+ optionally inactive-grid access); shrink `MarginTracker`
     when merged. **Validate**: `cargo build --release --bins`,
     `cargo test`, `./scripts/validate.sh`, then the §1 codex repro by
     hand — attach, let the TUI render, detach, reattach: the box, prompt,
     and cursor must be exactly where codex thinks they are.
+
+    **Outcome: validated.** `cargo build --release --bins` and `cargo test`
+    are green: 70 `--lib` unit + 40 `--bin a` unit, and 7 `screen_snapshot`
+    integration tests (plus the `#[ignore]`d `attach_round_trip_latency`
+    perf measurement), all passing. Counts as of the closing round that added
+    the two-step resize sweep and the sticky-collapse regression test
+    (§5.3's second correction), on top of the round that added the vt100
+    resize differential (§5.3), the PTY-driven client tests covering the
+    snapshot/Data-frame/switch margin scans and the resize thread's seeding,
+    and §7.1's reserved-row limitation.
+    `./scripts/validate.sh` stops at its first step, `cargo fmt --all --
+    --check`, and **does so on `main` too**: the repo has never been
+    `cargo fmt`'d, so 85 hunks across 11 files are already unformatted before
+    this work, under rustfmt 1.78 and rustfmt 1.9 alike (it is genuine drift,
+    not a newer-toolchain style change). Left alone rather than reformatted,
+    since a repo-wide `cargo fmt` is its own change and would bury this one;
+    the code added here was hand-formatted so the count stays at exactly 85,
+    i.e. this adds no new formatting debt. Every later step of `validate.sh`
+    was run by hand and passes (`cargo check --all-targets`,
+    `cargo test --all-targets`, `python3 -m compileall python`; `pytest` is
+    not installed on this box, which `validate.sh` itself treats as a skip).
+
+    The §1 codex repro was then run for real against `codex-cli` 0.150.1 in
+    an 80×24 PTY: attach, let the TUI render, `Ctrl-b d`, reattach. On
+    reattach the worker sent a **1,529-byte** snapshot (vs. the old fixed
+    32 KB tail) that reproduced codex's bordered header box on rows 0-6, the
+    `›` input prompt on row 13, the model/context status line on row 16, the
+    cursor at (14, 2) — exactly where the live worker-side model had it —
+    and `bracketed_paste=true` restored. No banner text anywhere on screen,
+    no stale rows, no misplaced cursor. The alt-screen path (which codex
+    0.150 does not exercise) was covered by the same repro against `vim`,
+    where the snapshot correctly led with `\x1b[?1049h` and the host
+    terminal came up on the alternate screen with the file rendered and the
+    cursor at (0, 8). The upstream `scroll_region()` PR remains open work
+    and is explicitly non-blocking.

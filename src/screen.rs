@@ -43,9 +43,11 @@ const MARGIN_PARAM_CAP: usize = 32;
 ///   intermediate bytes: DECSTBM. Empty params, or a range that spans the
 ///   full screen (`top == 1 && bottom == rows`), resets to full-screen and
 ///   is reported; a validated proper sub-range (`1 <= top < bottom <=
-///   rows`) is stored with no reset report (a workload's sub-range is
-///   confined to its own rows and cannot reach the client's reserved
-///   status-bar row -- see design doc section 7); anything that fails
+///   rows`) is stored with no reset report, because the client re-asserts
+///   that sub-range rather than replacing it (see `draw_status_bar` in
+///   `src/bin/a.rs` and design doc section 7 -- including the documented
+///   limitation that a sub-range does not protect the client's reserved row
+///   the way the client's own reservation does); anything that fails
 ///   validation is ignored (no state change, no report), matching how real
 ///   terminals silently ignore a malformed DECSTBM.
 /// - `ESC [ ... J` (Erase in Display / ED), any parameter and any private
@@ -68,9 +70,15 @@ pub struct MarginTracker {
     /// byte, which disqualifies it from being the bare `CSI params r` this
     /// tracker recognizes.
     disqualified: bool,
-    /// Current scroll region, 1-based inclusive `(top, bottom)`. `None`
-    /// means full-screen (the default, and the common case).
-    margins: Option<(u16, u16)>,
+    /// Current scroll region as *tracked*, 1-based inclusive `(top, bottom)`;
+    /// `None` means full-screen (the default, and the common case).
+    ///
+    /// Deliberately not the same thing as what should be *emitted*: a resize
+    /// can collapse this onto a single row (`top == bottom`), which the grid
+    /// beside it also does and which a later resize can grow back, but which
+    /// is not expressible as a DECSTBM. `margins()` is the emission-facing
+    /// view that filters that out; nothing outside this type reads the field.
+    region: Option<(u16, u16)>,
 }
 
 impl MarginTracker {
@@ -80,25 +88,160 @@ impl MarginTracker {
             state: MarginParseState::Ground,
             param_buf: Vec::new(),
             disqualified: false,
-            margins: None,
+            region: None,
         }
     }
 
-    /// Current scroll region, if non-default.
+    /// The current scroll region as it should be **emitted**: a proper
+    /// sub-range, or `None` for "no sub-range -- leave the default, or the
+    /// client's own status-bar reservation, in force".
+    ///
+    /// Filtered, not raw. `set_rows` can leave the tracked region collapsed
+    /// onto a single row, matching what the `vt100` grid does (see its doc
+    /// comment for why keeping it matters), but a one-row region is not
+    /// expressible as a DECSTBM at all: `finish_csi` here and vt100's own
+    /// `set_scroll_region` both require `top < bottom`, so emitting
+    /// `\x1b[8;8r` would be ignored by the host terminal and leave whatever
+    /// region was previously in force -- worse than saying nothing. Both
+    /// emission sites (`ScreenTracker::snapshot` and `draw_status_bar` in
+    /// `src/bin/a.rs`) want "no sub-range" in that case, which is exactly what
+    /// `None` already means to them, so the filter lives here rather than
+    /// being repeated at each of them.
     pub fn margins(&self) -> Option<(u16, u16)> {
-        self.margins
+        self.region.filter(|&(top, bottom)| top < bottom)
     }
 
-    /// xterm resets margins on resize; matching that is the least-surprise
-    /// approximation (design doc section 5.3). Also resets any in-flight
-    /// partial CSI parse, since the row count it would validate against is
-    /// changing anyway.
-    pub fn set_rows(&mut self, rows: u16) {
-        self.rows = rows.max(1);
-        self.margins = None;
+    /// The region as *tracked*, before that emission-time filtering -- the
+    /// state this tracker carries into the next `set_rows`, which is what has
+    /// to match the `vt100` grid case-for-case.
+    #[cfg(test)]
+    fn tracked_region(&self) -> Option<(u16, u16)> {
+        self.region
+    }
+
+    /// Forgets everything: full-screen margins and no half-parsed sequence.
+    ///
+    /// Distinct from `set_rows`, which *clamps* rather than clears (see its
+    /// doc comment). This is for the case where the bytes being tracked start
+    /// belonging to a different terminal altogether -- the client's in-process
+    /// session switch (`Ctrl-b n`), where continuing to hold the previous
+    /// session's scroll region would apply it to the new one.
+    pub fn reset(&mut self) {
+        self.region = None;
         self.state = MarginParseState::Ground;
         self.param_buf.clear();
         self.disqualified = false;
+    }
+
+    /// Re-fits the tracked region to a new row count, following
+    /// `vt100::Screen::set_size`'s rules for the grid's own scroll region --
+    /// exactly, with no exemptions (what `margins()` chooses to *report* for a
+    /// degenerate region is a separate, emission-time question; see below).
+    ///
+    /// This deliberately does **not** follow design doc section 5.3's
+    /// "margins reset to full-screen on resize, matching xterm". That would
+    /// be right for a tracker modelling a *terminal*, but this one models
+    /// what the `vt100` grid beside it believes, because `snapshot()` pairs
+    /// the grid's `state_formatted()` with *these* margins.
+    ///
+    /// vt100 0.16.2 (`grid.rs::set_size`, lines 66-99) applies three rules,
+    /// in this order, all translated here from its 0-based half-inclusive
+    /// storage to this tracker's 1-based inclusive `(top, bottom)`:
+    ///
+    /// 1. A **bottom-anchored** region -- one whose bottom edge sits on the
+    ///    old screen's last row -- follows the screen, in *both* directions
+    ///    (`if scroll_bottom == self.size.rows - 1 { scroll_bottom =
+    ///    size.rows - 1 }`). So `(3,23)` at 23 rows becomes `(3,39)` at 39
+    ///    rows: "two fixed header rows, everything below scrolls" keeps
+    ///    meaning that after the terminal is enlarged.
+    /// 2. A bottom past the new end is clamped to it, top preserved:
+    ///    `(5,23)` at 20 rows becomes `(5,20)`.
+    /// 3. A top that no longer fits below the clamped bottom degenerates to
+    ///    the full screen: `(21,23)` at 10 rows becomes full-screen (`None`).
+    ///
+    /// A region that still fits is left alone, which is the case every
+    /// attach hits -- and resetting instead made this tracker and the grid
+    /// disagree after every resize. Since *every* attach resizes the PTY by
+    /// one row to reserve the status-bar row, the practical effect was that
+    /// attaching to a workload with a scroll region silently dropped that
+    /// region from the snapshot, and the host then scrolled the wrong rows
+    /// for the rest of the session. See
+    /// `round_trip_preserves_scroll_region_across_resize`, and
+    /// `margin_tracker_resize_matches_real_vt100_set_size` for the
+    /// case-by-case differential against the real crate.
+    ///
+    /// **The degenerate one-row case.** When the clamps leave `top == bottom`
+    /// (only reachable as `top == bottom == rows`, e.g. `(5,15)` resized to 5
+    /// rows), vt100's grid keeps that single-row region -- and so does this
+    /// tracker. It is held as `Some((rows, rows))` and filtered out only at
+    /// emission time by `margins()`, which reports "no sub-range" because a
+    /// one-row region is not expressible as a DECSTBM.
+    ///
+    /// Keeping it is load-bearing rather than pedantic. A collapsed region is
+    /// always bottom-anchored -- `bottom == rows` by construction -- so rule 1
+    /// grows it again on the next enlargement, exactly as vt100 does:
+    /// `\x1b[8;9r` at 20 rows, shrunk to 8 rows and re-grown to 24, is
+    /// `(8,24)` in the grid, and now here too. Dropping it to full-screen
+    /// instead made the loss **sticky**: the tracker reported full-screen from
+    /// then on, at every later size, while the grid whose `state_formatted()`
+    /// `snapshot()` pairs these margins with held an ordinary region.
+    ///
+    /// An earlier version of this comment called that divergence
+    /// inconsequential *by construction*, on the grounds that a one-row region
+    /// "could not be re-emitted even if it were tracked". That reasoning was
+    /// wrong: it is about what can be emitted at that instant and says nothing
+    /// about what the region becomes after the next resize, which is when the
+    /// discarded state was needed. Measured over a two-step sweep, 4,823 of
+    /// 147,420 resize pairs ended up reporting a region that disagreed with
+    /// vt100 about a perfectly expressible sub-range. Both sweeps below now
+    /// pin the tracked region against the real crate with no exemption at all:
+    /// `margin_tracker_resize_divergence_from_vt100_is_only_the_degenerate_row`
+    /// (single step) and
+    /// `margin_tracker_tracked_region_matches_vt100_across_two_resizes`, plus
+    /// `margin_tracker_regrows_a_region_a_shrink_collapsed_onto_one_row` for
+    /// the reported-margins path end to end. The only remaining difference
+    /// anywhere is what `margins()` *reports* while the region is degenerate,
+    /// which is an emission decision, documented on `margins()`, and no longer
+    /// costs the tracker any state.
+    ///
+    /// Any in-flight partial CSI parse is deliberately preserved: a DECSTBM
+    /// split across two PTY reads with a resize landing in between is still
+    /// a DECSTBM, and dropping it would lose exactly the state this tracker
+    /// exists to keep.
+    pub fn set_rows(&mut self, rows: u16) {
+        let rows = rows.max(1);
+        let old_rows = self.rows;
+        self.rows = rows;
+        self.region = match self.region {
+            Some((top, bottom)) => {
+                let bottom = if bottom == old_rows {
+                    // Rule 1: bottom-anchored, so it follows the screen (and
+                    // needs no further clamping -- it *is* the new bottom).
+                    rows
+                } else {
+                    // Rule 2.
+                    bottom.min(rows)
+                };
+                // Rule 3 (`top > bottom`, which after the clamps can only
+                // mean `bottom == rows`, i.e. the full screen), plus the same
+                // whole-screen normalization `finish_csi` applies -- both of
+                // which this tracker spells `None`.
+                //
+                // `top == bottom` is deliberately *not* in here: that is the
+                // degenerate single-row region, which vt100's grid keeps and
+                // this tracker keeps with it, so a later enlargement can grow
+                // it back (see the doc comment above). `margins()` is what
+                // declines to emit it.
+                if top > bottom || (top == 1 && bottom == rows) {
+                    None
+                } else {
+                    Some((top, bottom))
+                }
+            }
+            // Full-screen is bottom-anchored by definition, so rule 1 keeps
+            // it full-screen at the new size.
+            None => None,
+        };
     }
 
     /// Feed a chunk of raw PTY bytes. Returns the triggers this chunk
@@ -125,7 +268,7 @@ impl MarginTracker {
             MarginParseState::Esc => match byte {
                 b'c' => {
                     self.state = MarginParseState::Ground;
-                    self.margins = None;
+                    self.region = None;
                     CsiEvent {
                         margins_reset: true,
                         erase: false,
@@ -192,7 +335,7 @@ impl MarginTracker {
             Err(_) => return CsiEvent::default(),
         };
         if text.is_empty() {
-            self.margins = None;
+            self.region = None;
             return CsiEvent {
                 margins_reset: true,
                 erase: false,
@@ -223,13 +366,13 @@ impl MarginTracker {
             return CsiEvent::default();
         }
         if top == 1 && bottom == self.rows {
-            self.margins = None;
+            self.region = None;
             CsiEvent {
                 margins_reset: true,
                 erase: false,
             }
         } else {
-            self.margins = Some((top, bottom));
+            self.region = Some((top, bottom));
             CsiEvent::default()
         }
     }
@@ -312,8 +455,12 @@ impl ScreenTracker {
         }
     }
 
-    /// Resizes both the parser's grid (content-preserving) and resets the
-    /// margin tracker to full-screen (design doc section 5.3).
+    /// Resizes the parser's grid (content-preserving) and re-fits the margin
+    /// tracker to the new row count the same way the grid re-fits its own
+    /// scroll region -- it is *not* reset to full-screen, correcting design
+    /// doc section 5.3's original "margins reset on resize" plan. See
+    /// `MarginTracker::set_rows` for the exact rules and why the tracker has
+    /// to follow the grid rather than a real terminal here.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -535,13 +682,380 @@ mod tests {
         }
     }
 
+    /// Resize clamping must match `vt100::Screen::set_size` exactly (see
+    /// `MarginTracker::set_rows`) -- these three cases were measured against
+    /// vt100 0.16.2 behaviourally, by line-feeding at the region bottom after
+    /// a resize and observing which rows scrolled.
     #[test]
-    fn margin_tracker_resize_resets_margins() {
+    fn margin_tracker_resize_clamps_like_vt100_instead_of_resetting() {
+        // Region still fits: kept as-is. This is the case every attach hits,
+        // since reserving the status-bar row shrinks the PTY by one row.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[5;15r");
+        t.set_rows(23);
+        assert_eq!(
+            t.margins(),
+            Some((5, 15)),
+            "a region that still fits must survive a resize"
+        );
+
+        // Bottom past the new end: clamped to it, top preserved.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[5;23r");
+        t.set_rows(20);
+        assert_eq!(t.margins(), Some((5, 20)));
+
+        // Top no longer fits: degenerates to full-screen.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[21;23r");
+        t.set_rows(10);
+        assert_eq!(t.margins(), None);
+
+        // Clamping that happens to produce the whole screen normalizes to
+        // `None`, the same representation `finish_csi` uses.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[1;20r");
+        t.set_rows(20);
+        assert_eq!(t.margins(), None);
+
+        // Growing the terminal leaves a sub-range alone.
         let mut t = MarginTracker::new(24);
         t.scan(b"\x1b[3;20r");
-        assert_eq!(t.margins(), Some((3, 20)));
         t.set_rows(30);
-        assert_eq!(t.margins(), None);
+        assert_eq!(t.margins(), Some((3, 20)));
+    }
+
+    /// Reads a `vt100::Screen`'s *real* scroll region back out of the crate,
+    /// without access to its private `scroll_top`/`scroll_bottom`: DECOM
+    /// (origin mode, `CSI ? 6 h`) makes CUP row-relative to the scroll region
+    /// *and* clamps to it (vt100 0.16.2 `grid.rs::set_pos` ->
+    /// `row_clamp_top`/`row_clamp_bottom`), so homing reports the top and
+    /// asking for row 999 reports the bottom.
+    ///
+    /// Returns 1-based inclusive `(top, bottom)` -- the same convention
+    /// `MarginTracker::margins()` uses, with full-screen spelled `(1, rows)`
+    /// rather than `None`. Destructive to cursor position and origin mode, so
+    /// only call it on a parser nothing else will assert on afterwards.
+    fn probe_vt100_scroll_region(parser: &mut vt100::Parser) -> (u16, u16) {
+        parser.process(b"\x1b[?6h\x1b[1;1H");
+        let top = parser.screen().cursor_position().0 + 1;
+        parser.process(b"\x1b[999;1H");
+        let bottom = parser.screen().cursor_position().0 + 1;
+        parser.process(b"\x1b[?6l");
+        (top, bottom)
+    }
+
+    /// The probe above, validated against regions vt100 is known to hold, so
+    /// a silently-broken probe can't quietly make the differential test below
+    /// vacuous (its whole job is to be the source of truth).
+    #[test]
+    fn vt100_scroll_region_probe_reads_back_what_decstbm_set() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        assert_eq!(
+            probe_vt100_scroll_region(&mut p),
+            (1, 24),
+            "a fresh parser must probe as full-screen"
+        );
+
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"\x1b[5;15r");
+        assert_eq!(probe_vt100_scroll_region(&mut p), (5, 15));
+
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"\x1b[5;15r\x1b[r");
+        assert_eq!(
+            probe_vt100_scroll_region(&mut p),
+            (1, 24),
+            "a bare CSI r must probe as full-screen again"
+        );
+    }
+
+    /// Differential test: `MarginTracker::set_rows` versus what the real
+    /// `vt100::Screen::set_size` actually does to the grid's scroll region
+    /// (0.16.2 `grid.rs::set_size`, lines 66-99), read back with the probe
+    /// above rather than assumed.
+    ///
+    /// vt100's rule set, in its own order:
+    ///
+    /// 1. `if scroll_bottom == old_rows - 1 { scroll_bottom = new_rows - 1 }`
+    ///    -- a *bottom-anchored* region follows the screen, in both
+    ///    directions. This is the rule the tracker was missing: two fixed
+    ///    header rows plus "everything below scrolls" (`CSI 3;23r` at 23
+    ///    rows) is the most ordinary TUI layout there is, and any terminal
+    ///    enlargement -- window maximize, on-screen keyboard hiding, a pane
+    ///    unsplit -- made the tracker and the grid disagree (vt100
+    ///    `(3, 39)`, tracker `(3, 23)`).
+    /// 2. `if scroll_bottom >= new_rows { scroll_bottom = new_rows - 1 }` --
+    ///    the shrink clamp.
+    /// 3. `if scroll_bottom < scroll_top { scroll_top = 0 }` -- a region
+    ///    whose top no longer fits below the clamped bottom degenerates to
+    ///    the full screen.
+    #[test]
+    fn margin_tracker_resize_matches_real_vt100_set_size() {
+        // (rows before, DECSTBM, rows after)
+        let cases: &[(u16, (u16, u16), u16)] = &[
+            // Shrink by one row -- the resize every attach performs to
+            // reserve the status-bar row.
+            (24, (5, 15), 23),
+            // Bottom past the new end: clamped, top preserved.
+            (24, (5, 23), 20),
+            // Top no longer fits below the clamped bottom: full screen.
+            (24, (21, 23), 10),
+            // Clamping that lands on the whole screen.
+            (24, (1, 20), 20),
+            // Growth, region not bottom-anchored: untouched.
+            (24, (3, 20), 30),
+            // Growth, region bottom-anchored: follows the screen. This is
+            // the case that used to mismatch.
+            (23, (3, 23), 39),
+            (24, (2, 24), 40),
+            // Bottom-anchored *and* shrinking: rule 1 then rule 2 agree.
+            (24, (5, 24), 12),
+            // Bottom-anchored growth by a single row (the inverse of the
+            // attach reserve).
+            (23, (5, 23), 24),
+            // Full-screen tracker state (`None`) across both directions.
+            (24, (1, 24), 40),
+            (24, (1, 24), 10),
+        ];
+        for &(before, (top, bottom), after) in cases {
+            let decstbm = format!("\x1b[{top};{bottom}r");
+
+            let mut real = vt100::Parser::new(before, 80, 0);
+            real.process(decstbm.as_bytes());
+            real.screen_mut().set_size(after, 80);
+            let expected = probe_vt100_scroll_region(&mut real);
+
+            let mut tracker = MarginTracker::new(before);
+            tracker.scan(decstbm.as_bytes());
+            tracker.set_rows(after);
+            let actual = tracker.margins().unwrap_or((1, after));
+
+            assert_eq!(
+                actual, expected,
+                "DECSTBM {top};{bottom} @ {before} rows -> {after} rows: \
+                 vt100={expected:?} tracker={actual:?}"
+            );
+        }
+    }
+
+    /// Exhaustive sweep of every DECSTBM sub-range at every screen height
+    /// from 2 to 24 rows, resized to every height from 1 to 30, against the
+    /// real crate -- so `set_rows`'s claim to follow `vt100::Screen::set_size`
+    /// is pinned by measurement rather than by reading its source once.
+    ///
+    /// Two claims, at the two different levels:
+    ///
+    /// - the *tracked* region (`tracked_region`) matches vt100 case-for-case
+    ///   with **no** exemption at all, degenerate cases included -- that is
+    ///   the state carried into the next resize, and losing any of it is what
+    ///   used to be sticky (see `set_rows`);
+    /// - the *reported* region (`margins()`) matches too, except while the
+    ///   region is degenerate, where it reports full-screen instead because a
+    ///   one-row region cannot be emitted as a DECSTBM. The test asserts that
+    ///   shape specifically, and that it is reached at all, so the exemption
+    ///   can't silently start absorbing real divergences.
+    #[test]
+    fn margin_tracker_resize_divergence_from_vt100_is_only_the_degenerate_row() {
+        let mut compared = 0usize;
+        let mut degenerate = 0usize;
+        for before in 2u16..=24 {
+            for top in 1u16..before {
+                for bottom in (top + 1)..=before {
+                    let decstbm = format!("\x1b[{top};{bottom}r");
+                    for after in 1u16..=30 {
+                        let mut real = vt100::Parser::new(before, 4, 0);
+                        real.process(decstbm.as_bytes());
+                        real.screen_mut().set_size(after, 4);
+                        let expected = probe_vt100_scroll_region(&mut real);
+
+                        let mut tracker = MarginTracker::new(before);
+                        tracker.scan(decstbm.as_bytes());
+                        tracker.set_rows(after);
+                        let tracked = tracker.tracked_region().unwrap_or((1, after));
+                        let actual = tracker.margins().unwrap_or((1, after));
+
+                        compared += 1;
+                        assert_eq!(
+                            tracked, expected,
+                            "the tracked region must match vt100 exactly: DECSTBM \
+                             {top};{bottom} @ {before} rows -> {after} rows: \
+                             vt100={expected:?} tracker={tracked:?}"
+                        );
+                        if actual == expected {
+                            continue;
+                        }
+                        assert_eq!(
+                            expected.0, expected.1,
+                            "undocumented divergence: DECSTBM {top};{bottom} @ {before} rows \
+                             -> {after} rows: vt100={expected:?} tracker={actual:?}"
+                        );
+                        assert_eq!(
+                            actual,
+                            (1, after),
+                            "the degenerate case must report full-screen: DECSTBM {top};{bottom} \
+                             @ {before} rows -> {after} rows"
+                        );
+                        degenerate += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 10_000, "sweep covered only {compared} cases");
+        assert!(
+            degenerate > 0,
+            "the degenerate one-row case was never reached -- the exemption above is \
+             now unfalsifiable and should be removed"
+        );
+    }
+
+    /// The sticky-collapse regression, as a single readable case, at the level
+    /// the rest of the system actually consumes (`margins()`), differentially
+    /// against the real crate.
+    ///
+    /// A shrink past the region's top collapses it onto one row; growing the
+    /// terminal again has to bring the region back, because that collapsed
+    /// region is bottom-anchored and vt100's rule 1 grows it with the screen.
+    /// Before the fix the tracker discarded the collapsed region entirely and
+    /// reported full-screen from then on, at every later size, while the grid
+    /// held `(8,24)`. Terminals get resized more than once -- every attach
+    /// reserves the status-bar row, on-screen keyboards come and go -- so
+    /// "shrunk, then grown" is an ordinary sequence, not a contrived one.
+    #[test]
+    fn margin_tracker_regrows_a_region_a_shrink_collapsed_onto_one_row() {
+        let mut real = vt100::Parser::new(20, 80, 0);
+        real.process(b"\x1b[8;9r");
+        real.screen_mut().set_size(8, 80);
+        real.screen_mut().set_size(24, 80);
+        assert_eq!(
+            probe_vt100_scroll_region(&mut real),
+            (8, 24),
+            "the real crate is expected to hold a grown region here"
+        );
+
+        let mut tracker = MarginTracker::new(20);
+        tracker.scan(b"\x1b[8;9r");
+        assert_eq!(tracker.margins(), Some((8, 9)));
+
+        tracker.set_rows(8);
+        assert_eq!(
+            tracker.margins(),
+            None,
+            "a region collapsed onto one row is not emittable, so nothing is reported"
+        );
+        assert_eq!(
+            tracker.tracked_region(),
+            Some((8, 8)),
+            "...but it must still be tracked, or the growth below cannot recover it"
+        );
+
+        tracker.set_rows(24);
+        assert_eq!(
+            tracker.margins(),
+            Some((8, 24)),
+            "the collapsed region is bottom-anchored, so growing the terminal must grow it \
+             back with the screen -- reporting full-screen here is the sticky bug"
+        );
+    }
+
+    /// The same sweep across **two** consecutive resizes.
+    ///
+    /// A single-step sweep cannot see a sticky error: it always starts from a
+    /// fresh tracker whose state is a real DECSTBM, so a step that throws
+    /// state away looks identical to one that keeps it. Resizing twice is
+    /// what makes the difference observable -- and a terminal gets resized
+    /// more than once (every attach reserves a row, every window change,
+    /// every on-screen keyboard).
+    ///
+    /// The invariant asserted is the strong one: after two arbitrary resizes
+    /// the *tracked* region equals what the real `vt100` grid holds,
+    /// case-for-case, with no exemptions. `margins()` may still report
+    /// full-screen for a region that is currently degenerate -- see its doc
+    /// comment, that is an emission-time decision -- but the tracker must not
+    /// have *forgotten* anything, or the next resize compounds the loss.
+    #[test]
+    fn margin_tracker_tracked_region_matches_vt100_across_two_resizes() {
+        let mut compared = 0usize;
+        let mut via_degenerate = 0usize;
+        for before in 2u16..=14 {
+            for top in 1u16..before {
+                for bottom in (top + 1)..=before {
+                    let decstbm = format!("\x1b[{top};{bottom}r");
+                    for mid in 1u16..=18 {
+                        for after in 1u16..=18 {
+                            let mut real = vt100::Parser::new(before, 4, 0);
+                            real.process(decstbm.as_bytes());
+                            real.screen_mut().set_size(mid, 4);
+                            real.screen_mut().set_size(after, 4);
+                            let expected = probe_vt100_scroll_region(&mut real);
+
+                            let mut tracker = MarginTracker::new(before);
+                            tracker.scan(decstbm.as_bytes());
+                            tracker.set_rows(mid);
+                            let midpoint = tracker.tracked_region();
+                            tracker.set_rows(after);
+                            let actual = tracker.tracked_region().unwrap_or((1, after));
+
+                            compared += 1;
+                            if midpoint.is_some_and(|(t, b)| t == b) {
+                                via_degenerate += 1;
+                            }
+                            assert_eq!(
+                                actual, expected,
+                                "DECSTBM {top};{bottom} @ {before} rows -> {mid} rows -> \
+                                 {after} rows: vt100={expected:?} tracker={actual:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 100_000, "sweep covered only {compared} cases");
+        assert!(
+            via_degenerate > 0,
+            "no two-step path went through a degenerate intermediate region -- the case this \
+             sweep exists for was never reached"
+        );
+    }
+
+    /// `reset` must actually clear, unlike `set_rows` -- the client's session
+    /// switch relies on it, and using `set_rows` there silently leaked the
+    /// previous session's scroll region onto the next one.
+    #[test]
+    fn margin_tracker_reset_clears_where_set_rows_only_clamps() {
+        let mut t = MarginTracker::new(23);
+        t.scan(b"\x1b[5;15r");
+        t.set_rows(23);
+        assert_eq!(
+            t.margins(),
+            Some((5, 15)),
+            "set_rows must not clear a region that still fits"
+        );
+        t.reset();
+        assert_eq!(t.margins(), None, "reset must clear the region");
+
+        // A half-parsed sequence must not survive a reset either, or it would
+        // complete against the new session's byte stream.
+        let mut t = MarginTracker::new(23);
+        t.scan(b"\x1b[5;");
+        t.reset();
+        t.scan(b"15r");
+        assert_eq!(
+            t.margins(),
+            None,
+            "a half-parsed CSI must not survive a reset"
+        );
+    }
+
+    #[test]
+    fn margin_tracker_resize_keeps_a_split_sequence_parsing() {
+        // A DECSTBM split across two PTY reads with a resize landing between
+        // them is still a DECSTBM.
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[3;");
+        t.set_rows(23);
+        t.scan(b"20r");
+        assert_eq!(t.margins(), Some((3, 20)));
     }
 
     // -- ScreenTracker: Layout events --
@@ -683,6 +1197,125 @@ mod tests {
         b.process(&snapshot);
         assert_eq!(tracker.contents(), b.screen().contents());
         assert_eq!(tracker.parser.screen().cursor_position(), b.screen().cursor_position());
+    }
+
+    /// Regression test for the scroll region being silently dropped from the
+    /// snapshot after a resize.
+    ///
+    /// `contents()` alone cannot catch this: immediately after the resize the
+    /// live screen and a snapshot-restored one look identical, and only
+    /// *diverge later*, once the workload line-feeds at the bottom of the
+    /// region it still believes in. So the oracle here is behavioural --
+    /// restore a snapshot into a fresh parser, then feed the *same subsequent
+    /// bytes* to both and require they still agree. With the region lost, the
+    /// restored screen scrolls the wrong rows and overwrites the ones below.
+    ///
+    /// This is the exact end-to-end failure it stands in for: every `a attach`
+    /// resizes the PTY by one row to reserve the status-bar row, so a workload
+    /// holding `\x1b[5;15r` lost it on every single attach, and the host
+    /// terminal then rendered its scrolling text over the fixed rows beneath
+    /// the region.
+    #[test]
+    fn round_trip_preserves_scroll_region_across_resize() {
+        let mut a = ScreenTracker::new(24, 80);
+        for row in 1..=23 {
+            a.process(format!("\x1b[{row};1HROW-{row:02}").as_bytes());
+        }
+        a.process(b"\x1b[5;15r");
+        // The resize every attach performs: reserve one row for the bar.
+        a.set_size(23, 80);
+        assert_eq!(
+            a.margins.margins(),
+            Some((5, 15)),
+            "the tracker must still hold the region the vt100 grid still holds"
+        );
+
+        let mut b = vt100::Parser::new(23, 80, 0);
+        b.process(&a.snapshot());
+
+        // Now make the workload scroll inside its region, exactly as a
+        // margin-using TUI does: park at the region's bottom row and feed.
+        for i in 1..=4 {
+            let bytes = format!("\x1b[15;1H\nSCROLLED-{i}");
+            a.process(bytes.as_bytes());
+            b.process(bytes.as_bytes());
+        }
+
+        assert_eq!(
+            a.contents(),
+            b.screen().contents(),
+            "a snapshot-restored screen must scroll the same rows as the live one"
+        );
+        // And specifically: the row just below the region must be untouched.
+        assert!(
+            b.screen().contents().contains("ROW-16"),
+            "the row below the scroll region was overwritten -- the region was lost:\n{}",
+            b.screen().contents()
+        );
+    }
+
+    /// The growth-direction half of
+    /// `round_trip_preserves_scroll_region_across_resize`, and the
+    /// behavioural regression test for `set_rows`'s rule 1 (a bottom-anchored
+    /// region follows the screen).
+    ///
+    /// The layout is the most ordinary one a TUI has: two fixed header rows,
+    /// everything below them scrolls (`\x1b[3;23r` on a 23-row workload
+    /// screen). The terminal then *grows* -- window maximized, on-screen
+    /// keyboard hidden, a pane unsplit -- and the workload's region has to
+    /// grow with it, because that is what the `vt100` grid beside this
+    /// tracker does.
+    ///
+    /// Same behavioural oracle as the shrink case: a snapshot restored into a
+    /// fresh parser must scroll the *same rows* as the live screen when both
+    /// are fed the same subsequent bytes. With the region frozen at its
+    /// pre-growth bottom, the restored screen stops scrolling at row 23 and
+    /// leaves rows 24-39 holding stale text while the live screen has moved
+    /// on.
+    #[test]
+    fn round_trip_preserves_a_bottom_anchored_region_when_the_screen_grows() {
+        let mut a = ScreenTracker::new(23, 80);
+        for row in 1..=23 {
+            a.process(format!("\x1b[{row};1HROW-{row:02}").as_bytes());
+        }
+        // Two fixed header rows; rows 3..23 scroll.
+        a.process(b"\x1b[3;23r");
+        // The terminal grows.
+        a.set_size(39, 80);
+        assert_eq!(
+            a.margins.margins(),
+            Some((3, 39)),
+            "a bottom-anchored region must follow the screen when it grows, \
+             the way the vt100 grid beside it does"
+        );
+
+        let mut b = vt100::Parser::new(39, 80, 0);
+        b.process(&a.snapshot());
+
+        // Scroll at the *new* region bottom, which is where the two models
+        // disagree if the region did not grow.
+        for i in 1..=4 {
+            let bytes = format!("\x1b[39;1H\nGROWN-{i}");
+            a.process(bytes.as_bytes());
+            b.process(bytes.as_bytes());
+        }
+
+        assert_eq!(
+            a.contents(),
+            b.screen().contents(),
+            "a snapshot-restored screen must scroll the same rows as the live one"
+        );
+        // The fixed header rows are above the region and must be untouched by
+        // that scrolling; row 3 (the region's top) must have scrolled away.
+        let restored = b.screen().contents();
+        assert!(
+            restored.contains("ROW-01") && restored.contains("ROW-02"),
+            "the fixed header rows above the region were scrolled away:\n{restored}"
+        );
+        assert!(
+            !restored.contains("ROW-03"),
+            "the region's own top row did not scroll -- the region was not in force:\n{restored}"
+        );
     }
 
     #[test]

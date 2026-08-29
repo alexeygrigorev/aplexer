@@ -2253,6 +2253,44 @@ fn apply_terminal_layout(stdout: &Arc<Mutex<io::Stdout>>, term: &Arc<Mutex<TermG
     }
 }
 
+/// Feeds PTY bytes on their way to the terminal through the client's copy of
+/// the worker's `MarginTracker`, so `draw_status_bar` knows which scroll
+/// region the workload currently holds -- see `StatusBarCtx::workload_margins`
+/// for why the bar must not blindly re-assert its own.
+///
+/// A byte-level state machine with no allocation on the common path, run on
+/// the same bytes that are about to be `write`n anyway; the worker already
+/// pays the identical cost per chunk (docs/terminal-state-design.md section
+/// 9's steady-state parse budget), and this is strictly cheaper than that
+/// since it recognizes two sequences rather than emulating a terminal.
+fn scan_workload_margins(margins: &Arc<Mutex<aplexer::screen::MarginTracker>>, data: &[u8]) {
+    if let Ok(mut m) = margins.lock() {
+        m.scan(data);
+    }
+}
+
+/// Forgets the tracked workload scroll region on an in-process session
+/// switch: the new session's margins are its own, and carrying the previous
+/// session's over would apply that region to it (observed directly --
+/// switching away from a session holding `\x1b[5;15r` left the bar
+/// re-asserting `5;15` on the session switched *to*).
+///
+/// Note this must be `reset()`, not `set_rows()`: `set_rows` clamps the
+/// region to a row count rather than clearing it, so on a switch that did
+/// not also change the terminal size it is a no-op.
+fn reset_workload_margins(
+    margins: &Arc<Mutex<aplexer::screen::MarginTracker>>,
+    term: &Arc<Mutex<TermGeom>>,
+) {
+    let rows = term.lock().map(|g| g.rows).unwrap_or(0);
+    if let Ok(mut m) = margins.lock() {
+        m.reset();
+        if rows > 0 {
+            m.set_rows(reserved_rows(rows));
+        }
+    }
+}
+
 /// Undoes `apply_terminal_layout` and clears the screen, exactly like tmux
 /// does on detach (Ctrl-b d) -- otherwise whatever was last drawn (including
 /// the status bar) just sits in the user's terminal after attach() returns.
@@ -2444,10 +2482,25 @@ struct StatusBarCtx {
     paths: Paths,
     record: Arc<Mutex<SessionRecord>>,
     flash: Arc<Mutex<Option<(String, Instant)>>>,
-    /// (text, rows, cols) last actually written, so an unchanged bar isn't
-    /// rewritten every debounce tick -- see `draw_status_bar`'s doc comment
-    /// and docs/low-bandwidth-remote-access-design.md section 2.1.
-    last_drawn: Arc<Mutex<Option<(String, u16, u16)>>>,
+    /// (text, rows, cols, workload margins) last actually written, so an
+    /// unchanged bar isn't rewritten every debounce tick -- see
+    /// `draw_status_bar`'s doc comment and
+    /// docs/low-bandwidth-remote-access-design.md section 2.1.
+    last_drawn: Arc<Mutex<Option<(String, u16, u16, Option<(u16, u16)>)>>>,
+    /// The *workload's* current DECSTBM scroll region, recovered by running
+    /// the same `MarginTracker` the worker uses over every PTY byte this
+    /// client writes to the terminal (including the attach snapshot, which
+    /// re-emits the region per docs/terminal-state-design.md section 6.2
+    /// step 3). `None` means the workload is on full-screen margins, the
+    /// common case.
+    ///
+    /// This exists so `draw_status_bar`'s defensive margin re-assert can
+    /// re-assert *the right region*. Without it the bar unconditionally
+    /// rewrote `\x1b[1;{rows-1}r`, which silently destroyed a workload's own
+    /// sub-range within one redraw cycle -- including the one the attach
+    /// snapshot had just restored, defeating section 6.3 step 3's "the
+    /// workload's sub-range lands after and wins".
+    workload_margins: Arc<Mutex<aplexer::screen::MarginTracker>>,
 }
 
 /// How long a switch-failure message stays on the status bar before the
@@ -2507,17 +2560,31 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 ///   units, sibling states rarely change), so this removes nearly all idle
 ///   redraw chatter with no behavior change when something *did* change.
 ///   See docs/low-bandwidth-remote-access-design.md section 2.1.
-/// - **Defensively reasserts the DECSTBM margin** (`apply_terminal_layout`'s
-///   own `\x1b[1;{rows-1}r`) every time it actually writes. A full-screen
-///   TUI switching to the alternate screen buffer, or resetting margins
-///   itself before laying out its own UI, can silently undo the reservation
-///   outside our control; the resize-poll thread only reapplies it when the
-///   physical terminal *size* changes, so a clobbered margin would
-///   otherwise stay clobbered for the rest of the attach. Reasserting it
-///   here means the reservation self-heals within one redraw cycle instead
-///   of being lost permanently. Cheap (a handful of extra bytes) and
-///   wrapped in the same save/restore-cursor pair so it can't disturb the
-///   workload's own cursor position.
+/// - **Defensively reasserts the DECSTBM scroll region** every time it
+///   actually writes. A full-screen TUI switching to the alternate screen
+///   buffer, or resetting margins itself before laying out its own UI, can
+///   silently undo the reservation outside our control; the resize-poll
+///   thread only reapplies it when the physical terminal *size* changes, so
+///   a clobbered margin would otherwise stay clobbered for the rest of the
+///   attach. Reasserting it here means the reservation self-heals within one
+///   redraw cycle instead of being lost permanently. Cheap (a handful of
+///   extra bytes) and wrapped in the same save/restore-cursor pair so it
+///   can't disturb the workload's own cursor position.
+///
+///   What gets reasserted is `ctx.workload_margins`-aware, and that
+///   distinction is load-bearing rather than cosmetic. Reasserting
+///   `apply_terminal_layout`'s own `\x1b[1;{rows-1}r` *unconditionally*
+///   clobbers a workload that set its own DECSTBM sub-range: the host
+///   terminal then stops scrolling the workload's region, so the workload's
+///   line feeds at the bottom of its region walk the cursor past it and
+///   overwrite whatever the workload placed below instead. Reproduced
+///   directly -- a workload holding `\x1b[5;15r` and scrolling inside it
+///   rendered `SCROLLER-70M-ROW-16` on the host, a mangled overlay of its
+///   scrolling text on the fixed row 16 the worker's own screen model
+///   correctly still showed as `FIXED-BOTTOM-ROW-16`. It also silently
+///   undid the sub-range the attach snapshot had just restored
+///   (docs/terminal-state-design.md section 6.2 step 3), on the very first
+///   bar redraw after attaching.
 ///
 /// `force`: bypass the dirty-check and write unconditionally. The
 /// dirty-check alone would let a *clobbered margin* go unrepaired
@@ -2544,10 +2611,15 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     if !geom.reserved {
         return false;
     }
+    let workload_margins = ctx
+        .workload_margins
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .margins();
     let text = status_bar_text(ctx, geom.cols as usize);
     {
         let mut last = ctx.last_drawn.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = (text.clone(), geom.rows, geom.cols);
+        let key = (text.clone(), geom.rows, geom.cols, workload_margins);
         if !force && last.as_ref() == Some(&key) {
             return false;
         }
@@ -2555,7 +2627,37 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     }
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b7");
-    seq.extend_from_slice(format!("\x1b[1;{}r", geom.rows - 1).as_bytes());
+    // Re-assert whichever scroll region should currently be in force: the
+    // workload's own sub-range when it has one, otherwise the bar's
+    // `1;rows-1` reservation.
+    //
+    // Known limitation, deliberately accepted (see
+    // `workload_line_feed_can_still_reach_the_reserved_row_under_a_sub_range`
+    // and docs/terminal-state-design.md section 7): while a workload
+    // sub-range is in force, the reserved row is *not* protected the way
+    // `1;rows-1` protects it. DECSTBM constrains scrolling inside the region,
+    // not cursor motion outside it, so a workload whose cursor sits on its
+    // own last row (`rows-1` -- outside its sub-range, since its PTY is one
+    // row shorter than the terminal) and emits a line feed walks onto the
+    // reserved row and writes there, because for the host terminal that row
+    // is just the screen bottom rather than a margin boundary. The bar text
+    // is repainted on the next redraw, but the workload's cursor is left one
+    // row lower than its own screen model believes.
+    //
+    // Not re-asserting the sub-range is not the alternative: that was the
+    // bug this replaced, and it corrupts every frame a margin-using TUI
+    // draws rather than one row on an uncommon cursor walk. Closing the gap
+    // properly means the client emulating the workload's stream well enough
+    // to clamp its cursor motion -- a different design (the client passes
+    // PTY bytes straight through today), tracked as a follow-up rather than
+    // papered over here.
+    seq.extend_from_slice(
+        match workload_margins {
+            Some((top, bottom)) => format!("\x1b[{top};{bottom}r"),
+            None => format!("\x1b[1;{}r", geom.rows - 1),
+        }
+        .as_bytes(),
+    );
     seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
     seq.extend_from_slice(b"\x1b[2K\x1b[7m");
     seq.extend_from_slice(text.as_bytes());
@@ -3209,6 +3311,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     let switch_in_progress = Arc::new(AtomicBool::new(false));
     let last_session: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let switch_replay_bytes = Some(history_bytes.unwrap_or(SWITCH_REPLAY_BYTES));
+    // Sized to the *workload's* row count (the terminal minus the reserved
+    // bar row), which is what a DECSTBM the workload emits is validated
+    // against -- see `StatusBarCtx::workload_margins`.
+    let workload_margins = Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(
+        initial_geometry
+            .map(|(rows, _)| reserved_rows(rows))
+            .unwrap_or(24),
+    )));
     let status_ctx = StatusBarCtx {
         stdout: stdout.clone(),
         term: term.clone(),
@@ -3216,6 +3326,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         record: shared_record.clone(),
         flash: Arc::new(Mutex::new(None)),
         last_drawn: Arc::new(Mutex::new(None)),
+        workload_margins: workload_margins.clone(),
     };
 
     // Reservation asserted *first* (docs/terminal-state-design.md section
@@ -3238,6 +3349,11 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // flash slot for this is future work (section 6.3 step 6).
         eprintln!("[aplexer attached; Ctrl-b d detaches; Ctrl-1..9 or Ctrl-b n/p/1-9/l switches]");
     }
+    // Scanned before the bar is drawn: the snapshot re-emits the workload's
+    // DECSTBM sub-range as its last bytes (design doc section 6.2 step 3), so
+    // scanning it here is what lets the immediately-following `draw_status_bar`
+    // re-assert that region instead of overwriting it with the bar's own.
+    scan_workload_margins(&workload_margins, &handshake.initial);
     write_locked(&stdout, &handshake.initial)?;
     if tty {
         draw_status_bar(&status_ctx, true); // the snapshot's ED2 blanked the bar row
@@ -3354,12 +3470,30 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let resize_active = active.clone();
         let resize_stdout = stdout.clone();
         let resize_term = term.clone();
+        let resize_margins = workload_margins.clone();
+        let resize_initial = initial_geometry;
         thread::spawn(move || {
-            let mut last = None;
+            // Seeded with the geometry `attach()` already applied and already
+            // sent in the Attach request, so this thread reacts to *changes*
+            // only. Starting from `None` made its very first poll look like a
+            // resize and re-run `apply_terminal_layout` unconditionally --
+            // harmless-looking, but it re-asserted `\x1b[1;{rows-1}r` and
+            // dropped the workload scroll region the attach snapshot had just
+            // restored (docs/terminal-state-design.md section 6.2 step 3),
+            // roughly 200 ms after every attach.
+            let mut last = resize_initial;
             while resize_active.load(Ordering::Relaxed) {
                 let size = terminal_size(libc::STDIN_FILENO);
                 if size != last {
                     if let Some((rows, cols)) = size {
+                        // Keep the client's tracker in step with the
+                        // worker-side model across the same resize: both
+                        // re-clamp the region to the new row count rather
+                        // than dropping it (see `MarginTracker::set_rows`
+                        // and design doc section 5.3's correction).
+                        if let Ok(mut m) = resize_margins.lock() {
+                            m.set_rows(reserved_rows(rows));
+                        }
                         apply_terminal_layout(&resize_stdout, &resize_term, rows, cols);
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
@@ -3461,6 +3595,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             };
             match frame.kind {
                 FrameKind::Data => {
+                    scan_workload_margins(&workload_margins, &frame.payload);
                     write_locked(&stdout, &frame.payload)?;
                     if let Ok(mut t) = last_activity.lock() {
                         *t = Instant::now();
@@ -3511,6 +3646,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // reset_terminal's.
         let mut seq: Vec<u8> = b"\x1b[2J\x1b[H\x1b[?25h".to_vec();
         seq.extend_from_slice(&outcome.history);
+        // The new session's margins are its own: drop whatever the previous
+        // one had, then learn the new one's from its snapshot payload.
+        reset_workload_margins(&workload_margins, &term);
+        scan_workload_margins(&workload_margins, &outcome.history);
         let _ = write_locked(&stdout, &seq);
         if let Ok(mut t) = last_activity.lock() {
             *t = Instant::now();
@@ -4212,7 +4351,203 @@ mod switching_tests {
             record: Arc::new(Mutex::new(mk_record("/ws/status-bar-test", "t", Phase::Running))),
             flash: Arc::new(Mutex::new(None)),
             last_drawn: Arc::new(Mutex::new(None)),
+            workload_margins: Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(23))),
         }
+    }
+
+    /// Serializes every test that redirects the process-wide fd 1. Without
+    /// it the default multi-threaded test harness lets one such test's
+    /// `dup(1)` capture another's pipe write end and hold it open, so the
+    /// reader blocks forever waiting for an EOF that never comes.
+    static FD1_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Like `StdoutToDevNull`, but keeps the bytes: redirects fd 1 to a pipe
+    /// so a test can assert on the exact escape sequences `draw_status_bar`
+    /// emitted, rather than only on its `bool` return.
+    struct StdoutToPipe {
+        saved_fd: i32,
+        read_fd: i32,
+    }
+    impl StdoutToPipe {
+        fn new() -> Self {
+            let saved_fd = unsafe { libc::dup(1) };
+            assert!(saved_fd >= 0, "dup stdout failed");
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+            // Non-blocking read end: everything of interest is flushed by
+            // `write_locked` before we read, so "no more data" must surface
+            // as EAGAIN rather than an indefinite block.
+            assert_eq!(
+                unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
+                0,
+                "set O_NONBLOCK failed"
+            );
+            assert!(unsafe { libc::dup2(fds[1], 1) } >= 0, "dup2 to pipe failed");
+            unsafe { libc::close(fds[1]) };
+            Self {
+                saved_fd,
+                read_fd: fds[0],
+            }
+        }
+        /// Restores stdout and returns everything written while redirected.
+        fn take(self) -> Vec<u8> {
+            // Restore first so the write end is fully closed before reading,
+            // otherwise the read below blocks on a still-open pipe.
+            unsafe {
+                libc::dup2(self.saved_fd, 1);
+                libc::close(self.saved_fd);
+            }
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        self.read_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe { libc::close(self.read_fd) };
+            out
+        }
+    }
+
+    /// Regression test for the DECSTBM clobber described on
+    /// `StatusBarCtx::workload_margins`: the bar's defensive scroll-region
+    /// re-assert used to write `\x1b[1;{rows-1}r` unconditionally, which
+    /// destroyed a workload's own sub-range -- including the one the attach
+    /// snapshot had just restored (docs/terminal-state-design.md section 6.2
+    /// step 3) -- and left the host terminal scrolling the wrong rows.
+    #[test]
+    fn draw_status_bar_reasserts_the_workload_scroll_region_not_its_own() {
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+        let ctx = status_ctx_for_test(true);
+        // No workload region: the bar reserves the bottom row for itself, as
+        // it always has.
+        let pipe = StdoutToPipe::new();
+        draw_status_bar(&ctx, true);
+        let default_margins = String::from_utf8_lossy(&pipe.take()).into_owned();
+        assert!(
+            default_margins.contains("\x1b[1;23r"),
+            "with a full-screen workload the bar must reserve row 24 for itself, got {default_margins:?}"
+        );
+
+        // Workload sets a DECSTBM sub-range (as an attach snapshot's trailing
+        // bytes do, and as a margin-using TUI does live).
+        scan_workload_margins(&ctx.workload_margins, b"\x1b[5;15r");
+        let pipe = StdoutToPipe::new();
+        draw_status_bar(&ctx, true);
+        let sub_range = String::from_utf8_lossy(&pipe.take()).into_owned();
+        assert!(
+            sub_range.contains("\x1b[5;15r"),
+            "the workload's own scroll region must be the one re-asserted, got {sub_range:?}"
+        );
+        assert!(
+            !sub_range.contains("\x1b[1;23r"),
+            "the bar must not clobber the workload's sub-range, got {sub_range:?}"
+        );
+
+        // Workload releases its region (`\x1b[r`): the bar's own reservation
+        // must come straight back, or the reserved row stops being protected.
+        scan_workload_margins(&ctx.workload_margins, b"\x1b[r");
+        let pipe = StdoutToPipe::new();
+        draw_status_bar(&ctx, true);
+        let released = String::from_utf8_lossy(&pipe.take()).into_owned();
+        assert!(
+            released.contains("\x1b[1;23r"),
+            "releasing the workload region must restore the bar's reservation, got {released:?}"
+        );
+    }
+
+    /// A workload margin change with otherwise-identical bar text must not be
+    /// swallowed by the dirty-check -- that would leave the wrong scroll
+    /// region in force on the host until some unrelated text change happened.
+    #[test]
+    fn draw_status_bar_dirty_check_notices_a_workload_margin_change() {
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = StdoutToDevNull::new();
+        let ctx = status_ctx_for_test(true);
+        assert!(
+            draw_status_bar(&ctx, false),
+            "first draw must be a real write"
+        );
+        assert!(
+            !draw_status_bar(&ctx, false),
+            "unchanged state must be a skip"
+        );
+        scan_workload_margins(&ctx.workload_margins, b"\x1b[5;15r");
+        assert!(
+            draw_status_bar(&ctx, false),
+            "a workload margin change must defeat the dirty-check even when the text is unchanged"
+        );
+    }
+
+    /// Characterization test for the documented limitation on
+    /// `draw_status_bar`'s scroll-region re-assert: re-asserting a workload's
+    /// own DECSTBM sub-range does **not** protect the client's reserved
+    /// bottom row, because DECSTBM constrains scrolling *inside* the region,
+    /// not cursor motion outside it.
+    ///
+    /// Both halves are measured against a real `vt100::Parser` standing in
+    /// for the host terminal, at the client's own geometry (24 physical rows,
+    /// row 24 reserved, the workload told it has 23):
+    ///
+    /// - under the bar's own `1;23`, a line feed on row 23 scrolls rows 1-23
+    ///   and the cursor stays on row 23 -- row 24 is untouched;
+    /// - under a workload sub-range (`5;15`), the same line feed walks the
+    ///   cursor onto row 24 and writes there, because for the host terminal
+    ///   that row is the screen bottom rather than a margin boundary.
+    ///
+    /// This is pinned rather than fixed (see the comment in
+    /// `draw_status_bar`): the alternative -- not re-asserting the workload's
+    /// region -- is the strictly worse bug this replaced. If the client ever
+    /// grows enough emulation to clamp the workload's cursor, this test is
+    /// where that shows up, and the comments it points at have to change with
+    /// it.
+    #[test]
+    fn workload_line_feed_can_still_reach_the_reserved_row_under_a_sub_range() {
+        // The workload parks on its own last row -- host row 23, which is
+        // *outside* a 5;15 sub-range -- and line-feeds, as anything printing
+        // a trailing newline at the bottom of its own screen does.
+        let walk = b"\x1b[23;1HWORKLOAD-LAST-ROW\nWALKED";
+
+        let mut protected = vt100::Parser::new(24, 80, 0);
+        protected.process(b"\x1b[24;1HBAR-TEXT\x1b[1;23r");
+        protected.process(walk);
+        assert_eq!(
+            protected.screen().cursor_position().0 + 1,
+            23,
+            "under the bar's own reservation the cursor must stay on row 23"
+        );
+        assert_eq!(
+            protected.screen().contents().lines().nth(23),
+            Some("BAR-TEXT"),
+            "under the bar's own reservation row 24 must be untouched"
+        );
+
+        let mut exposed = vt100::Parser::new(24, 80, 0);
+        exposed.process(b"\x1b[24;1HBAR-TEXT\x1b[5;15r");
+        exposed.process(walk);
+        assert_eq!(
+            exposed.screen().cursor_position().0 + 1,
+            24,
+            "known limitation: a workload sub-range lets a line feed on row 23 reach row 24"
+        );
+        assert!(
+            exposed
+                .screen()
+                .contents()
+                .lines()
+                .nth(23)
+                .is_some_and(|row| row.contains("WALKED")),
+            "known limitation: the reserved row is written over, not protected; row 24 was {:?}",
+            exposed.screen().contents().lines().nth(23)
+        );
     }
 
     #[test]
@@ -4224,6 +4559,7 @@ mod switching_tests {
 
     #[test]
     fn draw_status_bar_dirty_check_reports_skip_vs_real_write() {
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
         let _guard = StdoutToDevNull::new();
         let ctx = status_ctx_for_test(true);
         // Nothing drawn yet: even a non-forced call must actually write
