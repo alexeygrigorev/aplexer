@@ -967,7 +967,9 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     // the RPC itself failed, so `status` on a single session is worth the
     // extra round-trip that `list` deliberately skips.
     let rpc_reachable = rpc_result.is_ok();
-    let raw = rpc_result.unwrap_or_else(|_| serde_json::to_value(&record).unwrap_or(Value::Null));
+    let raw = rpc_result.unwrap_or_else(|_| {
+        serde_json::to_value(public_session_record(&record)).unwrap_or(Value::Null)
+    });
     let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
     let cgroup_stats = raw.get("cgroup").cloned();
     // Live-only (see foreground_command in lib.rs / Operation::Status):
@@ -980,7 +982,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         .map(str::to_string);
     let worker_alive = rpc_reachable || current.worker_alive();
     if json_output {
-        let mut value = serde_json::to_value(&current)?;
+        let mut value = serde_json::to_value(public_session_record(&current))?;
         if let Some(stats) = cgroup_stats {
             value["cgroup"] = stats;
         }
@@ -1499,7 +1501,10 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
     let record = read_record(&paths.record(id))
         .with_context(|| format!("session {id} (from APLEXER_SESSION_ID) has no persisted record"))?;
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&record)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&public_session_record(&record))?
+        );
     } else {
         println!("id: {}", record.id);
         println!("selector: {}", record.selector());
