@@ -168,9 +168,60 @@ enum AttachPayload {
 struct HubInner {
     history: History,
     screen: screen::ScreenTracker,
-    subscribers: HashMap<u64, mpsc::SyncSender<OutputEvent>>,
+    subscribers: HashMap<u64, SubscriberSender>,
     next_id: u64,
-    final_exit: Option<ExitInfo>,
+    terminal: Option<OutputEvent>,
+}
+
+struct SubscriberSender {
+    events: mpsc::SyncSender<OutputEvent>,
+    terminal: mpsc::SyncSender<OutputEvent>,
+}
+
+impl SubscriberSender {
+    fn try_event(&self, event: OutputEvent) -> bool {
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                let _ = self.terminal.try_send(OutputEvent::Error(
+                    "attached client fell behind live output; reattach for a fresh snapshot".into(),
+                ));
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn terminate(self, event: OutputEvent) {
+        let _ = self.terminal.try_send(event);
+    }
+}
+
+struct OutputReceiver {
+    events: mpsc::Receiver<OutputEvent>,
+    terminal: mpsc::Receiver<OutputEvent>,
+}
+
+impl OutputReceiver {
+    /// Drain already-queued output before reporting the terminal outcome.
+    /// If no output is ready, a terminal event wins immediately; otherwise
+    /// blocking on the data channel is safe because terminal publication also
+    /// drops its sender and wakes this receive.
+    fn recv(&self) -> Result<OutputEvent, mpsc::RecvError> {
+        match self.events.try_recv() {
+            Ok(event) => return Ok(event),
+            Err(mpsc::TryRecvError::Disconnected) => return self.terminal.recv(),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match self.terminal.try_recv() {
+            Ok(event) => Ok(event),
+            Err(mpsc::TryRecvError::Disconnected) => self.events.recv(),
+            Err(mpsc::TryRecvError::Empty) => match self.events.recv() {
+                Ok(event) => Ok(event),
+                Err(_) => self.terminal.recv(),
+            },
+        }
+    }
 }
 
 struct OutputHub {
@@ -193,7 +244,7 @@ impl OutputHub {
                 screen: screen::ScreenTracker::try_new(rows, cols)?,
                 subscribers: HashMap::new(),
                 next_id: 1,
-                final_exit: None,
+                terminal: None,
             }),
             screen_txt_path,
         })
@@ -208,11 +259,11 @@ impl OutputHub {
         // doc section 5.1).
         inner
             .subscribers
-            .retain(|_, tx| tx.try_send(OutputEvent::Data(data.to_vec())).is_ok());
+            .retain(|_, subscriber| subscriber.try_event(OutputEvent::Data(data.to_vec())));
         if let Some(change) = layout {
             inner
                 .subscribers
-                .retain(|_, tx| tx.try_send(OutputEvent::Layout(change)).is_ok());
+                .retain(|_, subscriber| subscriber.try_event(OutputEvent::Layout(change)));
         }
         Ok(())
     }
@@ -248,10 +299,7 @@ impl OutputHub {
     fn flush(&self) -> Result<()> {
         lock(&self.inner)?.history.flush()
     }
-    fn subscribe(
-        &self,
-        payload: AttachPayload,
-    ) -> Result<(u64, Vec<u8>, mpsc::Receiver<OutputEvent>)> {
+    fn subscribe(&self, payload: AttachPayload) -> Result<(u64, Vec<u8>, OutputReceiver)> {
         let mut inner = lock(&self.inner)?;
         let initial = match payload {
             AttachPayload::Screen => {
@@ -261,18 +309,30 @@ impl OutputHub {
             }
             AttachPayload::Tail(max) => inner.history.snapshot(Some(bounded_history_limit(max))),
         };
-        if inner.final_exit.is_none() && inner.subscribers.len() >= MAX_SUBSCRIBERS {
+        if inner.terminal.is_none() && inner.subscribers.len() >= MAX_SUBSCRIBERS {
             bail!("too many attached clients");
         }
         let id = inner.next_id;
         inner.next_id += 1;
-        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_EVENTS);
-        if let Some(exit) = inner.final_exit.clone() {
-            let _ = tx.try_send(OutputEvent::Exit(exit));
+        let (events_tx, events_rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_EVENTS);
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+        let subscriber = SubscriberSender {
+            events: events_tx,
+            terminal: terminal_tx,
+        };
+        if let Some(terminal) = inner.terminal.clone() {
+            subscriber.terminate(terminal);
         } else {
-            inner.subscribers.insert(id, tx);
+            inner.subscribers.insert(id, subscriber);
         }
-        Ok((id, initial, rx))
+        Ok((
+            id,
+            initial,
+            OutputReceiver {
+                events: events_rx,
+                terminal: terminal_rx,
+            },
+        ))
     }
     fn unsubscribe(&self, id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -281,7 +341,10 @@ impl OutputHub {
     }
     fn finish(&self, exit: ExitInfo) {
         if let Ok(mut inner) = self.inner.lock() {
-            inner.final_exit = Some(exit.clone());
+            let terminal = inner
+                .terminal
+                .get_or_insert_with(|| OutputEvent::Exit(exit.clone()))
+                .clone();
             if let Err(error) = inner.history.flush() {
                 eprintln!("aplexer worker: flush history at exit: {error:#}");
             }
@@ -293,15 +356,19 @@ impl OutputHub {
             if let Err(error) = fs::write(&self.screen_txt_path, inner.screen.contents()) {
                 eprintln!("aplexer worker: write screen.txt at exit: {error:#}");
             }
-            for (_, tx) in inner.subscribers.drain() {
-                let _ = tx.try_send(OutputEvent::Exit(exit.clone()));
+            for (_, subscriber) in inner.subscribers.drain() {
+                subscriber.terminate(terminal.clone());
             }
         }
     }
     fn fail_subscribers(&self, message: String) {
         if let Ok(mut inner) = self.inner.lock() {
-            for (_, tx) in inner.subscribers.drain() {
-                let _ = tx.try_send(OutputEvent::Error(message.clone()));
+            let terminal = inner
+                .terminal
+                .get_or_insert(OutputEvent::Error(message))
+                .clone();
+            for (_, subscriber) in inner.subscribers.drain() {
+                subscriber.terminate(terminal.clone());
             }
         }
     }
@@ -332,7 +399,57 @@ mod tests {
         }
 
         assert!(hub.inner.lock().unwrap().subscribers.is_empty());
-        assert_eq!(rx.iter().count(), SUBSCRIBER_QUEUE_EVENTS);
+        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+            assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
+        }
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Error(message) if message.contains("fell behind")
+        ));
+    }
+
+    #[test]
+    fn full_subscriber_queue_drains_before_explicit_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+            hub.append(b"x").unwrap();
+        }
+        let exit = ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 1,
+        };
+        hub.finish(exit.clone());
+
+        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+            assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
+        }
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Exit(received) if received.code == exit.code
+        ));
+    }
+
+    #[test]
+    fn full_subscriber_queue_drains_before_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+            hub.append(b"x").unwrap();
+        }
+        hub.fail_subscribers("PTY failed".into());
+
+        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+            assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
+        }
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Error(message) if message == "PTY failed"
+        ));
     }
 
     #[test]
