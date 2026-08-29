@@ -179,7 +179,7 @@ ${XDG_STATE_HOME:-~/.local/state}/aplexer/
 ```
 
 `<workspace-key>` is derived from the canonical (realpath'd, per spec §10)
-workspace path — a truncated SHA-256 of the canonical path is the safe choice
+workspace path — the first 128 bits of SHA-256 over its raw Unix path bytes
 (paths contain `/` and can exceed filename limits); `workspace.json` inside
 the directory makes the mapping reversible for `a doctor` and humans.
 Directories are `0700`, files `0600`, matching spec §26.
@@ -187,8 +187,9 @@ Directories are `0700`, files `0600`, matching spec §26.
 Consumption state lives in per-consumer **cursor files**, not in the messages
 (a broadcast has many readers, so no single reader may delete or mutate a
 message to mark it read). A cursor file records the consumer's last-acked
-message id plus optional per-id ack exceptions. Each consumer writes only its
-own cursor file — single-writer, atomic-rename, no contention.
+message id plus optional per-id ack exceptions. Cursor read-modify-write is
+protected by a per-consumer advisory lock because concurrent CLI invocations
+can still act for one session; the cursor itself is committed by atomic rename.
 
 ### 3.3 Notification: how a recipient learns there's mail
 

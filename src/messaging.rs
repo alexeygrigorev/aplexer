@@ -346,9 +346,10 @@ pub fn addressed_to(
 /// records the consumer's last-acked message id plus optional per-id ack
 /// exceptions" -- `acked_through` is the common in-order case (ack advances
 /// a single high-water mark), `exceptions` holds ids acked out of order
-/// that are not yet subsumed by `acked_through`. Each consumer writes only
-/// its own cursor file (single-writer, atomic-rename, no contention).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// that are not yet subsumed by `acked_through`. Updates use a per-consumer
+/// advisory lock because multiple CLI processes can act for one session at
+/// the same time; the cursor itself is still replaced atomically.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acked_through: Option<Uuid>,
@@ -361,42 +362,97 @@ impl Cursor {
     }
 }
 
-fn cursor_path(paths: &Paths, canonical_workspace: &Path, consumer_id: Uuid) -> PathBuf {
-    message_paths(paths, canonical_workspace)
-        .cursors_dir
-        .join(format!("{consumer_id}.json"))
+fn cursor_lock_path(cursors_dir: &Path, consumer_id: Uuid) -> PathBuf {
+    cursors_dir.join(format!("{consumer_id}.lock"))
 }
 
-pub fn read_cursor(paths: &Paths, canonical_workspace: &Path, consumer_id: Uuid) -> Result<Cursor> {
-    let path = cursor_path(paths, canonical_workspace, consumer_id);
-    match fs::read(&path) {
+fn read_cursor_file(path: &Path) -> Result<Cursor> {
+    match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursor::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
 }
 
+fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
+    let entries = match fs::read_dir(msgs_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", msgs_dir.display())),
+    };
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+        {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn read_cursor(paths: &Paths, canonical_workspace: &Path, consumer_id: Uuid) -> Result<Cursor> {
+    let mp = ensure_workspace(paths, canonical_workspace)?;
+    read_cursor_file(&mp.cursors_dir.join(format!("{consumer_id}.json")))
+}
+
+/// Promotes an acknowledged prefix into the high-water mark and discards
+/// exceptions for messages no longer retained. Promotion only crosses ids
+/// that are explicitly acknowledged, so an out-of-order ack never hides an
+/// earlier unread message. As GC removes old messages, stale exceptions are
+/// discarded and the set stays bounded by the mailbox itself.
+fn compact_cursor(cursor: &mut Cursor, retained_ids: &BTreeSet<Uuid>) {
+    cursor.exceptions.retain(|id| {
+        retained_ids.contains(id)
+            && cursor
+                .acked_through
+                .map(|through| *id > through)
+                .unwrap_or(true)
+    });
+
+    let mut through = cursor.acked_through;
+    for id in retained_ids {
+        if through.map(|value| *id <= value).unwrap_or(false) {
+            continue;
+        }
+        if cursor.exceptions.remove(id) {
+            through = Some(*id);
+        } else {
+            break;
+        }
+    }
+    cursor.acked_through = through;
+}
+
 /// Records `ids` as acked for `consumer_id`. Not required to be called with
-/// a contiguous prefix -- out-of-order ids simply accumulate in
-/// `exceptions`; `a message gc` drops exceptions whose message no longer
-/// exists once pruned, so this cannot grow without bound.
+/// a contiguous prefix -- out-of-order ids remain in `exceptions` until the
+/// preceding retained messages are acked or pruned. The read-modify-write is
+/// serialized per consumer so concurrent acknowledgements cannot overwrite
+/// each other.
 pub fn ack_messages(
     paths: &Paths,
     canonical_workspace: &Path,
     consumer_id: Uuid,
     ids: &[Uuid],
 ) -> Result<()> {
-    ensure_workspace(paths, canonical_workspace)?;
-    let mut cursor = read_cursor(paths, canonical_workspace, consumer_id)?;
+    let mp = ensure_workspace(paths, canonical_workspace)?;
+    let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
+    let _lock = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
+    let mut cursor = read_cursor_file(&path)?;
     for id in ids {
         if !cursor.is_acked(*id) {
             cursor.exceptions.insert(*id);
         }
     }
-    atomic_write_json(
-        &cursor_path(paths, canonical_workspace, consumer_id),
-        &cursor,
-    )
+    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+    compact_cursor(&mut cursor, &retained_ids);
+    atomic_write_json(&path, &cursor)
 }
 
 /// Known tags for a workspace (design doc section 2.3), from session
@@ -417,6 +473,41 @@ pub fn known_tags(paths: &Paths, canonical_workspace: &Path) -> Vec<String> {
 pub struct GcReport {
     pub removed: usize,
     pub remaining: usize,
+}
+
+fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
+    let entries = match fs::read_dir(&mp.cursors_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", mp.cursors_dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(consumer_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+        else {
+            continue;
+        };
+        let _lock = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
+        let mut cursor = read_cursor_file(&path)?;
+        let original = cursor.clone();
+        // Take the mailbox snapshot after acquiring this cursor's lock. An
+        // acknowledgement racing GC must either be visible in this read or
+        // run after the compacted cursor is committed; it cannot be silently
+        // discarded as an "absent" exception.
+        let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+        compact_cursor(&mut cursor, &retained_ids);
+        if cursor != original {
+            atomic_write_json(&path, &cursor)?;
+        }
+    }
+    Ok(())
 }
 
 /// Prunes a workspace mailbox per design doc section 4: default 7-day TTL,
@@ -457,23 +548,44 @@ pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcRepor
     entries.retain(|(_, e)| {
         let expired = now.saturating_sub(e.created_at) > DEFAULT_TTL_SECS;
         if expired {
-            let _ = fs::remove_file(&e.path);
-            removed += 1;
+            match fs::remove_file(&e.path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return true,
+            }
         }
         !expired
     });
-    while entries.len() > MAX_MESSAGES_PER_WORKSPACE {
-        let (_, e) = entries.remove(0);
-        let _ = fs::remove_file(&e.path);
-        removed += 1;
+    let mut index = 0;
+    while entries.len() > MAX_MESSAGES_PER_WORKSPACE && index < entries.len() {
+        match fs::remove_file(&entries[index].1.path) {
+            Ok(()) => {
+                entries.remove(index);
+                removed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                entries.remove(index);
+            }
+            Err(_) => index += 1,
+        }
     }
     let mut total: u64 = entries.iter().map(|(_, e)| e.size).sum();
-    while total > MAX_WORKSPACE_BYTES && !entries.is_empty() {
-        let (_, e) = entries.remove(0);
-        total = total.saturating_sub(e.size);
-        let _ = fs::remove_file(&e.path);
-        removed += 1;
+    index = 0;
+    while total > MAX_WORKSPACE_BYTES && index < entries.len() {
+        match fs::remove_file(&entries[index].1.path) {
+            Ok(()) => {
+                let (_, entry) = entries.remove(index);
+                total = total.saturating_sub(entry.size);
+                removed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (_, entry) = entries.remove(index);
+                total = total.saturating_sub(entry.size);
+            }
+            Err(_) => index += 1,
+        }
     }
+    compact_workspace_cursors(&mp)?;
     Ok(GcReport {
         removed,
         remaining: entries.len(),
@@ -609,6 +721,26 @@ mod tests {
         paths
     }
 
+    fn write_test_message(paths: &Paths, workspace: &Path, id: Uuid) {
+        write_message(
+            paths,
+            &MessageEnvelope {
+                schema_version: MESSAGE_SCHEMA_VERSION,
+                id,
+                workspace: workspace.to_path_buf(),
+                created_at: now_secs(),
+                from: MessageFrom::anonymous(),
+                to: Recipient::Broadcast { broadcast: true },
+                kind: "note".into(),
+                reply_to: None,
+                body: "test".into(),
+                data: None,
+                delivery: Delivery::Inbox,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn workspace_key_stable_and_distinct() {
         let a = workspace_key(Path::new("/home/alexey/git/pocketshell"));
@@ -690,6 +822,94 @@ mod tests {
         cursor.acked_through = Some(id2);
         assert!(cursor.is_acked(id1));
         assert!(cursor.is_acked(id2));
+    }
+
+    #[test]
+    fn cursor_compaction_promotes_only_an_acked_prefix() {
+        let id1 = Uuid::now_v7();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = Uuid::now_v7();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id3 = Uuid::now_v7();
+        let retained = BTreeSet::from([id1, id2, id3]);
+        let mut cursor = Cursor {
+            acked_through: None,
+            exceptions: BTreeSet::from([id1, id3]),
+        };
+
+        compact_cursor(&mut cursor, &retained);
+        assert_eq!(cursor.acked_through, Some(id1));
+        assert_eq!(cursor.exceptions, BTreeSet::from([id3]));
+
+        cursor.exceptions.insert(id2);
+        compact_cursor(&mut cursor, &retained);
+        assert_eq!(cursor.acked_through, Some(id3));
+        assert!(cursor.exceptions.is_empty());
+    }
+
+    #[test]
+    fn ack_waits_for_the_per_consumer_lock() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = PathBuf::from("/tmp/aplexer-ack-lock-workspace");
+        let consumer_id = Uuid::new_v4();
+        let message_id = Uuid::now_v7();
+        write_test_message(&paths, &workspace, message_id);
+        let mp = ensure_workspace(&paths, &workspace).unwrap();
+        let lock =
+            FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_paths = paths.clone();
+        let thread_workspace = workspace.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(ack_messages(
+                &thread_paths,
+                &thread_workspace,
+                consumer_id,
+                &[message_id],
+            ))
+            .unwrap();
+        });
+
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(lock);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(read_cursor(&paths, &workspace, consumer_id)
+            .unwrap()
+            .is_acked(message_id));
+    }
+
+    #[test]
+    fn gc_discards_exceptions_for_messages_no_longer_retained() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-cursor-gc-workspace");
+        let consumer_id = Uuid::new_v4();
+        let first = Uuid::now_v7();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = Uuid::now_v7();
+        write_test_message(&paths, workspace, first);
+        write_test_message(&paths, workspace, second);
+        ack_messages(&paths, workspace, consumer_id, &[second]).unwrap();
+        let before = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert_eq!(before.exceptions, BTreeSet::from([second]));
+
+        fs::remove_file(
+            message_paths(&paths, workspace)
+                .msgs_dir
+                .join(format!("{second}.json")),
+        )
+        .unwrap();
+        gc_workspace(&paths, workspace).unwrap();
+
+        let after = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert!(after.exceptions.is_empty());
+        assert!(!after.is_acked(first));
     }
 
     #[test]
