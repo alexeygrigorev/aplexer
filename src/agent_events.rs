@@ -730,7 +730,11 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -1250,6 +1254,12 @@ fn dummy_record(engine: &str) -> SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_truncation_respects_utf8_boundaries() {
+        let value = format!("{}é", "x".repeat(299));
+        assert_eq!(truncate(&value, 300), format!("{}...", "x".repeat(299)));
+    }
     use std::io::Write;
 
     #[test]
