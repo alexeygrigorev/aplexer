@@ -179,7 +179,7 @@ When any limit is requested, the worker creates a per-session cgroup-v2 leaf and
 
 ## Durable lifecycle
 
-Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. A worker keeps its socket alive after exit so reattach, status, and capture do not race record finalization.
+Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker.
 
 ## Watching events
 
@@ -222,8 +222,8 @@ from aplexer import Client
 
 client = Client()
 session = client.start(workspace=".", tag="demo", command=["/bin/bash", "-l"])
-client.send(session.id, b"printf 'hello\\n'\n")
-print(client.capture(session.id).decode(errors="replace"))
+print(session.id, session.phase)
+print(client.list())
 ```
 
 The Python package is intentionally thin: Rust remains authoritative for profile resolution, launch policy, PTY ownership, metadata durability, and cgroups.

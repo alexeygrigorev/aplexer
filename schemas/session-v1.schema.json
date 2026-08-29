@@ -60,6 +60,12 @@
         "type": "string"
       }
     },
+    "env_unset": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "limits": {
       "type": "object"
     },
