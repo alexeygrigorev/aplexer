@@ -1,11 +1,11 @@
 use crate::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -38,6 +38,8 @@ const MAX_SUBSCRIBERS: usize = 64;
 /// but never let a same-UID peer create worker threads without bound.
 const MAX_CLIENT_CONNECTIONS: usize = 128;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ConnectionPermit {
     active: Arc<AtomicUsize>,
@@ -375,26 +377,22 @@ impl WorkerRuntime {
     }
     fn kill(&self, signal: i32, grace_ms: u64) -> Result<()> {
         let _serialized = lock(&self.kill_gate)?;
-        let (running, pgid) = {
-            let state = lock(&self.workload)?;
-            (state.running, state.pgid)
-        };
-        if !running {
+        if !self.workload_populated()? {
             return Ok(());
         }
         let cgroup = lock(&self.cgroup)?.clone();
         if signal == libc::SIGKILL {
             if let Some(cg) = &cgroup {
                 cg.kill_all()?;
-            } else if unsafe { libc::kill(-pgid, libc::SIGKILL) } != 0 {
-                return Err(io::Error::last_os_error()).context("kill process group");
+            } else {
+                kill_descendants(std::process::id(), DESCENDANT_KILL_TIMEOUT)?;
             }
             return Ok(());
         }
         if let Some(cg) = &cgroup {
             cg.signal_all(signal)?;
-        } else if unsafe { libc::kill(-pgid, signal) } != 0 {
-            return Err(io::Error::last_os_error()).context("signal process group");
+        } else {
+            signal_descendants(std::process::id(), signal)?;
         }
         // Poll instead of sleeping the whole grace period: once the workload
         // is gone there is nothing to escalate to SIGKILL, and the response
@@ -402,20 +400,29 @@ impl WorkerRuntime {
         // after the workload does, so a response stuck behind a long sleep
         // could be lost entirely).
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
-        while lock(&self.workload)?.running && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
+        while self.workload_populated()? && Instant::now() < deadline {
+            thread::sleep(DESCENDANT_POLL_INTERVAL);
         }
-        let still_running = lock(&self.workload)?.running;
-        if still_running {
+        if self.workload_populated()? {
             if let Some(cg) = &cgroup {
                 cg.kill_all()?;
             } else {
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
+                kill_descendants(std::process::id(), DESCENDANT_KILL_TIMEOUT)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether any process remains inside this session's containment domain.
+    /// A leader exiting is not sufficient: a `setsid` descendant may have
+    /// escaped the leader's process group while still belonging to the
+    /// session. Limited sessions use the kernel's cgroup membership; ordinary
+    /// sessions use the worker's subreaper descendant tree.
+    fn workload_populated(&self) -> Result<bool> {
+        if let Some(cgroup) = lock(&self.cgroup)?.as_ref() {
+            return Ok(cgroup.populated());
+        }
+        Ok(!descendant_pids(std::process::id())?.is_empty())
     }
     fn rename(&self, workspace: std::path::PathBuf, tag: String) -> Result<SessionRecord> {
         validate_tag(&tag)?;
@@ -429,6 +436,168 @@ impl WorkerRuntime {
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| anyhow!("worker lock poisoned"))
+}
+
+/// Make the worker the reparenting boundary for daemonized workload
+/// descendants. This is process-wide on Linux and must happen before the
+/// workload is spawned. It does not require systemd or cgroup delegation.
+fn enable_child_subreaper() -> Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error()).context("enable child subreaper");
+    }
+    Ok(())
+}
+
+/// Read every child attached to any thread in a process. Reading only the
+/// thread-group leader's `children` file can miss children forked by another
+/// thread, which would create a containment escape for multi-threaded tools.
+fn direct_child_pids(pid: u32) -> Result<Vec<u32>> {
+    let tasks_path = format!("/proc/{pid}/task");
+    let tasks = match fs::read_dir(&tasks_path) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {tasks_path}")),
+    };
+    let mut children = HashSet::new();
+    for task in tasks {
+        let Ok(task) = task else { continue };
+        let Some(tid) = task
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let path = format!("/proc/{pid}/task/{tid}/children");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("read {path}")),
+        };
+        children.extend(
+            text.split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok()),
+        );
+    }
+    Ok(children.into_iter().collect())
+}
+
+fn descendant_pids(root: u32) -> Result<Vec<u32>> {
+    let mut pending = VecDeque::from([root]);
+    let mut seen = HashSet::from([root]);
+    let mut descendants = Vec::new();
+    while let Some(parent) = pending.pop_front() {
+        for child in direct_child_pids(parent)? {
+            if seen.insert(child) {
+                descendants.push(child);
+                pending.push_back(child);
+            }
+        }
+    }
+    Ok(descendants)
+}
+
+struct DescendantHandle {
+    pid: u32,
+    pidfd: File,
+}
+
+fn open_descendant_handle(pid: u32) -> Result<Option<DescendantHandle>> {
+    let start_time = match process_start_time_ticks(pid) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("open pidfd for descendant {pid}"));
+    }
+    let pidfd = unsafe { File::from_raw_fd(fd) };
+    // Pin first, then re-read identity. A numeric pid recycled between the
+    // tree walk and pidfd_open must never redirect a session signal.
+    if process_start_time_ticks(pid).ok() != Some(start_time) {
+        return Ok(None);
+    }
+    Ok(Some(DescendantHandle { pid, pidfd }))
+}
+
+fn descendant_handles(root: u32) -> Result<Vec<DescendantHandle>> {
+    descendant_pids(root)?
+        .into_iter()
+        .filter_map(|pid| open_descendant_handle(pid).transpose())
+        .collect()
+}
+
+fn signal_handle(handle: &DescendantHandle, signal: i32) -> Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("signal descendant {}", handle.pid));
+        }
+    }
+    Ok(())
+}
+
+fn signal_descendants(root: u32, signal: i32) -> Result<usize> {
+    let handles = descendant_handles(root)?;
+    for handle in &handles {
+        signal_handle(handle, signal)?;
+    }
+    Ok(handles.len())
+}
+
+/// Repeated scans close the fork-vs-scan race: the first pass stops the
+/// parents, and later passes catch children created immediately before the
+/// signal arrived. pidfds make every individual signal immune to pid reuse.
+fn kill_descendants(root: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if signal_descendants(root, libc::SIGKILL)? == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out killing contained workload descendants");
+        }
+        thread::sleep(DESCENDANT_POLL_INTERVAL);
+    }
+}
+
+/// The leader has its own `Child::wait` thread. Only after that waiter has
+/// reported completion may the lifecycle thread reap any other child,
+/// avoiding a waitpid(-1) race that could steal the leader's exit status.
+fn reap_adopted_children() -> Result<usize> {
+    let mut reaped = 0;
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid > 0 {
+            reaped += 1;
+            continue;
+        }
+        if pid == 0 {
+            return Ok(reaped);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(reaped);
+        }
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error).context("reap adopted workload descendant");
+    }
 }
 
 enum LifeEvent {
@@ -511,6 +680,9 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         Ok(value) => value,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
+    if let Err(error) = enable_child_subreaper() {
+        return Err(fail_startup(&paths, id, &record_path, &mut record, error));
+    }
     let master_write = master_read.try_clone()?;
     let child = match spawn_workload(
         &record,
@@ -754,32 +926,55 @@ fn spawn_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         let mut pty_eof = false;
         let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
         let mut fatal: Option<String> = None;
-        while let Ok(event) = rx.recv() {
-            match event {
-                LifeEvent::PtyEof => {
-                    pty_eof = true;
-                    if let Ok(mut pty) = runtime.pty_write.lock() {
-                        *pty = None;
+        loop {
+            match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
+                Ok(event) => match event {
+                    LifeEvent::PtyEof => {
+                        pty_eof = true;
+                        if let Ok(mut pty) = runtime.pty_write.lock() {
+                            *pty = None;
+                        }
                     }
-                }
-                LifeEvent::PtyError(message) => {
-                    pty_eof = true;
-                    fatal = Some(message.clone());
-                    if let Ok(mut pty) = runtime.pty_write.lock() {
-                        *pty = None;
+                    LifeEvent::PtyError(message) => {
+                        pty_eof = true;
+                        fatal = Some(message.clone());
+                        if let Ok(mut pty) = runtime.pty_write.lock() {
+                            *pty = None;
+                        }
+                        runtime.output.fail_subscribers(message);
                     }
-                    runtime.output.fail_subscribers(message);
-                }
-                LifeEvent::ChildExit { code, signal } => {
-                    child_exit = Some((code, signal));
-                    if let Ok(mut state) = runtime.workload.lock() {
-                        state.running = false;
+                    LifeEvent::ChildExit { code, signal } => {
+                        child_exit = Some((code, signal));
+                        let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
                     }
-                    let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) if child_exit.is_some() => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    fatal = Some("workload lifecycle channel disconnected".into());
+                    break;
                 }
             }
-            if pty_eof && child_exit.is_some() {
-                break;
+
+            if child_exit.is_some() {
+                if let Err(error) = reap_adopted_children() {
+                    fatal.get_or_insert_with(|| format!("reap descendants: {error:#}"));
+                }
+                match runtime.workload_populated() {
+                    Ok(populated) => {
+                        if let Ok(mut state) = runtime.workload.lock() {
+                            state.running = populated;
+                        }
+                        if pty_eof && !populated {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        // Fail closed: never finalize evidence while we cannot
+                        // establish that the containment domain is empty.
+                        fatal.get_or_insert_with(|| format!("inspect descendants: {error:#}"));
+                    }
+                }
             }
         }
         let (code, signal) = child_exit.unwrap_or((None, None));
