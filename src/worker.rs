@@ -577,6 +577,7 @@ impl WorkerRuntime {
         Ok(())
     }
     fn kill(&self, signal: i32, grace_ms: u64) -> Result<()> {
+        let grace = kill_grace_duration(grace_ms)?;
         let _serialized = lock(&self.kill_gate)?;
         if !self.workload_populated()? {
             return Ok(());
@@ -600,7 +601,9 @@ impl WorkerRuntime {
         // to this request should not be delayed (the worker exits shortly
         // after the workload does, so a response stuck behind a long sleep
         // could be lost entirely).
-        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| anyhow!("kill grace deadline overflow"))?;
         while self.workload_populated()? && Instant::now() < deadline {
             thread::sleep(DESCENDANT_POLL_INTERVAL);
         }

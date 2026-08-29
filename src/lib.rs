@@ -32,6 +32,16 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Long enough for graceful shutdown, but bounded so an authenticated local
+/// client cannot monopolize a worker's serialized kill path indefinitely.
+pub const MAX_KILL_GRACE_MS: u64 = 30_000;
+
+pub fn kill_grace_duration(grace_ms: u64) -> Result<Duration> {
+    if grace_ms > MAX_KILL_GRACE_MS {
+        bail!("kill grace exceeds maximum of {MAX_KILL_GRACE_MS} ms");
+    }
+    Ok(Duration::from_millis(grace_ms))
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -2407,6 +2417,16 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kill_grace_is_bounded_before_duration_or_deadline_math() {
+        assert_eq!(
+            kill_grace_duration(MAX_KILL_GRACE_MS).unwrap(),
+            Duration::from_millis(MAX_KILL_GRACE_MS)
+        );
+        assert!(kill_grace_duration(MAX_KILL_GRACE_MS + 1).is_err());
+        assert!(kill_grace_duration(u64::MAX).is_err());
     }
 
     #[test]

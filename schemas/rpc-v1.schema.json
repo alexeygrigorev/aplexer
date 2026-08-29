@@ -57,7 +57,8 @@
     },
     "grace_ms": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 30000
     },
     "workspace": {
       "type": "string"

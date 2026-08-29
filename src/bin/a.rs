@@ -1263,6 +1263,7 @@ fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
 fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
+    kill_grace_duration(args.grace_ms)?;
     let rpc = rpc_simple(
         &record,
         Operation::Kill {
@@ -1331,6 +1332,7 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
 /// verified against the APLEXER_SESSION_ID environment variable the worker
 /// stamped into the workload at spawn; on any mismatch this fails closed.
 fn kill_broken_workload(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
+    let grace = kill_grace_duration(grace_ms)?;
     let Some(pid) = record.workload_pid else {
         return Ok(());
     };
@@ -1350,7 +1352,9 @@ fn kill_broken_workload(record: &SessionRecord, signal: i32, grace_ms: u64) -> R
         return Err(io::Error::last_os_error()).context("signal workload process group");
     }
     if signal != libc::SIGKILL {
-        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| anyhow!("kill grace deadline overflow"))?;
         while process_alive(pid) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
