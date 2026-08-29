@@ -566,6 +566,7 @@ impl FileLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)?;
         let mut op = libc::LOCK_EX;
@@ -1090,9 +1091,11 @@ fn ordered_env_unset_union(extra: &[String]) -> Vec<String> {
 impl Config {
     pub fn load(paths: &Paths) -> Result<Self> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut config = Config::default();
-        config.version = 1;
-        config.default_engine = Some("shell".into());
+        let mut config = Config {
+            version: 1,
+            default_engine: Some("shell".into()),
+            ..Config::default()
+        };
         config.engines.insert(
             "shell".into(),
             EngineConfig {
@@ -1237,6 +1240,7 @@ impl Config {
         Ok(config)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         &self,
         direct: Vec<String>,
@@ -2204,8 +2208,10 @@ mod tests {
     /// the forced provider-key union, never replace or shrink it.
     #[test]
     fn env_unset_union_is_forced() {
-        let mut config = Config::default();
-        config.default_engine = Some("custom".into());
+        let mut config = Config {
+            default_engine: Some("custom".into()),
+            ..Config::default()
+        };
         config.engines.insert(
             "custom".into(),
             EngineConfig {

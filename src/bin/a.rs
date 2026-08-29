@@ -1100,7 +1100,7 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
             // only the plain text was preserved -- so --screen without
             // --plain against a dead session still surfaces the "worker
             // unavailable" error rather than silently downgrading to text.
-            Err(_) if args.plain => match fs::read(&paths.screen_txt(record.id)) {
+            Err(_) if args.plain => match fs::read(paths.screen_txt(record.id)) {
                 Ok(bytes) => bytes,
                 Err(read_error) => {
                     check_attachable(&record)?;
@@ -1788,8 +1788,15 @@ fn build_recipient(
 /// RPC path (`Operation::Send`, `rpc_send` below) -- the client resolves the
 /// target session and connects to its worker socket directly, exactly like
 /// `a send <target> <text>` does today. No new server-side RPC operation.
-fn deliver_pane(paths: &Paths, workspace: &Path, tag: &str, from_tag: Option<&str>, body: &str, raw: bool) -> Result<()> {
-    if body.as_bytes().len() > MAX_BODY_BYTES {
+fn deliver_pane(
+    paths: &Paths,
+    workspace: &Path,
+    tag: &str,
+    from_tag: Option<&str>,
+    body: &str,
+    raw: bool,
+) -> Result<()> {
+    if body.len() > MAX_BODY_BYTES {
         bail!("message body exceeds the {MAX_BODY_BYTES}-byte cap");
     }
     let record = list_records(paths)?
@@ -2496,7 +2503,7 @@ struct StatusBarCtx {
     /// unchanged bar isn't rewritten every debounce tick -- see
     /// `draw_status_bar`'s doc comment and
     /// docs/low-bandwidth-remote-access-design.md section 2.1.
-    last_drawn: Arc<Mutex<Option<(String, u16, u16, Option<(u16, u16)>)>>>,
+    last_drawn: Arc<Mutex<LastDrawnStatus>>,
     /// The *workload's* current DECSTBM scroll region, recovered by running
     /// the same `MarginTracker` the worker uses over every PTY byte this
     /// client writes to the terminal (including the attach snapshot, which
@@ -2512,6 +2519,8 @@ struct StatusBarCtx {
     /// workload's sub-range lands after and wins".
     workload_margins: Arc<Mutex<aplexer::screen::MarginTracker>>,
 }
+
+type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
 
 /// How long a switch-failure message stays on the status bar before the
 /// normal text resumes (docs/fast-session-switching-design.md section 6.1).
@@ -3175,6 +3184,7 @@ impl InputScanner {
 /// old one is touched, so any failure (resolution, `check_attachable`, or
 /// `establish` itself) leaves the attachment to the current session
 /// completely undisturbed.
+#[allow(clippy::too_many_arguments)]
 fn perform_switch(
     paths: &Paths,
     target: SwitchTarget,
@@ -3694,8 +3704,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod switching_tests {
     use super::*;
+
+    #[test]
+    fn parse_hex_rejects_non_ascii_without_panicking() {
+        assert!(parse_hex("aéa".as_bytes()).is_err());
+    }
 
     fn bytes(actions: &[InputAction]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3735,7 +3751,7 @@ mod switching_tests {
         let actions = s.scan(&[b'a', 0x13, b'z']);
         assert_eq!(actions.len(), 3);
         match &actions[0] {
-            InputAction::Forward(bytes) => assert_eq!(bytes, &[b'a']),
+            InputAction::Forward(bytes) => assert_eq!(bytes, b"a"),
             _ => panic!("expected Forward"),
         }
         assert!(matches!(
@@ -3743,7 +3759,7 @@ mod switching_tests {
             InputAction::Switch(SwitchTarget::Index(3))
         ));
         match &actions[2] {
-            InputAction::Forward(bytes) => assert_eq!(bytes, &[b'z']),
+            InputAction::Forward(bytes) => assert_eq!(bytes, b"z"),
             _ => panic!("expected Forward"),
         }
     }
@@ -3762,7 +3778,7 @@ mod switching_tests {
     fn scan_split_across_reads() {
         let mut s = InputScanner::default();
         assert!(s.scan(&[0x02]).is_empty());
-        let actions = s.scan(&[b'n']);
+        let actions = s.scan(b"n");
         assert!(matches!(
             actions.as_slice(),
             [InputAction::Switch(SwitchTarget::Next)]
@@ -3785,7 +3801,7 @@ mod switching_tests {
         let actions = s.scan(&[b'a', 0x02, b'3', b'z']);
         assert_eq!(actions.len(), 3);
         match &actions[0] {
-            InputAction::Forward(b) => assert_eq!(b, &[b'a']),
+            InputAction::Forward(b) => assert_eq!(b, b"a"),
             _ => panic!("expected Forward"),
         }
         assert!(matches!(
@@ -3793,7 +3809,7 @@ mod switching_tests {
             InputAction::Switch(SwitchTarget::Index(3))
         ));
         match &actions[2] {
-            InputAction::Forward(b) => assert_eq!(b, &[b'z']),
+            InputAction::Forward(b) => assert_eq!(b, b"z"),
             _ => panic!("expected Forward"),
         }
     }
@@ -4232,9 +4248,7 @@ mod switching_tests {
         let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
         let boot_id = boot_id.trim();
         fs::write(
-            paths
-                .state_session(record.id)
-                .join("worker.identity.json"),
+            paths.state_session(record.id).join("worker.identity.json"),
             format!(
                 "{{\"pid\":{},\"start_time_ticks\":{start_time},\"boot_id\":\"{boot_id}\"}}\n",
                 child.id(),
@@ -4750,6 +4764,9 @@ fn parse_hex(input: &[u8]) -> Result<Vec<u8>> {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>();
+    if !text.is_ascii() {
+        bail!("hex input must contain only ASCII hexadecimal digits");
+    }
     if text.len() % 2 != 0 {
         bail!("hex input must contain an even number of digits");
     }
