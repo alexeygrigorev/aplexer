@@ -19,8 +19,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 pub const MESSAGE_SCHEMA_VERSION: u32 = 1;
@@ -41,6 +43,11 @@ pub const MAX_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024;
 /// `inbox` (see `maybe_gc`) so a large mailbox is not rescanned on every
 /// call; `a message gc` itself always runs unconditionally.
 const OPPORTUNISTIC_GC_INTERVAL_SECS: u64 = 300;
+/// Cursor state belongs to one session UUID and has no value once that
+/// session is gone. Keep inactive cursor state for a full month before GC so
+/// short-lived cleanup/recovery gaps cannot make an acknowledgement reappear.
+/// Live/starting session ids are retained regardless of age.
+pub const STALE_CURSOR_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const MAILBOX_LOCK_FILE: &str = ".mailbox.lock";
 
 pub fn now_secs() -> u64 {
@@ -105,16 +112,16 @@ struct WorkspaceMetadata {
     workspace: PathBuf,
 }
 
-/// Verifies the reverse mapping before adopting a directory found under a
-/// legacy key. The old key was based on lossy UTF-8 and therefore could
-/// alias two distinct Unix paths; silently renaming without this check could
-/// expose another workspace's messages.
+/// Verifies the reverse mapping before adopting a mailbox directory. The old
+/// key was based on lossy UTF-8 and therefore could alias two distinct Unix
+/// paths; the stable key is truncated and likewise must never be trusted
+/// without its reverse mapping.
 fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -> Result<()> {
     let metadata_path = workspace_dir.join("workspace.json");
     let bytes = fs::read(&metadata_path)
-        .with_context(|| format!("read legacy mailbox metadata {}", metadata_path.display()))?;
+        .with_context(|| format!("read mailbox metadata {}", metadata_path.display()))?;
     let metadata: WorkspaceMetadata = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse legacy mailbox metadata {}", metadata_path.display()))?;
+        .with_context(|| format!("parse mailbox metadata {}", metadata_path.display()))?;
     if metadata.workspace != canonical_workspace {
         bail!(
             "refusing to migrate mailbox {}: workspace metadata names {}, expected {}",
@@ -124,6 +131,251 @@ fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -
         );
     }
     Ok(())
+}
+
+fn initialize_workspace_dir(mp: &MessagePaths, canonical_workspace: &Path) -> Result<()> {
+    ensure_private_dir(&mp.workspace_dir)?;
+    ensure_private_dir(&mp.msgs_dir)?;
+    ensure_private_dir(&mp.cursors_dir)?;
+    if mp.workspace_file.exists() {
+        verify_workspace_metadata(&mp.workspace_dir, canonical_workspace)?;
+    } else {
+        atomic_write_json(
+            &mp.workspace_file,
+            &serde_json::json!({"workspace": canonical_workspace}),
+        )?;
+    }
+    Ok(())
+}
+
+fn json_files_equal(left: &Path, right: &Path) -> Result<bool> {
+    let left_bytes = fs::read(left).with_context(|| format!("read {}", left.display()))?;
+    let right_bytes = fs::read(right).with_context(|| format!("read {}", right.display()))?;
+    if left_bytes == right_bytes {
+        return Ok(true);
+    }
+    let left_json = serde_json::from_slice::<Value>(&left_bytes);
+    let right_json = serde_json::from_slice::<Value>(&right_bytes);
+    Ok(matches!((left_json, right_json), (Ok(left), Ok(right)) if left == right))
+}
+
+fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            bail!(
+                "refusing to migrate non-file mailbox entry {}",
+                path.display()
+            );
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+enum MailboxMigration {
+    Move {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    RemoveDuplicate {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    MergeCursor {
+        source: PathBuf,
+        destination: PathBuf,
+        cursor: Cursor,
+    },
+}
+
+fn merged_cursor(left: &Cursor, right: &Cursor, retained_ids: &BTreeSet<Uuid>) -> Cursor {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    compact_cursor(&mut left, retained_ids);
+    compact_cursor(&mut right, retained_ids);
+    left.exceptions.extend(right.exceptions);
+    left
+}
+
+/// Preflights every collision before moving anything. A crash during the
+/// subsequent application can leave a partially drained legacy directory,
+/// but rerunning is idempotent: unique files use no-replace hard links,
+/// identical files are deduplicated, and cursors are unioned.
+fn plan_mailbox_merge(
+    stable: &MessagePaths,
+    legacy: &MessagePaths,
+) -> Result<Vec<MailboxMigration>> {
+    let mut actions = Vec::new();
+    for source in json_files(&legacy.msgs_dir)? {
+        let destination = stable.msgs_dir.join(
+            source
+                .file_name()
+                .ok_or_else(|| anyhow!("{} has no file name", source.display()))?,
+        );
+        if destination.exists() {
+            if !json_files_equal(&source, &destination)? {
+                bail!(
+                    "mailbox message collision: {} and {} have different content",
+                    source.display(),
+                    destination.display()
+                );
+            }
+            actions.push(MailboxMigration::RemoveDuplicate {
+                source,
+                destination,
+            });
+        } else {
+            actions.push(MailboxMigration::Move {
+                source,
+                destination,
+            });
+        }
+    }
+
+    let mut retained_ids = retained_message_ids(&stable.msgs_dir)?;
+    retained_ids.extend(retained_message_ids(&legacy.msgs_dir)?);
+    for source in json_files(&legacy.cursors_dir)? {
+        let destination = stable.cursors_dir.join(
+            source
+                .file_name()
+                .ok_or_else(|| anyhow!("{} has no file name", source.display()))?,
+        );
+        if !destination.exists() {
+            actions.push(MailboxMigration::Move {
+                source,
+                destination,
+            });
+            continue;
+        }
+        if json_files_equal(&source, &destination)? {
+            actions.push(MailboxMigration::RemoveDuplicate {
+                source,
+                destination,
+            });
+            continue;
+        }
+        let source_cursor: Cursor = serde_json::from_slice(
+            &fs::read(&source).with_context(|| format!("read {}", source.display()))?,
+        )
+        .with_context(|| format!("parse colliding cursor {}", source.display()))?;
+        let destination_cursor: Cursor = serde_json::from_slice(
+            &fs::read(&destination).with_context(|| format!("read {}", destination.display()))?,
+        )
+        .with_context(|| format!("parse colliding cursor {}", destination.display()))?;
+        actions.push(MailboxMigration::MergeCursor {
+            source,
+            destination,
+            cursor: merged_cursor(&source_cursor, &destination_cursor, &retained_ids),
+        });
+    }
+    Ok(actions)
+}
+
+fn apply_mailbox_merge(actions: Vec<MailboxMigration>) -> Result<()> {
+    let mut changed_dirs = BTreeSet::new();
+    for action in actions {
+        match action {
+            MailboxMigration::Move {
+                source,
+                destination,
+            } => {
+                match fs::hard_link(&source, &destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        if !json_files_equal(&source, &destination)? {
+                            bail!(
+                                "mailbox migration destination appeared with different content: {}",
+                                destination.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("migrate {} to {}", source.display(), destination.display())
+                        });
+                    }
+                }
+                fs::remove_file(&source)
+                    .with_context(|| format!("remove migrated {}", source.display()))?;
+                changed_dirs.insert(source.parent().unwrap().to_path_buf());
+                changed_dirs.insert(destination.parent().unwrap().to_path_buf());
+            }
+            MailboxMigration::RemoveDuplicate {
+                source,
+                destination,
+            } => {
+                if !json_files_equal(&source, &destination)? {
+                    bail!(
+                        "mailbox duplicate changed during migration: {}",
+                        source.display()
+                    );
+                }
+                fs::remove_file(&source)
+                    .with_context(|| format!("remove duplicate {}", source.display()))?;
+                changed_dirs.insert(source.parent().unwrap().to_path_buf());
+            }
+            MailboxMigration::MergeCursor {
+                source,
+                destination,
+                cursor,
+            } => {
+                atomic_write_json(&destination, &cursor)?;
+                fs::remove_file(&source)
+                    .with_context(|| format!("remove merged cursor {}", source.display()))?;
+                changed_dirs.insert(source.parent().unwrap().to_path_buf());
+                changed_dirs.insert(destination.parent().unwrap().to_path_buf());
+            }
+        }
+    }
+    for dir in changed_dirs {
+        fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn remove_drained_legacy_cursor_locks(legacy: &MessagePaths) -> Result<()> {
+    let mut directory_changed = false;
+    for consumer_id in cursor_entry_ids(&legacy.cursors_dir)? {
+        let cursor_path = legacy.cursors_dir.join(format!("{consumer_id}.json"));
+        if cursor_path.exists() {
+            continue;
+        }
+        let lock_path = cursor_lock_path(&legacy.cursors_dir, consumer_id);
+        let Some(_lock) = try_cursor_lock(&lock_path)? else {
+            continue;
+        };
+        match fs::remove_file(&lock_path) {
+            Ok(()) => directory_changed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("remove drained legacy cursor lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+    if directory_changed {
+        fs::File::open(&legacy.cursors_dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn merge_legacy_mailbox(stable: &MessagePaths, legacy: &MessagePaths) -> Result<()> {
+    let actions = plan_mailbox_merge(stable, legacy)?;
+    apply_mailbox_merge(actions)?;
+    remove_drained_legacy_cursor_locks(legacy)
 }
 
 /// Creates the workspace mailbox's directories (`0700`, spec.md 26) and its
@@ -144,16 +396,20 @@ pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<Mes
     let mp = message_paths_for_key(paths, &stable_key);
     let legacy_mp = message_paths_for_key(paths, &legacy_workspace_key(canonical_workspace));
 
-    // Serialize discovery and rename for this destination. Atomic rename
-    // makes the mailbox contents move as a unit; the lock also prevents two
-    // current processes from racing and treating a successful peer migration
-    // as a missing source.
+    // Serialize discovery/migration for this destination. If only the legacy
+    // directory exists it can still move atomically as a unit. If both exist,
+    // take both mailbox locks and losslessly drain legacy JSON files into the
+    // stable directory. The empty legacy skeleton is deliberately retained:
+    // an older concurrently-installed CLI may write there again, and every
+    // current operation will notice and drain it instead of silently ignoring
+    // those messages.
     let migration_lock = messages_root.join(format!(".{stable_key}.migration.lock"));
     let _migration = FileLock::exclusive(&migration_lock, false)?;
     if !mp.workspace_dir.exists()
         && legacy_mp.workspace_dir != mp.workspace_dir
         && legacy_mp.workspace_dir.exists()
     {
+        let _legacy_mailbox = FileLock::exclusive(&mailbox_lock_path(&legacy_mp), false)?;
         verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
         fs::rename(&legacy_mp.workspace_dir, &mp.workspace_dir).with_context(|| {
             format!(
@@ -162,17 +418,19 @@ pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<Mes
                 mp.workspace_dir.display()
             )
         })?;
+    } else {
+        initialize_workspace_dir(&mp, canonical_workspace)?;
+        if legacy_mp.workspace_dir != mp.workspace_dir && legacy_mp.workspace_dir.exists() {
+            let _stable_mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+            let _legacy_mailbox = FileLock::exclusive(&mailbox_lock_path(&legacy_mp), false)?;
+            verify_workspace_metadata(&mp.workspace_dir, canonical_workspace)?;
+            verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
+            ensure_private_dir(&legacy_mp.msgs_dir)?;
+            ensure_private_dir(&legacy_mp.cursors_dir)?;
+            merge_legacy_mailbox(&mp, &legacy_mp)?;
+        }
     }
-
-    ensure_private_dir(&mp.workspace_dir)?;
-    ensure_private_dir(&mp.msgs_dir)?;
-    ensure_private_dir(&mp.cursors_dir)?;
-    if !mp.workspace_file.exists() {
-        atomic_write_json(
-            &mp.workspace_file,
-            &serde_json::json!({"workspace": canonical_workspace}),
-        )?;
-    }
+    initialize_workspace_dir(&mp, canonical_workspace)?;
     Ok(mp)
 }
 
@@ -653,27 +911,28 @@ fn prune_workspace_locked(
     // compacted on the consumer's next read/ack. Keep append quota
     // enforcement independent from cursor-file health: otherwise a corrupt
     // unrelated cursor could make a send fail after old messages were
-    // already pruned. Explicit GC still performs the eager sweep.
-    if expire {
-        compact_workspace_cursors(mp)?;
-    }
+    // already pruned. Explicit GC performs the eager cursor sweep after this
+    // message pass succeeds.
     Ok(GcReport {
         removed,
         remaining: entries.len(),
     })
 }
 
-fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
-    let entries = match fs::read_dir(&mp.cursors_dir) {
+fn cursor_entry_ids(cursors_dir: &Path) -> Result<BTreeSet<Uuid>> {
+    let entries = match fs::read_dir(cursors_dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", mp.cursors_dir.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", cursors_dir.display())),
     };
-    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+    let mut ids = BTreeSet::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("json" | "lock")
+        ) {
             continue;
         }
         let Some(consumer_id) = path
@@ -683,13 +942,122 @@ fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
         else {
             continue;
         };
-        let _lock = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
-        let mut cursor = read_cursor_file(&path)?;
-        let original = cursor.clone();
-        compact_cursor(&mut cursor, &retained_ids);
-        if cursor != original {
-            atomic_write_json(&path, &cursor)?;
+        ids.insert(consumer_id);
+    }
+    Ok(ids)
+}
+
+fn modified_secs(path: &Path) -> Result<Option<u64>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("read mtime for {}", path.display()))?;
+    Ok(Some(
+        modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ))
+}
+
+fn stale_at(path: &Path, now: u64, retention_secs: u64) -> Result<bool> {
+    Ok(modified_secs(path)?.is_some_and(|modified| now.saturating_sub(modified) > retention_secs))
+}
+
+fn is_lock_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_error| io_error.kind() == io::ErrorKind::WouldBlock)
+    })
+}
+
+fn try_cursor_lock(path: &Path) -> Result<Option<FileLock>> {
+    match FileLock::exclusive(path, true) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if is_lock_busy(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Compacts live cursor contents and removes inactive cursor state older than
+/// `retention_secs`. The caller holds the workspace mailbox lock, which is
+/// first in every current read/ack lock order. A nonblocking per-consumer lock
+/// plus a post-lock mtime check also protects against older/external clients
+/// that may hold only the cursor lock.
+fn maintain_workspace_cursors_locked(
+    mp: &MessagePaths,
+    active_consumers: &BTreeSet<Uuid>,
+    now: u64,
+    retention_secs: u64,
+) -> Result<()> {
+    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+    let mut directory_changed = false;
+    for consumer_id in cursor_entry_ids(&mp.cursors_dir)? {
+        let cursor_path = mp.cursors_dir.join(format!("{consumer_id}.json"));
+        let lock_path = cursor_lock_path(&mp.cursors_dir, consumer_id);
+        let Some(_lock) = try_cursor_lock(&lock_path)? else {
+            continue;
+        };
+
+        // Re-read mtimes only after acquiring the consumer lock. An active
+        // writer that refreshed the cursor immediately before the lock handoff
+        // must not be judged using the earlier directory scan.
+        let cursor_exists = cursor_path.try_exists()?;
+        let remove_cursor = !active_consumers.contains(&consumer_id)
+            && cursor_exists
+            && stale_at(&cursor_path, now, retention_secs)?;
+        if remove_cursor {
+            match fs::remove_file(&cursor_path) {
+                Ok(()) => directory_changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("remove stale cursor {}", cursor_path.display()));
+                }
+            }
+            match fs::remove_file(&lock_path) {
+                Ok(()) => directory_changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("remove stale cursor lock {}", lock_path.display())
+                    });
+                }
+            }
+            continue;
         }
+
+        if cursor_exists {
+            let mut cursor = read_cursor_file(&cursor_path)?;
+            let original = cursor.clone();
+            compact_cursor(&mut cursor, &retained_ids);
+            if cursor != original {
+                atomic_write_json(&cursor_path, &cursor)?;
+            }
+        } else if !active_consumers.contains(&consumer_id)
+            && stale_at(&lock_path, now, retention_secs)?
+        {
+            // A read of an empty inbox may create only the advisory lock, not
+            // a JSON cursor. Once that orphan lock is both unlocked and old,
+            // it carries no state and is safe to unlink.
+            match fs::remove_file(&lock_path) {
+                Ok(()) => directory_changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("remove orphan cursor lock {}", lock_path.display())
+                    });
+                }
+            }
+        }
+    }
+    if directory_changed {
+        fs::File::open(&mp.cursors_dir)?.sync_all()?;
     }
     Ok(())
 }
@@ -701,13 +1069,25 @@ fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
 pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcReport> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
-    prune_workspace_locked(
+    let report = prune_workspace_locked(
         &mp,
         None,
         MAX_MESSAGES_PER_WORKSPACE,
         MAX_WORKSPACE_BYTES,
         true,
-    )
+    )?;
+    let active_consumers = list_records(paths)?
+        .into_iter()
+        .filter(|record| record.workspace == canonical_workspace && record.worker_phase_active())
+        .map(|record| record.id)
+        .collect();
+    maintain_workspace_cursors_locked(
+        &mp,
+        &active_consumers,
+        now_secs(),
+        STALE_CURSOR_RETENTION_SECS,
+    )?;
+    Ok(report)
 }
 
 /// Cheap opportunistic sweep, gated by a marker file's mtime so a busy
@@ -826,7 +1206,9 @@ pub fn resolve_consumer(
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs::{FileTimes, OpenOptions};
     use std::os::unix::ffi::OsStringExt;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_paths(root: &Path) -> Paths {
@@ -857,6 +1239,37 @@ mod tests {
 
     fn write_test_message(paths: &Paths, workspace: &Path, id: Uuid) {
         write_message(paths, &test_message(workspace, id)).unwrap();
+    }
+
+    fn create_legacy_mailbox(paths: &Paths, workspace: &Path) -> MessagePaths {
+        let legacy = message_paths_for_key(paths, &legacy_workspace_key(workspace));
+        ensure_private_dir(&legacy.workspace_dir).unwrap();
+        ensure_private_dir(&legacy.msgs_dir).unwrap();
+        ensure_private_dir(&legacy.cursors_dir).unwrap();
+        atomic_write_json(
+            &legacy.workspace_file,
+            &serde_json::json!({"workspace": workspace}),
+        )
+        .unwrap();
+        legacy
+    }
+
+    fn write_message_file(mp: &MessagePaths, message: &MessageEnvelope) {
+        atomic_write_bytes(
+            &mp.msgs_dir.join(format!("{}.json", message.id)),
+            &serialized_envelope(message).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn set_modified_secs(path: &Path, seconds: u64) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+            .unwrap();
     }
 
     #[test]
@@ -901,6 +1314,105 @@ mod tests {
         );
         assert!(migrated.msgs_dir.join("migration-marker").exists());
         assert!(!legacy.workspace_dir.exists());
+    }
+
+    #[test]
+    fn ensure_workspace_losslessly_merges_coexisting_mailboxes() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-coexisting-mailboxes");
+        let stable = ensure_workspace(&paths, workspace).unwrap();
+        let legacy = create_legacy_mailbox(&paths, workspace);
+        let duplicate_id = Uuid::from_u128(1);
+        let stable_only_id = Uuid::from_u128(2);
+        let legacy_only_id = Uuid::from_u128(3);
+        let duplicate = test_message(workspace, duplicate_id);
+        write_message_file(&stable, &duplicate);
+        write_message_file(&legacy, &duplicate);
+        write_message_file(&stable, &test_message(workspace, stable_only_id));
+        write_message_file(&legacy, &test_message(workspace, legacy_only_id));
+
+        let consumer_id = Uuid::from_u128(100);
+        atomic_write_json(
+            &stable.cursors_dir.join(format!("{consumer_id}.json")),
+            &Cursor {
+                acked_through: None,
+                exceptions: BTreeSet::from([stable_only_id]),
+            },
+        )
+        .unwrap();
+        atomic_write_json(
+            &legacy.cursors_dir.join(format!("{consumer_id}.json")),
+            &Cursor {
+                acked_through: None,
+                exceptions: BTreeSet::from([legacy_only_id]),
+            },
+        )
+        .unwrap();
+        fs::write(cursor_lock_path(&legacy.cursors_dir, consumer_id), b"").unwrap();
+
+        let merged = ensure_workspace(&paths, workspace).unwrap();
+        assert_eq!(merged.workspace_dir, stable.workspace_dir);
+        let messages = list_messages(&paths, workspace).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([duplicate_id, stable_only_id, legacy_only_id])
+        );
+        let cursor = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert_eq!(
+            cursor.exceptions,
+            BTreeSet::from([stable_only_id, legacy_only_id])
+        );
+        assert!(json_files(&legacy.msgs_dir).unwrap().is_empty());
+        assert!(json_files(&legacy.cursors_dir).unwrap().is_empty());
+        assert!(!cursor_lock_path(&legacy.cursors_dir, consumer_id).exists());
+
+        // The intentionally-retained compatibility skeleton makes future
+        // calls idempotent and lets current clients drain a later old-client
+        // append instead of ignoring it.
+        ensure_workspace(&paths, workspace).unwrap();
+        write_message_file(&legacy, &test_message(workspace, Uuid::from_u128(4)));
+        ensure_workspace(&paths, workspace).unwrap();
+        assert_eq!(list_messages(&paths, workspace).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn ensure_workspace_rejects_divergent_message_collision_without_mutation() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-mailbox-collision");
+        let stable = ensure_workspace(&paths, workspace).unwrap();
+        let legacy = create_legacy_mailbox(&paths, workspace);
+        let id = Uuid::from_u128(1);
+        let legacy_unique_id = Uuid::from_u128(2);
+        let stable_message = test_message(workspace, id);
+        let mut legacy_message = stable_message.clone();
+        legacy_message.body = "different".into();
+        write_message_file(&stable, &stable_message);
+        write_message_file(&legacy, &legacy_message);
+        write_message_file(&legacy, &test_message(workspace, legacy_unique_id));
+
+        let error = ensure_workspace(&paths, workspace).unwrap_err();
+        assert!(error.to_string().contains("mailbox message collision"));
+        assert_eq!(
+            fs::read(stable.msgs_dir.join(format!("{id}.json"))).unwrap(),
+            serialized_envelope(&stable_message).unwrap()
+        );
+        assert_eq!(
+            fs::read(legacy.msgs_dir.join(format!("{id}.json"))).unwrap(),
+            serialized_envelope(&legacy_message).unwrap()
+        );
+        assert!(legacy
+            .msgs_dir
+            .join(format!("{legacy_unique_id}.json"))
+            .exists());
+        assert!(!stable
+            .msgs_dir
+            .join(format!("{legacy_unique_id}.json"))
+            .exists());
     }
 
     #[test]
@@ -1044,6 +1556,72 @@ mod tests {
         let after = read_cursor(&paths, workspace, consumer_id).unwrap();
         assert!(after.exceptions.is_empty());
         assert!(!after.is_acked(first));
+    }
+
+    #[test]
+    fn cursor_gc_respects_retention_active_sessions_and_held_locks() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-stale-cursor-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let stale = Uuid::from_u128(10);
+        let active = Uuid::from_u128(11);
+        let fresh = Uuid::from_u128(12);
+        let busy = Uuid::from_u128(13);
+        let orphan_stale = Uuid::from_u128(14);
+        let orphan_fresh = Uuid::from_u128(15);
+        for consumer_id in [stale, active, fresh, busy] {
+            atomic_write_json(
+                &mp.cursors_dir.join(format!("{consumer_id}.json")),
+                &Cursor::default(),
+            )
+            .unwrap();
+        }
+        for consumer_id in [stale, active, fresh, busy, orphan_stale, orphan_fresh] {
+            fs::write(cursor_lock_path(&mp.cursors_dir, consumer_id), b"").unwrap();
+        }
+
+        let now = STALE_CURSOR_RETENTION_SECS + 10_000;
+        let old = 1;
+        let fresh_at = now - STALE_CURSOR_RETENTION_SECS;
+        for consumer_id in [stale, active, busy] {
+            set_modified_secs(&mp.cursors_dir.join(format!("{consumer_id}.json")), old);
+            set_modified_secs(&cursor_lock_path(&mp.cursors_dir, consumer_id), old);
+        }
+        set_modified_secs(&mp.cursors_dir.join(format!("{fresh}.json")), fresh_at);
+        set_modified_secs(&cursor_lock_path(&mp.cursors_dir, fresh), fresh_at);
+        set_modified_secs(&cursor_lock_path(&mp.cursors_dir, orphan_stale), old);
+        set_modified_secs(&cursor_lock_path(&mp.cursors_dir, orphan_fresh), fresh_at);
+
+        let busy_lock =
+            FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, busy), false).unwrap();
+        let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false).unwrap();
+        maintain_workspace_cursors_locked(
+            &mp,
+            &BTreeSet::from([active]),
+            now,
+            STALE_CURSOR_RETENTION_SECS,
+        )
+        .unwrap();
+
+        assert!(!mp.cursors_dir.join(format!("{stale}.json")).exists());
+        assert!(!cursor_lock_path(&mp.cursors_dir, stale).exists());
+        assert!(mp.cursors_dir.join(format!("{active}.json")).exists());
+        assert!(mp.cursors_dir.join(format!("{fresh}.json")).exists());
+        assert!(mp.cursors_dir.join(format!("{busy}.json")).exists());
+        assert!(!cursor_lock_path(&mp.cursors_dir, orphan_stale).exists());
+        assert!(cursor_lock_path(&mp.cursors_dir, orphan_fresh).exists());
+
+        drop(busy_lock);
+        maintain_workspace_cursors_locked(
+            &mp,
+            &BTreeSet::from([active]),
+            now,
+            STALE_CURSOR_RETENTION_SECS,
+        )
+        .unwrap();
+        assert!(!mp.cursors_dir.join(format!("{busy}.json")).exists());
+        assert!(!cursor_lock_path(&mp.cursors_dir, busy).exists());
     }
 
     #[test]

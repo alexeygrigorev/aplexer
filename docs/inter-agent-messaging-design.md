@@ -185,6 +185,17 @@ workspace path — the first 128 bits of SHA-256 over its raw Unix path bytes
 the directory makes the mapping reversible for `a doctor` and humans.
 Directories are `0700`, files `0600`, matching spec §26.
 
+Early builds used Rust's unspecified `DefaultHasher` over a lossy path
+string. Upgrade handling is lossless and idempotent: if only that legacy
+directory exists, it is renamed under its mailbox lock; if stable and legacy
+directories coexist, both mailbox locks are held while legacy messages are
+drained into the stable directory. Equal message-id collisions are
+content-checked and deduplicated, divergent content fails loudly before any
+file moves, and colliding cursor acknowledgements are unioned over the
+retained message set. An empty legacy compatibility skeleton remains so a
+later write from an older installed CLI is discovered and drained on the next
+current operation rather than silently ignored.
+
 Consumption state lives in per-consumer **cursor files**, not in the messages
 (a broadcast has many readers, so no single reader may delete or mutate a
 message to mark it read). Current cursors record exact acknowledged message
@@ -193,6 +204,14 @@ exact ids still retained, preserving upgrade compatibility without letting a
 delayed lower UUID be mistaken for an earlier acknowledgement. Cursor
 read-modify-write takes the workspace mailbox lock and then a per-consumer
 advisory lock; the cursor itself is committed by atomic rename.
+
+Explicit and opportunistic GC also bound cursor metadata. A cursor belonging
+to a session that is no longer starting/running/exiting is retained for 30
+days after its last write, then its JSON and advisory-lock file are removed.
+Active session ids are retained regardless of age. Orphan lock files use the
+same 30-day threshold. GC holds the mailbox lock, attempts each consumer lock
+nonblockingly, and rechecks mtimes after acquiring it; a lock held by an
+active or older client is skipped rather than raced.
 
 ### 3.3 Notification: how a recipient learns there's mail
 
@@ -246,7 +265,8 @@ pane mode trades durability for immediacy.
   other message commands opportunistically prune expired files. Acked-by-all
   status is *not* required for pruning (a session created 8 days later simply
   misses old traffic; `--queue` messages get a longer TTL or `ttl` field).
-  No daemon needed.
+  Inactive per-session cursor state uses the separate conservative 30-day
+  retention described in §3.2. No daemon needed.
 
 **Pane mode (§6.2):**
 
@@ -493,7 +513,7 @@ identity; `log` and `send` degrade gracefully per §2.1).
    workspace size/count caps may still be useful for fairness, but are not a
    disk-exhaustion requirement.
 10. **`a doctor` integration.** Mailbox health (orphaned workspace keys, torn
-    temp files, cursor files for dead sessions) belongs in doctor's checks.
+    temp files, and legacy/stable merge failures) belongs in doctor's checks.
 11. **Pane-mode framing details.** Exact prefix format for injected messages
     (`[aplexer message from <tag>]`), whether the trailing byte is `\r` or
     `\n` per engine (agents differ in what submits a prompt), whether
