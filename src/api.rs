@@ -21,6 +21,14 @@ use crate::{
     Phase, SCHEMA_VERSION, SessionRecord,
 };
 
+struct LaunchEnvironmentGuard(PathBuf);
+
+impl Drop for LaunchEnvironmentGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 pub fn engines_json(paths: &Paths) -> Result<Value> {
     let config = Config::load(paths)?;
     let values = config
@@ -170,6 +178,12 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
     ensure_private_dir(&paths.state_session(id))?;
     ensure_private_dir(&paths.runtime_session(id))?;
+    // Environment values may contain credentials. Hand them to the worker
+    // through a private, one-shot runtime file instead of placing them in
+    // the durable/public session record returned by list/status/watch.
+    let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
+    atomic_write_json(&launch_environment_path, &launch.env)?;
+    let _launch_environment_guard = LaunchEnvironmentGuard(launch_environment_path);
     let now = crate::now_ms();
     let record = SessionRecord {
         schema_version: SCHEMA_VERSION,
@@ -180,7 +194,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         profile: launch.profile,
         command: launch.command,
         cwd: launch.cwd,
-        env: launch.env,
+        env: BTreeMap::new(),
         env_unset: launch.env_unset,
         limits: launch.limits,
         history_bytes: launch.history_bytes,

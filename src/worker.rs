@@ -387,6 +387,17 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     let record_path = paths.record(id);
     let mut record = read_record(&record_path)?;
     ensure_private_dir(&paths.runtime_session(id))?;
+    let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
+    let launch_environment = match fs::read(&launch_environment_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("read private launch environment")?,
+        // Compatibility for sessions created by an older client, whose
+        // launch values were stored directly in the record.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => record.env.clone(),
+        Err(error) => return Err(error).context("read private launch environment"),
+    };
+    let _ = fs::remove_file(&launch_environment_path);
+    // Migrate a legacy record before exposing any further worker state.
+    record.env.clear();
     let _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;
 
@@ -412,7 +423,13 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
     let master_write = master_read.try_clone()?;
-    let child = match spawn_workload(&record, master_read.as_raw_fd(), slave, cgroup.as_ref()) {
+    let child = match spawn_workload(
+        &record,
+        &launch_environment,
+        master_read.as_raw_fd(),
+        slave,
+        cgroup.as_ref(),
+    ) {
         Ok(child) => child,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
@@ -494,6 +511,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
 
 fn spawn_workload(
     record: &SessionRecord,
+    launch_environment: &std::collections::BTreeMap<String, String>,
     master_fd: RawFd,
     slave: File,
     cgroup: Option<&Cgroup>,
@@ -514,7 +532,7 @@ fn spawn_workload(
     command
         .args(&record.command[1..])
         .current_dir(&record.cwd)
-        .envs(&record.env)
+        .envs(launch_environment)
         .env("APLEXER_SESSION_ID", record.id.to_string())
         .env("APLEXER_WORKSPACE", &record.workspace)
         .env("APLEXER_TAG", &record.tag)
