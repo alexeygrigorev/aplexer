@@ -1170,15 +1170,7 @@ fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
 /// worker can also fail an RPC, but then it must not be signalled directly.
 /// ESRCH is success because the process may exit between checks.
 fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
-    if let Some(pid) = record.worker_pid {
-        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).context("force-kill unreachable worker");
-            }
-        }
-    }
-    Ok(())
+    signal_recorded_worker(record, libc::SIGKILL).context("force-kill unreachable worker")
 }
 
 fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
@@ -4211,12 +4203,26 @@ mod switching_tests {
         // alive when we check.
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         record.worker_pid = Some(child.id());
+        record.history_path = paths.history(record.id);
         // Runtime session dir is deliberately never created -- this is the
         // race being simulated: the record claims a socket that isn't
         // there.
         record.socket_path = paths.socket(record.id);
         fs::create_dir_all(paths.state_session(record.id)).unwrap();
         atomic_write_json(&paths.record(record.id), &record).unwrap();
+        let start_time = process_start_time_ticks(child.id()).unwrap();
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let boot_id = boot_id.trim();
+        fs::write(
+            paths
+                .state_session(record.id)
+                .join("worker.identity.json"),
+            format!(
+                "{{\"pid\":{},\"start_time_ticks\":{start_time},\"boot_id\":\"{boot_id}\"}}\n",
+                child.id(),
+            ),
+        )
+        .unwrap();
 
         let args = KillArgs {
             target: TargetArgs {
@@ -4235,11 +4241,85 @@ mod switching_tests {
         // Reap before checking liveness: a just-SIGKILLed child is a zombie
         // (still "alive" to a bare kill(pid, 0) probe) until waited on.
         let status = child.wait().unwrap();
-        assert!(!status.success(), "child should have died from a signal, not exited cleanly");
+        assert!(
+            !status.success(),
+            "child should have died from a signal, not exited cleanly"
+        );
         assert!(
             !process_alive(record.worker_pid.unwrap()),
             "the unreachable worker_pid should have been force-killed, not left untouched"
         );
+    }
+
+    #[test]
+    fn force_kill_stale_worker_refuses_legacy_record_without_identity() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let mut record = mk_record("/ws/legacy", "main", Phase::Running);
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        record.worker_pid = Some(child.id());
+        record.history_path = paths.history(record.id);
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+        let error = force_kill_stale_worker(&record).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no trustworthy recorded worker identity"),
+            "{error:#}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "legacy pid was signalled"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn force_kill_stale_worker_refuses_start_time_mismatch() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let mut record = mk_record("/ws/reused", "main", Phase::Running);
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        record.worker_pid = Some(pid);
+        record.history_path = paths.history(record.id);
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), &record).unwrap();
+        let wrong_start = process_start_time_ticks(pid).unwrap().saturating_add(1);
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let boot_id = boot_id.trim();
+        fs::write(
+            paths.state_session(record.id).join("worker.identity.json"),
+            format!(
+                "{{\"pid\":{pid},\"start_time_ticks\":{wrong_start},\"boot_id\":\"{boot_id}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let error = force_kill_stale_worker(&record).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("has been reused"),
+            "{error:#}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "mismatched pid identity was signalled"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     /// The safety property this whole feature must preserve: a session

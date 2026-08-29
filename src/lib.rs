@@ -20,8 +20,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -189,24 +189,87 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", path.display()))?;
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+    if path.as_os_str().is_empty() {
+        bail!("directory path is empty");
+    }
+
+    // Walk the path a component at a time. `create_dir_all` followed by a
+    // path-based chmod leaves a check/use gap in which the final component
+    // can be replaced with a symlink, causing us to chmod its target. Keeping
+    // every component pinned by a directory fd, and refusing symlinks at each
+    // `openat`, makes both creation and the eventual chmod refer to the inode
+    // we actually inspected.
+    let base = if path.is_absolute() { "/" } else { "." };
+    let mut directory = open_directory_at(libc::AT_FDCWD, OsStr::new(base))
+        .with_context(|| format!("open directory base for {}", path.display()))?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => unreachable!("Unix paths have no prefix component"),
+        };
+        let name_c = CString::new(name.as_bytes()).context("directory component contains NUL")?;
+        let next = match open_directory_at(directory.as_raw_fd(), name) {
+            Ok(next) => next,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                if unsafe { libc::mkdirat(directory.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+                    let mkdir_error = io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(mkdir_error)
+                            .with_context(|| format!("create {}", path.display()));
+                    }
+                }
+                open_directory_at(directory.as_raw_fd(), name)
+                    .with_context(|| format!("open newly-created {}", path.display()))?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("open {} without following symbolic links", path.display())
+                });
+            }
+        };
+        directory = next;
+    }
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(directory.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("inspect {}", path.display()));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         bail!("{} is not a real directory", path.display());
     }
     let uid = unsafe { libc::geteuid() };
-    use std::os::unix::fs::MetadataExt;
-    if meta.uid() != uid {
+    if stat.st_uid != uid {
         bail!(
             "{} is owned by uid {}, expected {}",
             path.display(),
-            meta.uid(),
+            stat.st_uid,
             uid
         );
     }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("chmod 0700 {}", path.display()));
+    }
     Ok(())
+}
+
+fn open_directory_at(parent_fd: RawFd, name: &OsStr) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
 }
 
 pub fn canonical_workspace(path: &Path) -> Result<PathBuf> {
@@ -368,6 +431,8 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
     ensure_private_dir(parent)?;
+    let value = serde_json::to_value(value)?;
+    persist_worker_identity_once(path, &value)?;
     let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(
         ".{}.{}.{}.tmp",
@@ -383,13 +448,92 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .mode(0o600)
         .open(&temp)
         .with_context(|| format!("create {}", temp.display()))?;
-    serde_json::to_writer_pretty(&mut file, value)?;
+    serde_json::to_writer_pretty(&mut file, &value)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     fs::rename(&temp, path)
         .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time_ticks: u64,
+    boot_id: String,
+}
+
+const WORKER_IDENTITY_FILE: &str = "worker.identity.json";
+
+/// Capture the worker identity on the first record write that contains a
+/// worker pid. `run_worker` writes `worker_pid` and immediately persists the
+/// record, so doing this in the shared record writer keeps the identity
+/// update coupled to that registration without giving later record writes a
+/// chance to replace it after a pid has been recycled.
+fn persist_worker_identity_once(path: &Path, value: &Value) -> Result<()> {
+    if path.file_name() != Some(OsStr::new("session.json")) {
+        return Ok(());
+    }
+    let Some(pid) = value
+        .as_object()
+        .and_then(|object| object.get("worker_pid"))
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Ok(());
+    };
+    // Only the process registering itself may create this immutable file.
+    // A different process rewriting a legacy/stale record must never bless
+    // whichever unrelated process may now occupy its old numeric pid.
+    if pid != std::process::id() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    let identity_path = parent.join(WORKER_IDENTITY_FILE);
+    if identity_path.try_exists()? {
+        return Ok(());
+    }
+
+    let identity = ProcessIdentity {
+        pid,
+        start_time_ticks: process_start_time_ticks(pid)
+            .with_context(|| format!("inspect worker pid {pid} before recording its identity"))?,
+        boot_id: linux_boot_id()?,
+    };
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{WORKER_IDENTITY_FILE}.{}.{}.tmp",
+        std::process::id(),
+        seq
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("create {}", temp.display()))?;
+        serde_json::to_writer(&mut file, &identity)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+
+        // A hard link is an atomic no-replace publication. If another writer
+        // won the race, retain its earlier identity rather than refreshing it
+        // from what may now be a recycled pid.
+        match fs::hard_link(&temp, &identity_path) {
+            Ok(()) => File::open(parent)?.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("publish {}", identity_path.display()));
+            }
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temp);
+    result
 }
 
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -463,6 +607,145 @@ pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
 pub fn process_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Linux process start time (field 22 of `/proc/<pid>/stat`), measured in
+/// clock ticks since boot. Combined with the pid, this distinguishes a
+/// persisted process from a later process that reused its numeric pid.
+pub fn process_start_time_ticks(pid: u32) -> Result<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let stat = fs::read_to_string(&stat_path).with_context(|| format!("read {stat_path}"))?;
+    // The parenthesized comm field may itself contain spaces or `)`, so split
+    // after its final close-paren rather than tokenizing the whole line.
+    let after_comm = stat
+        .rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .ok_or_else(|| anyhow!("malformed {stat_path}"))?;
+    after_comm
+        .split_whitespace()
+        .nth(19) // field 3 is index 0 here; starttime is field 22
+        .ok_or_else(|| anyhow!("{stat_path} has no process start time"))?
+        .parse()
+        .with_context(|| format!("parse process start time from {stat_path}"))
+}
+
+fn linux_boot_id() -> Result<String> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read Linux boot identity")?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        bail!("Linux boot identity is empty");
+    }
+    Ok(boot_id.to_owned())
+}
+
+/// Signal the worker recorded for a session only if it is still the exact
+/// Linux process registered at startup. The pidfd pins the verified process
+/// across the final check/signal boundary, so an exit and pid reuse cannot
+/// redirect the signal to an unrelated process.
+///
+/// Records created before worker identities were introduced remain readable
+/// and otherwise usable, but direct stale-worker signalling fails closed.
+pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()> {
+    let Some(pid) = record.worker_pid else {
+        return Ok(());
+    };
+    let parent = record
+        .history_path
+        .parent()
+        .ok_or_else(|| anyhow!("session {} has no state directory", record.id))?;
+    let identity_path = parent.join(WORKER_IDENTITY_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&identity_path)
+        .with_context(|| {
+            format!(
+                "session {} has no trustworthy recorded worker identity; refusing to signal pid {}",
+                record.id, pid
+            )
+        })?;
+    let metadata = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "session {} has an untrusted worker identity file; refusing to signal pid {}",
+            record.id,
+            pid
+        );
+    }
+    let identity: ProcessIdentity = serde_json::from_reader(file)
+        .with_context(|| format!("parse {}", identity_path.display()))?;
+    if identity.pid != pid {
+        bail!(
+            "session {} recorded worker pid {}, but its identity belongs to pid {}; refusing to signal",
+            record.id,
+            pid,
+            identity.pid
+        );
+    }
+
+    let pidfd = match pidfd_open(pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open pidfd for worker pid {pid}"));
+        }
+    };
+    let current_boot_id = linux_boot_id()?;
+    if current_boot_id != identity.boot_id {
+        bail!(
+            "worker pid {} for session {} was recorded during a different boot; refusing to signal",
+            pid,
+            record.id
+        );
+    }
+    let current_start_time = match process_start_time_ticks(pid) {
+        Ok(start_time) => start_time,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if current_start_time != identity.start_time_ticks {
+        bail!(
+            "worker pid {} for session {} has been reused (recorded start {}, current start {}); refusing to signal",
+            pid,
+            record.id,
+            identity.start_time_ticks,
+            current_start_time
+        );
+    }
+
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("signal worker pid {pid} through pidfd"));
+        }
+    }
+    Ok(())
+}
+
+fn pidfd_open(pid: u32) -> io::Result<File> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
 }
 
 pub fn resolve_record(
@@ -1800,6 +2083,102 @@ pub fn c_string(path: &Path) -> Result<CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn ensure_private_dir_rejects_leaf_symlink_without_chmodding_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        let error = ensure_private_dir(&link).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without following symbolic links"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn ensure_private_dir_rejects_symlink_ancestor_without_creating_beneath_it() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        assert!(ensure_private_dir(&link.join("child")).is_err());
+        assert!(!target.join("child").exists());
+    }
+
+    #[test]
+    fn ensure_private_dir_validates_type_before_chmod() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("ordinary-file");
+        fs::write(&file, b"not a directory").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(ensure_private_dir(&file).is_err());
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn ensure_private_dir_chmods_verified_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("private");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_dir(&directory).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn session_record_write_persists_worker_start_identity_once() {
+        let root = tempfile::tempdir().unwrap();
+        let record_path = root.path().join("session.json");
+        let pid = std::process::id();
+        atomic_write_json(
+            &record_path,
+            &serde_json::json!({"worker_pid": pid, "value": 1}),
+        )
+        .unwrap();
+        let identity_path = root.path().join(WORKER_IDENTITY_FILE);
+        let original: ProcessIdentity =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        assert_eq!(original.pid, pid);
+        assert_eq!(original.boot_id, linux_boot_id().unwrap());
+        assert_eq!(
+            original.start_time_ticks,
+            process_start_time_ticks(pid).unwrap()
+        );
+
+        // A later write must not refresh the immutable registration.
+        atomic_write_json(
+            &record_path,
+            &serde_json::json!({"worker_pid": pid, "value": 2}),
+        )
+        .unwrap();
+        let after: ProcessIdentity =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        assert_eq!(after.pid, original.pid);
+        assert_eq!(after.start_time_ticks, original.start_time_ticks);
+    }
+
     #[test]
     fn frame_round_trip() {
         let mut bytes = Vec::new();
