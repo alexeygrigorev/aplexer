@@ -1308,17 +1308,10 @@ fn workload_identity_matches(pid: u32, id: Uuid) -> bool {
 }
 
 fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
-    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     let old = resolve_record(paths, Some(&args.selector), None, None)?;
     let workspace = canonical_workspace(args.workspace.as_deref().unwrap_or(&old.workspace))?;
     let tag = args.tag.unwrap_or_else(|| old.tag.clone());
     validate_tag(&tag)?;
-    if let Some(conflict) = list_records(paths)?
-        .into_iter()
-        .find(|r| r.id != old.id && r.workspace == workspace && r.tag == tag)
-    {
-        bail!("workspace+tag already belongs to session {}", conflict.id);
-    }
     let result = rpc_simple(&old, Operation::Rename { workspace, tag }, None)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);

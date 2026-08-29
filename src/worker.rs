@@ -389,6 +389,7 @@ struct WorkloadState {
 }
 
 struct WorkerRuntime {
+    paths: Paths,
     record_path: std::path::PathBuf,
     runtime_session_dir: std::path::PathBuf,
     socket_path: std::path::PathBuf,
@@ -510,6 +511,14 @@ impl WorkerRuntime {
     fn rename(&self, workspace: std::path::PathBuf, tag: String) -> Result<SessionRecord> {
         validate_tag(&tag)?;
         let workspace = canonical_workspace(&workspace)?;
+        let id = lock(&self.record)?.id;
+        let _registry = FileLock::exclusive(&self.paths.registry_lock(), false)?;
+        if let Some(conflict) = list_records(&self.paths)?
+            .into_iter()
+            .find(|record| record.id != id && record.workspace == workspace && record.tag == tag)
+        {
+            bail!("workspace+tag already belongs to session {}", conflict.id);
+        }
         self.update_record(|r| {
             r.workspace = workspace;
             r.tag = tag;
@@ -941,6 +950,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         startup_checkpoint("before_output_hub")?;
         let output = OutputHub::new(history, rows, cols, paths.screen_txt(id))?;
         let runtime = Arc::new(WorkerRuntime {
+            paths: paths.clone(),
             record_path: record_path.clone(),
             runtime_session_dir: paths.runtime_session(id),
             socket_path,
