@@ -93,6 +93,14 @@ fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
         atomic_write_bytes(std::path::Path::new(&marker), pid.to_string().as_bytes())
             .context("write worker startup test marker")?;
     }
+    if env::var("APLEXER_TEST_HANG_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
+        // Deliberately ignore TERMINATION_REQUESTED. This strictly test-only
+        // hook proves the launcher can escalate to SIGKILL and reclaim a
+        // workload even when the worker cannot execute its startup guard.
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
     if env::var("APLEXER_TEST_PAUSE_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
         while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(10));
