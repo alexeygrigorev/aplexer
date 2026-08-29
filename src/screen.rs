@@ -7,6 +7,32 @@
 //! per-pane virtual terminal; see the design doc section 4-6 for the full
 //! rationale and section 5.4 for why `MarginTracker` exists alongside it.
 
+use anyhow::{bail, Result};
+
+/// Maximum number of cells retained by the worker's live terminal model.
+///
+/// `vt100` keeps both normal and alternate grids and each cell carries
+/// formatting state, so accepting the protocol's full `u16 * u16` range
+/// would let a local client request multiple gigabytes of allocation. This
+/// still permits unusually large terminals (for example 512x512) while
+/// keeping each session's model within a defensible fixed bound.
+pub const MAX_SCREEN_CELLS: usize = 256 * 1024;
+
+/// Normalize the protocol's zero dimensions and reject grids that would
+/// exceed the worker's fixed cell budget. `checked_mul` keeps this correct if
+/// the dimension types are widened in the future.
+pub fn validate_size(rows: u16, cols: u16) -> Result<(u16, u16)> {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let cells = usize::from(rows)
+        .checked_mul(usize::from(cols))
+        .ok_or_else(|| anyhow::anyhow!("terminal dimensions overflow"))?;
+    if cells > MAX_SCREEN_CELLS {
+        bail!("terminal size {rows}x{cols} exceeds the maximum of {MAX_SCREEN_CELLS} cells");
+    }
+    Ok((rows, cols))
+}
+
 /// Byte-level parser states `MarginTracker` walks through. Deliberately not
 /// a general escape-sequence parser: only enough state to recognize `ESC c`
 /// (RIS) and `ESC [ ... r` (DECSTBM), with everything else falling straight
@@ -420,10 +446,9 @@ impl ScreenTracker {
     /// `Parser::new(rows, cols, 0)` -- zero model scrollback; scrolling is
     /// the host terminal's job (docs/scrollback-design.md), and this caps
     /// the model's memory at the two-grid cost (design doc section 5.2).
-    pub fn new(rows: u16, cols: u16) -> Self {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
-        Self {
+    pub fn try_new(rows: u16, cols: u16) -> Result<Self> {
+        let (rows, cols) = validate_size(rows, cols)?;
+        Ok(Self {
             // Invariant: the third argument (scrollback rows) must stay 0.
             // `ScreenTracker` is a current-screen-only cache, never a
             // retained history buffer -- retaining scrollback here would
@@ -433,7 +458,12 @@ impl ScreenTracker {
             parser: vt100::Parser::new(rows, cols, 0),
             margins: MarginTracker::new(rows),
             alt_screen: false,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new(rows: u16, cols: u16) -> Self {
+        Self::try_new(rows, cols).expect("test terminal size should be valid")
     }
 
     /// Feed PTY bytes; returns `Some(LayoutChange)` when the workload did
@@ -461,11 +491,17 @@ impl ScreenTracker {
     /// doc section 5.3's original "margins reset on resize" plan. See
     /// `MarginTracker::set_rows` for the exact rules and why the tracker has
     /// to follow the grid rather than a real terminal here.
-    pub fn set_size(&mut self, rows: u16, cols: u16) {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+    pub fn try_set_size(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let (rows, cols) = validate_size(rows, cols)?;
         self.parser.screen_mut().set_size(rows, cols);
         self.margins.set_rows(rows);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn set_size(&mut self, rows: u16, cols: u16) {
+        self.try_set_size(rows, cols)
+            .expect("test terminal size should be valid");
     }
 
     /// Plain text of the current screen, for `a capture --screen` and the
@@ -505,6 +541,14 @@ impl ScreenTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_dimensions_are_bounded_and_overflow_safe() {
+        assert_eq!(validate_size(0, 0).unwrap(), (1, 1));
+        assert_eq!(validate_size(512, 512).unwrap(), (512, 512));
+        assert!(validate_size(513, 512).is_err());
+        assert!(validate_size(u16::MAX, u16::MAX).is_err());
+    }
 
     // -- MarginTracker --
 

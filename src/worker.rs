@@ -33,6 +33,43 @@ enum OutputEvent {
 /// reattach to obtain a fresh tail or screen snapshot.
 const SUBSCRIBER_QUEUE_EVENTS: usize = 32;
 const MAX_SUBSCRIBERS: usize = 64;
+/// Attach connections are long-lived, while ordinary RPCs are short-lived.
+/// Leave room above the subscriber ceiling for status/capture/kill calls,
+/// but never let a same-UID peer create worker threads without bound.
+const MAX_CLIENT_CONNECTIONS: usize = 128;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionPermit> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_CLIENT_CONNECTIONS).then_some(count + 1)
+        })
+        .ok()?;
+    Some(ConnectionPermit {
+        active: Arc::clone(active),
+    })
+}
+
+fn bounded_history_limit(requested: Option<usize>) -> usize {
+    requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES)
+}
+
+fn ensure_frame_payload_size(kind: &str, len: usize) -> Result<()> {
+    if len > MAX_FRAME_BYTES {
+        bail!("{kind} exceeds the maximum frame size of {MAX_FRAME_BYTES} bytes");
+    }
+    Ok(())
+}
 
 /// What a newly-attaching client should be sent as its initial payload
 /// (design doc section 6.1/checklist item 4): the live screen snapshot, or
@@ -59,17 +96,22 @@ struct OutputHub {
     screen_txt_path: std::path::PathBuf,
 }
 impl OutputHub {
-    fn new(history: History, rows: u16, cols: u16, screen_txt_path: std::path::PathBuf) -> Self {
-        Self {
+    fn new(
+        history: History,
+        rows: u16,
+        cols: u16,
+        screen_txt_path: std::path::PathBuf,
+    ) -> Result<Self> {
+        Ok(Self {
             inner: Mutex::new(HubInner {
                 history,
-                screen: screen::ScreenTracker::new(rows, cols),
+                screen: screen::ScreenTracker::try_new(rows, cols)?,
                 subscribers: HashMap::new(),
                 next_id: 1,
                 final_exit: None,
             }),
             screen_txt_path,
-        }
+        })
     }
     fn append(&self, data: &[u8]) -> Result<()> {
         let mut inner = lock(&self.inner)?;
@@ -90,24 +132,29 @@ impl OutputHub {
         Ok(())
     }
     fn snapshot(&self, max: Option<usize>) -> Result<Vec<u8>> {
-        Ok(lock(&self.inner)?.history.snapshot(max))
+        Ok(lock(&self.inner)?
+            .history
+            .snapshot(Some(bounded_history_limit(max))))
     }
     /// The rendered current-screen snapshot (design doc section 6.2),
     /// shared by attach's `AttachPayload::Screen` and
     /// `Operation::CaptureScreen { plain: false }`.
     fn screen_snapshot(&self) -> Result<Vec<u8>> {
-        Ok(lock(&self.inner)?.screen.snapshot())
+        let data = lock(&self.inner)?.screen.snapshot();
+        ensure_frame_payload_size("screen snapshot", data.len())?;
+        Ok(data)
     }
     /// Plain text of the current screen (design doc section 8), for
     /// `Operation::CaptureScreen { plain: true }`.
     fn screen_contents(&self) -> Result<String> {
-        Ok(lock(&self.inner)?.screen.contents())
+        let data = lock(&self.inner)?.screen.contents();
+        ensure_frame_payload_size("plain screen capture", data.len())?;
+        Ok(data)
     }
     /// Resizes the live screen model; called by `WorkerRuntime::resize`
     /// before the PTY ioctl (design doc section 5.3).
     fn set_size(&self, rows: u16, cols: u16) -> Result<()> {
-        lock(&self.inner)?.screen.set_size(rows, cols);
-        Ok(())
+        lock(&self.inner)?.screen.try_set_size(rows, cols)
     }
     /// Persists any history bytes the debounced append path hasn't written
     /// yet; driven by a periodic thread so an idle session's tail doesn't
@@ -122,8 +169,12 @@ impl OutputHub {
     ) -> Result<(u64, Vec<u8>, mpsc::Receiver<OutputEvent>)> {
         let mut inner = lock(&self.inner)?;
         let initial = match payload {
-            AttachPayload::Screen => inner.screen.snapshot(),
-            AttachPayload::Tail(max) => inner.history.snapshot(max),
+            AttachPayload::Screen => {
+                let data = inner.screen.snapshot();
+                ensure_frame_payload_size("screen snapshot", data.len())?;
+                data
+            }
+            AttachPayload::Tail(max) => inner.history.snapshot(Some(bounded_history_limit(max))),
         };
         if inner.final_exit.is_none() && inner.subscribers.len() >= MAX_SUBSCRIBERS {
             bail!("too many attached clients");
@@ -182,6 +233,7 @@ mod tests {
             80,
             dir.path().join("screen.txt"),
         )
+        .unwrap()
     }
 
     #[test]
@@ -211,6 +263,38 @@ mod tests {
         assert!(hub.subscribe(AttachPayload::Tail(None)).is_err());
         assert_eq!(receivers.len(), MAX_SUBSCRIBERS);
     }
+
+    #[test]
+    fn history_capture_limits_cannot_exceed_one_frame() {
+        assert_eq!(bounded_history_limit(None), MAX_FRAME_BYTES);
+        assert_eq!(bounded_history_limit(Some(123)), 123);
+        assert_eq!(bounded_history_limit(Some(usize::MAX)), MAX_FRAME_BYTES);
+        assert!(ensure_frame_payload_size("test", MAX_FRAME_BYTES).is_ok());
+        assert!(ensure_frame_payload_size("test", MAX_FRAME_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn connection_permits_are_bounded_and_release_on_drop() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..MAX_CLIENT_CONNECTIONS)
+            .map(|_| try_acquire_connection(&active).expect("permit below limit"))
+            .collect();
+        assert!(try_acquire_connection(&active).is_none());
+        assert_eq!(active.load(Ordering::Acquire), MAX_CLIENT_CONNECTIONS);
+
+        drop(permits);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(try_acquire_connection(&active).is_some());
+
+        let _ = std::panic::catch_unwind({
+            let active = Arc::clone(&active);
+            move || {
+                let _permit = try_acquire_connection(&active).unwrap();
+                panic!("exercise unwind cleanup");
+            }
+        });
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
 }
 
 #[derive(Debug)]
@@ -232,7 +316,7 @@ struct WorkerRuntime {
     /// Connections currently being served; the lifecycle thread drains this
     /// (with a timeout) before exiting the worker so in-flight responses
     /// (e.g. the reply to the `kill` that ended the workload) are not lost.
-    active_connections: AtomicUsize,
+    active_connections: Arc<AtomicUsize>,
     /// Last PTY-output timestamp (ms since epoch), updated on every PTY read
     /// with a single relaxed atomic store -- no lock, no I/O -- so this can
     /// sit directly in the hot PTY-reader loop without reintroducing the
@@ -414,11 +498,15 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         .with_context(|| format!("bind {}", socket_path.display()))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
 
+    let requested_size = initial_size.unwrap_or((24, 80));
+    let (rows, cols) = match screen::validate_size(requested_size.0, requested_size.1) {
+        Ok(value) => value,
+        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
+    };
     let cgroup = match Cgroup::create(id, &record.limits) {
         Ok(value) => value,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
     };
-    let (rows, cols) = initial_size.unwrap_or((24, 80));
     let (master_read, slave) = match open_pty(rows, cols) {
         Ok(value) => value,
         Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
@@ -455,8 +543,8 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         }),
         cgroup: Mutex::new(cgroup),
         kill_gate: Mutex::new(()),
-        output: OutputHub::new(history, rows, cols, screen_txt_path),
-        active_connections: AtomicUsize::new(0),
+        output: OutputHub::new(history, rows, cols, screen_txt_path)?,
+        active_connections: Arc::new(AtomicUsize::new(0)),
         last_activity_ms: AtomicU64::new(0),
     });
     let (life_tx, life_rx) = mpsc::channel();
@@ -495,14 +583,22 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let Some(permit) = try_acquire_connection(&runtime.active_connections) else {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                };
                 let runtime = runtime.clone();
-                runtime.active_connections.fetch_add(1, Ordering::SeqCst);
-                thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, runtime.clone()) {
-                        eprintln!("aplexer connection: {error:#}");
-                    }
-                    runtime.active_connections.fetch_sub(1, Ordering::SeqCst);
-                });
+                let spawn = thread::Builder::new()
+                    .name("aplexer-client".into())
+                    .spawn(move || {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, runtime) {
+                            eprintln!("aplexer connection: {error:#}");
+                        }
+                    });
+                if let Err(error) = spawn {
+                    eprintln!("aplexer worker: spawn client thread: {error}");
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("accept control connection"),
@@ -759,6 +855,8 @@ fn fail_startup(
 }
 
 fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Result<()> {
+    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
     let uid = peer_uid(stream.as_raw_fd())?;
     if uid != unsafe { libc::geteuid() } {
         bail!("peer uid {uid} is not authorized");
@@ -860,6 +958,13 @@ fn handle_attach(
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<()> {
+    if let (Some(rows), Some(cols)) = (rows, cols) {
+        screen::validate_size(rows, cols)?;
+    }
+    // An established attach is intentionally long-lived. Before this point,
+    // the handshake used the worker-wide deadline so a peer cannot reserve a
+    // connection slot forever with a partial frame.
+    reader.set_read_timeout(None)?;
     // Geometry-first (design doc section 6.1): resize the PTY and the
     // screen model to the client's real terminal size *before* rendering
     // the snapshot below, so there is no wrong-size frame followed by a
