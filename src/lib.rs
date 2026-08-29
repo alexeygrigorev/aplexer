@@ -410,10 +410,39 @@ impl SessionRecord {
     }
 
     /// Whether the worker process is present in `/proc`. This is a cheap,
-    /// pessimistic check: callers with a live worker socket may use a
-    /// successful RPC as stronger evidence.
+    /// pessimistic check for legacy records. New records also pin the
+    /// worker's boot and process start time, so a recycled numeric pid does
+    /// not keep a dead session alive forever. An absent or unreadable
+    /// identity sidecar deliberately falls back to the legacy pid check:
+    /// uncertainty must not let prune/tag replacement delete a live worker.
     pub fn worker_alive(&self) -> bool {
-        self.worker_pid.map(process_alive).unwrap_or(false)
+        let Some(pid) = self.worker_pid else {
+            return false;
+        };
+        if !process_alive(pid) {
+            return false;
+        }
+        let identity = match read_worker_identity(self) {
+            Ok(Some(identity)) if identity.pid == pid => identity,
+            Ok(Some(_)) | Ok(None) | Err(_) => return true,
+        };
+        let Ok(boot_id) = linux_boot_id() else {
+            return true;
+        };
+        if identity.boot_id != boot_id {
+            return false;
+        }
+        match process_start_time_ticks(pid) {
+            Ok(start_time) => start_time == identity.start_time_ticks,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                false
+            }
+            Err(_) => true,
+        }
     }
 
     /// Whether the worker's lifetime phase is still active according to its
@@ -492,6 +521,29 @@ struct ProcessIdentity {
 }
 
 const WORKER_IDENTITY_FILE: &str = "worker.identity.json";
+
+fn read_worker_identity(record: &SessionRecord) -> Result<Option<ProcessIdentity>> {
+    let parent = record
+        .history_path
+        .parent()
+        .ok_or_else(|| anyhow!("session {} has no state directory", record.id))?;
+    let path = parent.join(WORKER_IDENTITY_FILE);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let metadata = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("untrusted worker identity file {}", path.display());
+    }
+    serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))
+}
 
 /// Capture the worker identity on the first record write that contains a
 /// worker pid. `run_worker` writes `worker_pid` and immediately persists the
@@ -2238,6 +2290,77 @@ mod tests {
             serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
         assert_eq!(after.pid, original.pid);
         assert_eq!(after.start_time_ticks, original.start_time_ticks);
+    }
+
+    fn liveness_record(state_dir: &Path) -> SessionRecord {
+        let pid = std::process::id();
+        SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            workspace: state_dir.to_path_buf(),
+            tag: "identity-test".into(),
+            engine: "shell".into(),
+            profile: None,
+            command: vec!["/bin/true".into()],
+            cwd: state_dir.to_path_buf(),
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: DEFAULT_HISTORY_BYTES,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_activity_ms: None,
+            phase: Phase::Running,
+            worker_pid: Some(pid),
+            workload_pid: None,
+            socket_path: state_dir.join("control.sock"),
+            history_path: state_dir.join("history.bin"),
+            exit: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn worker_liveness_rejects_recycled_pid_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let mut record = liveness_record(state.path());
+        let pid = record.worker_pid.unwrap();
+        let identity = ProcessIdentity {
+            pid,
+            start_time_ticks: process_start_time_ticks(pid).unwrap() + 1,
+            boot_id: linux_boot_id().unwrap(),
+        };
+        fs::write(
+            state.path().join(WORKER_IDENTITY_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!record.worker_alive());
+        record.phase = Phase::Failed;
+        assert!(record.worker_finished());
+    }
+
+    #[test]
+    fn worker_liveness_uses_safe_legacy_fallback_for_missing_or_corrupt_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let record = liveness_record(state.path());
+        assert!(record.worker_alive(), "missing sidecar uses numeric pid");
+
+        fs::write(state.path().join(WORKER_IDENTITY_FILE), b"not-json").unwrap();
+        assert!(record.worker_alive(), "corrupt sidecar fails closed");
+
+        let identity = ProcessIdentity {
+            pid: record.worker_pid.unwrap() + 1,
+            start_time_ticks: 0,
+            boot_id: "corrupt".into(),
+        };
+        fs::write(
+            state.path().join(WORKER_IDENTITY_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        assert!(record.worker_alive(), "pid mismatch fails closed");
     }
 
     #[test]
