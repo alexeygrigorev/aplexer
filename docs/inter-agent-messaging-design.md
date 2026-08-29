@@ -158,12 +158,13 @@ diff isn't small), a crashed writer can leave a torn tail line that every
 future reader must skip over, and pruning old messages means rewriting the
 file under concurrent appenders — a lock, or a compaction dance.
 
-One file per message dissolves all of that using the exact write discipline
-aplexer already mandates for metadata (spec §14.1): write to a unique temp
-file, fsync, atomically rename into place. Readers never see partial
-messages. Any process can prune old messages by unlinking files — idempotent,
-no lock, no owner. Naming files by the message's UUIDv7 makes lexical
-directory order equal time order, which gives ordering (§4) for free.
+One file per message dissolves torn-tail handling using the exact write
+discipline aplexer already mandates for metadata (spec §14.1): write to a
+unique temp file, fsync, atomically rename into place. Readers never see
+partial messages. Append and pruning share a per-workspace advisory lock so
+each successful send also leaves the mailbox within its hard count/byte
+quotas. Naming files by the message's UUIDv7 gives readers a deterministic
+approximate wall-clock order (§4).
 
 Layout, following the spec §14 state directory:
 
@@ -186,10 +187,12 @@ Directories are `0700`, files `0600`, matching spec §26.
 
 Consumption state lives in per-consumer **cursor files**, not in the messages
 (a broadcast has many readers, so no single reader may delete or mutate a
-message to mark it read). A cursor file records the consumer's last-acked
-message id plus optional per-id ack exceptions. Cursor read-modify-write is
-protected by a per-consumer advisory lock because concurrent CLI invocations
-can still act for one session; the cursor itself is committed by atomic rename.
+message to mark it read). Current cursors record exact acknowledged message
+ids. Older cursor files' `acked_through` watermark is expanded once into the
+exact ids still retained, preserving upgrade compatibility without letting a
+delayed lower UUID be mistaken for an earlier acknowledgement. Cursor
+read-modify-write takes the workspace mailbox lock and then a per-consumer
+advisory lock; the cursor itself is committed by atomic rename.
 
 ### 3.3 Notification: how a recipient learns there's mail
 
@@ -237,10 +240,10 @@ pane mode trades durability for immediacy.
   approximate, and fine: this is a mailbox between colleagues, not a
   replicated log. Consumers read in id order; `a message log` shows the
   workspace conversation in one deterministic sequence.
-- **Retention.** Messages persist until pruned: default TTL 7 days, plus a
-  per-workspace cap (e.g. 1000 messages / 10 MB) as backstop. Pruning is
-  opportunistic — any `a message` invocation may unlink expired files — and
-  ownerless: unlinking an old file is safe from any process. Acked-by-all
+- **Retention.** Messages persist until pruned: default TTL 7 days, with hard
+  per-workspace caps of 1000 messages and 10 MiB. Every successful append
+  enforces both caps under the workspace lock, pruning oldest files first;
+  other message commands opportunistically prune expired files. Acked-by-all
   status is *not* required for pruning (a session created 8 days later simply
   misses old traffic; `--queue` messages get a longer TTL or `ttl` field).
   No daemon needed.
@@ -302,7 +305,9 @@ Field notes:
   the workspace's own files are the right place for large artifacts; messages
   point at paths.
 - `data` — optional structured payload for machine consumers; opaque to
-  aplexer.
+  aplexer. The complete serialized envelope (including `body`, `data`, and
+  metadata) is capped at 512 KiB so structured data and JSON escaping cannot
+  bypass the per-message bound.
 - `reply_to` — message id this responds to; gives threads without a thread
   object.
 - `delivery` — `"inbox"` (default) or `"pane"` (§6.2); records how the
@@ -484,10 +489,9 @@ identity; `log` and `send` degrade gracefully per §2.1).
    inherits spec §10's symlink decision; confirm the canonicalization used
    for mailboxes is byte-identical to the one used for session metadata, or
    siblings will straddle two mailboxes.
-9. **Quotas and abuse.** Per-sender rate/size caps beyond the global body cap
-   — probably unnecessary for a per-user local tool, but a runaway agent in a
-   send loop should hit *some* wall before the disk does (the workspace cap
-   in §4 may suffice).
+9. **Quotas and abuse.** Per-sender rate caps beyond the hard message and
+   workspace size/count caps may still be useful for fairness, but are not a
+   disk-exhaustion requirement.
 10. **`a doctor` integration.** Mailbox health (orphaned workspace keys, torn
     temp files, cursor files for dead sessions) belongs in doctor's checks.
 11. **Pane-mode framing details.** Exact prefix format for injected messages

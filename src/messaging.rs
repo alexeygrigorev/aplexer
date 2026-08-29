@@ -7,7 +7,10 @@
 //! for session metadata (spec.md 14.1). No process owns this state; any
 //! process may read, append, or prune it.
 
-use crate::{atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock, Paths};
+use crate::{
+    atomic_write_bytes, atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock,
+    Paths,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +26,11 @@ use uuid::Uuid;
 pub const MESSAGE_SCHEMA_VERSION: u32 = 1;
 /// Design doc section 5: "body ... size-capped (e.g. 64 KB)".
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Cap the complete serialized envelope too: `data`, sender metadata, and
+/// JSON escaping must not provide a route around the body limit. Eight times
+/// the body cap leaves room for the worst-case JSON escaping of a 64 KiB body
+/// while still keeping every individual mailbox file comfortably bounded.
+pub const MAX_ENVELOPE_BYTES: usize = 8 * MAX_BODY_BYTES;
 /// Design doc section 4: "default TTL 7 days".
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Design doc section 4: "a per-workspace cap (e.g. 1000 messages / 10 MB)
@@ -33,6 +41,7 @@ pub const MAX_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024;
 /// `inbox` (see `maybe_gc`) so a large mailbox is not rescanned on every
 /// call; `a message gc` itself always runs unconditionally.
 const OPPORTUNISTIC_GC_INTERVAL_SECS: u64 = 300;
+const MAILBOX_LOCK_FILE: &str = ".mailbox.lock";
 
 pub fn now_secs() -> u64 {
     now_ms() / 1000
@@ -264,15 +273,70 @@ pub fn check_body_size(body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes one message file via the crate's standard atomic-write-json
+fn serialized_envelope(envelope: &MessageEnvelope) -> Result<Vec<u8>> {
+    check_body_size(&envelope.body)?;
+    // Match `atomic_write_json`'s durable representation exactly: it first
+    // converts to a Value, pretty-prints it, and appends a newline.
+    let value = serde_json::to_value(envelope)?;
+    let mut bytes = serde_json::to_vec_pretty(&value)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        bail!(
+            "serialized message envelope exceeds the {MAX_ENVELOPE_BYTES}-byte cap (got {} bytes)",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+fn mailbox_lock_path(mp: &MessagePaths) -> PathBuf {
+    mp.workspace_dir.join(MAILBOX_LOCK_FILE)
+}
+
+/// Writes one serialized JSON message via the crate's standard atomic-write
 /// discipline (temp file + fsync + rename, spec.md 14.1), named by the
 /// message's own UUIDv7 id so lexical directory order is chronological
 /// order (design doc section 3.2/4).
 pub fn write_message(paths: &Paths, envelope: &MessageEnvelope) -> Result<()> {
-    check_body_size(&envelope.body)?;
+    write_message_with_limits(
+        paths,
+        envelope,
+        MAX_MESSAGES_PER_WORKSPACE,
+        MAX_WORKSPACE_BYTES,
+    )
+}
+
+fn write_message_with_limits(
+    paths: &Paths,
+    envelope: &MessageEnvelope,
+    max_messages: usize,
+    max_bytes: u64,
+) -> Result<()> {
+    let bytes = serialized_envelope(envelope)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "serialized message envelope is {} bytes, larger than the {max_bytes}-byte workspace quota",
+            bytes.len()
+        );
+    }
     let mp = ensure_workspace(paths, &envelope.workspace)?;
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
     let path = mp.msgs_dir.join(format!("{}.json", envelope.id));
-    atomic_write_json(&path, envelope)
+    if path.try_exists()? {
+        bail!("message {} already exists", envelope.id);
+    }
+    atomic_write_bytes(&path, &bytes)?;
+
+    // The new message is protected from eviction: a successful send must
+    // mean that exact id is still durable when this function returns. If an
+    // old file cannot be removed, roll this append back and report failure
+    // instead of returning success with the mailbox above its hard limits.
+    if let Err(error) = prune_workspace_locked(&mp, Some(&path), max_messages, max_bytes, false) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::File::open(&mp.msgs_dir).and_then(|dir| dir.sync_all());
+        return Err(error).context("enforce mailbox quota after append");
+    }
+    Ok(())
 }
 
 pub fn read_message(
@@ -338,13 +402,13 @@ pub fn addressed_to(
     }
 }
 
-/// Per-consumer read/ack state (design doc section 3.2): "a cursor file
-/// records the consumer's last-acked message id plus optional per-id ack
-/// exceptions" -- `acked_through` is the common in-order case (ack advances
-/// a single high-water mark), `exceptions` holds ids acked out of order
-/// that are not yet subsumed by `acked_through`. Updates use a per-consumer
-/// advisory lock because multiple CLI processes can act for one session at
-/// the same time; the cursor itself is still replaced atomically.
+/// Per-consumer read/ack state (design doc section 3.2). New acknowledgements
+/// are exact ids in `exceptions`; despite its legacy name, this set is now the
+/// source of truth. `acked_through` remains only to read cursor files emitted
+/// by older versions and is expanded into exact ids on the next cursor read.
+/// Exact ids matter because UUID generation precedes the atomic mailbox
+/// append: a delayed writer may commit a lower id after a later message was
+/// acknowledged, which makes a high-water comparison unsafe.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,42 +459,36 @@ fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
 
 pub fn read_cursor(paths: &Paths, canonical_workspace: &Path, consumer_id: Uuid) -> Result<Cursor> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
-    read_cursor_file(&mp.cursors_dir.join(format!("{consumer_id}.json")))
-}
-
-/// Promotes an acknowledged prefix into the high-water mark and discards
-/// exceptions for messages no longer retained. Promotion only crosses ids
-/// that are explicitly acknowledged, so an out-of-order ack never hides an
-/// earlier unread message. As GC removes old messages, stale exceptions are
-/// discarded and the set stays bounded by the mailbox itself.
-fn compact_cursor(cursor: &mut Cursor, retained_ids: &BTreeSet<Uuid>) {
-    cursor.exceptions.retain(|id| {
-        retained_ids.contains(id)
-            && cursor
-                .acked_through
-                .map(|through| *id > through)
-                .unwrap_or(true)
-    });
-
-    let mut through = cursor.acked_through;
-    for id in retained_ids {
-        if through.map(|value| *id <= value).unwrap_or(false) {
-            continue;
-        }
-        if cursor.exceptions.remove(id) {
-            through = Some(*id);
-        } else {
-            break;
-        }
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
+    let _cursor = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
+    let mut value = read_cursor_file(&path)?;
+    let original = value.clone();
+    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+    compact_cursor(&mut value, &retained_ids);
+    if value != original {
+        atomic_write_json(&path, &value)?;
     }
-    cursor.acked_through = through;
+    Ok(value)
 }
 
-/// Records `ids` as acked for `consumer_id`. Not required to be called with
-/// a contiguous prefix -- out-of-order ids remain in `exceptions` until the
-/// preceding retained messages are acked or pruned. The read-modify-write is
-/// serialized per consumer so concurrent acknowledgements cannot overwrite
-/// each other.
+/// Migrates a legacy high-water mark into exact ids for the messages that are
+/// currently retained, then discards exact ids whose messages were pruned.
+/// Once migrated, a message that commits later is unread regardless of how
+/// its UUID compares with messages acknowledged earlier.
+fn compact_cursor(cursor: &mut Cursor, retained_ids: &BTreeSet<Uuid>) {
+    if let Some(through) = cursor.acked_through.take() {
+        cursor
+            .exceptions
+            .extend(retained_ids.range(..=through).copied());
+    }
+    cursor.exceptions.retain(|id| retained_ids.contains(id));
+}
+
+/// Records `ids` exactly as acknowledged for `consumer_id`. The mailbox lock
+/// prevents append/GC from changing the retained set during the update; the
+/// per-consumer lock prevents two acknowledgements from overwriting each
+/// other. Lock order is always mailbox then cursor.
 pub fn ack_messages(
     paths: &Paths,
     canonical_workspace: &Path,
@@ -439,15 +497,16 @@ pub fn ack_messages(
 ) -> Result<()> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
-    let _lock = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    let _cursor = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
     let mut cursor = read_cursor_file(&path)?;
+    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
+    compact_cursor(&mut cursor, &retained_ids);
     for id in ids {
-        if !cursor.is_acked(*id) {
+        if retained_ids.contains(id) && !cursor.is_acked(*id) {
             cursor.exceptions.insert(*id);
         }
     }
-    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
-    compact_cursor(&mut cursor, &retained_ids);
     atomic_write_json(&path, &cursor)
 }
 
@@ -471,12 +530,146 @@ pub struct GcReport {
     pub remaining: usize,
 }
 
+struct MailboxEntry {
+    path: PathBuf,
+    created_at: Option<u64>,
+    size: u64,
+}
+
+fn mailbox_entries(mp: &MessagePaths, read_created_at: bool) -> Result<Vec<MailboxEntry>> {
+    let mut entries = Vec::new();
+    let dir = match fs::read_dir(&mp.msgs_dir) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", mp.msgs_dir.display()));
+        }
+    };
+    for entry in dir {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        // Count malformed legacy/corrupt JSON files toward hard quotas too;
+        // otherwise corruption would become a disk-cap bypass. Only valid
+        // envelopes participate in TTL expiration.
+        let size = fs::metadata(&path)
+            .with_context(|| format!("inspect {}", path.display()))?
+            .len();
+        let created_at = if read_created_at {
+            fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<MessageEnvelope>(&bytes).ok())
+                .map(|envelope| envelope.created_at)
+        } else {
+            None
+        };
+        entries.push(MailboxEntry {
+            path,
+            created_at,
+            size,
+        });
+    }
+    // Message paths are UUIDv7 filenames, so bytewise path order is the
+    // existing deterministic mailbox order. Malformed names still get a
+    // stable eviction order rather than escaping the cap.
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn remove_mailbox_entry(
+    entries: &mut Vec<MailboxEntry>,
+    index: usize,
+    total: &mut u64,
+) -> Result<bool> {
+    match fs::remove_file(&entries[index].path) {
+        Ok(()) => {
+            let entry = entries.remove(index);
+            *total = total.saturating_sub(entry.size);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let entry = entries.remove(index);
+            *total = total.saturating_sub(entry.size);
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("remove mailbox message {}", entries[index].path.display())),
+    }
+}
+
+/// Applies TTL and hard caps while the caller holds `MAILBOX_LOCK_FILE`.
+/// `protected` is the just-appended file: a successful send must not evict
+/// itself merely because its UUID sorts before an older committed writer.
+fn prune_workspace_locked(
+    mp: &MessagePaths,
+    protected: Option<&Path>,
+    max_messages: usize,
+    max_bytes: u64,
+    expire: bool,
+) -> Result<GcReport> {
+    let mut entries = mailbox_entries(mp, expire)?;
+    let mut total: u64 = entries.iter().map(|entry| entry.size).sum();
+    let mut removed = 0usize;
+    let mut directory_changed = false;
+
+    if expire {
+        let now = now_secs();
+        let mut index = 0;
+        while index < entries.len() {
+            let is_protected = protected.is_some_and(|path| entries[index].path == path);
+            let expired = entries[index]
+                .created_at
+                .is_some_and(|created_at| now.saturating_sub(created_at) > DEFAULT_TTL_SECS);
+            if !is_protected && expired {
+                let deleted = remove_mailbox_entry(&mut entries, index, &mut total)?;
+                removed += usize::from(deleted);
+                directory_changed |= deleted;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    while entries.len() > max_messages || total > max_bytes {
+        let Some(index) = entries
+            .iter()
+            .position(|entry| !protected.is_some_and(|protected| entry.path == protected))
+        else {
+            bail!(
+                "mailbox quota cannot retain the protected message ({} messages, {total} bytes)",
+                entries.len()
+            );
+        };
+        let deleted = remove_mailbox_entry(&mut entries, index, &mut total)?;
+        removed += usize::from(deleted);
+        directory_changed |= deleted;
+    }
+
+    if directory_changed {
+        fs::File::open(&mp.msgs_dir)?.sync_all()?;
+    }
+    // Exact acknowledgements for removed messages are harmless, and are
+    // compacted on the consumer's next read/ack. Keep append quota
+    // enforcement independent from cursor-file health: otherwise a corrupt
+    // unrelated cursor could make a send fail after old messages were
+    // already pruned. Explicit GC still performs the eager sweep.
+    if expire {
+        compact_workspace_cursors(mp)?;
+    }
+    Ok(GcReport {
+        removed,
+        remaining: entries.len(),
+    })
+}
+
 fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
     let entries = match fs::read_dir(&mp.cursors_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("read {}", mp.cursors_dir.display())),
     };
+    let retained_ids = retained_message_ids(&mp.msgs_dir)?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -493,11 +686,6 @@ fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
         let _lock = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
         let mut cursor = read_cursor_file(&path)?;
         let original = cursor.clone();
-        // Take the mailbox snapshot after acquiring this cursor's lock. An
-        // acknowledgement racing GC must either be visible in this read or
-        // run after the compacted cursor is committed; it cannot be silently
-        // discarded as an "absent" exception.
-        let retained_ids = retained_message_ids(&mp.msgs_dir)?;
         compact_cursor(&mut cursor, &retained_ids);
         if cursor != original {
             atomic_write_json(&path, &cursor)?;
@@ -507,85 +695,19 @@ fn compact_workspace_cursors(mp: &MessagePaths) -> Result<()> {
 }
 
 /// Prunes a workspace mailbox per design doc section 4: default 7-day TTL,
-/// then a per-workspace cap (~1000 messages / 10 MB) as backstop, oldest
-/// first. Unlinking a message file is always safe from any process --
-/// idempotent, no lock, no owner (section 3.2).
+/// then a per-workspace cap (1000 messages / 10 MiB), oldest first. The same
+/// mailbox lock used by append makes the scan/delete/cursor-compaction pass a
+/// transaction with respect to sends and acknowledgements.
 pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcReport> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
-    struct Entry {
-        path: PathBuf,
-        created_at: u64,
-        size: u64,
-    }
-    let mut entries = Vec::new();
-    if let Ok(dir) = fs::read_dir(&mp.msgs_dir) {
-        for e in dir.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else { continue };
-            let Ok(envelope) = serde_json::from_slice::<MessageEnvelope>(&bytes) else {
-                continue;
-            };
-            entries.push((
-                envelope.id,
-                Entry {
-                    path,
-                    created_at: envelope.created_at,
-                    size: bytes.len() as u64,
-                },
-            ));
-        }
-    }
-    entries.sort_by_key(|(id, _)| *id);
-    let now = now_secs();
-    let mut removed = 0usize;
-    entries.retain(|(_, e)| {
-        let expired = now.saturating_sub(e.created_at) > DEFAULT_TTL_SECS;
-        if expired {
-            match fs::remove_file(&e.path) {
-                Ok(()) => removed += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return true,
-            }
-        }
-        !expired
-    });
-    let mut index = 0;
-    while entries.len() > MAX_MESSAGES_PER_WORKSPACE && index < entries.len() {
-        match fs::remove_file(&entries[index].1.path) {
-            Ok(()) => {
-                entries.remove(index);
-                removed += 1;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                entries.remove(index);
-            }
-            Err(_) => index += 1,
-        }
-    }
-    let mut total: u64 = entries.iter().map(|(_, e)| e.size).sum();
-    index = 0;
-    while total > MAX_WORKSPACE_BYTES && index < entries.len() {
-        match fs::remove_file(&entries[index].1.path) {
-            Ok(()) => {
-                let (_, entry) = entries.remove(index);
-                total = total.saturating_sub(entry.size);
-                removed += 1;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let (_, entry) = entries.remove(index);
-                total = total.saturating_sub(entry.size);
-            }
-            Err(_) => index += 1,
-        }
-    }
-    compact_workspace_cursors(&mp)?;
-    Ok(GcReport {
-        removed,
-        remaining: entries.len(),
-    })
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    prune_workspace_locked(
+        &mp,
+        None,
+        MAX_MESSAGES_PER_WORKSPACE,
+        MAX_WORKSPACE_BYTES,
+        true,
+    )
 }
 
 /// Cheap opportunistic sweep, gated by a marker file's mtime so a busy
@@ -717,24 +839,24 @@ mod tests {
         paths
     }
 
+    fn test_message(workspace: &Path, id: Uuid) -> MessageEnvelope {
+        MessageEnvelope {
+            schema_version: MESSAGE_SCHEMA_VERSION,
+            id,
+            workspace: workspace.to_path_buf(),
+            created_at: now_secs(),
+            from: MessageFrom::anonymous(),
+            to: Recipient::Broadcast { broadcast: true },
+            kind: "note".into(),
+            reply_to: None,
+            body: "test".into(),
+            data: None,
+            delivery: Delivery::Inbox,
+        }
+    }
+
     fn write_test_message(paths: &Paths, workspace: &Path, id: Uuid) {
-        write_message(
-            paths,
-            &MessageEnvelope {
-                schema_version: MESSAGE_SCHEMA_VERSION,
-                id,
-                workspace: workspace.to_path_buf(),
-                created_at: now_secs(),
-                from: MessageFrom::anonymous(),
-                to: Recipient::Broadcast { broadcast: true },
-                kind: "note".into(),
-                reply_to: None,
-                body: "test".into(),
-                data: None,
-                delivery: Delivery::Inbox,
-            },
-        )
-        .unwrap();
+        write_message(paths, &test_message(workspace, id)).unwrap();
     }
 
     #[test]
@@ -821,26 +943,42 @@ mod tests {
     }
 
     #[test]
-    fn cursor_compaction_promotes_only_an_acked_prefix() {
-        let id1 = Uuid::now_v7();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let id2 = Uuid::now_v7();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let id3 = Uuid::now_v7();
+    fn cursor_compaction_migrates_legacy_watermark_to_exact_ids() {
+        let id1 = Uuid::from_u128(1);
+        let id2 = Uuid::from_u128(2);
+        let id3 = Uuid::from_u128(3);
         let retained = BTreeSet::from([id1, id2, id3]);
         let mut cursor = Cursor {
-            acked_through: None,
-            exceptions: BTreeSet::from([id1, id3]),
+            acked_through: Some(id2),
+            exceptions: BTreeSet::from([id3]),
         };
 
         compact_cursor(&mut cursor, &retained);
-        assert_eq!(cursor.acked_through, Some(id1));
-        assert_eq!(cursor.exceptions, BTreeSet::from([id3]));
+        assert_eq!(cursor.acked_through, None);
+        assert_eq!(cursor.exceptions, retained);
+    }
 
-        cursor.exceptions.insert(id2);
-        compact_cursor(&mut cursor, &retained);
-        assert_eq!(cursor.acked_through, Some(id3));
-        assert!(cursor.exceptions.is_empty());
+    #[test]
+    fn exact_acks_do_not_hide_a_lower_id_committed_later() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-delayed-message-workspace");
+        let consumer_id = Uuid::from_u128(100);
+        let lower = Uuid::from_u128(1);
+        let higher = Uuid::from_u128(2);
+
+        write_test_message(&paths, workspace, higher);
+        ack_messages(&paths, workspace, consumer_id, &[higher]).unwrap();
+        let before = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert_eq!(before.acked_through, None);
+        assert!(before.is_acked(higher));
+
+        // This is the problematic interleaving: an id generated earlier is
+        // committed only after the later id was acknowledged.
+        write_test_message(&paths, workspace, lower);
+        let after = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert!(after.is_acked(higher));
+        assert!(!after.is_acked(lower));
     }
 
     #[test]
@@ -914,5 +1052,105 @@ mod tests {
         assert!(check_body_size(&big).is_err());
         let ok = "x".repeat(MAX_BODY_BYTES);
         assert!(check_body_size(&ok).is_ok());
+    }
+
+    #[test]
+    fn serialized_envelope_cap_rejects_oversized_structured_data() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-envelope-cap-workspace");
+        let mut message = test_message(workspace, Uuid::from_u128(1));
+        message.body = "tiny".into();
+        message.data = Some(serde_json::json!({
+            "blob": "x".repeat(MAX_ENVELOPE_BYTES)
+        }));
+
+        let error = write_message(&paths, &message).unwrap_err();
+        assert!(error.to_string().contains("serialized message envelope"));
+        assert!(!message_paths(&paths, workspace)
+            .msgs_dir
+            .join(format!("{}.json", message.id))
+            .exists());
+    }
+
+    #[test]
+    fn append_enforces_message_count_and_keeps_the_new_message() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-count-cap-workspace");
+        let first = test_message(workspace, Uuid::from_u128(1));
+        let second = test_message(workspace, Uuid::from_u128(2));
+        let delayed_lower = test_message(workspace, Uuid::from_u128(0));
+
+        write_message_with_limits(&paths, &first, 2, MAX_WORKSPACE_BYTES).unwrap();
+        write_message_with_limits(&paths, &second, 2, MAX_WORKSPACE_BYTES).unwrap();
+        write_message_with_limits(&paths, &delayed_lower, 2, MAX_WORKSPACE_BYTES).unwrap();
+
+        let retained = list_messages(&paths, workspace).unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(retained
+            .iter()
+            .any(|message| message.id == delayed_lower.id));
+        assert!(!retained.iter().any(|message| message.id == first.id));
+    }
+
+    #[test]
+    fn append_enforces_workspace_byte_cap() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-byte-cap-workspace");
+        let first = test_message(workspace, Uuid::from_u128(1));
+        let mut second = test_message(workspace, Uuid::from_u128(2));
+        second.body = "second".into();
+        let second_size = serialized_envelope(&second).unwrap().len() as u64;
+
+        write_message_with_limits(&paths, &first, 10, second_size).unwrap();
+        write_message_with_limits(&paths, &second, 10, second_size).unwrap();
+
+        let retained = list_messages(&paths, workspace).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, second.id);
+    }
+
+    #[test]
+    fn append_rolls_back_when_quota_cannot_retain_the_new_message() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-impossible-cap-workspace");
+        let message = test_message(workspace, Uuid::from_u128(1));
+
+        let error = write_message_with_limits(&paths, &message, 0, MAX_WORKSPACE_BYTES)
+            .expect_err("a zero-message quota must reject the append");
+
+        assert!(error.to_string().contains("enforce mailbox quota"));
+        assert!(list_messages(&paths, workspace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_waits_for_the_workspace_mailbox_lock() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = PathBuf::from("/tmp/aplexer-append-lock-workspace");
+        let mp = ensure_workspace(&paths, &workspace).unwrap();
+        let lock = FileLock::exclusive(&mailbox_lock_path(&mp), false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_paths = paths.clone();
+        let thread_workspace = workspace.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(write_message(
+                &thread_paths,
+                &test_message(&thread_workspace, Uuid::from_u128(1)),
+            ))
+            .unwrap();
+        });
+
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(lock);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 }
