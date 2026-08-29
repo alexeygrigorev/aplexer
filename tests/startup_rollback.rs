@@ -1,8 +1,12 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
+#[cfg(feature = "startup-test-hooks")]
+use std::process::Stdio;
+#[cfg(feature = "startup-test-hooks")]
 use std::thread;
+#[cfg(feature = "startup-test-hooks")]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -12,14 +16,17 @@ struct Harness {
     config_file: PathBuf,
 }
 
+#[cfg(feature = "startup-test-hooks")]
 struct ProcessGroupCleanup(Option<i32>);
 
+#[cfg(feature = "startup-test-hooks")]
 impl ProcessGroupCleanup {
     fn disarm(&mut self) {
         self.0 = None;
     }
 }
 
+#[cfg(feature = "startup-test-hooks")]
 impl Drop for ProcessGroupCleanup {
     fn drop(&mut self) {
         if let Some(pgid) = self.0 {
@@ -77,6 +84,7 @@ fn assert_directory_empty(path: &Path) {
     assert!(entries.is_empty(), "{} is not empty", path.display());
 }
 
+#[cfg(feature = "startup-test-hooks")]
 fn assert_process_exited(pid: u32) {
     let process_path = PathBuf::from(format!("/proc/{pid}"));
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -89,6 +97,7 @@ fn assert_process_exited(pid: u32) {
     );
 }
 
+#[cfg(feature = "startup-test-hooks")]
 fn wait_for_path(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !path.exists() && Instant::now() < deadline {
@@ -151,6 +160,7 @@ fn zero_timeout_rolls_back_and_same_tag_can_retry() {
 }
 
 #[test]
+#[cfg(feature = "startup-test-hooks")]
 fn timeout_after_workload_spawn_does_not_orphan_workload() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");
@@ -234,6 +244,7 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
 }
 
 #[test]
+#[cfg(feature = "startup-test-hooks")]
 fn externally_reaped_worker_preserves_ambiguous_containment_evidence() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");

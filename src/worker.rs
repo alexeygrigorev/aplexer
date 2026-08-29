@@ -93,10 +93,11 @@ fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
         atomic_write_bytes(std::path::Path::new(&marker), pid.to_string().as_bytes())
             .context("write worker startup test marker")?;
     }
+    #[cfg(feature = "startup-test-hooks")]
     if env::var("APLEXER_TEST_HANG_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
-        // Deliberately ignore TERMINATION_REQUESTED. This strictly test-only
-        // hook proves the launcher can escalate to SIGKILL and reclaim a
-        // workload even when the worker cannot execute its startup guard.
+        // Deliberately ignore TERMINATION_REQUESTED. The non-default Cargo
+        // feature is the authorization boundary for this destructive hook;
+        // default and release builds do not contain the hang path.
         loop {
             thread::sleep(Duration::from_secs(1));
         }

@@ -36,6 +36,9 @@ pyo3 = { version = "0.25", optional = true, features = ["extension-module", "abi
 [features]
 default = []
 python = ["dep:pyo3"]
+# Enables deliberately disruptive startup fault injection used by the
+# integration suite. Never enable this feature in production packages.
+startup-test-hooks = []
 
 [dev-dependencies]
 tempfile = "3.10"
