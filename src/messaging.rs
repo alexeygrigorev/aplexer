@@ -7,14 +7,16 @@
 //! for session metadata (spec.md 14.1). No process owns this state; any
 //! process may read, append, or prune it.
 
-use crate::{atomic_write_json, ensure_private_dir, list_records, now_ms, Paths};
+use crate::{atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock, Paths};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -37,18 +39,26 @@ pub fn now_secs() -> u64 {
 }
 
 /// Directory-naming key for a workspace's mailbox (design doc section 3.2
-/// and open question 8). The design doc suggests a truncated SHA-256 of the
-/// canonical workspace path; `sha2` is not otherwise a dependency of this
-/// crate, and this key is not a security boundary (the containing directory
-/// is already `0700`, owned by this uid, per spec.md 26) -- it only needs to
-/// be a stable, collision-resistant *filename*. Rather than add a crypto
-/// hash dependency for that, this combines two independently-seeded
-/// `DefaultHasher` (SipHash-1-3) digests of the canonical path into a
-/// 32-hex-digit (128-bit) key -- the same key space a truncated SHA-256
-/// would give, at zero new dependency cost. Every caller MUST pass a path
-/// already run through `canonical_workspace` (open question 8) so two
-/// sessions in the same workspace can never straddle two mailboxes.
+/// and open question 8): the first 128 bits of SHA-256 over the canonical
+/// Unix path's exact bytes. Hashing the raw bytes avoids aliasing distinct
+/// non-UTF-8 paths through lossy string conversion, and specifying SHA-256
+/// keeps keys stable across Rust/toolchain releases. Every caller MUST pass
+/// a path already run through `canonical_workspace` (open question 8) so
+/// two sessions in the same workspace can never straddle two mailboxes.
 pub fn workspace_key(canonical_workspace: &Path) -> String {
+    let digest = Sha256::digest(canonical_workspace.as_os_str().as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Key emitted before mailbox keys were specified as truncated SHA-256.
+/// This intentionally preserves the old implementation exactly so
+/// `ensure_workspace` can locate and migrate existing mailboxes. It must not
+/// be used for new directories: both `DefaultHasher`'s algorithm and the
+/// lossy path conversion are unsuitable as a persistent storage format.
+fn legacy_workspace_key(canonical_workspace: &Path) -> String {
     let text = canonical_workspace.to_string_lossy();
     let mut h1 = DefaultHasher::new();
     text.hash(&mut h1);
@@ -67,17 +77,44 @@ pub struct MessagePaths {
     pub workspace_file: PathBuf,
 }
 
-pub fn message_paths(paths: &Paths, canonical_workspace: &Path) -> MessagePaths {
-    let workspace_dir = paths
-        .state_root
-        .join("messages")
-        .join(workspace_key(canonical_workspace));
+fn message_paths_for_key(paths: &Paths, key: &str) -> MessagePaths {
+    let workspace_dir = paths.state_root.join("messages").join(key);
     MessagePaths {
         msgs_dir: workspace_dir.join("msgs"),
         cursors_dir: workspace_dir.join("cursors"),
         workspace_file: workspace_dir.join("workspace.json"),
         workspace_dir,
     }
+}
+
+pub fn message_paths(paths: &Paths, canonical_workspace: &Path) -> MessagePaths {
+    message_paths_for_key(paths, &workspace_key(canonical_workspace))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceMetadata {
+    workspace: PathBuf,
+}
+
+/// Verifies the reverse mapping before adopting a directory found under a
+/// legacy key. The old key was based on lossy UTF-8 and therefore could
+/// alias two distinct Unix paths; silently renaming without this check could
+/// expose another workspace's messages.
+fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -> Result<()> {
+    let metadata_path = workspace_dir.join("workspace.json");
+    let bytes = fs::read(&metadata_path)
+        .with_context(|| format!("read legacy mailbox metadata {}", metadata_path.display()))?;
+    let metadata: WorkspaceMetadata = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse legacy mailbox metadata {}", metadata_path.display()))?;
+    if metadata.workspace != canonical_workspace {
+        bail!(
+            "refusing to migrate mailbox {}: workspace metadata names {}, expected {}",
+            workspace_dir.display(),
+            metadata.workspace.display(),
+            canonical_workspace.display()
+        );
+    }
+    Ok(())
 }
 
 /// Creates the workspace mailbox's directories (`0700`, spec.md 26) and its
@@ -91,8 +128,33 @@ pub fn message_paths(paths: &Paths, canonical_workspace: &Path) -> MessagePaths 
 /// creates it up front. So the shared `messages/` root is chmod'd
 /// explicitly here, before the per-workspace subdirectories.
 pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<MessagePaths> {
-    let mp = message_paths(paths, canonical_workspace);
-    ensure_private_dir(&paths.state_root.join("messages"))?;
+    let messages_root = paths.state_root.join("messages");
+    ensure_private_dir(&messages_root)?;
+
+    let stable_key = workspace_key(canonical_workspace);
+    let mp = message_paths_for_key(paths, &stable_key);
+    let legacy_mp = message_paths_for_key(paths, &legacy_workspace_key(canonical_workspace));
+
+    // Serialize discovery and rename for this destination. Atomic rename
+    // makes the mailbox contents move as a unit; the lock also prevents two
+    // current processes from racing and treating a successful peer migration
+    // as a missing source.
+    let migration_lock = messages_root.join(format!(".{stable_key}.migration.lock"));
+    let _migration = FileLock::exclusive(&migration_lock, false)?;
+    if !mp.workspace_dir.exists()
+        && legacy_mp.workspace_dir != mp.workspace_dir
+        && legacy_mp.workspace_dir.exists()
+    {
+        verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
+        fs::rename(&legacy_mp.workspace_dir, &mp.workspace_dir).with_context(|| {
+            format!(
+                "migrate legacy mailbox {} to {}",
+                legacy_mp.workspace_dir.display(),
+                mp.workspace_dir.display()
+            )
+        })?;
+    }
+
     ensure_private_dir(&mp.workspace_dir)?;
     ensure_private_dir(&mp.msgs_dir)?;
     ensure_private_dir(&mp.cursors_dir)?;
@@ -217,8 +279,12 @@ pub fn write_message(paths: &Paths, envelope: &MessageEnvelope) -> Result<()> {
     atomic_write_json(&path, envelope)
 }
 
-pub fn read_message(paths: &Paths, canonical_workspace: &Path, id: Uuid) -> Result<MessageEnvelope> {
-    let mp = message_paths(paths, canonical_workspace);
+pub fn read_message(
+    paths: &Paths,
+    canonical_workspace: &Path,
+    id: Uuid,
+) -> Result<MessageEnvelope> {
+    let mp = ensure_workspace(paths, canonical_workspace)?;
     let path = mp.msgs_dir.join(format!("{id}.json"));
     let bytes = fs::read(&path).with_context(|| format!("no such message {id}"))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
@@ -229,7 +295,7 @@ pub fn read_message(paths: &Paths, canonical_workspace: &Path, id: Uuid) -> Resu
 /// but a partial/corrupt file must never wedge every other read) are
 /// silently skipped rather than failing the whole listing.
 pub fn list_messages(paths: &Paths, canonical_workspace: &Path) -> Result<Vec<MessageEnvelope>> {
-    let mp = message_paths(paths, canonical_workspace);
+    let mp = ensure_workspace(paths, canonical_workspace)?;
     let mut out = Vec::new();
     let entries = match fs::read_dir(&mp.msgs_dir) {
         Ok(e) => e,
@@ -327,7 +393,10 @@ pub fn ack_messages(
             cursor.exceptions.insert(*id);
         }
     }
-    atomic_write_json(&cursor_path(paths, canonical_workspace, consumer_id), &cursor)
+    atomic_write_json(
+        &cursor_path(paths, canonical_workspace, consumer_id),
+        &cursor,
+    )
 }
 
 /// Known tags for a workspace (design doc section 2.3), from session
@@ -436,7 +505,11 @@ pub fn maybe_gc(paths: &Paths, canonical_workspace: &Path) -> Result<()> {
 /// first, else `APLEXER_SESSION_ID`/`APLEXER_TAG` from the environment
 /// (with a best-effort lookup of the full session record for engine/
 /// profile), else anonymous.
-pub fn resolve_sender(paths: &Paths, canonical_workspace: &Path, from_tag: Option<&str>) -> Result<MessageFrom> {
+pub fn resolve_sender(
+    paths: &Paths,
+    canonical_workspace: &Path,
+    from_tag: Option<&str>,
+) -> Result<MessageFrom> {
     if let Some(tag) = from_tag {
         let record = list_records(paths)?
             .into_iter()
@@ -456,7 +529,10 @@ pub fn resolve_sender(paths: &Paths, canonical_workspace: &Path, from_tag: Optio
         });
     }
     if let Some(session_id) = crate::discover_session_id() {
-        if let Some(record) = list_records(paths)?.into_iter().find(|r| r.id == session_id) {
+        if let Some(record) = list_records(paths)?
+            .into_iter()
+            .find(|r| r.id == session_id)
+        {
             return Ok(MessageFrom {
                 session_id: Some(record.id),
                 tag: Some(record.tag),
@@ -502,7 +578,12 @@ pub fn resolve_consumer(
             .into_iter()
             .find(|r| r.id == session_id)
             .map(|r| (r.tag, r.engine))
-            .unwrap_or_else(|| (std::env::var("APLEXER_TAG").unwrap_or_default(), String::new()));
+            .unwrap_or_else(|| {
+                (
+                    std::env::var("APLEXER_TAG").unwrap_or_default(),
+                    String::new(),
+                )
+            });
         return Ok((session_id, tag, engine));
     }
     bail!(
@@ -514,6 +595,19 @@ pub fn resolve_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use tempfile::TempDir;
+
+    fn test_paths(root: &Path) -> Paths {
+        let paths = Paths {
+            runtime_root: root.join("runtime"),
+            state_root: root.join("state"),
+            config_file: root.join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        paths
+    }
 
     #[test]
     fn workspace_key_stable_and_distinct() {
@@ -523,6 +617,40 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 32);
+        assert_eq!(a, "9c3c95a47c6557b18956e6903a57497f");
+    }
+
+    #[test]
+    fn workspace_key_hashes_raw_unix_path_bytes() {
+        let a = PathBuf::from(OsString::from_vec(b"/tmp/aplexer-\x80".to_vec()));
+        let b = PathBuf::from(OsString::from_vec(b"/tmp/aplexer-\x81".to_vec()));
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        assert_ne!(workspace_key(&a), workspace_key(&b));
+    }
+
+    #[test]
+    fn ensure_workspace_migrates_valid_legacy_mailbox() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-legacy-workspace");
+        let legacy = message_paths_for_key(&paths, &legacy_workspace_key(workspace));
+        ensure_private_dir(&legacy.workspace_dir).unwrap();
+        ensure_private_dir(&legacy.msgs_dir).unwrap();
+        ensure_private_dir(&legacy.cursors_dir).unwrap();
+        atomic_write_json(
+            &legacy.workspace_file,
+            &serde_json::json!({"workspace": workspace}),
+        )
+        .unwrap();
+        fs::write(legacy.msgs_dir.join("migration-marker"), b"present").unwrap();
+
+        let migrated = ensure_workspace(&paths, workspace).unwrap();
+        assert_eq!(
+            migrated.workspace_dir,
+            message_paths(&paths, workspace).workspace_dir
+        );
+        assert!(migrated.msgs_dir.join("migration-marker").exists());
+        assert!(!legacy.workspace_dir.exists());
     }
 
     #[test]
