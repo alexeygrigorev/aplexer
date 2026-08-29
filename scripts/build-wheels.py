@@ -1,8 +1,10 @@
 #!/usr/bin/env -S uv run python
-"""Build platform-tagged wheels for the ``aplexer`` PyPI package.
+"""Build native-platform wheels for the ``aplexer`` CLI package.
 
 Usage:
     uv run python scripts/build-wheels.py --binaries-dir ./artifacts --output-dir ./dist
+    uv run python scripts/build-wheels.py --platform linux-amd64 \
+        --binaries-dir ./staging --output-dir ./dist
 
 The binaries-dir is expected to contain one subdirectory per platform,
 named "aplexer-bins-<platform>" (matching the artifact names uploaded by
@@ -11,13 +13,16 @@ release binaries for that platform:
 
     aplexer-bins-linux-amd64/a
     aplexer-bins-linux-amd64/aplexer
-    aplexer-bins-windows-amd64/a.exe
-    aplexer-bins-windows-amd64/aplexer.exe
-    ...
+Each platform's pair of binaries is packaged into a single wheel (PyPI
+project "aplexer", import package "aplexer_cli"), exposing both as console
+scripts ("a" and "aplexer"). Linux wheels intentionally start with the
+conservative ``linux_<arch>`` tag. Release CI builds the binaries in a pinned
+PyPA manylinux image and uses auditwheel to validate/repair that wheel into
+the advertised ``manylinux_2_28`` tag.
 
-Each platform's pair of binaries is packaged into a single platform-tagged
-wheel (PyPI project "aplexer", import package "aplexer_cli"), exposing both
-as console scripts ("a" and "aplexer").
+The default is strict: every target in ``TARGETS`` must be present before any
+wheel is written. Local/manual builds can select one or more ``--platform``
+values, or opt into skipping absent targets with ``--allow-partial``.
 """
 
 import argparse
@@ -35,14 +40,13 @@ import zipfile
 PROJECT_NAME = "aplexer"
 IMPORT_PACKAGE = "aplexer_cli"
 
-# (platform key, wheel platform tag, binary suffix)
+# This is the release matrix, not a wishlist. Adding a target here makes it a
+# required input to a default build and therefore must be paired with a build
+# job in .github/workflows/release.yml.
+# (platform key, conservative pre-audit wheel platform tag, binary suffix)
 TARGETS = [
-    ("linux-amd64", "manylinux_2_17_x86_64.manylinux2014_x86_64", ""),
-    ("linux-arm64", "manylinux_2_17_aarch64.manylinux2014_aarch64", ""),
-    ("darwin-amd64", "macosx_10_12_x86_64", ""),
-    ("darwin-arm64", "macosx_11_0_arm64", ""),
-    ("windows-amd64", "win_amd64", ".exe"),
-    ("windows-arm64", "win_arm64", ".exe"),
+    ("linux-amd64", "linux_x86_64", ""),
+    ("linux-arm64", "linux_aarch64", ""),
 ]
 
 BINARY_NAMES = ["a", "aplexer"]
@@ -240,7 +244,7 @@ Tag: py3-none-{platform}
     return wheel_path
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Build platform-tagged wheels for aplexer")
     parser.add_argument(
         "--binaries-dir",
@@ -257,15 +261,30 @@ def main():
         default=None,
         help="Version override (default: read from python-cli/pyproject.toml)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--platform",
+        action="append",
+        choices=[target[0] for target in TARGETS],
+        help="Build only this release platform (repeatable; default: require the full matrix)",
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Explicitly skip missing selected platforms (intended for local builds only)",
+    )
+    args = parser.parse_args(argv)
 
     version = args.version or read_version()
-    os.makedirs(args.output_dir, exist_ok=True)
+    requested = set(args.platform or [])
+    selected_targets = [target for target in TARGETS if not requested or target[0] in requested]
+    # A flat directory cannot identify an architecture. Accept it only when
+    # the caller selected exactly one target; full-matrix builds must use the
+    # artifact subdirectories and cannot accidentally relabel one binary pair.
+    allow_flat_layout = len(selected_targets) == 1
 
-    built = []
-    skipped = []
-
-    for platform_key, platform_tag, suffix in TARGETS:
+    ready = []
+    missing_targets = []
+    for platform_key, platform_tag, suffix in selected_targets:
         artifact_name = "aplexer-bins-{platform}".format(platform=platform_key)
         binary_paths = {}
         missing = []
@@ -273,7 +292,7 @@ def main():
             filename = name + suffix
             # download-artifact creates a subdirectory per artifact name
             candidate = os.path.join(args.binaries_dir, artifact_name, filename)
-            if not os.path.isfile(candidate):
+            if allow_flat_layout and not os.path.isfile(candidate):
                 # also accept a flat layout for local/manual testing
                 candidate = os.path.join(args.binaries_dir, filename)
             if not os.path.isfile(candidate):
@@ -282,13 +301,38 @@ def main():
             binary_paths[name] = candidate
 
         if missing:
-            print(
-                "WARNING: missing {missing} for {platform}, skipping".format(
-                    missing=missing, platform=platform_key
-                )
-            )
-            skipped.append(platform_key)
+            missing_targets.append((platform_key, missing))
             continue
+        ready.append((platform_key, platform_tag, suffix, binary_paths))
+
+    if missing_targets and not args.allow_partial:
+        for platform_key, missing in missing_targets:
+            print(
+                "ERROR: missing {missing} for required platform {platform}".format(
+                    missing=missing, platform=platform_key
+                ),
+                file=sys.stderr,
+            )
+        print(
+            "ERROR: refusing a partial wheel matrix; pass --allow-partial only for a local build",
+            file=sys.stderr,
+        )
+        return 1
+
+    for platform_key, missing in missing_targets:
+        print(
+            "WARNING: missing {missing} for {platform}, skipping because --allow-partial was set".format(
+                missing=missing, platform=platform_key
+            )
+        )
+
+    if not ready:
+        print("ERROR: No complete platform inputs were found", file=sys.stderr)
+        return 1
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    built = []
+    for platform_key, platform_tag, suffix, binary_paths in ready:
 
         wheel_path = build_wheel(binary_paths, platform_tag, suffix, version, args.output_dir)
         built.append(wheel_path)
@@ -296,14 +340,9 @@ def main():
 
     print(
         "\nSummary: {built} wheels built, {skipped} skipped".format(
-            built=len(built), skipped=len(skipped)
+            built=len(built), skipped=len(missing_targets)
         )
     )
-
-    if not built:
-        print("ERROR: No wheels were built!", file=sys.stderr)
-        sys.exit(1)
-
     return 0
 
 
