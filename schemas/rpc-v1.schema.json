@@ -26,7 +26,70 @@
         "kill",
         "rename"
       ]
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "history_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "want_screen": {
+      "type": "boolean"
+    },
+    "rows": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "cols": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "signal": {
+      "type": "integer"
+    },
+    "grace_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "tag": {
+      "type": "string"
+    },
+    "plain": {
+      "type": "boolean"
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"op": {"const": "send"}}, "required": ["op"]},
+      "then": {"required": ["bytes"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "resize"}}, "required": ["op"]},
+      "then": {"required": ["rows", "cols"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "kill"}}, "required": ["op"]},
+      "then": {"required": ["signal", "grace_ms"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "rename"}}, "required": ["op"]},
+      "then": {"required": ["workspace", "tag"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "capture_screen"}}, "required": ["op"]},
+      "then": {"required": ["plain"]}
+    }
+  ],
   "additionalProperties": true
 }
