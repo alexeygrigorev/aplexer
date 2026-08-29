@@ -444,6 +444,14 @@ pub fn read_record(path: &Path) -> Result<SessionRecord> {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+struct AtomicTempGuard(PathBuf);
+
+impl Drop for AtomicTempGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
@@ -466,6 +474,7 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .mode(0o600)
         .open(&temp)
         .with_context(|| format!("create {}", temp.display()))?;
+    let _temp_guard = AtomicTempGuard(temp.clone());
     serde_json::to_writer_pretty(&mut file, &value)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -566,6 +575,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&temp)?;
+    let _temp_guard = AtomicTempGuard(temp.clone());
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
@@ -2167,6 +2177,35 @@ mod tests {
             fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn atomic_write_json_removes_temp_after_rename_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("record.json");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(atomic_write_json(&destination, &serde_json::json!({"secret": "value"})).is_err());
+        assert_no_atomic_temps(root.path());
+    }
+
+    #[test]
+    fn atomic_write_bytes_removes_temp_after_rename_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("history.bin");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(atomic_write_bytes(&destination, b"secret bytes").is_err());
+        assert_no_atomic_temps(root.path());
+    }
+
+    fn assert_no_atomic_temps(directory: &Path) {
+        let leftovers = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     #[test]
