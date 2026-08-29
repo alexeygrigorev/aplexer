@@ -34,21 +34,21 @@ class Client:
         runtime_dir: str | os.PathLike[str] | None = None,
         config: str | os.PathLike[str] | None = None,
     ) -> None:
-        if state_dir is not None:
-            os.environ["APLEXER_STATE_DIR"] = os.fspath(state_dir)
-        if runtime_dir is not None:
-            os.environ["APLEXER_RUNTIME_DIR"] = os.fspath(runtime_dir)
-        if config is not None:
-            os.environ["APLEXER_CONFIG"] = os.fspath(config)
+        self.state_dir = None if state_dir is None else os.fsdecode(state_dir)
+        self.runtime_dir = None if runtime_dir is None else os.fsdecode(runtime_dir)
+        self.config = None if config is None else os.fsdecode(config)
+
+    def _path_args(self) -> tuple[str | None, str | None, str | None]:
+        return self.state_dir, self.runtime_dir, self.config
 
     def engines(self) -> list[dict[str, Any]]:
-        payload = json.loads(_native().engines())
+        payload = json.loads(_native().engines(*self._path_args()))
         if not isinstance(payload, list):
             raise AplexerError("engines payload was not a list")
         return payload
 
     def profiles(self) -> dict[str, Any]:
-        payload = json.loads(_native().profiles())
+        payload = json.loads(_native().profiles(*self._path_args()))
         if not isinstance(payload, dict):
             raise AplexerError("profiles payload was not an object")
         return payload
@@ -67,6 +67,7 @@ class Client:
                 profile,
                 None if cwd is None else os.fspath(cwd),
                 no_skip_permissions,
+                *self._path_args(),
             )
         )
         if not isinstance(payload, dict):
@@ -74,7 +75,7 @@ class Client:
         return payload
 
     def snapshot(self, *, running: bool = False) -> list[dict[str, Any]]:
-        payload = json.loads(_native().snapshot(running))
+        payload = json.loads(_native().snapshot(running, *self._path_args()))
         if not isinstance(payload, list):
             raise AplexerError("snapshot payload was not a list")
         return payload
@@ -110,6 +111,7 @@ class Client:
                 no_skip_permissions,
                 sys.executable,
                 10_000,
+                *self._path_args(),
             )
         )
         return Session.from_dict(raw)

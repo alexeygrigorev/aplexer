@@ -217,6 +217,9 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         .context("create worker log")?;
     let mut command = worker_command(id, req.python.as_deref())?;
     command
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(worker_log));
