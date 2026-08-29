@@ -27,6 +27,13 @@ enum OutputEvent {
     Error(String),
 }
 
+/// Bound memory retained on behalf of clients that stop reading. PTY reads
+/// are at most 32 KiB, so this caps queued data at roughly 1 MiB per client
+/// (layout events are small). A lagging client is disconnected and can
+/// reattach to obtain a fresh tail or screen snapshot.
+const SUBSCRIBER_QUEUE_EVENTS: usize = 32;
+const MAX_SUBSCRIBERS: usize = 64;
+
 /// What a newly-attaching client should be sent as its initial payload
 /// (design doc section 6.1/checklist item 4): the live screen snapshot, or
 /// the historical raw-tail replay old clients (and `--history-bytes`) still
@@ -39,7 +46,7 @@ enum AttachPayload {
 struct HubInner {
     history: History,
     screen: screen::ScreenTracker,
-    subscribers: HashMap<u64, mpsc::Sender<OutputEvent>>,
+    subscribers: HashMap<u64, mpsc::SyncSender<OutputEvent>>,
     next_id: u64,
     final_exit: Option<ExitInfo>,
 }
@@ -74,11 +81,11 @@ impl OutputHub {
         // doc section 5.1).
         inner
             .subscribers
-            .retain(|_, tx| tx.send(OutputEvent::Data(data.to_vec())).is_ok());
+            .retain(|_, tx| tx.try_send(OutputEvent::Data(data.to_vec())).is_ok());
         if let Some(change) = layout {
             inner
                 .subscribers
-                .retain(|_, tx| tx.send(OutputEvent::Layout(change)).is_ok());
+                .retain(|_, tx| tx.try_send(OutputEvent::Layout(change)).is_ok());
         }
         Ok(())
     }
@@ -118,11 +125,14 @@ impl OutputHub {
             AttachPayload::Screen => inner.screen.snapshot(),
             AttachPayload::Tail(max) => inner.history.snapshot(max),
         };
+        if inner.final_exit.is_none() && inner.subscribers.len() >= MAX_SUBSCRIBERS {
+            bail!("too many attached clients");
+        }
         let id = inner.next_id;
         inner.next_id += 1;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_EVENTS);
         if let Some(exit) = inner.final_exit.clone() {
-            let _ = tx.send(OutputEvent::Exit(exit));
+            let _ = tx.try_send(OutputEvent::Exit(exit));
         } else {
             inner.subscribers.insert(id, tx);
         }
@@ -148,16 +158,58 @@ impl OutputHub {
                 eprintln!("aplexer worker: write screen.txt at exit: {error:#}");
             }
             for (_, tx) in inner.subscribers.drain() {
-                let _ = tx.send(OutputEvent::Exit(exit.clone()));
+                let _ = tx.try_send(OutputEvent::Exit(exit.clone()));
             }
         }
     }
     fn fail_subscribers(&self, message: String) {
         if let Ok(mut inner) = self.inner.lock() {
             for (_, tx) in inner.subscribers.drain() {
-                let _ = tx.send(OutputEvent::Error(message.clone()));
+                let _ = tx.try_send(OutputEvent::Error(message.clone()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hub(dir: &tempfile::TempDir) -> OutputHub {
+        OutputHub::new(
+            History::open(dir.path().join("history.bin"), 1024 * 1024).unwrap(),
+            24,
+            80,
+            dir.path().join("screen.txt"),
+        )
+    }
+
+    #[test]
+    fn lagging_subscriber_is_evicted_when_queue_fills() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        for _ in 0..=SUBSCRIBER_QUEUE_EVENTS {
+            hub.append(b"x").unwrap();
+        }
+
+        assert!(hub.inner.lock().unwrap().subscribers.is_empty());
+        assert_eq!(rx.iter().count(), SUBSCRIBER_QUEUE_EVENTS);
+    }
+
+    #[test]
+    fn subscriber_count_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_SUBSCRIBERS {
+            let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+            receivers.push(rx);
+        }
+
+        assert!(hub.subscribe(AttachPayload::Tail(None)).is_err());
+        assert_eq!(receivers.len(), MAX_SUBSCRIBERS);
     }
 }
 
