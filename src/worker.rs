@@ -1,7 +1,7 @@
 use crate::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -11,7 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -40,6 +40,89 @@ const MAX_CLIENT_CONNECTIONS: usize = 128;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn request_worker_termination(_: libc::c_int) {
+    TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// The launcher blocks TERM/INT before exec so no timeout signal can land in
+/// the gap before these handlers exist. Install first, then explicitly
+/// unblock; a pending signal is delivered to the handler and becomes a normal
+/// startup cancellation whose guard can unwind all resources.
+fn install_termination_handlers() -> Result<()> {
+    TERMINATION_REQUESTED.store(false, Ordering::SeqCst);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = request_worker_termination as *const () as usize;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("install signal handler {signal}"));
+            }
+        }
+        let mut unblocked: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut unblocked);
+        libc::sigaddset(&mut unblocked, libc::SIGTERM);
+        libc::sigaddset(&mut unblocked, libc::SIGINT);
+        let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblocked, std::ptr::null_mut());
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc))
+                .context("unblock worker termination signals");
+        }
+    }
+    Ok(())
+}
+
+fn startup_checkpoint(point: &str) -> Result<()> {
+    if TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+        bail!("worker startup cancelled by termination signal");
+    }
+    if env::var("APLEXER_TEST_FAIL_WORKER_STARTUP_AT").as_deref() == Ok(point) {
+        bail!("injected worker startup failure at {point}");
+    }
+    Ok(())
+}
+
+fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
+    if let Some(marker) = env::var_os("APLEXER_TEST_WORKER_STARTUP_MARKER") {
+        atomic_write_bytes(std::path::Path::new(&marker), pid.to_string().as_bytes())
+            .context("write worker startup test marker")?;
+    }
+    if env::var("APLEXER_TEST_PAUSE_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
+        while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    startup_checkpoint("after_workload_spawn")
+}
+
+struct SecretBytes(Vec<u8>);
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+struct LaunchEnvironment(BTreeMap<String, String>);
+
+impl Drop for LaunchEnvironment {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            // Overwrite the initialized allocation before String drops it.
+            // The temporary non-UTF-8 contents are never observed as text.
+            unsafe {
+                value.as_bytes_mut().fill(0);
+            }
+            value.clear();
+        }
+    }
+}
 
 struct ConnectionPermit {
     active: Arc<AtomicUsize>,
@@ -600,6 +683,157 @@ fn reap_adopted_children() -> Result<usize> {
     }
 }
 
+/// Owns every resource created before the worker's accept loop is committed.
+/// Drop is a last-resort rollback; normal error paths call `rollback` so the
+/// persisted failure contains the original error rather than a generic one.
+struct StartupGuard {
+    armed: bool,
+    record_path: std::path::PathBuf,
+    runtime_session_dir: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
+    failure_record: SessionRecord,
+    cgroup: Option<Cgroup>,
+    child: Option<Arc<Mutex<Option<Child>>>>,
+}
+
+impl StartupGuard {
+    fn new(paths: &Paths, record: &SessionRecord) -> Self {
+        Self {
+            armed: true,
+            record_path: paths.record(record.id),
+            runtime_session_dir: paths.runtime_session(record.id),
+            socket_path: paths.socket(record.id),
+            failure_record: record.clone(),
+            cgroup: None,
+            child: None,
+        }
+    }
+
+    fn rollback(&mut self, error: &anyhow::Error) {
+        self.cleanup(format!("{error:#}"));
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.child = None;
+        self.cgroup = None;
+    }
+
+    fn cleanup(&mut self, message: String) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+
+        if let Some(cgroup) = &self.cgroup {
+            if let Err(error) = cgroup.kill_all() {
+                eprintln!("aplexer worker: rollback cgroup kill: {error:#}");
+            }
+        } else if let Err(error) = signal_descendants(std::process::id(), libc::SIGKILL) {
+            eprintln!("aplexer worker: rollback descendant kill: {error:#}");
+        }
+
+        if let Some(slot) = &self.child {
+            if let Ok(mut slot) = slot.lock() {
+                if let Some(mut child) = slot.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // Once the tracked leader has been waited, every remaining process
+        // is an adopted child and may safely be reaped here. Repeat signaling
+        // to close the final fork-vs-scan window without confusing zombies
+        // for live processes.
+        let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
+        loop {
+            let _ = reap_adopted_children();
+            let remaining = descendant_pids(std::process::id()).unwrap_or_default();
+            if remaining.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            let _ = signal_descendants(std::process::id(), libc::SIGKILL);
+            thread::sleep(DESCENDANT_POLL_INTERVAL);
+        }
+
+        if let Some(cgroup) = self.cgroup.take() {
+            cgroup.cleanup();
+        }
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_dir_all(&self.runtime_session_dir);
+
+        self.failure_record.phase = Phase::Failed;
+        self.failure_record.error = Some(message);
+        self.failure_record.updated_at_ms = now_ms();
+        if let Err(error) = atomic_write_json(&self.record_path, &self.failure_record) {
+            eprintln!("aplexer worker: persist startup rollback: {error:#}");
+        }
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        self.cleanup("worker startup aborted before commit".into());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadStart {
+    Pending,
+    Run,
+    Abort,
+}
+
+type ThreadStartGate = Arc<(Mutex<ThreadStart>, Condvar)>;
+
+fn await_thread_start(gate: &ThreadStartGate) -> bool {
+    let (state, ready) = &**gate;
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    while *state == ThreadStart::Pending {
+        let Ok(next) = ready.wait(state) else {
+            return false;
+        };
+        state = next;
+    }
+    *state == ThreadStart::Run
+}
+
+fn release_startup_threads(gate: &ThreadStartGate, decision: ThreadStart) {
+    let (state, ready) = &**gate;
+    if let Ok(mut state) = state.lock() {
+        *state = decision;
+        ready.notify_all();
+    }
+}
+
+fn load_launch_environment(
+    path: &std::path::Path,
+    legacy: LaunchEnvironment,
+) -> Result<LaunchEnvironment> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let bytes = SecretBytes(bytes);
+            let environment = serde_json::from_slice(&bytes.0)
+                .with_context(|| format!("parse private launch environment {}", path.display()))?;
+            // Keeping a readable secret file after consumption is not a
+            // recoverable warning. Fail startup so the transaction removes
+            // the whole private runtime directory.
+            fs::remove_file(path).with_context(|| {
+                format!("remove consumed launch environment {}", path.display())
+            })?;
+            Ok(LaunchEnvironment(environment))
+        }
+        // Compatibility for sessions created by an older client, whose
+        // launch values were stored directly in the record.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(legacy),
+        Err(error) => Err(error)
+            .with_context(|| format!("read private launch environment {}", path.display())),
+    }
+}
+
 enum LifeEvent {
     PtyEof,
     PtyError(String),
@@ -636,121 +870,103 @@ enum LifeEvent {
 /// src/bin/a.rs), the same as before this fix -- this only eliminates the
 /// race for the case where the size is already known at spawn time.
 pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
+    install_termination_handlers()?;
     let paths = Paths::discover()?;
     let record_path = paths.record(id);
     let mut record = read_record(&record_path)?;
     ensure_private_dir(&paths.runtime_session(id))?;
-    let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
-    let launch_environment = match fs::read(&launch_environment_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("read private launch environment")?,
-        // Compatibility for sessions created by an older client, whose
-        // launch values were stored directly in the record.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => record.env.clone(),
-        Err(error) => return Err(error).context("read private launch environment"),
-    };
-    let _ = fs::remove_file(&launch_environment_path);
-    // Migrate a legacy record before exposing any further worker state,
-    // retaining only non-secret roots needed for transcript discovery.
-    record.env = session_metadata_env(&record.env);
     let _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;
+    let legacy_environment = LaunchEnvironment(std::mem::take(&mut record.env));
+    record.env = session_metadata_env(&legacy_environment.0);
+    let mut startup = StartupGuard::new(&paths, &record);
+    let setup = (|| -> Result<(UnixListener, Arc<WorkerRuntime>)> {
+        startup_checkpoint("after_worker_lock")?;
+        let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
+        let launch_environment =
+            load_launch_environment(&launch_environment_path, legacy_environment)?;
+        // Migrate a legacy record before exposing any further worker state,
+        // retaining only non-secret roots needed for transcript discovery.
+        record.worker_pid = Some(std::process::id());
+        record.updated_at_ms = now_ms();
+        startup.failure_record = record.clone();
+        atomic_write_json(&record_path, &record)?;
+        startup_checkpoint("after_worker_record")?;
 
-    record.worker_pid = Some(std::process::id());
-    record.updated_at_ms = now_ms();
-    atomic_write_json(&record_path, &record)?;
+        let socket_path = paths.socket(id);
+        if socket_path.exists() {
+            fs::remove_file(&socket_path).context("remove stale control socket")?;
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("bind {}", socket_path.display()))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        startup_checkpoint("after_control_socket")?;
 
-    let socket_path = paths.socket(id);
-    if socket_path.exists() {
-        fs::remove_file(&socket_path).context("remove stale control socket")?;
-    }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind {}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let requested_size = initial_size.unwrap_or((24, 80));
+        let (rows, cols) = screen::validate_size(requested_size.0, requested_size.1)?;
+        let cgroup = Cgroup::create(id, &record.limits)?;
+        startup.cgroup = cgroup.clone();
+        startup_checkpoint("after_cgroup")?;
+        let (master_read, slave) = open_pty(rows, cols)?;
+        enable_child_subreaper()?;
+        let master_write = master_read.try_clone()?;
+        let child_result = spawn_workload(
+            &record,
+            &launch_environment.0,
+            master_read.as_raw_fd(),
+            slave,
+            cgroup.as_ref(),
+        );
+        // Launch values are one-shot: overwrite them as soon as spawn has
+        // either succeeded or failed, never retaining them in the accept
+        // loop or its background threads.
+        drop(launch_environment);
+        let child = child_result?;
+        let pid = child.id();
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        startup.child = Some(Arc::clone(&child_slot));
+        record.workload_pid = Some(pid);
+        startup.failure_record = record.clone();
+        after_workload_spawn_checkpoint(pid)?;
 
-    let requested_size = initial_size.unwrap_or((24, 80));
-    let (rows, cols) = match screen::validate_size(requested_size.0, requested_size.1) {
-        Ok(value) => value,
-        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
-    };
-    let cgroup = match Cgroup::create(id, &record.limits) {
-        Ok(value) => value,
-        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
-    };
-    let (master_read, slave) = match open_pty(rows, cols) {
-        Ok(value) => value,
-        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
-    };
-    if let Err(error) = enable_child_subreaper() {
-        return Err(fail_startup(&paths, id, &record_path, &mut record, error));
-    }
-    let master_write = master_read.try_clone()?;
-    let child = match spawn_workload(
-        &record,
-        &launch_environment,
-        master_read.as_raw_fd(),
-        slave,
-        cgroup.as_ref(),
-    ) {
-        Ok(child) => child,
-        Err(error) => return Err(fail_startup(&paths, id, &record_path, &mut record, error)),
-    };
-    let pid = child.id();
-    record.workload_pid = Some(pid);
-    record.phase = Phase::Running;
-    record.updated_at_ms = now_ms();
-    record.error = None;
-    atomic_write_json(&record_path, &record)?;
+        record.phase = Phase::Running;
+        record.updated_at_ms = now_ms();
+        record.error = None;
+        startup.failure_record = record.clone();
+        atomic_write_json(&record_path, &record)?;
+        startup_checkpoint("after_running_record")?;
 
-    let history = History::open(record.history_path.clone(), record.history_bytes)?;
-    let screen_txt_path = paths.screen_txt(id);
-    let runtime = Arc::new(WorkerRuntime {
-        record_path,
-        runtime_session_dir: paths.runtime_session(id),
-        socket_path,
-        record: Mutex::new(record),
-        pty_write: Mutex::new(Some(master_write)),
-        workload: Mutex::new(WorkloadState {
-            running: true,
-            pgid: pid as i32,
-        }),
-        cgroup: Mutex::new(cgroup),
-        kill_gate: Mutex::new(()),
-        output: OutputHub::new(history, rows, cols, screen_txt_path)?,
-        active_connections: Arc::new(AtomicUsize::new(0)),
-        last_activity_ms: AtomicU64::new(0),
-    });
-    let (life_tx, life_rx) = mpsc::channel();
-    {
-        // Debounced history persistence (see History::append) needs a
-        // periodic sweep so output followed by silence still reaches disk.
-        // The same tick also persists last_activity_ms (see its doc comment
-        // on WorkerRuntime) -- reusing this interval rather than adding a
-        // second timer, and only writing the record when the in-memory
-        // timestamp actually moved since the previous tick, so an idle
-        // session does not get its record rewritten every interval forever.
-        let runtime = runtime.clone();
-        thread::spawn(move || {
-            let mut persisted_activity_ms: u64 = 0;
-            loop {
-                thread::sleep(HISTORY_FLUSH_INTERVAL);
-                if let Err(error) = runtime.output.flush() {
-                    eprintln!("aplexer worker: flush history: {error:#}");
-                }
-                let current = runtime.last_activity_ms.load(Ordering::Relaxed);
-                if current != 0 && current != persisted_activity_ms {
-                    persisted_activity_ms = current;
-                    if let Err(error) =
-                        runtime.update_record(|r| r.last_activity_ms = Some(current))
-                    {
-                        eprintln!("aplexer worker: persist activity: {error:#}");
-                    }
-                }
-            }
+        startup_checkpoint("before_history_open")?;
+        let history = History::open(record.history_path.clone(), record.history_bytes)?;
+        startup_checkpoint("before_output_hub")?;
+        let output = OutputHub::new(history, rows, cols, paths.screen_txt(id))?;
+        let runtime = Arc::new(WorkerRuntime {
+            record_path: record_path.clone(),
+            runtime_session_dir: paths.runtime_session(id),
+            socket_path,
+            record: Mutex::new(record.clone()),
+            pty_write: Mutex::new(Some(master_write)),
+            workload: Mutex::new(WorkloadState {
+                running: true,
+                pgid: pid as i32,
+            }),
+            cgroup: Mutex::new(cgroup),
+            kill_gate: Mutex::new(()),
+            output,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            last_activity_ms: AtomicU64::new(0),
         });
-    }
-    spawn_pty_reader(master_read, runtime.clone(), life_tx.clone());
-    spawn_child_waiter(child, life_tx);
-    spawn_lifecycle(runtime.clone(), life_rx);
+        start_worker_threads(Arc::clone(&runtime), master_read, Arc::clone(&child_slot))?;
+        Ok((listener, runtime))
+    })();
+    let (listener, runtime) = match setup {
+        Ok(value) => value,
+        Err(error) => {
+            startup.rollback(&error);
+            return Err(error);
+        }
+    };
+    startup.disarm();
 
     loop {
         match listener.accept() {
@@ -873,180 +1089,262 @@ fn spawn_workload(
     Ok(child)
 }
 
-fn spawn_pty_reader(mut master: File, runtime: Arc<WorkerRuntime>, tx: mpsc::Sender<LifeEvent>) {
-    thread::spawn(move || {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            match master.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = tx.send(LifeEvent::PtyEof);
+fn spawn_startup_thread<F>(
+    name: &str,
+    index: usize,
+    gate: &ThreadStartGate,
+    handles: &mut Vec<thread::JoinHandle<()>>,
+    job: F,
+) -> Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    startup_checkpoint(name)?;
+    startup_checkpoint(&format!("thread_{index}"))?;
+    let gate = Arc::clone(gate);
+    handles.push(
+        thread::Builder::new()
+            .name(format!("aplexer-{name}"))
+            .spawn(move || {
+                if await_thread_start(&gate) {
+                    job();
+                }
+            })
+            .with_context(|| format!("spawn {name} thread"))?,
+    );
+    Ok(())
+}
+
+fn start_worker_threads(
+    runtime: Arc<WorkerRuntime>,
+    master_read: File,
+    child_slot: Arc<Mutex<Option<Child>>>,
+) -> Result<()> {
+    let gate = Arc::new((Mutex::new(ThreadStart::Pending), Condvar::new()));
+    let mut handles = Vec::new();
+    let (life_tx, life_rx) = mpsc::channel();
+    let setup = (|| -> Result<()> {
+        let periodic_runtime = Arc::clone(&runtime);
+        spawn_startup_thread("history-flush", 1, &gate, &mut handles, move || {
+            run_periodic_flush(periodic_runtime)
+        })?;
+
+        let reader_runtime = Arc::clone(&runtime);
+        let reader_tx = life_tx.clone();
+        spawn_startup_thread("pty-reader", 2, &gate, &mut handles, move || {
+            run_pty_reader(master_read, reader_runtime, reader_tx)
+        })?;
+
+        let waiter_tx = life_tx;
+        spawn_startup_thread("child-waiter", 3, &gate, &mut handles, move || {
+            let child = match child_slot.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => {
+                    let _ = waiter_tx.send(LifeEvent::PtyError(
+                        "workload child slot lock poisoned".into(),
+                    ));
+                    return;
+                }
+            };
+            if let Some(child) = child {
+                run_child_waiter(child, waiter_tx);
+            }
+        })?;
+
+        let lifecycle_runtime = Arc::clone(&runtime);
+        spawn_startup_thread("lifecycle", 4, &gate, &mut handles, move || {
+            run_lifecycle(lifecycle_runtime, life_rx)
+        })?;
+
+        let termination_runtime = Arc::clone(&runtime);
+        spawn_startup_thread("termination", 5, &gate, &mut handles, move || {
+            run_termination_monitor(termination_runtime)
+        })?;
+        startup_checkpoint("after_thread_setup")?;
+        Ok(())
+    })();
+    if let Err(error) = setup {
+        release_startup_threads(&gate, ThreadStart::Abort);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        return Err(error);
+    }
+    release_startup_threads(&gate, ThreadStart::Run);
+    Ok(())
+}
+
+fn run_periodic_flush(runtime: Arc<WorkerRuntime>) {
+    // Debounced history persistence (see History::append) needs a periodic
+    // sweep so output followed by silence still reaches disk. The same tick
+    // persists last_activity_ms, but only when it has changed.
+    let mut persisted_activity_ms: u64 = 0;
+    loop {
+        thread::sleep(HISTORY_FLUSH_INTERVAL);
+        if let Err(error) = runtime.output.flush() {
+            eprintln!("aplexer worker: flush history: {error:#}");
+        }
+        let current = runtime.last_activity_ms.load(Ordering::Relaxed);
+        if current != 0 && current != persisted_activity_ms {
+            persisted_activity_ms = current;
+            if let Err(error) = runtime.update_record(|r| r.last_activity_ms = Some(current)) {
+                eprintln!("aplexer worker: persist activity: {error:#}");
+            }
+        }
+    }
+}
+
+fn run_termination_monitor(runtime: Arc<WorkerRuntime>) {
+    while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if let Err(error) = runtime.kill(libc::SIGTERM, 500) {
+        eprintln!("aplexer worker: terminate contained workload: {error:#}");
+        let _ = runtime.kill(libc::SIGKILL, 0);
+    }
+}
+
+fn run_pty_reader(mut master: File, runtime: Arc<WorkerRuntime>, tx: mpsc::Sender<LifeEvent>) {
+    let mut buffer = vec![0u8; 32 * 1024];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => {
+                let _ = tx.send(LifeEvent::PtyEof);
+                break;
+            }
+            Ok(n) => {
+                runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+                if let Err(error) = runtime.output.append(&buffer[..n]) {
+                    let _ = tx.send(LifeEvent::PtyError(format!("persist output: {error:#}")));
                     break;
                 }
-                Ok(n) => {
-                    // Cheap, lock-free activity marker (see WorkerRuntime's
-                    // last_activity_ms doc comment) -- deliberately updated
-                    // unconditionally here, before the debounced/possibly
-                    // I/O-performing append below, so it reflects PTY output
-                    // recency even if history persistence is momentarily slow.
-                    runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-                    if let Err(error) = runtime.output.append(&buffer[..n]) {
-                        let _ = tx.send(LifeEvent::PtyError(format!("persist output: {error:#}")));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                let _ = tx.send(LifeEvent::PtyEof);
+                break;
+            }
+            Err(error) => {
+                let _ = tx.send(LifeEvent::PtyError(format!("read PTY: {error}")));
+                break;
+            }
+        }
+    }
+}
+
+fn run_child_waiter(mut child: Child, tx: mpsc::Sender<LifeEvent>) {
+    let event = match child.wait() {
+        Ok(status) => LifeEvent::ChildExit {
+            code: status.code(),
+            signal: status.signal(),
+        },
+        Err(error) => LifeEvent::PtyError(format!("wait workload: {error}")),
+    };
+    let _ = tx.send(event);
+}
+
+fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
+    let mut pty_eof = false;
+    let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
+    let mut fatal: Option<String> = None;
+    loop {
+        match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
+            Ok(event) => match event {
+                LifeEvent::PtyEof => {
+                    pty_eof = true;
+                    if let Ok(mut pty) = runtime.pty_write.lock() {
+                        *pty = None;
+                    }
+                }
+                LifeEvent::PtyError(message) => {
+                    pty_eof = true;
+                    fatal = Some(message.clone());
+                    if let Ok(mut pty) = runtime.pty_write.lock() {
+                        *pty = None;
+                    }
+                    runtime.output.fail_subscribers(message);
+                }
+                LifeEvent::ChildExit { code, signal } => {
+                    child_exit = Some((code, signal));
+                    let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if child_exit.is_some() => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                fatal = Some("workload lifecycle channel disconnected".into());
+                break;
+            }
+        }
+
+        if child_exit.is_some() {
+            if let Err(error) = reap_adopted_children() {
+                fatal.get_or_insert_with(|| format!("reap descendants: {error:#}"));
+            }
+            match runtime.workload_populated() {
+                Ok(populated) => {
+                    if let Ok(mut state) = runtime.workload.lock() {
+                        state.running = populated;
+                    }
+                    if pty_eof && !populated {
                         break;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                    let _ = tx.send(LifeEvent::PtyEof);
-                    break;
-                }
                 Err(error) => {
-                    let _ = tx.send(LifeEvent::PtyError(format!("read PTY: {error}")));
-                    break;
+                    // Fail closed: never finalize evidence while we cannot
+                    // establish that the containment domain is empty.
+                    fatal.get_or_insert_with(|| format!("inspect descendants: {error:#}"));
                 }
             }
         }
-    });
-}
-
-fn spawn_child_waiter(mut child: Child, tx: mpsc::Sender<LifeEvent>) {
-    thread::spawn(move || {
-        let event = match child.wait() {
-            Ok(status) => LifeEvent::ChildExit {
-                code: status.code(),
-                signal: status.signal(),
-            },
-            Err(error) => LifeEvent::PtyError(format!("wait workload: {error}")),
-        };
-        let _ = tx.send(event);
-    });
-}
-
-fn spawn_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
-    thread::spawn(move || {
-        let mut pty_eof = false;
-        let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
-        let mut fatal: Option<String> = None;
-        loop {
-            match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
-                Ok(event) => match event {
-                    LifeEvent::PtyEof => {
-                        pty_eof = true;
-                        if let Ok(mut pty) = runtime.pty_write.lock() {
-                            *pty = None;
-                        }
-                    }
-                    LifeEvent::PtyError(message) => {
-                        pty_eof = true;
-                        fatal = Some(message.clone());
-                        if let Ok(mut pty) = runtime.pty_write.lock() {
-                            *pty = None;
-                        }
-                        runtime.output.fail_subscribers(message);
-                    }
-                    LifeEvent::ChildExit { code, signal } => {
-                        child_exit = Some((code, signal));
-                        let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
-                    }
-                },
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) if child_exit.is_some() => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    fatal = Some("workload lifecycle channel disconnected".into());
-                    break;
-                }
-            }
-
-            if child_exit.is_some() {
-                if let Err(error) = reap_adopted_children() {
-                    fatal.get_or_insert_with(|| format!("reap descendants: {error:#}"));
-                }
-                match runtime.workload_populated() {
-                    Ok(populated) => {
-                        if let Ok(mut state) = runtime.workload.lock() {
-                            state.running = populated;
-                        }
-                        if pty_eof && !populated {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        // Fail closed: never finalize evidence while we cannot
-                        // establish that the containment domain is empty.
-                        fatal.get_or_insert_with(|| format!("inspect descendants: {error:#}"));
-                    }
-                }
-            }
-        }
-        let (code, signal) = child_exit.unwrap_or((None, None));
-        let (oom, cg) = match runtime.cgroup.lock() {
-            Ok(mut g) => {
-                let cg = g.take();
-                let oom = cg.as_ref().map(Cgroup::oom_killed).unwrap_or(false);
-                (oom, cg)
-            }
-            Err(_) => (false, None),
-        };
-        let exit = ExitInfo {
-            code,
-            signal,
-            oom_killed: oom,
-            exited_at_ms: now_ms(),
-        };
-        let error = fatal.clone();
-        let _ = runtime.update_record(|r| {
-            r.phase = if error.is_some() {
-                Phase::Failed
-            } else {
-                Phase::Exited
-            };
-            r.exit = Some(exit.clone());
-            r.error = error;
-        });
-        runtime.output.finish(exit.clone());
-        if let Some(cg) = cg {
-            cg.cleanup();
-        }
-        // Keep the terminal record, history, final screen, and transcript
-        // binding for successful exits too. Besides enabling post-mortem
-        // capture/status, this gives polling watchers a durable transition
-        // to observe. `a kill` and `a prune` remain explicit cleanup paths.
-        // The workload is gone and the final record/history are persisted;
-        // a daemonless design must not leave a worker process (plus its
-        // socket and runtime dir) behind for every session that ever ran.
-        // Unlink the socket first so new clients fail fast and fall back to
-        // the persisted record/history, then give in-flight connections
-        // (the `kill` response, attach Exit events) a bounded window to
-        // drain before exiting the process.
-        let _ = fs::remove_file(&runtime.socket_path);
-        let drain_deadline = Instant::now() + Duration::from_secs(3);
-        while runtime.active_connections.load(Ordering::SeqCst) > 0
-            && Instant::now() < drain_deadline
-        {
-            thread::sleep(Duration::from_millis(25));
-        }
-        let _ = fs::remove_dir_all(&runtime.runtime_session_dir);
-        std::process::exit(0);
-    });
-}
-
-fn fail_startup(
-    paths: &Paths,
-    id: Uuid,
-    record_path: &std::path::Path,
-    record: &mut SessionRecord,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    record.phase = Phase::Failed;
-    record.error = Some(format!("{error:#}"));
-    record.updated_at_ms = now_ms();
-    if let Err(write_error) = atomic_write_json(record_path, record) {
-        eprintln!("aplexer worker: persist failure record: {write_error:#}");
     }
-    // A worker that failed to launch its workload must not leave its bound
-    // socket (and runtime dir) behind: a present-but-dead socket makes the
-    // session look temporarily unavailable instead of failed.
-    let _ = fs::remove_dir_all(paths.runtime_session(id));
-    error
+    let (code, signal) = child_exit.unwrap_or((None, None));
+    let (oom, cg) = match runtime.cgroup.lock() {
+        Ok(mut g) => {
+            let cg = g.take();
+            let oom = cg.as_ref().map(Cgroup::oom_killed).unwrap_or(false);
+            (oom, cg)
+        }
+        Err(_) => (false, None),
+    };
+    let exit = ExitInfo {
+        code,
+        signal,
+        oom_killed: oom,
+        exited_at_ms: now_ms(),
+    };
+    let error = fatal.clone();
+    let _ = runtime.update_record(|r| {
+        r.phase = if error.is_some() {
+            Phase::Failed
+        } else {
+            Phase::Exited
+        };
+        r.exit = Some(exit.clone());
+        r.error = error;
+    });
+    runtime.output.finish(exit.clone());
+    if let Some(cg) = cg {
+        cg.cleanup();
+    }
+    // Keep the terminal record, history, final screen, and transcript
+    // binding for successful exits too. Besides enabling post-mortem
+    // capture/status, this gives polling watchers a durable transition
+    // to observe. `a kill` and `a prune` remain explicit cleanup paths.
+    // The workload is gone and the final record/history are persisted;
+    // a daemonless design must not leave a worker process (plus its
+    // socket and runtime dir) behind for every session that ever ran.
+    // Unlink the socket first so new clients fail fast and fall back to
+    // the persisted record/history, then give in-flight connections
+    // (the `kill` response, attach Exit events) a bounded window to
+    // drain before exiting the process.
+    let _ = fs::remove_file(&runtime.socket_path);
+    let drain_deadline = Instant::now() + Duration::from_secs(3);
+    while runtime.active_connections.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = fs::remove_dir_all(&runtime.runtime_session_dir);
+    std::process::exit(0);
 }
 
 fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Result<()> {
