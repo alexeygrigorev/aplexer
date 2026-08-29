@@ -1410,7 +1410,6 @@ fn build_launch_preview(paths: &Paths, args: &LaunchArgs) -> Result<LaunchPrevie
 /// creating a session or spawning anything.
 fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result<()> {
     let preview = build_launch_preview(paths, &args)?;
-    let public_env = redacted_env(&preview.env_set);
     if json_output {
         println!(
             "{}",
@@ -1418,7 +1417,7 @@ fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result
                 "engine": preview.engine,
                 "profile": preview.profile,
                 "argv": preview.argv,
-                "env_set": public_env,
+                "env_set": preview.env_set,
                 "env_unset": preview.env_unset,
                 "cwd": preview.cwd,
             }))?
@@ -1438,7 +1437,7 @@ fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        for (k, v) in &public_env {
+        for (k, v) in &preview.env_set {
             println!("env set:   {k}={v}");
         }
         println!(

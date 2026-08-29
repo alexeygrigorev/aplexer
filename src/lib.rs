@@ -404,12 +404,6 @@ pub fn public_session_record(record: &SessionRecord) -> SessionRecord {
     public
 }
 
-pub fn redacted_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    env.keys()
-        .map(|key| (key.clone(), "<redacted>".to_string()))
-        .collect()
-}
-
 impl SessionRecord {
     pub fn selector(&self) -> String {
         format!("{}:{}", self.workspace.display(), self.tag)
@@ -2237,10 +2231,6 @@ mod tests {
         assert_eq!(
             session_metadata_env(&env),
             BTreeMap::from([("CODEX_HOME".to_string(), "/profiles/codex".to_string())])
-        );
-        assert_eq!(
-            redacted_env(&env).get("API_TOKEN").map(String::as_str),
-            Some("<redacted>")
         );
     }
     /// The load-bearing property from pocketshell-integration-plan.md 0.2: a

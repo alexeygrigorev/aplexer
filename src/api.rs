@@ -17,9 +17,8 @@ use uuid::Uuid;
 
 use crate::{
     atomic_write_json, canonical_workspace, command_exists, ensure_private_dir, list_records,
-    parse_byte_size, public_session_record, read_record, redacted_env, session_metadata_env,
-    validate_tag, worker_executable, Config, FileLock, Limits, Paths, Phase, SessionRecord,
-    SCHEMA_VERSION,
+    parse_byte_size, public_session_record, read_record, session_metadata_env, validate_tag,
+    worker_executable, Config, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -52,7 +51,7 @@ pub fn engines_json(paths: &Paths) -> Result<Value> {
 pub fn profiles_json(paths: &Paths) -> Result<Value> {
     let mut profiles = Config::load(paths)?.profiles;
     for profile in profiles.values_mut() {
-        profile.env = redacted_env(&profile.env);
+        profile.env = session_metadata_env(&profile.env);
     }
     Ok(serde_json::to_value(profiles)?)
 }
@@ -85,7 +84,7 @@ pub fn launch_spec_json(
         "engine": launch.engine,
         "profile": launch.profile,
         "argv": argv,
-        "env_set": redacted_env(&launch.env),
+        "env_set": launch.env,
         "env_unset": launch.env_unset,
         "cwd": cwd,
     }))
