@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -3502,6 +3502,11 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     };
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
+    let mut signal_bridge = if tty {
+        Some(AttachSignalBridge::install(writer.clone(), active.clone())?)
+    } else {
+        None
+    };
     let term = Arc::new(Mutex::new(TermGeom {
         rows: 0,
         cols: 0,
@@ -3888,6 +3893,16 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     active.store(false, Ordering::Relaxed);
     if let Ok(stream) = writer.lock() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    // Restore display state and cooked termios before restoring the prior
+    // signal disposition and re-raising. A default TERM/HUP/QUIT action can
+    // terminate the process immediately, so RAII alone cannot run after it.
+    drop(_ui_guard);
+    drop(_raw);
+    if let Some(signal) = signal_bridge.take().and_then(AttachSignalBridge::finish) {
+        unsafe {
+            libc::raise(signal);
+        }
     }
     Ok(())
 }
@@ -4973,6 +4988,147 @@ fn send_data(writer: &Arc<Mutex<UnixStream>>, data: &[u8]) -> Result<()> {
 fn send_control(writer: &Arc<Mutex<UnixStream>>, control: &AttachControl) -> Result<()> {
     let mut stream = writer.lock().map_err(|_| anyhow!("socket lock poisoned"))?;
     write_json(&mut *stream, control)
+}
+
+const ATTACH_CLEANUP_SIGNALS: [i32; 4] = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
+static ATTACH_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Async-signal-safe half of attach cleanup. The handler deliberately does
+/// nothing except write one byte to a nonblocking self-pipe. Terminal I/O,
+/// socket locking, termios restoration, and allocation all remain on normal
+/// Rust threads.
+extern "C" fn attach_cleanup_signal(signal: i32) {
+    let fd = ATTACH_SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = signal as u8;
+        unsafe {
+            libc::write(fd, std::ptr::from_ref(&byte).cast(), 1);
+        }
+    }
+}
+
+struct AttachSignalBridge {
+    read_fd: i32,
+    write_fd: i32,
+    previous: Vec<(i32, libc::sigaction)>,
+    watcher: Option<thread::JoinHandle<()>>,
+    caught: Arc<AtomicI32>,
+}
+
+impl AttachSignalBridge {
+    fn install(writer: Arc<Mutex<UnixStream>>, active: Arc<AtomicBool>) -> Result<Self> {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error()).context("create attach signal pipe");
+        }
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(error).context("make attach signal pipe nonblocking");
+        }
+
+        ATTACH_SIGNAL_WRITE_FD.store(fds[1], Ordering::Release);
+        let mut previous = Vec::with_capacity(ATTACH_CLEANUP_SIGNALS.len());
+        for signal in ATTACH_CLEANUP_SIGNALS {
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            action.sa_sigaction = attach_cleanup_signal as *const () as usize;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut old = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            if unsafe { libc::sigaction(signal, &action, &mut old) } != 0 {
+                let error = io::Error::last_os_error();
+                for (installed, prior) in previous.iter().rev() {
+                    unsafe {
+                        libc::sigaction(*installed, prior, std::ptr::null_mut());
+                    }
+                }
+                ATTACH_SIGNAL_WRITE_FD.store(-1, Ordering::Release);
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(error).with_context(|| format!("install attach signal {signal}"));
+            }
+            previous.push((signal, old));
+        }
+
+        let caught = Arc::new(AtomicI32::new(0));
+        let watcher_caught = caught.clone();
+        let read_fd = fds[0];
+        let watcher = thread::spawn(move || {
+            let mut byte = 0u8;
+            loop {
+                let read = unsafe { libc::read(read_fd, std::ptr::from_mut(&mut byte).cast(), 1) };
+                if read == 1 {
+                    if byte == 0 {
+                        return;
+                    }
+                    watcher_caught
+                        .compare_exchange(0, i32::from(byte), Ordering::SeqCst, Ordering::Relaxed)
+                        .ok();
+                    active.store(false, Ordering::Relaxed);
+                    if let Ok(stream) = writer.lock() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    return;
+                }
+                if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+        });
+        Ok(Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+            previous,
+            watcher: Some(watcher),
+            caught,
+        })
+    }
+
+    fn finish(mut self) -> Option<i32> {
+        self.stop_and_restore();
+        match self.caught.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    fn stop_and_restore(&mut self) {
+        if self.write_fd < 0 {
+            return;
+        }
+        let stop = 0u8;
+        unsafe {
+            libc::write(self.write_fd, std::ptr::from_ref(&stop).cast(), 1);
+        }
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
+        ATTACH_SIGNAL_WRITE_FD.store(-1, Ordering::Release);
+        for (signal, prior) in self.previous.iter().rev() {
+            unsafe {
+                libc::sigaction(*signal, prior, std::ptr::null_mut());
+            }
+        }
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
+        self.read_fd = -1;
+        self.write_fd = -1;
+    }
+}
+
+impl Drop for AttachSignalBridge {
+    fn drop(&mut self) {
+        self.stop_and_restore();
+    }
 }
 
 struct RawMode {
