@@ -1133,16 +1133,20 @@ fn resolve_quick_index(
 
 fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &target)?;
-    let rpc_result = rpc_simple(&record, Operation::Status, None);
-    // A successful round-trip to the worker's own socket is stronger
-    // evidence of liveness than a pid-existence check (e.g. it also rules
-    // out a hung/unresponsive worker); fall back to the pid check only if
-    // the RPC itself failed, so `status` on a single session is worth the
-    // extra round-trip that `list` deliberately skips.
-    let rpc_reachable = rpc_result.is_ok();
-    let raw = rpc_result.unwrap_or_else(|_| {
-        serde_json::to_value(public_session_record(&record)).unwrap_or(Value::Null)
-    });
+    // Process existence and control-plane reachability are separate facts:
+    // a wedged worker can still have a live pid, while a successfully reached
+    // worker is stronger evidence than a stale persisted pid. Preserve both
+    // instead of folding them into one optimistic `worker_alive` bit, and
+    // surface the actual RPC failure so recovery tooling has evidence to act
+    // on rather than a mysteriously stale record.
+    let (raw, worker_reachable, rpc_error) = match rpc_simple(&record, Operation::Status, None) {
+        Ok(raw) => (raw, true, None),
+        Err(error) => (
+            serde_json::to_value(public_session_record(&record)).unwrap_or(Value::Null),
+            false,
+            Some(format!("{error:#}")),
+        ),
+    };
     let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
     let cgroup_stats = raw.get("cgroup").cloned();
     let history_persistence_error = raw
@@ -1161,7 +1165,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         .get("foreground_command")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let worker_alive = rpc_reachable || current.worker_alive();
+    let worker_alive = current.worker_alive();
     if json_output {
         let mut value = serde_json::to_value(public_session_record(&current))?;
         if let Some(stats) = cgroup_stats {
@@ -1177,6 +1181,10 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
             value["record_persistence_error"] = json!(error);
         }
         value["worker_alive"] = json!(worker_alive);
+        value["worker_reachable"] = json!(worker_reachable);
+        if let Some(error) = &rpc_error {
+            value["rpc_error"] = json!(error);
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("id: {}", current.id);
@@ -1202,6 +1210,11 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".into())
         );
+        println!("worker_alive: {worker_alive}");
+        println!("worker_reachable: {worker_reachable}");
+        if let Some(error) = rpc_error {
+            println!("rpc_error: {error}");
+        }
         println!(
             "workload_pid: {}",
             current
@@ -1761,17 +1774,30 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
             let record_count = records.len();
             let broken: Vec<Value> = records
                 .into_iter()
-                .filter(|record| record.worker_phase_active() && !record.worker_alive())
-                .map(|record| {
-                    json!({
+                .filter_map(|record| {
+                    if !record.worker_phase_active() {
+                        return None;
+                    }
+                    let worker_alive = record.worker_alive();
+                    let rpc_error = rpc_simple(&record, Operation::Status, None)
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                    let worker_reachable = rpc_error.is_none();
+                    if worker_alive && worker_reachable {
+                        return None;
+                    }
+                    Some(json!({
                         "id": record.id,
                         "selector": record.selector(),
                         "phase": phase_name(&record.phase),
+                        "worker_alive": worker_alive,
+                        "worker_reachable": worker_reachable,
+                        "rpc_error": rpc_error,
                         "recovery": {
                             "kill": format!("a kill {}", record.id),
                             "forget": format!("a forget {} --force", record.id),
                         },
-                    })
+                    }))
                 })
                 .collect();
             let detail = if broken.is_empty() {

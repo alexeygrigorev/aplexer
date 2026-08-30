@@ -69,6 +69,10 @@ fn status_cli_bounds_connect_to_a_saturated_control_backlog() {
     assert!(output.status.success(), "status failed: {output:?}");
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["worker_alive"], false);
+    assert_eq!(value["worker_reachable"], false);
+    assert!(value["rpc_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("timed out")));
     assert!(elapsed >= Duration::from_millis(2_500), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }

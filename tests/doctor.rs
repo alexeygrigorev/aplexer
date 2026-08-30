@@ -76,6 +76,11 @@ fn doctor_reports_stale_active_records_with_recovery_commands() {
         .unwrap();
     assert_eq!(sessions["ok"], false);
     assert_eq!(sessions["broken_sessions"][0]["id"], record.id.to_string());
+    assert_eq!(sessions["broken_sessions"][0]["worker_alive"], false);
+    assert_eq!(sessions["broken_sessions"][0]["worker_reachable"], false);
+    assert!(sessions["broken_sessions"][0]["rpc_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("connect")));
     assert_eq!(
         sessions["broken_sessions"][0]["recovery"]["kill"],
         format!("a kill {}", record.id)
@@ -84,4 +89,62 @@ fn doctor_reports_stale_active_records_with_recovery_commands() {
         sessions["broken_sessions"][0]["recovery"]["forget"],
         format!("a forget {} --force", record.id)
     );
+}
+
+#[test]
+fn status_and_doctor_report_alive_but_unreachable_workers_separately() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut record = stale_running_record(&paths);
+    record.worker_pid = Some(std::process::id());
+    std::fs::create_dir_all(paths.state_session(record.id)).unwrap();
+    atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+    let base_command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_a"));
+        command
+            .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+            .env("APLEXER_STATE_DIR", &paths.state_root)
+            .env("APLEXER_CONFIG", &paths.config_file);
+        command
+    };
+
+    let json_status = base_command()
+        .args(["--json", "status", &record.id.to_string()])
+        .output()
+        .unwrap();
+    assert!(json_status.status.success(), "{json_status:?}");
+    let status: Value = serde_json::from_slice(&json_status.stdout).unwrap();
+    assert_eq!(status["worker_alive"], true);
+    assert_eq!(status["worker_reachable"], false);
+    assert!(status["rpc_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("connect")));
+
+    let human_status = base_command()
+        .args(["status", &record.id.to_string()])
+        .output()
+        .unwrap();
+    assert!(human_status.status.success(), "{human_status:?}");
+    let human = String::from_utf8_lossy(&human_status.stdout);
+    assert!(human.contains("worker_alive: true"), "{human}");
+    assert!(human.contains("worker_reachable: false"), "{human}");
+    assert!(human.contains("rpc_error: "), "{human}");
+
+    let doctor_output = base_command().args(["--json", "doctor"]).output().unwrap();
+    assert!(!doctor_output.status.success(), "{doctor_output:?}");
+    let report: Value = serde_json::from_slice(&doctor_output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .unwrap();
+    let broken = &sessions["broken_sessions"][0];
+    assert_eq!(broken["id"], record.id.to_string());
+    assert_eq!(broken["worker_alive"], true);
+    assert_eq!(broken["worker_reachable"], false);
+    assert!(broken["rpc_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("connect")));
 }
