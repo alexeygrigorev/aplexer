@@ -686,7 +686,8 @@ fn cursor_lock_path(cursors_dir: &Path, consumer_id: Uuid) -> PathBuf {
 
 fn read_cursor_file(path: &Path) -> Result<Cursor> {
     match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse mailbox cursor {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursor::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
@@ -1452,6 +1453,36 @@ mod tests {
         cursor.acked_through = Some(id2);
         assert!(cursor.is_acked(id1));
         assert!(cursor.is_acked(id2));
+    }
+
+    #[test]
+    fn corrupt_cursor_fails_without_reset_or_ack_overwrite() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-corrupt-cursor-workspace");
+        let consumer_id = Uuid::from_u128(100);
+        let message_id = Uuid::from_u128(1);
+        write_test_message(&paths, workspace, message_id);
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let cursor_path = mp.cursors_dir.join(format!("{consumer_id}.json"));
+        let corrupt = b"{\"exceptions\":";
+        fs::write(&cursor_path, corrupt).unwrap();
+
+        let read_error = read_cursor(&paths, workspace, consumer_id)
+            .expect_err("a corrupt cursor must not be interpreted as empty");
+        assert!(
+            format!("{read_error:#}").contains("parse mailbox cursor"),
+            "unexpected error: {read_error:#}"
+        );
+        assert_eq!(fs::read(&cursor_path).unwrap(), corrupt);
+
+        let ack_error = ack_messages(&paths, workspace, consumer_id, &[message_id])
+            .expect_err("ack must not overwrite a corrupt cursor from an empty default");
+        assert!(
+            format!("{ack_error:#}").contains("parse mailbox cursor"),
+            "unexpected error: {ack_error:#}"
+        );
+        assert_eq!(fs::read(&cursor_path).unwrap(), corrupt);
     }
 
     #[test]
