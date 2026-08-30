@@ -21,6 +21,26 @@ class CgroupIdentity:
     cgroup_root_device: int
     cgroup_root_inode: int
 
+
+@dataclass(frozen=True)
+class ForgetResult:
+    id: str
+    forgotten: bool
+    signalled: bool
+    containment_proven_empty: bool
+    workload_may_survive: bool
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ForgetResult":
+        return cls(
+            id=str(value["id"]),
+            forgotten=bool(value["forgotten"]),
+            signalled=bool(value["signalled"]),
+            containment_proven_empty=bool(value["containment_proven_empty"]),
+            workload_may_survive=bool(value["workload_may_survive"]),
+        )
+
+
 @dataclass(frozen=True)
 class Session:
     id: str

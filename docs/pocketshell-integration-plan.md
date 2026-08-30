@@ -157,7 +157,8 @@ That is no longer remotely true. Verified against the built binary and source:
   `UnifiedEvent` envelope, separately from the lifecycle stream.
 - Python client distribution `aplexer-client` (import name `aplexer`): an in-process PyO3 API,
   not a socket/subprocess wrapper. It currently exposes `engines()`, `profiles()`,
-  `launch_spec()`, `snapshot()`/`list()`, and `start()`.
+  `launch_spec()`, `snapshot()`/`list()`, `start()`, `status()`, byte-exact
+  `send()`/`capture()`, `kill()`, and explicitly forced `forget()`.
 - Per-session worker processes, cgroup-v2 memory/pids/cpu limits with OOM detection, durable
   session records, destructive isolation integration tests (`tests/oom_isolation.rs`).
 - Session identity is **UUIDv4** (`Uuid::new_v4` in `cmd_start`), not the ULID the original

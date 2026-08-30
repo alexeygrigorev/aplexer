@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from aplexer.models import Session
+from aplexer import ForgetResult, Session
 
 def test_session_model():
     session = Session.from_dict({
@@ -78,3 +78,18 @@ def test_session_containment_proof_fields_and_legacy_exit():
         }
     )
     assert not explicit_failure.containment_empty
+
+
+def test_forget_result_model():
+    result = ForgetResult.from_dict(
+        {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "forgotten": True,
+            "signalled": False,
+            "containment_proven_empty": False,
+            "workload_may_survive": True,
+        }
+    )
+    assert result.forgotten
+    assert not result.signalled
+    assert result.workload_may_survive

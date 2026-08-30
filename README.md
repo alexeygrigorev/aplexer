@@ -235,9 +235,22 @@ client = Client()
 session = client.start(workspace=".", tag="demo", command=["/bin/bash", "-l"])
 print(session.id, session.phase)
 print(client.list())
+
+# Operational methods stay in-process through the native Rust bindings.
+print(client.status(session.id))
+client.send(session.id, b"printf 'hello\\n'\n")
+raw_output = client.capture(session.id, max_bytes=4096)
+client.kill(session.id, signal=15, grace_ms=2000)
+
+# Once status reports that the worker is gone, explicitly discard its records.
+result = client.forget(session.id, force=True)
+print(result.workload_may_survive)
 ```
 
-The Python package is intentionally thin: Rust remains authoritative for profile resolution, launch policy, PTY ownership, metadata durability, and cgroups.
+`send()` and `capture()` use `bytes` end to end; they never decode PTY data as
+text. The Python package is intentionally thin: Rust remains authoritative for
+profile resolution, launch policy, PTY ownership, metadata durability, and
+cgroups.
 
 ## Inter-agent messaging
 

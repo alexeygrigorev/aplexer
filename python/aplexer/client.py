@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import Session
+from .models import ForgetResult, Session
 
 
 class AplexerError(RuntimeError):
@@ -83,6 +83,20 @@ class Client:
     def list(self) -> list[Session]:
         return [Session.from_dict(row) for row in self.snapshot()]
 
+    def status(self, selector: str) -> Session:
+        """Return live status, or persisted status with reachability details."""
+        payload = json.loads(_native().status(selector, *self._path_args()))
+        if not isinstance(payload, dict):
+            raise AplexerError("status payload was not an object")
+        return Session.from_dict(payload)
+
+    def capture(self, selector: str, *, max_bytes: int | None = None) -> bytes:
+        """Return raw captured PTY history bytes without decoding or transcoding."""
+        payload = _native().capture(selector, max_bytes, *self._path_args())
+        if not isinstance(payload, bytes):
+            raise AplexerError("capture payload was not bytes")
+        return payload
+
     def start(
         self,
         *,
@@ -115,3 +129,27 @@ class Client:
             )
         )
         return Session.from_dict(raw)
+
+    def send(self, selector: str, data: bytes) -> int:
+        """Send raw bytes to a session PTY and return the acknowledged count."""
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+        sent = _native().send(selector, data, *self._path_args())
+        if isinstance(sent, bool) or not isinstance(sent, int):
+            raise AplexerError("send result was not an integer byte count")
+        if sent != len(data):
+            raise AplexerError(
+                f"send byte count mismatch: supplied {len(data)}, acknowledged {sent}"
+            )
+        return sent
+
+    def kill(self, selector: str, *, signal: int = 15, grace_ms: int = 2_000) -> None:
+        """Signal a live session's complete workload containment domain."""
+        _native().kill(selector, signal, grace_ms, *self._path_args())
+
+    def forget(self, selector: str, *, force: bool = False) -> ForgetResult:
+        """Delete a dead session's records without signalling any process."""
+        payload = json.loads(_native().forget(selector, force, *self._path_args()))
+        if not isinstance(payload, dict):
+            raise AplexerError("forget payload was not an object")
+        return ForgetResult.from_dict(payload)

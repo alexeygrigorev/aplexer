@@ -4,6 +4,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
 from aplexer.client import Client
 
 
@@ -134,6 +136,93 @@ def test_client_paths_are_instance_local_including_start(monkeypatch, tmp_path):
     assert {key: os.environ[key] for key in ambient} == ambient
 
 
+def test_operational_methods_use_native_boundary_and_preserve_bytes(monkeypatch, tmp_path):
+    calls = []
+    payload = b"\x00\xffA\r\n\x1b[31m"
+    record = {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "workspace": "/ws",
+        "tag": "raw",
+        "engine": "shell",
+        "profile": None,
+        "command": ["/bin/cat"],
+        "cwd": "/ws",
+        "phase": "running",
+        "socket_path": "/run/control.sock",
+        "history_path": "/state/history.bin",
+        "worker_alive": True,
+        "worker_reachable": True,
+    }
+
+    class Native:
+        @staticmethod
+        def status(selector, state_dir, runtime_dir, config):
+            calls.append(("status", selector, state_dir, runtime_dir, config))
+            return json.dumps(record)
+
+        @staticmethod
+        def capture(selector, max_bytes, state_dir, runtime_dir, config):
+            calls.append(
+                ("capture", selector, max_bytes, state_dir, runtime_dir, config)
+            )
+            return payload
+
+        @staticmethod
+        def send(selector, data, state_dir, runtime_dir, config):
+            calls.append(("send", selector, data, state_dir, runtime_dir, config))
+            return len(data)
+
+        @staticmethod
+        def kill(selector, signal, grace_ms, state_dir, runtime_dir, config):
+            calls.append(
+                (
+                    "kill",
+                    selector,
+                    signal,
+                    grace_ms,
+                    state_dir,
+                    runtime_dir,
+                    config,
+                )
+            )
+
+        @staticmethod
+        def forget(selector, force, state_dir, runtime_dir, config):
+            calls.append(("forget", selector, force, state_dir, runtime_dir, config))
+            return json.dumps(
+                {
+                    "id": selector,
+                    "forgotten": True,
+                    "signalled": False,
+                    "containment_proven_empty": True,
+                    "workload_may_survive": False,
+                }
+            )
+
+    monkeypatch.setattr("aplexer.client._native", lambda: Native)
+    paths = tuple(str(tmp_path / name) for name in ("state", "run", "config"))
+    client = Client(state_dir=paths[0], runtime_dir=paths[1], config=paths[2])
+    selector = record["id"]
+
+    assert client.status(selector).raw["worker_reachable"] is True
+    assert client.capture(selector, max_bytes=123) is payload
+    assert client.send(selector, payload) == len(payload)
+    assert client.kill(selector, signal=9, grace_ms=0) is None
+    forgotten = client.forget(selector, force=True)
+    assert forgotten.forgotten
+    assert forgotten.containment_proven_empty
+    assert calls == [
+        ("status", selector, *paths),
+        ("capture", selector, 123, *paths),
+        ("send", selector, payload, *paths),
+        ("kill", selector, 9, 0, *paths),
+        ("forget", selector, True, *paths),
+    ]
+
+    with pytest.raises(TypeError, match="data must be bytes"):
+        client.send(selector, "not bytes")
+
+
 def test_native_clients_isolate_worker_start_and_snapshot():
     # Keep the root short enough for Linux's 108-byte Unix-socket path limit.
     with tempfile.TemporaryDirectory(prefix="apx-py-") as directory:
@@ -168,3 +257,80 @@ def test_native_clients_isolate_worker_start_and_snapshot():
         else:
             raise AssertionError("short-lived isolation-test workers did not exit")
         time.sleep(0.1)
+
+
+def _wait_for_terminal_status(client, selector, timeout=5):
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        latest = client.status(selector)
+        if latest.phase in {"exited", "failed"} and not latest.raw["worker_alive"]:
+            return latest
+        time.sleep(0.02)
+    raise AssertionError(f"session did not become terminal: {latest!r}")
+
+
+def test_native_operations_round_trip_arbitrary_bytes_and_forget():
+    # Keep the root short enough for Linux's 108-byte Unix-socket path limit.
+    with tempfile.TemporaryDirectory(prefix="apx-py-op-") as directory:
+        root = Path(directory)
+        client = Client(
+            state_dir=root / "state",
+            runtime_dir=root / "run",
+            config=root / "config.toml",
+        )
+        payload = b"\x00\xffA\r\n\x1b[31mZ\x1b[0m"
+        marker = b"APX_READY"
+        command = [
+            "/bin/sh",
+            "-c",
+            f"stty raw -echo; printf APX_READY; dd bs=1 count={len(payload)} 2>/dev/null",
+        ]
+        session = client.start(workspace=root, tag="bytes", command=command)
+
+        with pytest.raises(RuntimeError, match="force=True"):
+            client.forget(session.id)
+        with pytest.raises(RuntimeError, match="live worker"):
+            client.forget(session.id, force=True)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if client.capture(session.id).endswith(marker):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("byte transport workload did not become ready")
+
+        assert client.status(session.id).raw["worker_reachable"] is True
+        assert client.send(session.id, payload) == len(payload)
+        terminal = _wait_for_terminal_status(client, session.id)
+        assert terminal.phase == "exited"
+        assert client.capture(session.id).endswith(marker + payload)
+        forgotten = client.forget(session.id, force=True)
+        assert forgotten.forgotten
+        assert not forgotten.signalled
+        assert forgotten.containment_proven_empty
+        assert not forgotten.workload_may_survive
+        assert all(item.id != session.id for item in client.list())
+
+
+def test_native_kill_stops_live_session():
+    with tempfile.TemporaryDirectory(prefix="apx-py-kill-") as directory:
+        root = Path(directory)
+        client = Client(
+            state_dir=root / "state",
+            runtime_dir=root / "run",
+            config=root / "config.toml",
+        )
+        session = client.start(
+            workspace=root,
+            tag="kill",
+            command=["/bin/sleep", "10"],
+        )
+        with pytest.raises(RuntimeError, match="signal out of range"):
+            client.kill(session.id, signal=0)
+        with pytest.raises(RuntimeError, match="kill grace exceeds maximum"):
+            client.kill(session.id, grace_ms=30_001)
+        assert client.kill(session.id, signal=15, grace_ms=200) is None
+        _wait_for_terminal_status(client, session.id)
+        assert client.forget(session.id, force=True).forgotten
