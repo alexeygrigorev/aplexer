@@ -1074,6 +1074,7 @@ enum LifeEvent {
 /// src/bin/a.rs), the same as before this fix -- this only eliminates the
 /// race for the case where the size is already known at spawn time.
 pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
+    normalize_sigchld_for_child_management()?;
     install_termination_handlers()?;
     // This is process-wide and must precede every helper or workload spawn.
     // In particular, Cgroup::create invokes systemd-run and a waiter thread;

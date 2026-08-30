@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
-    ensure_private_dir, list_records, parse_byte_size, process_start_time_ticks,
-    public_session_record, read_record, session_metadata_env, validate_tag, worker_executable,
-    Config, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION,
+    ensure_private_dir, list_records, normalize_sigchld_for_child_management, parse_byte_size,
+    process_start_time_ticks, public_session_record, read_record, session_metadata_env,
+    validate_tag, worker_executable, Config, FileLock, Limits, Paths, Phase, SessionRecord,
+    SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -1004,6 +1005,7 @@ pub struct StartRequest {
 }
 
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
+    normalize_sigchld_for_child_management()?;
     validate_tag(&req.tag)?;
     let workspace = canonical_workspace(&req.workspace)?;
     let id = Uuid::new_v4();

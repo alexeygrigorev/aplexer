@@ -40,6 +40,23 @@ const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
 
+/// Child ownership through `std::process::Child` requires the normal
+/// SIGCHLD disposition. In particular, an inherited SIG_IGN/SA_NOCLDWAIT can
+/// make the kernel auto-reap children before `Child::wait`, destroying both
+/// exit reporting and the worker's subreaper containment boundary.
+pub fn normalize_sigchld_for_child_management() -> Result<()> {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error()).context("restore SIGCHLD default disposition");
+        }
+    }
+    Ok(())
+}
+
 pub fn kill_grace_duration(grace_ms: u64) -> Result<Duration> {
     if grace_ms > MAX_KILL_GRACE_MS {
         bail!("kill grace exceeds maximum of {MAX_KILL_GRACE_MS} ms");
@@ -1933,6 +1950,7 @@ impl Cgroup {
         if !limits.requested() {
             return Ok(None);
         }
+        normalize_sigchld_for_child_management()?;
         let identity = current_cgroup_identity()?;
         let unit = format!("aplexer-workload-{id}");
         let mut command = Command::new("systemd-run");

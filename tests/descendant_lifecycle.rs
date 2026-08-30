@@ -7,6 +7,7 @@
 //! stdout/stderr on the PTY and therefore also delays PTY EOF.
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -55,6 +56,32 @@ impl Harness {
         assert!(
             output.status.success(),
             "`a {}` failed (status {:?}):\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn run_ok_with_ignored_sigchld(&self, args: &[&str], timeout: Duration) -> String {
+        let mut command = self.command();
+        command.args(args);
+        unsafe {
+            command.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = run_with_timeout(command, timeout);
+        assert!(
+            output.status.success(),
+            "`a {}` with ignored SIGCHLD failed (status {:?}):\nstdout: {}\nstderr: {}",
             args.join(" "),
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
@@ -150,7 +177,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, description: &str) {
     }
 }
 
-fn run_detached_descendant_case(retain_pty: bool) {
+fn run_detached_descendant_case(retain_pty: bool, inherit_ignored_sigchld: bool) {
     assert!(Path::new("/usr/bin/setsid").is_file(), "setsid is required");
     let harness = Harness::new();
     let workspace_dir = TempDir::new().expect("workspace tempdir");
@@ -168,25 +195,27 @@ fn run_detached_descendant_case(retain_pty: bool) {
         pid_file.display(),
     );
     let workspace = workspace_dir.path().to_str().expect("utf8 workspace");
-    let stdout = harness.run_ok(
-        &[
-            "start",
-            "--workspace",
-            workspace,
-            "--tag",
-            if retain_pty {
-                "retain-pty"
-            } else {
-                "close-pty"
-            },
-            "--json",
-            "--",
-            "/bin/sh",
-            "-c",
-            &script,
-        ],
-        Duration::from_secs(15),
-    );
+    let start_args = [
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        if retain_pty {
+            "retain-pty"
+        } else {
+            "close-pty"
+        },
+        "--json",
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ];
+    let stdout = if inherit_ignored_sigchld {
+        harness.run_ok_with_ignored_sigchld(&start_args, Duration::from_secs(15))
+    } else {
+        harness.run_ok(&start_args, Duration::from_secs(15))
+    };
     let started: Value = serde_json::from_str(&stdout).expect("start JSON");
     let id = started["id"].as_str().expect("session id").to_owned();
     let worker_pid = started["worker_pid"].as_u64().expect("worker pid") as u32;
@@ -240,10 +269,15 @@ fn run_detached_descendant_case(retain_pty: bool) {
 
 #[test]
 fn kill_contains_detached_descendant_after_leader_exit() {
-    run_detached_descendant_case(false);
+    run_detached_descendant_case(false, false);
 }
 
 #[test]
 fn kill_contains_detached_descendant_that_retains_pty() {
-    run_detached_descendant_case(true);
+    run_detached_descendant_case(true, false);
+}
+
+#[test]
+fn inherited_ignored_sigchld_does_not_break_detached_descendant_cleanup() {
+    run_detached_descendant_case(true, true);
 }
