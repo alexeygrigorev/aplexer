@@ -576,6 +576,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_pty_resize_restores_the_previous_screen_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let before = hub.screen_snapshot().unwrap();
+
+        let error = resize_screen_and_pty(&hub, (24, 80), (10, 20), || {
+            bail!("injected PTY ioctl failure")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected PTY ioctl failure");
+        assert_eq!(
+            hub.screen_snapshot().unwrap(),
+            before,
+            "failed PTY resize left the screen model at the rejected size"
+        );
+    }
+
+    #[test]
     fn connection_permits_are_bounded_and_release_on_drop() {
         let active = Arc::new(AtomicUsize::new(0));
         let permits: Vec<_> = (0..MAX_CLIENT_CONNECTIONS)
@@ -615,6 +634,25 @@ struct WorkloadState {
     pgid: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachedClient {
+    geometry: Option<(u16, u16)>,
+    last_activity: u64,
+}
+
+/// The one PTY has one size, even when several clients are attached. tmux's
+/// default `window-size=latest` policy resolves that by giving the most
+/// recently active sized client control of the PTY geometry. Keep the client
+/// registry and the applied size behind the same mutex so two clients cannot
+/// race an older resize past a newer activity event.
+struct TerminalState {
+    rows: u16,
+    cols: u16,
+    clients: HashMap<u64, AttachedClient>,
+    next_client_id: u64,
+    activity_clock: u64,
+}
+
 struct WorkerRuntime {
     paths: Paths,
     record_path: std::path::PathBuf,
@@ -623,6 +661,7 @@ struct WorkerRuntime {
     record: Mutex<SessionRecord>,
     pty_write: Mutex<Option<File>>,
     workload: Mutex<WorkloadState>,
+    terminal: Mutex<TerminalState>,
     cgroup: Mutex<Option<Cgroup>>,
     kill_gate: Mutex<()>,
     output: OutputHub,
@@ -675,6 +714,25 @@ impl WorkerRuntime {
         file.flush()?;
         Ok(())
     }
+    /// Apply a size while `terminal` is held. The shared state check avoids
+    /// sending SIGWINCH for every keystroke from the already-active client.
+    fn apply_size(&self, terminal: &mut TerminalState, rows: u16, cols: u16) -> Result<()> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if (terminal.rows, terminal.cols) == (rows, cols) {
+            return Ok(());
+        }
+        let pty = lock(&self.pty_write)?;
+        let file = pty.as_ref().ok_or_else(|| anyhow!("PTY is closed"))?;
+        let previous_size = (terminal.rows, terminal.cols);
+        resize_screen_and_pty(&self.output, previous_size, (rows, cols), || {
+            set_winsize(file.as_raw_fd(), rows, cols)
+        })?;
+        terminal.rows = rows;
+        terminal.cols = cols;
+        Ok(())
+    }
+
     /// Resizes the live screen model *before* the PTY ioctl (design doc
     /// section 5.3): output already in flight at the old size is parsed at
     /// the new one -- a transient tmux shares too -- but this ordering
@@ -682,10 +740,138 @@ impl WorkerRuntime {
     /// model that's still the wrong shape for the geometry the workload was
     /// just told about.
     fn resize(&self, rows: u16, cols: u16) -> Result<()> {
-        self.output.set_size(rows, cols)?;
-        let pty = lock(&self.pty_write)?;
-        let file = pty.as_ref().ok_or_else(|| anyhow!("PTY is closed"))?;
-        set_winsize(file.as_raw_fd(), rows.max(1), cols.max(1))
+        let mut terminal = lock(&self.terminal)?;
+        self.apply_size(&mut terminal, rows, cols)
+    }
+
+    fn bump_client_activity(terminal: &mut TerminalState, client_id: u64) -> Option<(u16, u16)> {
+        let geometry = terminal.clients.get(&client_id)?.geometry;
+        if geometry.is_some() {
+            terminal.activity_clock = terminal.activity_clock.saturating_add(1);
+            if let Some(client) = terminal.clients.get_mut(&client_id) {
+                client.last_activity = terminal.activity_clock;
+            }
+        }
+        geometry
+    }
+
+    /// Registers a subscriber and renders its initial payload while holding
+    /// the client-size mutex. This makes geometry selection + snapshot one
+    /// indivisible operation with respect to another client's attach/input/
+    /// resize, instead of allowing a concurrent client to change the model's
+    /// dimensions between those two steps.
+    fn attach_client(
+        &self,
+        payload: AttachPayload,
+        geometry: Option<(u16, u16)>,
+    ) -> Result<(u64, u64, Vec<u8>, OutputReceiver)> {
+        let mut terminal = lock(&self.terminal)?;
+        let previous_size = (terminal.rows, terminal.cols);
+        let client_id = terminal.next_client_id;
+        terminal.next_client_id += 1;
+        terminal.clients.insert(
+            client_id,
+            AttachedClient {
+                geometry,
+                last_activity: 0,
+            },
+        );
+        if let Some((rows, cols)) = Self::bump_client_activity(&mut terminal, client_id) {
+            // Attaching a real terminal makes it the latest active client,
+            // matching tmux. Keep attach best-effort if the PTY is exiting.
+            let _ = self.apply_size(&mut terminal, rows, cols);
+        }
+        match self.output.subscribe(payload) {
+            Ok((subscription, initial, rx)) => Ok((client_id, subscription, initial, rx)),
+            Err(error) => {
+                terminal.clients.remove(&client_id);
+                // The attach was never established, so it must not retain
+                // ownership of the shared PTY geometry. No other client can
+                // race us while `terminal` is held.
+                let _ = self.apply_size(&mut terminal, previous_size.0, previous_size.1);
+                Err(error)
+            }
+        }
+    }
+
+    /// Input activity transfers size ownership before the bytes reach the
+    /// workload. Both operations happen under `terminal`, so another client
+    /// cannot slip its resize between this client's activation and input.
+    fn send_from_client(&self, client_id: u64, data: &[u8]) -> Result<()> {
+        let mut terminal = lock(&self.terminal)?;
+        if let Some((rows, cols)) = Self::bump_client_activity(&mut terminal, client_id) {
+            // Preserve input delivery if a closing/broken PTY rejects the
+            // best-effort geometry update; `send` below remains the source
+            // of truth for whether the workload can still accept input.
+            let _ = self.apply_size(&mut terminal, rows, cols);
+        }
+        // PTY writes can block behind a stopped or backpressured workload.
+        // Geometry ownership is settled above; never hold the global client
+        // registry mutex while waiting for the workload to consume input.
+        drop(terminal);
+        self.send(data)
+    }
+
+    fn resize_client(&self, client_id: u64, rows: u16, cols: u16) -> Result<()> {
+        let (rows, cols) = screen::validate_size(rows, cols)?;
+        let mut terminal = lock(&self.terminal)?;
+        let previous_activity_clock = terminal.activity_clock;
+        let client = terminal
+            .clients
+            .get_mut(&client_id)
+            .ok_or_else(|| anyhow!("attached client is gone"))?;
+        let previous_client = *client;
+        client.geometry = Some((rows, cols));
+        let (rows, cols) = Self::bump_client_activity(&mut terminal, client_id)
+            .ok_or_else(|| anyhow!("attached client has no geometry"))?;
+        if let Err(error) = self.apply_size(&mut terminal, rows, cols) {
+            terminal.activity_clock = previous_activity_clock;
+            if let Some(client) = terminal.clients.get_mut(&client_id) {
+                *client = previous_client;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn signal_from_client(&self, client_id: u64, signal: i32) -> Result<()> {
+        let mut terminal = lock(&self.terminal)?;
+        if let Some((rows, cols)) = Self::bump_client_activity(&mut terminal, client_id) {
+            let _ = self.apply_size(&mut terminal, rows, cols);
+        }
+        self.signal(signal)
+    }
+
+    /// If the latest client leaves, fall back to the most recently active
+    /// remaining sized client. If no sized client remains, keep the current
+    /// PTY size, as tmux does for a detached window.
+    fn detach_client(&self, client_id: u64) {
+        let Ok(mut terminal) = self.terminal.lock() else {
+            return;
+        };
+        let latest_before = terminal
+            .clients
+            .iter()
+            .filter(|(_, client)| client.geometry.is_some())
+            .max_by_key(|(_, client)| client.last_activity)
+            .map(|(&id, _)| id);
+        terminal.clients.remove(&client_id);
+        if latest_before != Some(client_id) {
+            return;
+        }
+        let fallback = terminal
+            .clients
+            .values()
+            .filter_map(|client| {
+                client
+                    .geometry
+                    .map(|geometry| (client.last_activity, geometry))
+            })
+            .max_by_key(|(activity, _)| *activity)
+            .map(|(_, geometry)| geometry);
+        if let Some((rows, cols)) = fallback {
+            let _ = self.apply_size(&mut terminal, rows, cols);
+        }
     }
     fn signal(&self, signal: i32) -> Result<()> {
         let workload = lock(&self.workload)?;
@@ -768,6 +954,28 @@ impl WorkerRuntime {
             r.tag = tag;
         })
     }
+}
+
+/// Keep the rendered model and kernel PTY geometry transactional. The model
+/// must be resized first so concurrent output is parsed at the intended new
+/// dimensions, but a rejected ioctl must not leave future snapshots claiming
+/// a size the workload never received.
+fn resize_screen_and_pty(
+    output: &OutputHub,
+    previous_size: (u16, u16),
+    new_size: (u16, u16),
+    resize_pty: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    output.set_size(new_size.0, new_size.1)?;
+    if let Err(error) = resize_pty() {
+        if let Err(rollback_error) = output.set_size(previous_size.0, previous_size.1) {
+            eprintln!(
+                "aplexer worker: roll back screen after PTY resize failure: {rollback_error:#}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
@@ -1279,6 +1487,13 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             workload: Mutex::new(WorkloadState {
                 running: true,
                 pgid: pid as i32,
+            }),
+            terminal: Mutex::new(TerminalState {
+                rows,
+                cols,
+                clients: HashMap::new(),
+                next_client_id: 1,
+                activity_clock: 0,
             }),
             cgroup: Mutex::new(cgroup),
             kill_gate: Mutex::new(()),
@@ -2104,9 +2319,10 @@ fn handle_attach(
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<()> {
-    if let (Some(rows), Some(cols)) = (rows, cols) {
-        screen::validate_size(rows, cols)?;
-    }
+    let geometry = match (rows, cols) {
+        (Some(rows), Some(cols)) => Some(screen::validate_size(rows, cols)?),
+        _ => None,
+    };
     // An established attach is intentionally long-lived. Before this point,
     // the handshake used the worker-wide deadline so a peer cannot reserve a
     // connection slot forever with a partial frame.
@@ -2120,15 +2336,17 @@ fn handle_attach(
     // already closing) must not block the attach -- the pre-existing
     // client-side post-connect Resize control frame remains the fallback
     // (section 6.3 step 7).
-    if let (Some(rows), Some(cols)) = (rows, cols) {
-        let _ = runtime.resize(rows, cols);
-    }
     let payload = if want_screen {
         AttachPayload::Screen
     } else {
         AttachPayload::Tail(history_bytes)
     };
-    let (subscription, initial, rx) = runtime.output.subscribe(payload)?;
+    let (client_id, subscription, initial, rx) = runtime.attach_client(payload, geometry)?;
+    let _attach_guard = AttachGuard {
+        runtime: runtime.clone(),
+        client_id,
+        subscription,
+    };
     let writer_stream = reader.try_clone()?;
     let writer = Arc::new(Mutex::new(writer_stream));
     {
@@ -2198,7 +2416,7 @@ fn handle_attach(
         };
         match frame.kind {
             FrameKind::Data => {
-                if runtime.send(&frame.payload).is_err() {
+                if runtime.send_from_client(client_id, &frame.payload).is_err() {
                     break;
                 }
             }
@@ -2207,17 +2425,33 @@ fn handle_attach(
                 let control: AttachControl = serde_json::from_slice(&frame.payload)?;
                 match control {
                     AttachControl::Resize { rows, cols } => {
-                        let _ = runtime.resize(rows, cols);
+                        let _ = runtime.resize_client(client_id, rows, cols);
                     }
                     AttachControl::Signal { signal } => {
-                        let _ = runtime.signal(signal);
+                        let _ = runtime.signal_from_client(client_id, signal);
                     }
                     AttachControl::Detach => break,
                 }
             }
         }
     }
-    runtime.output.unsubscribe(subscription);
     let _ = reader.shutdown(std::net::Shutdown::Both);
     Ok(())
+}
+
+/// Ensures every attach exit path (EOF, explicit detach, malformed control
+/// frame, or socket error) removes both the output subscription and its
+/// geometry entry. `OutputHub::unsubscribe` is idempotent, so it is safe for
+/// the writer thread to race this cleanup after a failed write.
+struct AttachGuard {
+    runtime: Arc<WorkerRuntime>,
+    client_id: u64,
+    subscription: u64,
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        self.runtime.output.unsubscribe(self.subscription);
+        self.runtime.detach_client(self.client_id);
+    }
 }

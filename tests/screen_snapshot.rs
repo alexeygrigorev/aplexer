@@ -33,7 +33,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aplexer::{frame_json, read_frame, write_json, FrameKind, Operation, Request, Response};
+use aplexer::{
+    frame_json, read_frame, write_frame, write_json, AttachControl, FrameKind, Operation, Request,
+    Response,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -259,6 +262,47 @@ fn raw_attach(
     (stream, body, data_frame.payload)
 }
 
+fn send_attached_input(stream: &mut UnixStream, command: &str) {
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.push(b'\r');
+    write_frame(stream, FrameKind::Data, &bytes).expect("send attached input");
+}
+
+fn send_attach_control(stream: &mut UnixStream, control: &AttachControl) {
+    write_json(stream, control).expect("send attach control");
+}
+
+fn read_attached_until(stream: &mut UnixStream, marker: &str, label: &str) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set attach read timeout");
+    let mut data = Vec::new();
+    loop {
+        let frame = read_frame(stream)
+            .unwrap_or_else(|error| panic!("{label}: read attach frame: {error:#}"))
+            .unwrap_or_else(|| panic!("{label}: attach closed before marker {marker:?}"));
+        if frame.kind == FrameKind::Data {
+            data.extend_from_slice(&frame.payload);
+            if String::from_utf8_lossy(&data).contains(marker) {
+                return data;
+            }
+        }
+    }
+}
+
+fn wait_for_attach_eof(stream: &mut UnixStream, label: &str) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set attach EOF timeout");
+    loop {
+        match read_frame(stream) {
+            Ok(Some(_)) => continue,
+            Ok(None) => return,
+            Err(error) => panic!("{label}: waiting for attach EOF: {error:#}"),
+        }
+    }
+}
+
 /// Shell command (executed via `a send ... --enter`) that paints a
 /// bordered-box-like full-screen TUI on the alternate screen and moves the
 /// cursor into it -- a synthesized stand-in for the codex-like TUI the
@@ -411,6 +455,179 @@ fn old_client_compat_want_screen_false_gets_raw_tail() {
         "raw-tail replay missing the marker; got:\n{text}"
     );
 
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// tmux 3.4's default `window-size=latest` behavior, measured against two
+/// real differently-sized tmux clients, is:
+///
+/// - a newly attached client owns the PTY size;
+/// - input or resize activity transfers ownership to that client;
+/// - detaching the latest client falls back to the most recently active
+///   remaining client.
+///
+/// Exercise the same lifecycle through two simultaneous aplexer protocol
+/// attachments. The marker assertions are also the user-visible contract:
+/// text entered from device B is PTY output received by device A, and vice
+/// versa -- both clients are live views of one shared terminal.
+#[test]
+fn multi_client_attach_shares_output_and_uses_latest_active_geometry() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("multi-client");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "multi-client");
+    let socket = socket_path(&harness, &id);
+    let (mut device_a, _, _) = raw_attach(&socket, Some(0), false, Some(30), Some(100));
+    let (mut device_b, _, _) = raw_attach(&socket, Some(0), false, Some(20), Some(70));
+
+    // B attached last, so its geometry is current. Its command's composed
+    // marker does not occur literally in the typed input, proving the shell
+    // executed it and the resulting PTY output was broadcast to both A/B.
+    send_attached_input(&mut device_b, "stty size; printf 'FROM-B-%s\\n' 'VISIBLE'");
+    for (stream, label) in [(&mut device_a, "device A"), (&mut device_b, "device B")] {
+        let output = read_attached_until(stream, "FROM-B-VISIBLE", label);
+        assert!(
+            String::from_utf8_lossy(&output).contains("20 70"),
+            "{label} did not observe device B's active geometry; output:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // Typing on A makes A latest before its bytes enter the PTY. B must see
+    // both A's output and the size transition, just as A saw B's above.
+    send_attached_input(&mut device_a, "stty size; printf 'FROM-A-%s\\n' 'VISIBLE'");
+    for (stream, label) in [(&mut device_a, "device A"), (&mut device_b, "device B")] {
+        let output = read_attached_until(stream, "FROM-A-VISIBLE", label);
+        assert!(
+            String::from_utf8_lossy(&output).contains("30 100"),
+            "{label} did not observe device A's active geometry; output:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // An oversized resize is rejected before it can replace B's remembered
+    // geometry or make B the latest client. When B next types, its last valid
+    // 20x70 geometry must still transfer to the PTY.
+    send_attach_control(
+        &mut device_b,
+        &AttachControl::Resize {
+            rows: u16::MAX,
+            cols: u16::MAX,
+        },
+    );
+    send_attached_input(
+        &mut device_b,
+        "stty size; printf 'B-AFTER-INVALID-%s\n' 'VISIBLE'",
+    );
+    for (stream, label) in [(&mut device_a, "device A"), (&mut device_b, "device B")] {
+        let output = read_attached_until(stream, "B-AFTER-INVALID-VISIBLE", label);
+        assert!(
+            String::from_utf8_lossy(&output).contains("20 70"),
+            "{label} observed invalid resize mutate B's remembered geometry; output:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // A terminal resize is activity in tmux and likewise makes B latest.
+    send_attach_control(&mut device_b, &AttachControl::Resize { rows: 25, cols: 90 });
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "stty size; printf 'B-RESIZE-%s\\n' 'VISIBLE'",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    for (stream, label) in [(&mut device_a, "device A"), (&mut device_b, "device B")] {
+        let output = read_attached_until(stream, "B-RESIZE-VISIBLE", label);
+        assert!(
+            String::from_utf8_lossy(&output).contains("25 90"),
+            "{label} did not observe device B's resized geometry; output:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // B is latest. Once it detaches, the PTY immediately falls back to A's
+    // last geometry; the out-of-band send deliberately cannot make A active
+    // and mask a missing detach fallback.
+    send_attach_control(&mut device_b, &AttachControl::Detach);
+    wait_for_attach_eof(&mut device_b, "device B");
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "stty size; printf 'AFTER-B-%s\\n' 'DETACH'",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    let output = read_attached_until(&mut device_a, "AFTER-B-DETACH", "device A");
+    assert!(
+        String::from_utf8_lossy(&output).contains("30 100"),
+        "device A did not regain geometry after B detached; output:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+#[test]
+fn rejected_attach_does_not_keep_its_requested_geometry() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("rejected-attach-geometry");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "rejected-attach-geometry");
+    let socket = socket_path(&harness, &id);
+    let (mut owner, _, _) = raw_attach(&socket, Some(0), false, Some(30), Some(100));
+    let mut held = Vec::new();
+    // One owner plus 63 geometry-less clients fills the worker's bounded
+    // subscriber registry without changing the owner's PTY size.
+    for _ in 0..63 {
+        held.push(raw_attach(&socket, Some(0), false, None, None).0);
+    }
+
+    let mut rejected = UnixStream::connect(&socket).expect("connect rejected attach");
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_json(
+        &mut rejected,
+        &Request::new(Operation::Attach {
+            history_bytes: Some(0),
+            want_screen: false,
+            rows: Some(10),
+            cols: Some(20),
+        }),
+    )
+    .unwrap();
+    match read_frame(&mut rejected) {
+        Ok(None) => {}
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {}
+        other => panic!("over-capacity attach was not rejected: {other:?}"),
+    }
+
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "stty size; printf 'AFTER-REJECT-%s\\n' 'VISIBLE'",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    let output = read_attached_until(&mut owner, "AFTER-REJECT-VISIBLE", "owner");
+    assert!(
+        String::from_utf8_lossy(&output).contains("30 100"),
+        "rejected attach retained its 10x20 geometry; output:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    drop(held);
     harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
 }
 
@@ -864,6 +1081,94 @@ fn set_scroll_region_and_wait(harness: &Harness, id: &str) {
 /// entirely by which region the host terminal has in force.
 fn scroll_command(prefix: &str, count: u32) -> String {
     format!("for i in $(seq 1 {count}); do echo {prefix}-$i; done")
+}
+
+/// End-user version of the raw-protocol multi-client test above: run two
+/// actual `a attach` processes on differently-sized PTYs, type on each
+/// device, and assert the other device receives the executed output. This
+/// includes the CLI's raw mode, input scanner, status-row reservation, and
+/// stdout rendering -- the same path used by two laptops/phones attaching
+/// over separate SSH connections.
+#[test]
+fn two_real_attach_clients_see_each_others_changes() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("two-real-clients");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "two-real-clients");
+    let mut device_a = PtyClient::spawn(&harness, &id, 30, 100);
+    device_a.wait_for(b"[aplexer attached", 0, "device A to attach");
+    let mut device_b = PtyClient::spawn(&harness, &id, 20, 70);
+    device_b.wait_for(b"[aplexer attached", 0, "device B to attach");
+
+    let a_mark = device_a.mark();
+    let b_mark = device_b.mark();
+    device_b.send(b"stty size; printf 'FROM-B-%s\\n' 'VISIBLE'\r");
+    let a_end = device_a.wait_for_offset(
+        b"FROM-B-VISIBLE",
+        a_mark,
+        "device A to see device B's output",
+    );
+    let b_end = device_b.wait_for_offset(b"FROM-B-VISIBLE", b_mark, "device B to see its output");
+    for (output, start, end, label) in [
+        (device_a.output(), a_mark, a_end, "device A"),
+        (device_b.output(), b_mark, b_end, "device B"),
+    ] {
+        assert!(
+            String::from_utf8_lossy(&output[start..end]).contains("19 70"),
+            "{label} did not see device B's tmux-style active size; captured:\n{}",
+            escape(&output[start..end])
+        );
+    }
+    for (client, rows, cols, label) in [
+        (&device_a, 30, 100, "device A"),
+        (&device_b, 20, 70, "device B"),
+    ] {
+        let host = host_terminal(&client.output(), rows, cols);
+        let contents = host.screen().contents();
+        assert!(
+            contents.contains("FROM-B-VISIBLE"),
+            "{label} received device B's bytes but did not visibly render them at {rows}x{cols}; \
+             screen:\n{contents}"
+        );
+    }
+
+    let a_mark = device_a.mark();
+    let b_mark = device_b.mark();
+    device_a.send(b"stty size; printf 'FROM-A-%s\\n' 'VISIBLE'\r");
+    let a_end = device_a.wait_for_offset(b"FROM-A-VISIBLE", a_mark, "device A to see its output");
+    let b_end = device_b.wait_for_offset(
+        b"FROM-A-VISIBLE",
+        b_mark,
+        "device B to see device A's output",
+    );
+    for (output, start, end, label) in [
+        (device_a.output(), a_mark, a_end, "device A"),
+        (device_b.output(), b_mark, b_end, "device B"),
+    ] {
+        assert!(
+            String::from_utf8_lossy(&output[start..end]).contains("29 100"),
+            "{label} did not see device A's tmux-style active size; captured:\n{}",
+            escape(&output[start..end])
+        );
+    }
+    for (client, rows, cols, label) in [
+        (&device_a, 30, 100, "device A"),
+        (&device_b, 20, 70, "device B"),
+    ] {
+        let host = host_terminal(&client.output(), rows, cols);
+        let contents = host.screen().contents();
+        assert!(
+            contents.contains("FROM-A-VISIBLE"),
+            "{label} received device A's bytes but did not visibly render them at {rows}x{cols}; \
+             screen:\n{contents}"
+        );
+    }
+
+    device_b.detach();
+    device_a.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
 }
 
 /// Regression test for the *client-side* half of the scroll-region fix: the
