@@ -1,0 +1,12 @@
+version = 1
+revision = 3
+requires-python = ">=3.8"
+
+[options]
+exclude-newer = "2026-08-20T07:11:18.987777261Z"
+exclude-newer-span = "P7D"
+
+[[package]]
+name = "aplexer"
+version = "0.1.1"
+source = { editable = "." }
