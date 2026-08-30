@@ -2009,6 +2009,17 @@ fn release_anchor_child(anchor: &mut std::process::Child) -> Result<()> {
     Ok(())
 }
 
+fn release_anchor_slot<T>(
+    slot: &mut Option<T>,
+    release: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<()> {
+    if let Some(anchor) = slot.as_mut() {
+        release(anchor)?;
+        *slot = None;
+    }
+    Ok(())
+}
+
 fn cleanup_anchor_after_failure(
     anchor: &mut std::process::Child,
     error: anyhow::Error,
@@ -2155,11 +2166,7 @@ impl Cgroup {
             .anchor
             .lock()
             .map_err(|_| anyhow!("systemd-run anchor lock poisoned"))?;
-        if let Some(anchor) = slot.as_mut() {
-            release_anchor_child(anchor)?;
-            *slot = None;
-        }
-        Ok(())
+        release_anchor_slot(&mut slot, release_anchor_child)
     }
     pub fn signal_all_until(&self, signal: i32, deadline: Instant) -> Result<()> {
         check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
@@ -3358,17 +3365,11 @@ mod tests {
 
     #[test]
     fn cgroup_anchor_release_retains_handle_when_reaping_fails() {
-        let mut anchor = Command::new("/bin/true").spawn().unwrap();
-        anchor.wait().unwrap();
-        let cgroup = Cgroup {
-            path: PathBuf::from("/does/not/exist"),
-            identity: current_cgroup_identity().unwrap(),
-            anchor: Arc::new(Mutex::new(Some(anchor))),
-            initial_oom_kill: 0,
-        };
-
-        assert!(cgroup.release_anchor().is_err());
-        assert!(cgroup.anchor.lock().unwrap().is_some());
+        let mut slot = Some(7_u8);
+        let error = release_anchor_slot(&mut slot, |_| bail!("injected release failure"))
+            .expect_err("release must fail");
+        assert!(error.to_string().contains("injected release failure"));
+        assert_eq!(slot, Some(7), "failed release must preserve ownership");
     }
 
     #[test]
