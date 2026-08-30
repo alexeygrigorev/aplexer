@@ -190,6 +190,126 @@ fn zero_timeout_rolls_back_and_same_tag_can_retry() {
 }
 
 #[test]
+fn failed_replacement_preserves_finished_session_evidence() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+
+    let old = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'important-old-history\\n'",
+    ]);
+    assert!(
+        old.status.success(),
+        "old session failed: {}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let old: Value = serde_json::from_slice(&old.stdout).expect("old session JSON");
+    let old_id = old["id"].as_str().expect("old session id");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snapshot = harness.run(&["snapshot"]);
+        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+        let finished = records.as_array().is_some_and(|records| {
+            records.iter().any(|record| {
+                record["id"] == old_id
+                    && record["phase"] == "exited"
+                    && record["worker_alive"] == false
+            })
+        });
+        if finished {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old session did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let capture_before = harness.run(&["capture", old_id]);
+    assert_eq!(capture_before.stdout, b"important-old-history\r\n");
+
+    let replacement = harness.run(&[
+        "start",
+        "--startup-timeout-ms",
+        "0",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sleep",
+        "30",
+    ]);
+    assert!(!replacement.status.success(), "replacement unexpectedly started");
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("within 0 ms"));
+
+    let capture_after = harness.run(&["capture", old_id]);
+    assert!(
+        capture_after.status.success(),
+        "old capture was lost: {}",
+        String::from_utf8_lossy(&capture_after.stderr)
+    );
+    assert_eq!(capture_after.stdout, capture_before.stdout);
+    assert!(
+        harness
+            .state_dir
+            .path()
+            .join("sessions")
+            .join(old_id)
+            .exists(),
+        "failed replacement removed old durable state"
+    );
+
+    let successful = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sleep",
+        "30",
+    ]);
+    assert!(
+        successful.status.success(),
+        "successful replacement failed: {}",
+        String::from_utf8_lossy(&successful.stderr)
+    );
+    let successful: Value =
+        serde_json::from_slice(&successful.stdout).expect("replacement JSON");
+    assert!(
+        !harness
+            .state_dir
+            .path()
+            .join("sessions")
+            .join(old_id)
+            .exists(),
+        "ready replacement did not retire old durable state"
+    );
+    let replacement_id = successful["id"].as_str().expect("replacement id");
+    let killed = harness.run(&[
+        "kill",
+        replacement_id,
+        "--signal",
+        "KILL",
+        "--grace-ms",
+        "0",
+    ]);
+    assert!(killed.status.success(), "replacement cleanup failed");
+}
+
+#[test]
 #[cfg(feature = "startup-test-hooks")]
 fn timeout_after_workload_spawn_does_not_orphan_workload() {
     let harness = Harness::new();

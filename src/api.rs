@@ -1117,19 +1117,16 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
     worker_command(id, req.python.as_deref())?;
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
-    if let Some(existing) = list_records(paths)?
+    let superseded = list_records(paths)?
         .into_iter()
-        .find(|r| r.workspace == workspace && r.tag == req.tag)
-    {
+        .find(|r| r.workspace == workspace && r.tag == req.tag);
+    if let Some(existing) = &superseded {
         if !existing.worker_finished() {
             bail!(
                 "workspace+tag already belongs to session {}; rename it or choose a different tag",
                 existing.id
             );
         }
-        fs::remove_dir_all(paths.state_session(existing.id))
-            .with_context(|| format!("remove superseded session {}", existing.id))?;
-        let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
     }
     let mut startup = StartupGuard::new(paths, id);
     let result = (|| -> Result<SessionRecord> {
@@ -1249,6 +1246,20 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     match result {
         Ok(record) => {
             startup.hand_off_to_reaper()?;
+            // Keep a finished predecessor's post-mortem evidence until the
+            // replacement has completed startup and its worker is safely
+            // owned by the detached reaper. A failed replacement therefore
+            // cannot destroy history, final screen, or transcript bindings.
+            if let Some(existing) = superseded {
+                if let Err(error) = fs::remove_dir_all(paths.state_session(existing.id)) {
+                    eprintln!(
+                        "aplexer: replacement {} is ready, but superseded session {} could not be removed: {error}",
+                        record.id, existing.id
+                    );
+                } else {
+                    let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
+                }
+            }
             Ok(record)
         }
         Err(start_error) => match startup.rollback() {
