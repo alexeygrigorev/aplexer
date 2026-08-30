@@ -117,7 +117,10 @@ fn worker_recovers_after_accept_hits_file_descriptor_limit() {
         if String::from_utf8_lossy(&capture.stdout).contains(marker) {
             break;
         }
-        assert!(Instant::now() < deadline, "shell stopped responding after EMFILE");
+        assert!(
+            Instant::now() < deadline,
+            "shell stopped responding after EMFILE"
+        );
         thread::sleep(Duration::from_millis(50));
     }
 }
