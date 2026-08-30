@@ -172,3 +172,73 @@ fn stdin_eof_detaches_without_ending_the_session() {
 
     let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
 }
+
+#[test]
+fn redirected_stdin_eof_resets_modes_written_to_tty_stdout() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().unwrap();
+    let id = harness.start(workspace.path(), "mixed-fd-eof");
+    let sent = harness.output(&[
+        "send",
+        &id,
+        r#"printf '\033[?1049h\033[?1000h\033[?1006hMIXED-FD-MARK'"#,
+        "--enter",
+    ]);
+    assert!(sent.status.success(), "send failed: {sent:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = harness.output(&["capture", &id, "--screen"]);
+        if snapshot.status.success()
+            && snapshot.stdout.starts_with(b"\x1b[?1049h")
+            && snapshot
+                .stdout
+                .windows(b"MIXED-FD-MARK".len())
+                .any(|window| window == b"MIXED-FD-MARK")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "mode snapshot was not ready");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let (mut master, slave) = aplexer::open_pty(24, 80).unwrap();
+    let mut command = harness.command();
+    command.args(["attach", &id]);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::from(slave.try_clone().unwrap()));
+    command.stderr(Stdio::from(slave.try_clone().unwrap()));
+    let mut child = command.spawn().unwrap();
+
+    let status = wait_for_exit(&mut child);
+    assert!(status.success(), "attach failed after stdin EOF: {status}");
+    let mut bytes = Vec::new();
+    read_until(
+        &mut master,
+        &mut bytes,
+        b"\x1b[?1049l\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
+    );
+    assert!(
+        bytes
+            .windows(b"\x1b[?1049h".len())
+            .any(|window| window == b"\x1b[?1049h"),
+        "attach never wrote the alternate-screen snapshot"
+    );
+    assert!(
+        bytes
+            .windows(b"\x1b[?1000h".len())
+            .any(|window| window == b"\x1b[?1000h")
+            && bytes
+                .windows(b"\x1b[?1006h".len())
+                .any(|window| window == b"\x1b[?1006h"),
+        "attach never wrote the snapshot's mouse modes"
+    );
+
+    let output = harness.output(&["status", &id, "--json"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["phase"], "running");
+    assert_eq!(value["worker_alive"], true);
+
+    let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
+}

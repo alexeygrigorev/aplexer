@@ -759,15 +759,14 @@ fn attach_round_trip_latency() {
 // ---------------------------------------------------------------------------
 // Client-side terminal-state wiring, driven through a real PTY.
 //
-// `a attach`'s scroll-region handling lives entirely behind
-// `isatty(STDIN_FILENO)`: the snapshot scan, the Data-frame scan, the
-// resize-poll thread's seeding, the status bar's margin re-assert and the
-// session-switch margin reset all only run for a tty client. The raw
-// control-socket helpers above therefore cannot reach any of it. These tests
-// spawn the real `a attach` binary with its stdio on a PTY, capture every
+// `a attach`'s visual terminal handling is gated by a tty stdout, while raw
+// input/prefix scanning is independently gated by a tty stdin. The raw
+// control-socket helpers above cannot reach either side. These tests spawn
+// the real `a attach` binary with both descriptors on a PTY, capture every
 // byte it writes, and replay those bytes into a `vt100::Parser` acting as the
 // user's terminal -- so the assertions are about what the terminal actually
-// ends up showing, not about internal state.
+// ends up showing, not about internal state. Mixed-descriptor behavior has a
+// separate regression in terminal_signal_cleanup.rs.
 // ---------------------------------------------------------------------------
 
 /// A live `a attach` process on its own PTY, with everything it writes to the

@@ -3070,8 +3070,8 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
 /// -- explicit Ctrl-b d detach, the remote session exiting, a connection
 /// error, or an early `?` return -- so a new exit path added later can't
-/// forget the cleanup. Only constructed when stdin is a tty (mirrors
-/// `RawMode`, which it's dropped alongside).
+/// forget the cleanup. Constructed whenever stdout is a tty, independently
+/// of whether stdin is interactive; `RawMode` remains stdin-specific.
 struct TerminalUiGuard {
     stdout: Arc<Mutex<io::Stdout>>,
 }
@@ -4044,7 +4044,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     check_attachable(record)?;
     let explicit_history = history_bytes.is_some();
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
-    let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let input_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let display_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     // Geometry read up front (docs/terminal-state-design.md section 6.3
     // step 1), not after the handshake: sent in the Attach request itself
     // so the worker can resize the PTY and its screen model *before*
@@ -4052,28 +4053,36 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // SIGWINCH repaint. `--history-bytes` is the explicit escape hatch back
     // to the old raw-tail semantics (section 6.1); `want_screen` follows
     // its absence.
-    let initial_geometry = if tty {
+    let initial_geometry = if display_tty {
+        terminal_size(libc::STDOUT_FILENO)
+    } else if input_tty {
         terminal_size(libc::STDIN_FILENO)
     } else {
         None
     };
-    let handshake = establish(
-        record,
-        replay_bytes,
-        !explicit_history,
-        initial_geometry.map(|(rows, cols)| (reserved_rows(rows), cols)),
-    )?;
+    let worker_geometry = initial_geometry.map(|(rows, cols)| {
+        (
+            if display_tty {
+                reserved_rows(rows)
+            } else {
+                rows
+            },
+            cols,
+        )
+    });
+    let handshake = establish(record, replay_bytes, !explicit_history, worker_geometry)?;
     let mut reader = handshake.reader;
     let stdout = Arc::new(Mutex::new(io::stdout()));
-    let _raw = if tty {
+    let _raw = if input_tty {
         Some(RawMode::enter(libc::STDIN_FILENO)?)
     } else {
         None
     };
-    // Constructed only for a tty, and dropped (LIFO, so before `_raw`
-    // restores cooked termios) on every exit from this point on -- see
-    // `TerminalUiGuard`'s doc comment for why this is the one cleanup path.
-    let _ui_guard = if tty {
+    // Display cleanup is independent of where input comes from. In
+    // particular, `a attach </dev/null` still writes the snapshot to a tty
+    // stdout before stdin EOF detaches, so it must undo that snapshot's
+    // alternate-screen and input modes even though stdin was never raw.
+    let _ui_guard = if display_tty {
         Some(TerminalUiGuard {
             stdout: stdout.clone(),
         })
@@ -4082,7 +4091,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     };
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let active = Arc::new(AtomicBool::new(true));
-    let mut signal_bridge = if tty {
+    let mut signal_bridge = if input_tty || display_tty {
         Some(AttachSignalBridge::install(writer.clone(), active.clone())?)
     } else {
         None
@@ -4109,9 +4118,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // bar row), which is what a DECSTBM the workload emits is validated
     // against -- see `StatusBarCtx::workload_margins`.
     let workload_margins = Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(
-        initial_geometry
-            .map(|(rows, _)| reserved_rows(rows))
-            .unwrap_or(24),
+        worker_geometry.map(|(rows, _)| rows).unwrap_or(24),
     )));
     let status_ctx = StatusBarCtx {
         stdout: stdout.clone(),
@@ -4128,12 +4135,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // re-establishes below (numerically within rows 1..rows-1, since the
     // workload PTY is one row shorter) lands after and wins, while a
     // default-margin workload leaves this reservation standing.
-    if tty {
+    if display_tty {
         if let Some((rows, cols)) = initial_geometry {
             apply_terminal_layout(&stdout, &term, rows, cols);
         }
     }
-    if tty {
+    if display_tty {
         // No banner into the output stream (section 6.3 step 6 / section
         // 10.1 item c): printed here, before the snapshot write below, so
         // the snapshot's own ED2 clear repaints over it -- this ordering
@@ -4149,7 +4156,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // re-assert that region instead of overwriting it with the bar's own.
     scan_workload_margins(&workload_margins, &handshake.initial);
     write_locked(&stdout, &handshake.initial)?;
-    if tty {
+    if display_tty {
         draw_status_bar(&status_ctx, true); // the snapshot's ED2 blanked the bar row
     }
     // The explicit post-connect Resize control send is unnecessary when the
@@ -4157,15 +4164,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // (the "screen" key is present in the response either way, true or
     // false); kept only for the old-worker fallback path, whose response
     // predates the field (section 6.3 step 7).
-    if tty && handshake.screen.is_none() {
-        if let Some((rows, cols)) = initial_geometry {
-            send_control(
-                &writer,
-                &AttachControl::Resize {
-                    rows: reserved_rows(rows),
-                    cols,
-                },
-            )?;
+    if handshake.screen.is_none() {
+        if let Some((rows, cols)) = worker_geometry {
+            send_control(&writer, &AttachControl::Resize { rows, cols })?;
         }
     }
 
@@ -4213,7 +4214,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     break;
                 }
             };
-            if !tty {
+            if !input_tty {
                 if send_data(&input_writer, &buffer[..n]).is_err() {
                     detach_attached_client(&input_writer, &input_active);
                     break;
@@ -4266,7 +4267,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             }
         }
     });
-    if tty {
+    if display_tty {
         let resize_writer = writer.clone();
         let resize_active = active.clone();
         let resize_stdout = stdout.clone();
@@ -4284,7 +4285,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             // roughly 200 ms after every attach.
             let mut last = resize_initial;
             while resize_active.load(Ordering::Relaxed) {
-                let size = terminal_size(libc::STDIN_FILENO);
+                let size = terminal_size(libc::STDOUT_FILENO);
                 if size != last {
                     if let Some((rows, cols)) = size {
                         // Keep the client's tracker in step with the
