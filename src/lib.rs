@@ -1810,7 +1810,10 @@ impl Cgroup {
     // scope directly under the user's own slice (a sibling, not a nested
     // child, of the ambient cgroup) and hold it open with a placeholder
     // process until the real workload can be moved in.
-    pub fn create(id: Uuid, limits: &Limits) -> Result<Option<Self>> {
+    pub fn create<F>(id: Uuid, limits: &Limits, setup_started: F) -> Result<Option<Self>>
+    where
+        F: FnOnce(),
+    {
         if !limits.requested() {
             return Ok(None);
         }
@@ -1855,6 +1858,10 @@ impl Cgroup {
         let mut anchor = command
             .spawn()
             .context("spawn systemd-run anchor; limits fail closed")?;
+        // From this point, systemd may own a scope member outside the worker's
+        // procfs descendant tree. Let the caller preserve recovery evidence
+        // until an authoritative cgroup path has been recorded.
+        setup_started();
         let anchor_pid = anchor.id();
         thread::spawn(move || {
             let _ = anchor.wait();
@@ -2273,24 +2280,22 @@ fn kill_cgroup_path_until(path: &Path, deadline: Instant) -> Result<()> {
 fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
     let deadline = Instant::now() + timeout;
     loop {
-        let output = Command::new("systemctl")
-            .args([
-                "--user",
-                "show",
-                &format!("{unit}.scope"),
-                "-p",
-                "ControlGroup",
-                "--value",
-            ])
-            .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let relative = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !relative.is_empty() && relative != "/" {
-                    let path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-                    if path.join("cgroup.procs").exists() {
-                        return Ok(path);
-                    }
+        let mut command = Command::new("systemctl");
+        command.args([
+            "--user",
+            "show",
+            &format!("{unit}.scope"),
+            "-p",
+            "ControlGroup",
+            "--value",
+        ]);
+        let output = command_output_until(&mut command, deadline, "query systemd scope")?;
+        if output.status.success() {
+            let relative = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !relative.is_empty() && relative != "/" {
+                let path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+                if path.join("cgroup.procs").exists() {
+                    return Ok(path);
                 }
             }
         }
@@ -2299,6 +2304,64 @@ fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Run a small setup query without allowing a wedged helper to defeat the
+/// caller's wall-clock timeout. Stdout is intentionally bounded: systemctl's
+/// ControlGroup value is one short path, and anything larger is malformed.
+fn command_output_until(
+    command: &mut Command,
+    deadline: Instant,
+    operation: &str,
+) -> Result<std::process::Output> {
+    if Instant::now() >= deadline {
+        bail!("timed out before {operation}");
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn helper to {operation}"))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).with_context(|| format!("wait for {operation}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            // A helper stuck in uninterruptible sleep must not extend the
+            // startup deadline. Reap asynchronously once the kernel permits.
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            bail!("timed out waiting to {operation}");
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(Duration::from_millis(20).min(remaining));
+    };
+    if Instant::now() >= deadline {
+        bail!("timed out waiting to {operation}");
+    }
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{operation} helper has no stdout"))?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut stdout)
+        .with_context(|| format!("read output from {operation}"))?;
+    if stdout.len() > 64 * 1024 {
+        bail!("output from {operation} exceeds 64 KiB");
+    }
+    if Instant::now() >= deadline {
+        bail!("timed out reading output from {operation}");
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 fn read_counter(path: &Path, key: &str) -> Result<u64> {
     let text = fs::read_to_string(path)?;
@@ -2824,6 +2887,35 @@ mod tests {
         .unwrap();
         signal_cgroup_path_until(dir.path(), 0, Instant::now() + Duration::from_secs(1))
             .expect("pidfd signal-zero probe");
+    }
+
+    #[test]
+    fn cgroup_setup_helper_obeys_wall_clock_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let error = command_output_until(
+            &mut command,
+            Instant::now() + Duration::from_millis(50),
+            "exercise setup timeout",
+        )
+        .expect_err("wedged setup helper must time out");
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cgroup_setup_helper_collects_bounded_output() {
+        let mut command = Command::new("/bin/printf");
+        command.arg("/user.slice/example.scope\n");
+        let output = command_output_until(
+            &mut command,
+            Instant::now() + Duration::from_secs(1),
+            "exercise setup output",
+        )
+        .expect("short-lived setup helper");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"/user.slice/example.scope\n");
     }
 
     #[test]

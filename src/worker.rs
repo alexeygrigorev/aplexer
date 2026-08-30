@@ -831,6 +831,7 @@ struct StartupGuard {
     socket_path: std::path::PathBuf,
     failure_record: SessionRecord,
     cgroup: Option<Cgroup>,
+    cgroup_setup_started: bool,
     child: Option<Arc<Mutex<Option<Child>>>>,
 }
 
@@ -843,6 +844,7 @@ impl StartupGuard {
             socket_path: paths.socket(record.id),
             failure_record: record.clone(),
             cgroup: None,
+            cgroup_setup_started: false,
             child: None,
         }
     }
@@ -935,6 +937,11 @@ impl StartupGuard {
                     }
                 }
             }
+        }
+        if self.cgroup_setup_started && self.cgroup.is_none() {
+            cleanup_failures.push(
+                "cgroup setup spawned a helper but no authoritative locator was recorded".into(),
+            );
         }
 
         self.failure_record.phase = Phase::Failed;
@@ -1098,7 +1105,9 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
 
         let requested_size = initial_size.unwrap_or((24, 80));
         let (rows, cols) = screen::validate_size(requested_size.0, requested_size.1)?;
-        let cgroup = Cgroup::create(id, &record.limits)?;
+        let cgroup = Cgroup::create(id, &record.limits, || {
+            startup.cgroup_setup_started = true;
+        })?;
         startup.cgroup = cgroup.clone();
         record.containment_cgroup = cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
         startup.failure_record = record.clone();
