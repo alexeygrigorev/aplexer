@@ -1,4 +1,5 @@
 use aplexer::{atomic_write_json, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -86,6 +87,13 @@ impl Harness {
             .output()
             .unwrap()
     }
+
+    fn capture_json(&self, record: &SessionRecord) -> std::process::Output {
+        self.command()
+            .args(["--json", "capture", &record.id.to_string()])
+            .output()
+            .unwrap()
+    }
 }
 
 #[test]
@@ -118,4 +126,32 @@ fn persisted_history_remains_available_for_terminal_and_dead_workers() {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, history.as_bytes());
     }
+}
+
+#[test]
+fn json_capture_base64_preserves_arbitrary_bytes_without_lossy_utf8() {
+    let harness = Harness::new();
+    let record = harness.record(Phase::Exited, None, &[0x00, 0xff, b'A', 0x80]);
+
+    let output = harness.capture_json(&record);
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["id"], record.id.to_string());
+    assert_eq!(value["bytes"], 4);
+    assert_eq!(value["encoding"], "base64");
+    assert_eq!(value["data"], "AP9BgA==");
+    assert!(value.get("utf8").is_none(), "{value}");
+}
+
+#[test]
+fn json_capture_keeps_exact_utf8_as_an_optional_convenience() {
+    let harness = Harness::new();
+    let record = harness.record(Phase::Exited, None, "hello, 世界\n".as_bytes());
+
+    let output = harness.capture_json(&record);
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["encoding"], "base64");
+    assert_eq!(value["data"], "aGVsbG8sIOS4lueVjAo=");
+    assert_eq!(value["utf8"], "hello, 世界\n");
 }

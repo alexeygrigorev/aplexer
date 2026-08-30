@@ -982,6 +982,11 @@ a capture .:review --lines 500
 
 V1 may expose bounded raw terminal output/history rather than a full tmux-style terminal screen model.
 
+JSON capture is lossless for arbitrary PTY bytes. Its payload shape is
+`{"id":"...","bytes":N,"encoding":"base64","data":"..."}`. A redundant
+`utf8` field is present only when the bytes are valid UTF-8; consumers must
+decode `data` according to `encoding` for the byte-authoritative result.
+
 ---
 
 ## 17. Terminal history

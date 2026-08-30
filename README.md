@@ -69,7 +69,7 @@ a status --workspace "$PWD" --tag shell
 a kill --workspace "$PWD" --tag shell --signal TERM --grace-ms 2000
 ```
 
-Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them. `capture --screen` asks for the live screen instead of the byte history: as paintable escape sequences by default, or as plain text with `--plain`.
+Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them. `capture --screen` asks for the live screen instead of the byte history: as paintable escape sequences by default, or as plain text with `--plain`. With `--json`, capture returns `{ "id": "...", "bytes": N, "encoding": "base64", "data": "..." }`; `utf8` is added as a convenience only when the captured bytes are valid UTF-8.
 
 ## Engines, profiles, and shortcuts
 

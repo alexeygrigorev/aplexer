@@ -1295,6 +1295,45 @@ fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> 
     Ok(())
 }
 
+fn base64_standard(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(data.len().div_ceil(3).saturating_mul(4));
+    for chunk in data.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn capture_json_value(record: &SessionRecord, data: &[u8]) -> Value {
+    let mut value = json!({
+        "id": record.id,
+        "bytes": data.len(),
+        "encoding": "base64",
+        "data": base64_standard(data),
+    });
+    // Preserve the old ergonomic field for text consumers, but only when it
+    // is exact. `from_utf8_lossy` corrupted arbitrary PTY bytes while still
+    // presenting the replacement-filled string as if it were authoritative.
+    if let Ok(text) = std::str::from_utf8(data) {
+        value["utf8"] = json!(text);
+    }
+    value
+}
+
 fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let data = if args.screen {
@@ -1353,10 +1392,7 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
     if let Some(path) = args.output {
         fs::write(&path, &data).with_context(|| format!("write {}", path.display()))?;
     } else if json_output {
-        println!(
-            "{}",
-            json!({"id":record.id,"bytes":data.len(),"utf8":String::from_utf8_lossy(&data)})
-        );
+        println!("{}", capture_json_value(&record, &data));
     } else {
         io::stdout().write_all(&data)?;
     }
