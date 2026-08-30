@@ -2302,7 +2302,9 @@ fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
         if Instant::now() >= deadline {
             bail!("timed out waiting for systemd scope {unit}.scope to appear");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -2321,47 +2323,96 @@ fn command_output_until(
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn helper to {operation}"))?;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).with_context(|| format!("wait for {operation}")),
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{operation} helper has no stdout"))?;
+    let flags = unsafe { libc::fcntl(child_stdout.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe {
+            libc::fcntl(
+                child_stdout.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        let error = io::Error::last_os_error();
+        let _ = child.kill();
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Err(error).with_context(|| format!("make {operation} output nonblocking"));
+    }
+    let mut stdout = Vec::new();
+    let mut stdout_eof = false;
+    let mut status = None;
+    loop {
+        loop {
+            let mut buffer = [0_u8; 4096];
+            match child_stdout.read(&mut buffer) {
+                Ok(0) => {
+                    stdout_eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    stdout.extend_from_slice(&buffer[..count]);
+                    if stdout.len() > 64 * 1024 {
+                        let _ = child.kill();
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        bail!("output from {operation} exceeds 64 KiB");
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = child.kill();
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Err(error).with_context(|| format!("read output from {operation}"));
+                }
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            // A helper stuck in uninterruptible sleep must not extend the
-            // startup deadline. Reap asynchronously once the kernel permits.
-            thread::spawn(move || {
-                let _ = child.wait();
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(result)) => status = Some(result),
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = child.kill();
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Err(error).with_context(|| format!("wait for {operation}"));
+                }
+            }
+        }
+        if let (Some(status), true) = (status, stdout_eof) {
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
             });
+        }
+
+        if Instant::now() >= deadline {
+            if status.is_none() {
+                let _ = child.kill();
+                // A helper stuck in uninterruptible sleep must not extend the
+                // startup deadline. Reap asynchronously once the kernel permits.
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
             bail!("timed out waiting to {operation}");
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(Duration::from_millis(20).min(remaining));
-    };
-    if Instant::now() >= deadline {
-        bail!("timed out waiting to {operation}");
     }
-    let mut stdout = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("{operation} helper has no stdout"))?
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut stdout)
-        .with_context(|| format!("read output from {operation}"))?;
-    if stdout.len() > 64 * 1024 {
-        bail!("output from {operation} exceeds 64 KiB");
-    }
-    if Instant::now() >= deadline {
-        bail!("timed out reading output from {operation}");
-    }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
 }
 fn read_counter(path: &Path, key: &str) -> Result<u64> {
     let text = fs::read_to_string(path)?;
@@ -2916,6 +2967,21 @@ mod tests {
         .expect("short-lived setup helper");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"/user.slice/example.scope\n");
+    }
+
+    #[test]
+    fn cgroup_setup_helper_pipe_cannot_outlive_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.2 & exit 0"]);
+        let started = Instant::now();
+        let error = command_output_until(
+            &mut command,
+            Instant::now() + Duration::from_millis(50),
+            "exercise inherited output pipe",
+        )
+        .expect_err("inherited helper pipe must not defeat deadline");
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
