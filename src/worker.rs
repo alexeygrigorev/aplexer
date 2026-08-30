@@ -598,17 +598,23 @@ impl WorkerRuntime {
         if !self.workload_populated()? {
             return Ok(());
         }
+        let grace_deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| anyhow!("kill grace deadline overflow"))?;
+        let cleanup_deadline = grace_deadline
+            .checked_add(DESCENDANT_KILL_TIMEOUT)
+            .ok_or_else(|| anyhow!("kill cleanup deadline overflow"))?;
         let cgroup = lock(&self.cgroup)?.clone();
         if signal == libc::SIGKILL {
             if let Some(cg) = &cgroup {
-                cg.kill_all()?;
+                cg.kill_all_until(cleanup_deadline)?;
             } else {
                 kill_descendants(std::process::id(), DESCENDANT_KILL_TIMEOUT)?;
             }
             return Ok(());
         }
         if let Some(cg) = &cgroup {
-            cg.signal_all(signal)?;
+            cg.signal_all_until(signal, cleanup_deadline)?;
         } else {
             signal_descendants(std::process::id(), signal)?;
         }
@@ -617,15 +623,12 @@ impl WorkerRuntime {
         // to this request should not be delayed (the worker exits shortly
         // after the workload does, so a response stuck behind a long sleep
         // could be lost entirely).
-        let deadline = Instant::now()
-            .checked_add(grace)
-            .ok_or_else(|| anyhow!("kill grace deadline overflow"))?;
-        while self.workload_populated()? && Instant::now() < deadline {
+        while self.workload_populated()? && Instant::now() < grace_deadline {
             thread::sleep(DESCENDANT_POLL_INTERVAL);
         }
         if self.workload_populated()? {
             if let Some(cg) = &cgroup {
-                cg.kill_all()?;
+                cg.kill_all_until(cleanup_deadline)?;
             } else {
                 kill_descendants(std::process::id(), DESCENDANT_KILL_TIMEOUT)?;
             }
@@ -873,8 +876,9 @@ impl StartupGuard {
         self.armed = false;
 
         let mut cleanup_failures = Vec::new();
+        let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
         if let Some(cgroup) = &self.cgroup {
-            if let Err(error) = cgroup.kill_all() {
+            if let Err(error) = cgroup.kill_all_until(deadline) {
                 cleanup_failures.push(format!("kill startup cgroup: {error:#}"));
             }
         } else if let Err(error) = signal_descendants(std::process::id(), libc::SIGKILL) {
@@ -904,7 +908,6 @@ impl StartupGuard {
         // is an adopted child and may safely be reaped here. Repeat signaling
         // to close the final fork-vs-scan window without confusing zombies
         // for live processes.
-        let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
         loop {
             if let Err(error) = reap_adopted_children() {
                 cleanup_failures.push(format!("reap startup descendants: {error:#}"));
@@ -929,7 +932,6 @@ impl StartupGuard {
         }
 
         if let Some(cgroup) = &self.cgroup {
-            let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
             loop {
                 match cgroup.populated() {
                     Ok(false) => break,
@@ -1487,7 +1489,9 @@ fn cleanup_after_lifecycle_failure(runtime: &WorkerRuntime) -> Result<()> {
     let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
     loop {
         if let Some(cgroup) = &cgroup {
-            cgroup.kill_all().context("kill failed lifecycle cgroup")?;
+            cgroup
+                .kill_all_until(deadline)
+                .context("kill failed lifecycle cgroup")?;
         } else {
             signal_descendants(std::process::id(), libc::SIGKILL)
                 .context("kill failed lifecycle descendants")?;

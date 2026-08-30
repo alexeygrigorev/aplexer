@@ -2147,25 +2147,17 @@ impl Cgroup {
         }
         Ok(())
     }
-    pub fn signal_all(&self, signal: i32) -> Result<()> {
-        let pids = fs::read_to_string(self.path.join("cgroup.procs"))?;
-        for text in pids.lines() {
-            if let Ok(pid) = text.parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, signal);
-                }
-            }
-        }
-        Ok(())
+    pub fn signal_all_until(&self, signal: i32, deadline: Instant) -> Result<()> {
+        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
+        verify_recorded_cgroup_identity(Some(&self.identity))?;
+        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
+        signal_cgroup_path_until(&self.path, signal, deadline)
     }
-    pub fn kill_all(&self) -> Result<()> {
-        let kill = self.path.join("cgroup.kill");
-        if kill.exists() {
-            fs::write(kill, "1")?;
-            Ok(())
-        } else {
-            self.signal_all(libc::SIGKILL)
-        }
+    pub fn kill_all_until(&self, deadline: Instant) -> Result<()> {
+        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
+        verify_recorded_cgroup_identity(Some(&self.identity))?;
+        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
+        kill_cgroup_path_until(&self.path, deadline)
     }
     pub fn populated(&self) -> Result<bool> {
         Ok(read_counter(&self.path.join("cgroup.events"), "populated")? != 0)
