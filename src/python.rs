@@ -3,6 +3,7 @@
 use anyhow::Context;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -191,6 +192,112 @@ fn start(
 }
 
 #[pyfunction]
+#[pyo3(signature = (selector, state_dir=None, runtime_dir=None, config=None))]
+fn status(
+    selector: &str,
+    state_dir: Option<&str>,
+    runtime_dir: Option<&str>,
+    config: Option<&str>,
+) -> PyResult<String> {
+    let value = api::status_json(
+        &paths(state_dir, runtime_dir, config).map_err(py_err)?,
+        selector,
+    )
+    .map_err(py_err)?;
+    serde_json::to_string(&value)
+        .context("serialize status")
+        .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (selector, data, state_dir=None, runtime_dir=None, config=None))]
+fn send(
+    selector: &str,
+    data: &[u8],
+    state_dir: Option<&str>,
+    runtime_dir: Option<&str>,
+    config: Option<&str>,
+) -> PyResult<usize> {
+    api::send_bytes(
+        &paths(state_dir, runtime_dir, config).map_err(py_err)?,
+        selector,
+        data,
+    )
+    .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (selector, max_bytes=None, state_dir=None, runtime_dir=None, config=None))]
+fn capture<'py>(
+    py: Python<'py>,
+    selector: &str,
+    max_bytes: Option<usize>,
+    state_dir: Option<&str>,
+    runtime_dir: Option<&str>,
+    config: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let data = api::capture_bytes(
+        &paths(state_dir, runtime_dir, config).map_err(py_err)?,
+        selector,
+        max_bytes,
+    )
+    .map_err(py_err)?;
+    Ok(PyBytes::new(py, &data))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    selector,
+    signal=libc::SIGTERM,
+    grace_ms=2_000,
+    state_dir=None,
+    runtime_dir=None,
+    config=None,
+))]
+fn kill(
+    selector: &str,
+    signal: i32,
+    grace_ms: u64,
+    state_dir: Option<&str>,
+    runtime_dir: Option<&str>,
+    config: Option<&str>,
+) -> PyResult<()> {
+    api::kill_session(
+        &paths(state_dir, runtime_dir, config).map_err(py_err)?,
+        selector,
+        signal,
+        grace_ms,
+    )
+    .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    selector,
+    force=false,
+    state_dir=None,
+    runtime_dir=None,
+    config=None,
+))]
+fn forget(
+    selector: &str,
+    force: bool,
+    state_dir: Option<&str>,
+    runtime_dir: Option<&str>,
+    config: Option<&str>,
+) -> PyResult<String> {
+    let value = api::forget_session(
+        &paths(state_dir, runtime_dir, config).map_err(py_err)?,
+        selector,
+        force,
+    )
+    .map_err(py_err)?;
+    serde_json::to_string(&value)
+        .context("serialize forget result")
+        .map_err(py_err)
+}
+
+#[pyfunction]
 fn run_worker(id: &str) -> PyResult<()> {
     let id: Uuid = id
         .parse()
@@ -205,6 +312,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(launch_spec, m)?)?;
     m.add_function(wrap_pyfunction!(snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(start, m)?)?;
+    m.add_function(wrap_pyfunction!(status, m)?)?;
+    m.add_function(wrap_pyfunction!(send, m)?)?;
+    m.add_function(wrap_pyfunction!(capture, m)?)?;
+    m.add_function(wrap_pyfunction!(kill, m)?)?;
+    m.add_function(wrap_pyfunction!(forget, m)?)?;
     m.add_function(wrap_pyfunction!(run_worker, m)?)?;
     Ok(())
 }

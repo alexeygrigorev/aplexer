@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -22,11 +22,12 @@ use uuid::Uuid;
 
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
-    ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json, list_records,
-    parse_byte_size, process_start_time_ticks, public_session_record, read_frame, read_record,
-    read_session_record, session_metadata_env, validate_tag, worker_executable, write_json, Config,
-    FileLock, Limits, Operation, Paths, Phase, Request, Response, SessionRecord, PROTOCOL_VERSION,
-    SCHEMA_VERSION,
+    ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json,
+    kill_grace_duration, list_records, parse_byte_size, process_start_time_ticks,
+    public_session_record, read_frame, read_record, read_session_record, resolve_record,
+    session_metadata_env, validate_tag, worker_executable, write_frame, write_json, Config,
+    FileLock, FrameKind, Limits, Operation, Paths, Phase, Request, Response, SessionRecord,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -1058,6 +1059,254 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         enriched.push(value);
     }
     Ok(Value::Array(enriched))
+}
+
+#[cfg(not(test))]
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+
+fn selected_record(paths: &Paths, selector: &str) -> Result<SessionRecord> {
+    resolve_record(paths, Some(selector), None, None)
+}
+
+fn connect_control(record: &SessionRecord) -> Result<UnixStream> {
+    let deadline = Instant::now() + CONTROL_RPC_TIMEOUT;
+    let stream = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("connect {} timed out", record.socket_path.display());
+        }
+        match connect_startup_control(&record.socket_path, remaining) {
+            Ok(stream) => break stream,
+            Err(error)
+                if error.raw_os_error() == Some(libc::EAGAIN) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("connect {}", record.socket_path.display()))
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(CONTROL_RPC_TIMEOUT))
+        .context("set worker response deadline")?;
+    stream
+        .set_write_timeout(Some(CONTROL_RPC_TIMEOUT))
+        .context("set worker request deadline")?;
+    Ok(stream)
+}
+
+fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
+    let mut stream = connect_control(record)?;
+    let request = Request::new(record.id, operation);
+    let request_id = request.request_id.clone();
+    write_json(&mut stream, &request)?;
+    if let Some(data) = data {
+        write_frame(&mut stream, FrameKind::Data, data)?;
+    }
+    let frame = read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed connection"))?;
+    let response: Response = frame_json(frame).context("parse worker response")?;
+    if response.version != PROTOCOL_VERSION {
+        bail!("worker response used unsupported protocol version");
+    }
+    if response.request_id != request_id {
+        bail!("worker response request id mismatch");
+    }
+    response.into_result()
+}
+
+/// Return the live session record when reachable, or the persisted record plus
+/// explicit reachability evidence when the worker cannot answer.
+pub fn status_json(paths: &Paths, selector: &str) -> Result<Value> {
+    let persisted = selected_record(paths, selector)?;
+    let (mut value, current, worker_reachable, rpc_error) =
+        match rpc_simple(&persisted, Operation::Status, None) {
+            Ok(value) => {
+                let current: SessionRecord = serde_json::from_value(value.clone())
+                    .context("worker returned an invalid status record")?;
+                (value, current, true, None)
+            }
+            Err(error) => {
+                let value = serde_json::to_value(public_session_record(&persisted))?;
+                (value, persisted.clone(), false, Some(format!("{error:#}")))
+            }
+        };
+    value["worker_alive"] = json!(current.worker_alive());
+    value["worker_reachable"] = json!(worker_reachable);
+    if let Some(error) = rpc_error {
+        value["rpc_error"] = json!(error);
+    }
+    Ok(value)
+}
+
+/// Send bytes without transcoding, splitting only at the framing limit.
+pub fn send_bytes(paths: &Paths, selector: &str, data: &[u8]) -> Result<usize> {
+    let record = selected_record(paths, selector)?;
+    for chunk in data.chunks(MAX_FRAME_BYTES) {
+        let result = rpc_simple(&record, Operation::Send { bytes: chunk.len() }, Some(chunk))?;
+        let reported = result
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow!("worker send response omitted byte count"))?;
+        if reported != chunk.len() {
+            bail!(
+                "worker send byte count mismatch: sent {}, acknowledged {reported}",
+                chunk.len()
+            );
+        }
+    }
+    Ok(data.len())
+}
+
+fn rpc_capture(record: &SessionRecord, max_bytes: Option<usize>) -> Result<Vec<u8>> {
+    let mut stream = connect_control(record)?;
+    let request = Request::new(record.id, Operation::Capture { max_bytes });
+    let request_id = request.request_id.clone();
+    write_json(&mut stream, &request)?;
+    let response: Response = frame_json(
+        read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed before capture response"))?,
+    )
+    .context("parse worker capture response")?;
+    if response.version != PROTOCOL_VERSION {
+        bail!("worker response used unsupported protocol version");
+    }
+    if response.request_id != request_id {
+        bail!("worker response request id mismatch");
+    }
+    let result = response.into_result()?;
+    let reported = result
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| anyhow!("worker capture response omitted byte count"))?;
+    let frame =
+        read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed before capture data"))?;
+    if frame.kind != FrameKind::Data {
+        bail!("worker returned a non-data capture frame");
+    }
+    if frame.payload.len() != reported {
+        bail!(
+            "worker capture byte count mismatch: reported {reported}, returned {}",
+            frame.payload.len()
+        );
+    }
+    Ok(frame.payload)
+}
+
+fn read_history_tail(path: &Path, requested: Option<usize>) -> Result<Vec<u8>> {
+    let limit = requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let length = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?
+        .len();
+    let count = length.min(limit as u64);
+    file.seek(SeekFrom::Start(length - count))
+        .with_context(|| format!("seek {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(count as usize);
+    file.take(count)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read tail of {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Capture live history bytes, falling back to the bounded persisted tail only
+/// when the worker is terminal or known gone.
+pub fn capture_bytes(paths: &Paths, selector: &str, max_bytes: Option<usize>) -> Result<Vec<u8>> {
+    let record = selected_record(paths, selector)?;
+    match rpc_capture(&record, max_bytes) {
+        Ok(data) => Ok(data),
+        Err(_) if record.worker_finished() || !record.worker_alive() => {
+            read_history_tail(&record.history_path, max_bytes)
+                .context("worker unavailable and persisted history cannot be read")
+        }
+        Err(error) => Err(error).context(
+            "capture RPC failed while the worker process is still alive; refusing to return potentially stale persisted history",
+        ),
+    }
+}
+
+/// Ask the live worker to stop its complete workload containment domain.
+pub fn kill_session(paths: &Paths, selector: &str, signal: i32, grace_ms: u64) -> Result<()> {
+    if !(1..=64).contains(&signal) {
+        bail!("signal out of range");
+    }
+    kill_grace_duration(grace_ms)?;
+    let record = selected_record(paths, selector)?;
+    let result = rpc_simple(&record, Operation::Kill { signal, grace_ms }, None)?;
+    if result.get("signalled").and_then(Value::as_bool) != Some(true) {
+        bail!("worker kill response omitted confirmation");
+    }
+    Ok(())
+}
+
+/// Forget a session record without signalling any process. This preserves the
+/// CLI's registry/startup locking and refuses a worker that may still be live.
+pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Value> {
+    if !force {
+        bail!("forget requires force=True");
+    }
+    let selected = selected_record(paths, selector)?;
+    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    let current = read_record(&paths.record(selected.id))
+        .with_context(|| format!("re-read session {} before forgetting", selected.id))?;
+    if current.worker_alive() {
+        bail!(
+            "session {} still has a live worker; refusing to forget it",
+            current.id
+        );
+    }
+    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
+        let lock_path = paths.worker_lock(current.id);
+        match FileLock::exclusive(&lock_path, true) {
+            Ok(lock) => Some(lock),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error)
+                    .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
+            {
+                bail!(
+                    "session {} still has a worker holding {}; refusing to forget it",
+                    current.id,
+                    lock_path.display()
+                )
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot fence session {}'s pre-PID worker; refusing to forget it",
+                        current.id
+                    )
+                })
+            }
+        }
+    } else {
+        None
+    };
+
+    let containment_proven_empty = current.containment_proven_empty();
+    match fs::remove_dir_all(paths.runtime_session(current.id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove forgotten session runtime state"),
+    }
+    fs::remove_dir_all(paths.state_session(current.id))
+        .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
+    Ok(json!({
+        "id": current.id,
+        "forgotten": true,
+        "signalled": false,
+        "containment_proven_empty": containment_proven_empty,
+        "workload_may_survive": !containment_proven_empty,
+    }))
 }
 
 #[derive(Debug, Clone)]
