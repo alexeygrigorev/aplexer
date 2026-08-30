@@ -13,6 +13,7 @@ command -v cargo >/dev/null 2>&1 || { echo 'cargo is required' >&2; exit 127; }
 cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --all-targets
+cargo test --features startup-test-hooks --test startup_rollback
 
 if [ -d python ]; then
   printf '==> Python syntax and tests\n'

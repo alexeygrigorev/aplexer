@@ -88,6 +88,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --release --verbose
 
+      - name: Run startup containment fault-injection tests
+        run: cargo test --locked --release --features startup-test-hooks --test startup_rollback --verbose
+
       - name: Install pinned uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
