@@ -1,3 +1,4 @@
+#[cfg(feature = "startup-test-hooks")]
 use aplexer::read_persisted_history_tail;
 use serde_json::Value;
 use std::fs;
