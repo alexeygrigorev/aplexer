@@ -24,6 +24,16 @@ def _native():
     return native
 
 
+def _call_native(method: str, /, *args: Any) -> Any:
+    """Call one native operation using the public client's error contract."""
+    try:
+        return getattr(_native(), method)(*args)
+    except AplexerError:
+        raise
+    except RuntimeError as exc:
+        raise AplexerError(str(exc)) from exc
+
+
 class Client:
     """In-process client: calls the Rust library through PyO3, never a subprocess."""
 
@@ -50,13 +60,13 @@ class Client:
         return self.state_dir, self.runtime_dir, self.config
 
     def engines(self) -> list[dict[str, Any]]:
-        payload = json.loads(_native().engines(*self._path_args()))
+        payload = json.loads(_call_native("engines", *self._path_args()))
         if not isinstance(payload, list):
             raise AplexerError("engines payload was not a list")
         return payload
 
     def profiles(self) -> dict[str, Any]:
-        payload = json.loads(_native().profiles(*self._path_args()))
+        payload = json.loads(_call_native("profiles", *self._path_args()))
         if not isinstance(payload, dict):
             raise AplexerError("profiles payload was not an object")
         return payload
@@ -70,7 +80,8 @@ class Client:
         no_skip_permissions: bool = False,
     ) -> dict[str, Any]:
         payload = json.loads(
-            _native().launch_spec(
+            _call_native(
+                "launch_spec",
                 engine,
                 profile,
                 None if cwd is None else os.fspath(cwd),
@@ -83,7 +94,7 @@ class Client:
         return payload
 
     def snapshot(self, *, running: bool = False) -> list[dict[str, Any]]:
-        payload = json.loads(_native().snapshot(running, *self._path_args()))
+        payload = json.loads(_call_native("snapshot", running, *self._path_args()))
         if not isinstance(payload, list):
             raise AplexerError("snapshot payload was not a list")
         return payload
@@ -93,14 +104,14 @@ class Client:
 
     def status(self, selector: str) -> Session:
         """Return live status, or persisted status with reachability details."""
-        payload = json.loads(_native().status(selector, *self._path_args()))
+        payload = json.loads(_call_native("status", selector, *self._path_args()))
         if not isinstance(payload, dict):
             raise AplexerError("status payload was not an object")
         return Session.from_dict(payload)
 
     def capture(self, selector: str, *, max_bytes: int | None = None) -> bytes:
         """Return raw captured PTY history bytes without decoding or transcoding."""
-        payload = _native().capture(selector, max_bytes, *self._path_args())
+        payload = _call_native("capture", selector, max_bytes, *self._path_args())
         if not isinstance(payload, bytes):
             raise AplexerError("capture payload was not bytes")
         return payload
@@ -120,7 +131,8 @@ class Client:
         no_skip_permissions: bool = False,
     ) -> Session:
         raw = json.loads(
-            _native().start(
+            _call_native(
+                "start",
                 os.fspath(workspace),
                 tag,
                 engine,
@@ -142,7 +154,7 @@ class Client:
         """Send raw bytes to a session PTY and return the acknowledged count."""
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
-        sent = _native().send(selector, data, *self._path_args())
+        sent = _call_native("send", selector, data, *self._path_args())
         if isinstance(sent, bool) or not isinstance(sent, int):
             raise AplexerError("send result was not an integer byte count")
         if sent != len(data):
@@ -153,11 +165,13 @@ class Client:
 
     def kill(self, selector: str, *, signal: int = 15, grace_ms: int = 2_000) -> None:
         """Signal a live session's complete workload containment domain."""
-        _native().kill(selector, signal, grace_ms, *self._path_args())
+        _call_native("kill", selector, signal, grace_ms, *self._path_args())
 
     def forget(self, selector: str, *, force: bool = False) -> ForgetResult:
         """Delete a dead session's records without signalling any process."""
-        payload = json.loads(_native().forget(selector, force, *self._path_args()))
+        payload = json.loads(
+            _call_native("forget", selector, force, *self._path_args())
+        )
         if not isinstance(payload, dict):
             raise AplexerError("forget payload was not an object")
         return ForgetResult.from_dict(payload)

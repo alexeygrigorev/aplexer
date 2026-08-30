@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aplexer.client import Client
+from aplexer.client import AplexerError, Client
 
 
 def test_client_calls_native_not_subprocess(monkeypatch):
@@ -278,6 +278,69 @@ def test_operational_methods_use_native_boundary_and_preserve_bytes(monkeypatch,
         client.send(selector, "not bytes")
 
 
+@pytest.mark.parametrize(
+    ("native_method", "invoke"),
+    [
+        ("engines", lambda client: client.engines()),
+        ("profiles", lambda client: client.profiles()),
+        ("launch_spec", lambda client: client.launch_spec()),
+        ("snapshot", lambda client: client.snapshot()),
+        ("snapshot", lambda client: client.list()),
+        ("status", lambda client: client.status("missing")),
+        ("capture", lambda client: client.capture("missing")),
+        ("start", lambda client: client.start()),
+        ("send", lambda client: client.send("missing", b"data")),
+        ("kill", lambda client: client.kill("missing")),
+        ("forget", lambda client: client.forget("missing")),
+    ],
+)
+def test_public_methods_translate_native_runtime_errors(
+    monkeypatch, tmp_path, native_method, invoke
+):
+    class Native:
+        def __getattr__(self, name):
+            def fail(*args):
+                raise RuntimeError(f"{name} native failure")
+
+            return fail
+
+    monkeypatch.setattr("aplexer.client._native", lambda: Native())
+    client = Client(
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "run",
+        config=tmp_path / "config.toml",
+    )
+
+    with pytest.raises(AplexerError, match="native failure") as caught:
+        invoke(client)
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert native_method in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda client: client.status("definitely-missing-session"),
+        lambda client: client.capture("definitely-missing-session"),
+        lambda client: client.send("definitely-missing-session", b"data"),
+        lambda client: client.kill("definitely-missing-session"),
+        lambda client: client.forget("definitely-missing-session", force=True),
+    ],
+)
+def test_native_missing_session_errors_use_aplexer_error(tmp_path, invoke):
+    client = Client(
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "run",
+        config=tmp_path / "config.toml",
+    )
+
+    with pytest.raises(AplexerError, match="no matching session") as caught:
+        invoke(client)
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
 def test_native_clients_isolate_worker_start_and_snapshot():
     # Keep the root short enough for Linux's 108-byte Unix-socket path limit.
     with tempfile.TemporaryDirectory(prefix="apx-py-") as directory:
@@ -343,9 +406,9 @@ def test_native_operations_round_trip_arbitrary_bytes_and_forget():
         ]
         session = client.start(workspace=root, tag="bytes", command=command)
 
-        with pytest.raises(RuntimeError, match="force=True"):
+        with pytest.raises(AplexerError, match="force=True"):
             client.forget(session.id)
-        with pytest.raises(RuntimeError, match="live worker"):
+        with pytest.raises(AplexerError, match="live worker"):
             client.forget(session.id, force=True)
 
         deadline = time.monotonic() + 5
@@ -382,9 +445,9 @@ def test_native_kill_stops_live_session():
             tag="kill",
             command=["/bin/sleep", "10"],
         )
-        with pytest.raises(RuntimeError, match="signal out of range"):
+        with pytest.raises(AplexerError, match="signal out of range"):
             client.kill(session.id, signal=0)
-        with pytest.raises(RuntimeError, match="kill grace exceeds maximum"):
+        with pytest.raises(AplexerError, match="kill grace exceeds maximum"):
             client.kill(session.id, grace_ms=30_001)
         assert client.kill(session.id, signal=15, grace_ms=200) is None
         _wait_for_terminal_status(client, session.id)
