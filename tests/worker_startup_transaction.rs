@@ -1,3 +1,5 @@
+#![cfg(feature = "startup-test-hooks")]
+
 use aplexer::{
     atomic_write_json, now_ms, process_alive, Limits, Paths, Phase, SessionRecord,
     DEFAULT_HISTORY_BYTES,

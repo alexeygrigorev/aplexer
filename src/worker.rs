@@ -82,13 +82,17 @@ fn startup_checkpoint(point: &str) -> Result<()> {
     if TERMINATION_REQUESTED.load(Ordering::SeqCst) {
         bail!("worker startup cancelled by termination signal");
     }
+    #[cfg(feature = "startup-test-hooks")]
     if env::var("APLEXER_TEST_FAIL_WORKER_STARTUP_AT").as_deref() == Ok(point) {
         bail!("injected worker startup failure at {point}");
     }
+    #[cfg(not(feature = "startup-test-hooks"))]
+    let _ = point;
     Ok(())
 }
 
 fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
+    #[cfg(feature = "startup-test-hooks")]
     if let Some(marker) = env::var_os("APLEXER_TEST_WORKER_STARTUP_MARKER") {
         atomic_write_bytes(std::path::Path::new(&marker), pid.to_string().as_bytes())
             .context("write worker startup test marker")?;
@@ -102,11 +106,14 @@ fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
             thread::sleep(Duration::from_secs(1));
         }
     }
+    #[cfg(feature = "startup-test-hooks")]
     if env::var("APLEXER_TEST_PAUSE_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
         while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    #[cfg(not(feature = "startup-test-hooks"))]
+    let _ = pid;
     startup_checkpoint("after_workload_spawn")
 }
 
