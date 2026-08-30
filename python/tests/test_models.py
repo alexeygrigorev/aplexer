@@ -29,12 +29,23 @@ def test_session_containment_proof_fields_and_legacy_exit():
         {
             **base,
             "containment_cgroup": "/sys/fs/cgroup/aplexer-workload-test.scope",
+            "containment_cgroup_identity": {
+                "boot_id": "boot",
+                "cgroup_namespace_device": 4,
+                "cgroup_namespace_inode": 10,
+                "mount_namespace_device": 4,
+                "mount_namespace_inode": 11,
+                "cgroup_root_device": 28,
+                "cgroup_root_inode": 1,
+            },
             "containment_empty": True,
         }
     )
     assert current.containment_cgroup == Path(
         "/sys/fs/cgroup/aplexer-workload-test.scope"
     )
+    assert current.containment_cgroup_identity is not None
+    assert current.containment_cgroup_identity.boot_id == "boot"
     assert current.containment_empty
 
     legacy = Session.from_dict(
@@ -49,6 +60,7 @@ def test_session_containment_proof_fields_and_legacy_exit():
             },
         }
     )
+    assert legacy.containment_cgroup_identity is None
     assert legacy.containment_empty
 
     explicit_failure = Session.from_dict(

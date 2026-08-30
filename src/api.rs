@@ -746,7 +746,9 @@ fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) -> Result<(
     if record.worker_pid.is_some() && record.worker_pid != Some(worker_pid) {
         bail!("startup record no longer belongs to worker {worker_pid}");
     }
-    let missing_required_cgroup = record.limits.requested() && record.containment_cgroup.is_none();
+    let missing_required_cgroup = record.limits.requested()
+        && (record.containment_cgroup.is_none() || record.containment_cgroup_identity.is_none());
+    let recorded_cgroup_identity = record.containment_cgroup_identity.clone();
     let recorded_cgroup = record.containment_cgroup;
     let max_descendants = safe_startup_descendant_capacity(deadline)?;
     // Opening a worker pidfd and exercising pidfd_send_signal(2) with signal
@@ -790,6 +792,7 @@ fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) -> Result<(
             cleanup_recorded_cgroup_until(
                 record.id,
                 locator,
+                recorded_cgroup_identity.as_ref(),
                 libc::SIGKILL,
                 Duration::ZERO,
                 deadline.0,
@@ -1083,6 +1086,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             worker_pid: None,
             workload_pid: None,
             containment_cgroup: None,
+            containment_cgroup_identity: None,
             containment_empty: Some(false),
             socket_path: paths.socket(id),
             history_path: paths.history(id),

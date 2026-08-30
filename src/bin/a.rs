@@ -1340,8 +1340,12 @@ fn preflight_broken_containment_recovery(record: &SessionRecord) -> Result<()> {
             record.id
         );
     };
-    validate_recorded_cgroup_locator(record.id, locator)
-        .context("validate recorded cgroup before stopping unreachable worker")
+    validate_recorded_cgroup_locator(
+        record.id,
+        locator,
+        record.containment_cgroup_identity.as_ref(),
+    )
+    .context("validate recorded cgroup before stopping unreachable worker")
 }
 
 /// Record that the client killed an orphaned workload after its worker died.
@@ -1376,8 +1380,14 @@ fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64
             record.id
         );
     };
-    cleanup_recorded_cgroup(record.id, locator, signal, grace)
-        .context("recover recorded cgroup containment")
+    cleanup_recorded_cgroup(
+        record.id,
+        locator,
+        record.containment_cgroup_identity.as_ref(),
+        signal,
+        grace,
+    )
+    .context("recover recorded cgroup containment")
 }
 
 fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
@@ -4148,6 +4158,7 @@ mod switching_tests {
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
             containment_cgroup: None,
+            containment_cgroup_identity: None,
             containment_empty: Some(false),
             // Must exist on disk: check_attachable now checks socket_path
             // (this test binary's own executable is a convenient stand-in

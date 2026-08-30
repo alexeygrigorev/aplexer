@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -352,6 +352,23 @@ pub struct ExitInfo {
     pub exited_at_ms: u64,
 }
 
+/// Kernel identity of the cgroup-v2 domain in which a limited session was
+/// created. A pathname alone is not durable authority: after reboot, or from
+/// another container/cgroup/mount namespace, the same text can name an
+/// unrelated domain. Recovery compares every field before inspecting or
+/// signalling the recorded path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CgroupIdentity {
+    pub boot_id: String,
+    pub cgroup_namespace_device: u64,
+    pub cgroup_namespace_inode: u64,
+    pub mount_namespace_device: u64,
+    pub mount_namespace_inode: u64,
+    pub cgroup_root_device: u64,
+    pub cgroup_root_inode: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema_version: u32,
@@ -397,6 +414,11 @@ pub struct SessionRecord {
     /// an absent locator is never equivalent to an empty domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment_cgroup: Option<PathBuf>,
+    /// Boot, namespace, and mount identity that makes
+    /// `containment_cgroup` authoritative. Older records omit this field and
+    /// remain readable, but destructive recovery from them fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_cgroup_identity: Option<CgroupIdentity>,
     /// Durable proof that the worker (or an independent cgroup recovery)
     /// observed the complete containment domain empty. Numeric leader PIDs
     /// are not such proof because descendants may call `setsid` and outlive
@@ -573,7 +595,6 @@ fn read_worker_identity(record: &SessionRecord) -> Result<Option<ProcessIdentity
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
     };
     let metadata = file.metadata()?;
-    use std::os::unix::fs::MetadataExt;
     if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
         bail!("untrusted worker identity file {}", path.display());
     }
@@ -782,7 +803,6 @@ pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()>
             )
         })?;
     let metadata = file.metadata()?;
-    use std::os::unix::fs::MetadataExt;
     if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
             "session {} has an untrusted worker identity file; refusing to signal pid {}",
@@ -1784,9 +1804,82 @@ impl History {
     }
 }
 
+const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+
+fn namespace_coordinates(path: &Path, label: &str) -> Result<(u64, u64)> {
+    let metadata = fs::metadata(path).with_context(|| format!("inspect {label} namespace"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn ensure_cgroup2_filesystem(path: &Path) -> Result<()> {
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("encode cgroup path {}", path.display()))?;
+    let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(encoded.as_ptr(), &mut stats) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("inspect filesystem for {}", path.display()));
+    }
+    if stats.f_type != CGROUP2_SUPER_MAGIC {
+        bail!("{} is not on a cgroup-v2 filesystem", path.display());
+    }
+    Ok(())
+}
+
+/// Capture the kernel domain that gives a persisted cgroup locator meaning.
+/// The root checks also keep resource-limit setup from accepting a lookalike
+/// directory mounted at `/sys/fs/cgroup`.
+pub fn current_cgroup_identity() -> Result<CgroupIdentity> {
+    let root = Path::new(CGROUP_V2_ROOT);
+    let root_metadata = fs::metadata(root).context("inspect cgroup-v2 root")?;
+    if !root_metadata.is_dir() {
+        bail!("{CGROUP_V2_ROOT} is not a directory");
+    }
+    ensure_cgroup2_filesystem(root)?;
+    let controllers = root.join("cgroup.controllers");
+    if !fs::metadata(&controllers)
+        .with_context(|| format!("inspect {}", controllers.display()))?
+        .is_file()
+    {
+        bail!(
+            "{} is not a cgroup-v2 controllers file",
+            controllers.display()
+        );
+    }
+    let (cgroup_namespace_device, cgroup_namespace_inode) =
+        namespace_coordinates(Path::new("/proc/self/ns/cgroup"), "cgroup")?;
+    let (mount_namespace_device, mount_namespace_inode) =
+        namespace_coordinates(Path::new("/proc/self/ns/mnt"), "mount")?;
+    Ok(CgroupIdentity {
+        boot_id: linux_boot_id()?,
+        cgroup_namespace_device,
+        cgroup_namespace_inode,
+        mount_namespace_device,
+        mount_namespace_inode,
+        cgroup_root_device: root_metadata.dev(),
+        cgroup_root_inode: root_metadata.ino(),
+    })
+}
+
+fn verify_recorded_cgroup_identity(recorded: Option<&CgroupIdentity>) -> Result<CgroupIdentity> {
+    let recorded = recorded.ok_or_else(|| {
+        anyhow!(
+            "recorded cgroup has no boot/namespace/mount identity; refusing legacy destructive recovery"
+        )
+    })?;
+    let current = current_cgroup_identity()?;
+    if recorded != &current {
+        bail!(
+            "recorded cgroup identity does not match the current boot, cgroup namespace, mount namespace, or cgroup-v2 root"
+        );
+    }
+    Ok(current)
+}
+
 #[derive(Debug, Clone)]
 pub struct Cgroup {
     path: PathBuf,
+    identity: CgroupIdentity,
     /// Keep exclusive ownership of the unreaped child until release. An
     /// unreaped child reserves its pid, so Child::kill cannot be redirected
     /// to a recycled process; clones serialize the single kill+wait through
@@ -1840,10 +1933,7 @@ impl Cgroup {
         if !limits.requested() {
             return Ok(None);
         }
-        let controllers = Path::new("/sys/fs/cgroup/cgroup.controllers");
-        if !controllers.exists() {
-            bail!("resource limits require cgroup v2");
-        }
+        let identity = current_cgroup_identity()?;
         let unit = format!("aplexer-workload-{id}");
         let mut command = Command::new("systemd-run");
         command
@@ -1909,6 +1999,7 @@ impl Cgroup {
         let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);
         Ok(Some(Self {
             path,
+            identity,
             anchor: Arc::new(Mutex::new(Some(anchor))),
             initial_oom_kill,
         }))
@@ -1932,6 +2023,9 @@ impl Cgroup {
     }
     pub fn locator(&self) -> &Path {
         &self.path
+    }
+    pub fn identity(&self) -> &CgroupIdentity {
+        &self.identity
     }
     /// Kills the placeholder process that was keeping the delegated scope
     /// alive. Call this only after the real workload pid has been added to
@@ -2013,6 +2107,7 @@ impl Cgroup {
 pub fn cleanup_recorded_cgroup(
     id: Uuid,
     locator: &Path,
+    identity: Option<&CgroupIdentity>,
     signal: i32,
     grace: Duration,
 ) -> Result<()> {
@@ -2020,14 +2115,18 @@ pub fn cleanup_recorded_cgroup(
         .checked_add(grace)
         .and_then(|deadline| deadline.checked_add(Duration::from_secs(2)))
         .ok_or_else(|| anyhow!("cgroup cleanup deadline overflow"))?;
-    cleanup_recorded_cgroup_until(id, locator, signal, grace, deadline)
+    cleanup_recorded_cgroup_until(id, locator, identity, signal, grace, deadline)
 }
 
 /// Preflight a durable locator before destroying a broken session's worker
 /// subreaper. This performs no signalling; it only establishes that later
 /// cgroup recovery will operate inside the expected kernel domain.
-pub fn validate_recorded_cgroup_locator(id: Uuid, locator: &Path) -> Result<()> {
-    validate_recorded_cgroup(id, locator).map(|_| ())
+pub fn validate_recorded_cgroup_locator(
+    id: Uuid,
+    locator: &Path,
+    identity: Option<&CgroupIdentity>,
+) -> Result<()> {
+    validate_recorded_cgroup(id, locator, identity).map(|_| ())
 }
 
 /// Deadline-sharing variant for startup rollback, where cgroup recovery must
@@ -2035,12 +2134,13 @@ pub fn validate_recorded_cgroup_locator(id: Uuid, locator: &Path) -> Result<()> 
 pub fn cleanup_recorded_cgroup_until(
     id: Uuid,
     locator: &Path,
+    identity: Option<&CgroupIdentity>,
     signal: i32,
     grace: Duration,
     deadline: Instant,
 ) -> Result<()> {
     check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
-    let Some(path) = validate_recorded_cgroup(id, locator)? else {
+    let Some(path) = validate_recorded_cgroup(id, locator, identity)? else {
         check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
         return Ok(());
     };
@@ -2094,8 +2194,16 @@ fn sleep_until_cgroup_deadline(deadline: Instant, operation: &str) -> Result<()>
     check_cgroup_cleanup_deadline(deadline, operation)
 }
 
-fn validate_recorded_cgroup(id: Uuid, locator: &Path) -> Result<Option<PathBuf>> {
-    let root = Path::new("/sys/fs/cgroup");
+fn validate_recorded_cgroup(
+    id: Uuid,
+    locator: &Path,
+    identity: Option<&CgroupIdentity>,
+) -> Result<Option<PathBuf>> {
+    // This comparison intentionally precedes canonicalizing the leaf. A
+    // missing leaf proves emptiness only inside the exact kernel domain in
+    // which it was durably recorded.
+    let current_identity = verify_recorded_cgroup_identity(identity)?;
+    let root = Path::new(CGROUP_V2_ROOT);
     let expected = format!("aplexer-workload-{id}.scope");
     if !locator.is_absolute()
         || !locator.starts_with(root)
@@ -2131,6 +2239,21 @@ fn validate_recorded_cgroup(id: Uuid, locator: &Path) -> Result<Option<PathBuf>>
             "recorded cgroup is not a directory: {}",
             canonical.display()
         );
+    }
+    ensure_cgroup2_filesystem(&canonical)?;
+    let metadata = fs::metadata(&canonical)?;
+    if metadata.dev() != current_identity.cgroup_root_device {
+        bail!(
+            "recorded cgroup {} is on a different cgroup-v2 mount",
+            canonical.display()
+        );
+    }
+    let procs = canonical.join("cgroup.procs");
+    if !fs::metadata(&procs)
+        .with_context(|| format!("inspect {}", procs.display()))?
+        .is_file()
+    {
+        bail!("{} is not a cgroup member file", procs.display());
     }
     Ok(Some(canonical))
 }
@@ -2810,6 +2933,7 @@ mod tests {
             worker_pid: Some(pid),
             workload_pid: None,
             containment_cgroup: None,
+            containment_cgroup_identity: None,
             containment_empty: Some(false),
             socket_path: state_dir.join("control.sock"),
             history_path: state_dir.join("history.bin"),
@@ -2913,6 +3037,7 @@ mod tests {
         let error = cleanup_recorded_cgroup_until(
             id,
             &locator,
+            None,
             libc::SIGKILL,
             Duration::ZERO,
             Instant::now(),
@@ -2924,9 +3049,11 @@ mod tests {
     #[test]
     fn recorded_cgroup_cleanup_rejects_untrusted_locator() {
         let id = Uuid::new_v4();
+        let identity = current_cgroup_identity().unwrap();
         let error = cleanup_recorded_cgroup_until(
             id,
             Path::new("/tmp/not-a-cgroup"),
+            Some(&identity),
             libc::SIGKILL,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
@@ -2935,6 +3062,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("untrusted recorded cgroup locator"));
+    }
+
+    #[test]
+    fn cgroup_identity_captures_current_v2_kernel_domain() {
+        let identity = current_cgroup_identity().unwrap();
+        assert_eq!(identity.boot_id, linux_boot_id().unwrap());
+        assert_ne!(identity.cgroup_namespace_inode, 0);
+        assert_ne!(identity.mount_namespace_inode, 0);
+        assert_ne!(identity.cgroup_root_inode, 0);
+        ensure_cgroup2_filesystem(Path::new(CGROUP_V2_ROOT)).unwrap();
+    }
+
+    #[test]
+    fn missing_cgroup_leaf_requires_matching_persisted_identity() {
+        let id = Uuid::new_v4();
+        let locator = PathBuf::from(format!("{CGROUP_V2_ROOT}/aplexer-workload-{id}.scope"));
+        let missing = validate_recorded_cgroup(id, &locator, None)
+            .expect_err("legacy locator must not prove emptiness");
+        assert!(missing
+            .to_string()
+            .contains("no boot/namespace/mount identity"));
+
+        let mut wrong_boot = current_cgroup_identity().unwrap();
+        wrong_boot.boot_id = Uuid::new_v4().to_string();
+        let mismatch = validate_recorded_cgroup(id, &locator, Some(&wrong_boot))
+            .expect_err("cross-boot locator must not prove emptiness");
+        assert!(mismatch.to_string().contains("does not match"));
+
+        let identity = current_cgroup_identity().unwrap();
+        assert_eq!(
+            validate_recorded_cgroup(id, &locator, Some(&identity)).unwrap(),
+            None,
+            "same-domain missing cgroup is empty"
+        );
     }
 
     #[test]
@@ -3015,6 +3176,7 @@ mod tests {
         let anchor_pid = anchor.id();
         let cgroup = Cgroup {
             path: PathBuf::from("/does/not/exist"),
+            identity: current_cgroup_identity().unwrap(),
             anchor: Arc::new(Mutex::new(Some(anchor))),
             initial_oom_kill: 0,
         };
@@ -3037,11 +3199,27 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_anchor_release_retains_handle_when_reaping_fails() {
+        let mut anchor = Command::new("/bin/true").spawn().unwrap();
+        anchor.wait().unwrap();
+        let cgroup = Cgroup {
+            path: PathBuf::from("/does/not/exist"),
+            identity: current_cgroup_identity().unwrap(),
+            anchor: Arc::new(Mutex::new(Some(anchor))),
+            initial_oom_kill: 0,
+        };
+
+        assert!(cgroup.release_anchor().is_err());
+        assert!(cgroup.anchor.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn legacy_exit_info_remains_a_containment_proof() {
         let state = tempfile::tempdir().unwrap();
         let mut value = serde_json::to_value(liveness_record(state.path())).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("containment_cgroup");
+        object.remove("containment_cgroup_identity");
         object.remove("containment_empty");
         object.insert("phase".into(), serde_json::json!("exited"));
         object.insert(

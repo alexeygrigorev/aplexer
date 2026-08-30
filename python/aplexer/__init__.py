@@ -1,4 +1,4 @@
 from .client import AplexerError, Client
-from .models import ExitInfo, Session
+from .models import CgroupIdentity, ExitInfo, Session
 
-__all__ = ["AplexerError", "Client", "ExitInfo", "Session"]
+__all__ = ["AplexerError", "CgroupIdentity", "Client", "ExitInfo", "Session"]

@@ -11,6 +11,16 @@ class ExitInfo:
     exited_at_ms: int
 
 @dataclass(frozen=True)
+class CgroupIdentity:
+    boot_id: str
+    cgroup_namespace_device: int
+    cgroup_namespace_inode: int
+    mount_namespace_device: int
+    mount_namespace_inode: int
+    cgroup_root_device: int
+    cgroup_root_inode: int
+
+@dataclass(frozen=True)
 class Session:
     id: str
     workspace: Path
@@ -25,6 +35,7 @@ class Session:
     worker_pid: int | None = None
     workload_pid: int | None = None
     containment_cgroup: Path | None = None
+    containment_cgroup_identity: CgroupIdentity | None = None
     containment_empty: bool = False
     exit: ExitInfo | None = None
     error: str | None = None
@@ -34,6 +45,8 @@ class Session:
     def from_dict(cls, value: dict[str, Any]) -> "Session":
         exit_value = value.get("exit")
         exit_info = ExitInfo(**exit_value) if exit_value else None
+        identity_value = value.get("containment_cgroup_identity")
+        cgroup_identity = CgroupIdentity(**identity_value) if identity_value else None
         return cls(
             id=str(value["id"]), workspace=Path(value["workspace"]), tag=str(value["tag"]),
             engine=str(value["engine"]), profile=value.get("profile"),
@@ -46,6 +59,7 @@ class Session:
                 if value.get("containment_cgroup")
                 else None
             ),
+            containment_cgroup_identity=cgroup_identity,
             containment_empty=(
                 bool(value["containment_empty"])
                 if "containment_empty" in value

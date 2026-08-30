@@ -721,6 +721,7 @@ foreground_pid
 foreground_exe
 observed_engine
 containment_cgroup
+containment_cgroup_identity
 containment_empty
 exit_code
 exit_signal

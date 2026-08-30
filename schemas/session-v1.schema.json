@@ -109,6 +109,28 @@
         "null"
       ]
     },
+    "containment_cgroup_identity": {
+      "type": ["object", "null"],
+      "required": [
+        "boot_id",
+        "cgroup_namespace_device",
+        "cgroup_namespace_inode",
+        "mount_namespace_device",
+        "mount_namespace_inode",
+        "cgroup_root_device",
+        "cgroup_root_inode"
+      ],
+      "properties": {
+        "boot_id": {"type": "string", "minLength": 1},
+        "cgroup_namespace_device": {"type": "integer", "minimum": 0},
+        "cgroup_namespace_inode": {"type": "integer", "minimum": 1},
+        "mount_namespace_device": {"type": "integer", "minimum": 0},
+        "mount_namespace_inode": {"type": "integer", "minimum": 1},
+        "cgroup_root_device": {"type": "integer", "minimum": 0},
+        "cgroup_root_inode": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
     "containment_empty": {
       "type": "boolean"
     },

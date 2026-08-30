@@ -1117,6 +1117,8 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         })?;
         startup.cgroup = cgroup.clone();
         record.containment_cgroup = cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
+        record.containment_cgroup_identity =
+            cgroup.as_ref().map(|cgroup| cgroup.identity().clone());
         startup.failure_record = record.clone();
         atomic_write_json(&record_path, &record)?;
         startup_checkpoint("after_cgroup")?;
