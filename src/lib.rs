@@ -2007,6 +2007,7 @@ const HISTORY_BANK_MAGIC: &[u8; 8] = b"APLXH2D\0";
 const HISTORY_BANK_HEADER_PREFIX_BYTES: usize = 72;
 const HISTORY_BANK_HEADER_BYTES: usize = HISTORY_BANK_HEADER_PREFIX_BYTES + 32;
 const HISTORY_COMMIT_MAX_BYTES: usize = 4096;
+const HISTORY_MARKER_MAX_BYTES: usize = 4096;
 const HISTORY_BANK_COUNT: u8 = 2;
 const HISTORY_COMMIT_COUNT: u8 = 2;
 
@@ -2036,6 +2037,15 @@ fn history_data_path(path: &Path, slot: u8) -> PathBuf {
 
 fn history_commit_path(path: &Path, slot: u8) -> PathBuf {
     history_sidecar_path(path, "commit", slot)
+}
+
+fn history_marker_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("history.bin"))
+        .to_os_string();
+    name.push(".v2.marker");
+    path.with_file_name(name)
 }
 
 fn history_session_id(path: &Path) -> Uuid {
@@ -2079,6 +2089,7 @@ fn open_optional_history_file(path: &Path, label: &str, write: bool) -> Result<O
 
 fn validate_history_artifacts(path: &Path) -> Result<()> {
     validate_optional_history_node(path, "legacy history")?;
+    validate_optional_history_node(&history_marker_path(path), "history marker")?;
     for slot in 0..HISTORY_BANK_COUNT {
         let data_path = history_data_path(path, slot);
         if validate_optional_history_node(&data_path, "history data bank")? {
@@ -2097,6 +2108,42 @@ fn validate_history_artifacts(path: &Path) -> Result<()> {
         validate_optional_history_node(&history_commit_path(path, slot), "history commit")?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HistoryMarker {
+    format_version: u32,
+    store_id: Uuid,
+    session_id: Uuid,
+    metadata_sha256: String,
+}
+
+impl HistoryMarker {
+    fn seal(mut self) -> Result<Self> {
+        self.metadata_sha256.clear();
+        self.metadata_sha256 = sha256_hex(&serde_json::to_vec(&self)?);
+        Ok(self)
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        if self.format_version != HISTORY_FORMAT_VERSION {
+            bail!("unsupported history marker format {}", self.format_version);
+        }
+        if self.store_id.is_nil() {
+            bail!("history marker has a nil store id");
+        }
+        if self.session_id != history_session_id(path) {
+            bail!("history marker belongs to a different session");
+        }
+        let mut unsigned = self.clone();
+        let supplied = std::mem::take(&mut unsigned.metadata_sha256);
+        let expected = sha256_hex(&serde_json::to_vec(&unsigned)?);
+        if supplied != expected {
+            bail!("history marker metadata checksum mismatch");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2266,6 +2313,57 @@ fn read_history_commit(path: &Path, slot: u8) -> Result<Option<HistoryCommit>> {
     Ok(Some(commit))
 }
 
+fn read_history_marker(path: &Path) -> Result<Option<HistoryMarker>> {
+    let marker_path = history_marker_path(path);
+    let Some(file) = open_optional_history_file(&marker_path, "history marker", false)? else {
+        return Ok(None);
+    };
+    let length = file.metadata()?.len();
+    if length > HISTORY_MARKER_MAX_BYTES as u64 {
+        bail!(
+            "history marker {} exceeds the {}-byte cap",
+            marker_path.display(),
+            HISTORY_MARKER_MAX_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(HISTORY_MARKER_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read history marker {}", marker_path.display()))?;
+    if bytes.len() > HISTORY_MARKER_MAX_BYTES {
+        bail!("history marker {} exceeds its cap", marker_path.display());
+    }
+    let marker: HistoryMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse history marker {}", marker_path.display()))?;
+    marker
+        .validate(path)
+        .with_context(|| format!("validate history marker {}", marker_path.display()))?;
+    Ok(Some(marker))
+}
+
+fn publish_history_marker(path: &Path, commit: &HistoryCommit) -> Result<()> {
+    if let Some(marker) = read_history_marker(path)? {
+        if marker.store_id != commit.store_id || marker.session_id != commit.session_id {
+            bail!("history marker does not match the committed history store");
+        }
+        return Ok(());
+    }
+    let marker = HistoryMarker {
+        format_version: HISTORY_FORMAT_VERSION,
+        store_id: commit.store_id,
+        session_id: commit.session_id,
+        metadata_sha256: String::new(),
+    }
+    .seal()?;
+    let serialized = serde_json::to_vec(&marker)?;
+    if serialized.len() > HISTORY_MARKER_MAX_BYTES {
+        bail!("history marker exceeds its bounded metadata size");
+    }
+    let marker_path = history_marker_path(path);
+    atomic_write_json(&marker_path, &marker)
+        .with_context(|| format!("publish history marker {}", marker_path.display()))
+}
+
 fn recover_history_candidate(
     path: &Path,
     commit: HistoryCommit,
@@ -2326,8 +2424,9 @@ fn recover_history_candidate(
     })
 }
 
-fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<Option<RecoveredHistory>> {
+fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<(Option<RecoveredHistory>, bool)> {
     validate_history_artifacts(path)?;
+    let marker = read_history_marker(path)?;
     let mut metadata_seen = false;
     let mut valid = Vec::new();
     let mut failures = Vec::new();
@@ -2335,6 +2434,14 @@ fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<Option<Recovered
         match read_history_commit(path, slot) {
             Ok(Some(commit)) => {
                 metadata_seen = true;
+                if marker.as_ref().is_some_and(|marker| {
+                    marker.store_id != commit.store_id || marker.session_id != commit.session_id
+                }) {
+                    failures.push(format!(
+                        "commit slot {slot}: history commit does not match the history marker"
+                    ));
+                    continue;
+                }
                 match recover_history_candidate(path, commit, tail_limit) {
                     Ok(candidate) => valid.push(candidate),
                     Err(error) => failures.push(format!("commit slot {slot}: {error:#}")),
@@ -2348,13 +2455,20 @@ fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<Option<Recovered
         }
     }
     if valid.is_empty() {
-        if metadata_seen {
+        if metadata_seen || marker.is_some() {
             bail!(
                 "no valid committed history generation remains: {}",
                 failures.join("; ")
             );
         }
-        return Ok(None);
+        return Ok((None, false));
+    }
+    if marker.is_none()
+        && valid
+            .iter()
+            .any(|candidate| candidate.commit.store_id != valid[0].commit.store_id)
+    {
+        bail!("valid history commits belong to different stores");
     }
     valid.sort_by_key(|candidate| candidate.commit.commit_generation);
     if valid.len() >= 2 {
@@ -2366,7 +2480,7 @@ fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<Option<Recovered
             bail!("conflicting history commits have the same generation");
         }
     }
-    Ok(valid.pop())
+    Ok((valid.pop(), marker.is_some()))
 }
 
 struct LegacyHistory {
@@ -2399,12 +2513,12 @@ fn read_legacy_history_tail(path: &Path, limit: usize) -> Result<LegacyHistory> 
 }
 
 /// Read a byte-exact, frame-bounded persisted tail from either the v2
-/// generation store or a legacy raw `history.bin`. Once any v2 commit exists,
-/// corruption fails closed instead of falling back to potentially stale raw
-/// bytes.
+/// generation store or a legacy raw `history.bin`. Once the v2 presence
+/// marker is published, corruption fails closed instead of falling back to
+/// potentially stale raw bytes.
 pub fn read_persisted_history_tail(path: &Path, requested: Option<usize>) -> Result<Vec<u8>> {
     let limit = requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES);
-    if let Some(recovered) = recover_v2_history(path, limit)? {
+    if let (Some(recovered), _) = recover_v2_history(path, limit)? {
         return Ok(recovered.tail);
     }
     Ok(read_legacy_history_tail(path, limit)?.tail)
@@ -2435,7 +2549,7 @@ pub struct History {
 impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
         validate_history_bytes(cap)?;
-        let recovered = recover_v2_history(&path, cap)?;
+        let (recovered, marker_present) = recover_v2_history(&path, cap)?;
         let had_v2 = recovered.is_some();
         let legacy = if recovered.is_none() {
             Some(read_legacy_history_tail(&path, cap)?)
@@ -2477,6 +2591,14 @@ impl History {
             #[cfg(test)]
             data_bytes_written: 0,
         };
+        if had_v2 && !marker_present {
+            let commit = &history
+                .persisted
+                .as_ref()
+                .expect("v2 recovery has a committed generation")
+                .commit;
+            publish_history_marker(&history.path, commit)?;
+        }
         let needs_capacity_migration = history
             .persisted
             .as_ref()
@@ -2723,6 +2845,7 @@ impl History {
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;
+        publish_history_marker(&self.path, &commit)?;
         #[cfg(test)]
         {
             self.data_bytes_written = self.data_bytes_written.saturating_add(pending.len() as u64);
@@ -2790,6 +2913,7 @@ impl History {
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;
+        publish_history_marker(&self.path, &commit)?;
         #[cfg(test)]
         {
             self.data_bytes_written = self
@@ -4413,6 +4537,122 @@ mod tests {
             b"prior-newest",
             "fail-closed v2 recovery mutated the raw compatibility evidence"
         );
+    }
+
+    #[test]
+    fn history_marker_prevents_raw_fallback_when_all_commits_disappear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"v2-authoritative").unwrap();
+        history.flush().unwrap();
+        assert!(history_marker_path(&path).is_file());
+        assert!(history_data_path(&path, 0).is_file());
+
+        fs::write(&path, b"stale-raw").unwrap();
+        for slot in 0..HISTORY_COMMIT_COUNT {
+            let commit = history_commit_path(&path, slot);
+            if commit.exists() {
+                fs::remove_file(commit).unwrap();
+            }
+        }
+
+        let read_error = read_persisted_history_tail(&path, None).unwrap_err();
+        assert!(
+            format!("{read_error:#}").contains("no valid committed history generation"),
+            "{read_error:#}"
+        );
+        assert!(History::open(path.clone(), 16).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"stale-raw");
+    }
+
+    #[test]
+    fn history_unpublished_first_bank_without_marker_still_recovers_legacy_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"raw-precommit").unwrap();
+        let blocked_commit = history_commit_path(&path, 1);
+        fs::create_dir(&blocked_commit).unwrap();
+
+        assert!(history.flush().is_err());
+        assert!(history_data_path(&path, 0).is_file());
+        assert!(!history_marker_path(&path).exists());
+        assert_eq!(fs::read(&path).unwrap(), b"raw-precommit");
+        drop(history);
+        fs::remove_dir(blocked_commit).unwrap();
+
+        assert_eq!(
+            read_persisted_history_tail(&path, None).unwrap(),
+            b"raw-precommit"
+        );
+        let reopened = History::open(path.clone(), 16).unwrap();
+        assert_eq!(reopened.snapshot(None), b"raw-precommit");
+        assert!(history_marker_path(&path).is_file());
+    }
+
+    #[test]
+    fn history_markerless_v2_is_readable_and_next_writable_open_publishes_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"pre-marker-v2").unwrap();
+        history.flush().unwrap();
+        fs::remove_file(history_marker_path(&path)).unwrap();
+
+        assert_eq!(
+            read_persisted_history_tail(&path, None).unwrap(),
+            b"pre-marker-v2"
+        );
+        assert!(!history_marker_path(&path).exists());
+        let reopened = History::open(path.clone(), 16).unwrap();
+        assert_eq!(reopened.snapshot(None), b"pre-marker-v2");
+        assert!(history_marker_path(&path).is_file());
+    }
+
+    #[test]
+    fn history_marker_is_bounded_checksummed_and_a_safe_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let marker_path = history_marker_path(&path);
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"committed").unwrap();
+        history.flush().unwrap();
+        let valid_marker = fs::read(&marker_path).unwrap();
+
+        let mut bad_checksum: HistoryMarker = serde_json::from_slice(&valid_marker).unwrap();
+        bad_checksum.store_id = Uuid::new_v4();
+        fs::write(&marker_path, serde_json::to_vec(&bad_checksum).unwrap()).unwrap();
+        let error = read_persisted_history_tail(&path, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "{error:#}"
+        );
+
+        let wrong_store = bad_checksum.seal().unwrap();
+        fs::write(&marker_path, serde_json::to_vec(&wrong_store).unwrap()).unwrap();
+        let error = read_persisted_history_tail(&path, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no valid committed history generation"),
+            "{error:#}"
+        );
+
+        fs::write(&marker_path, vec![b'x'; HISTORY_MARKER_MAX_BYTES + 1]).unwrap();
+        let error = read_persisted_history_tail(&path, None).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds the"), "{error:#}");
+
+        fs::remove_file(&marker_path).unwrap();
+        let target = dir.path().join("marker-target");
+        fs::write(&target, b"unrelated").unwrap();
+        symlink(&target, &marker_path).unwrap();
+        assert!(read_persisted_history_tail(&path, None).is_err());
+        fs::remove_file(&marker_path).unwrap();
+
+        let marker_c = CString::new(marker_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(marker_c.as_ptr(), 0o600) }, 0);
+        assert!(read_persisted_history_tail(&path, None).is_err());
+        assert!(History::open(path.clone(), 16).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unrelated");
     }
 
     #[test]
