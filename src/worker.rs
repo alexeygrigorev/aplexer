@@ -46,6 +46,9 @@ const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
+type FileIdentity = (u64, u64);
+type RecoveredControlSocket = (UnixListener, FileIdentity, Option<FileLock>, FileIdentity);
+
 static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1430,7 +1433,7 @@ fn trusted_lock_identity(path: &std::path::Path) -> Result<(u64, u64)> {
 fn recover_control_socket(
     runtime: &WorkerRuntime,
     held_lock_identity: (u64, u64),
-) -> Result<(UnixListener, (u64, u64), Option<FileLock>, (u64, u64))> {
+) -> Result<RecoveredControlSocket> {
     let record = read_record(&runtime.record_path).context("read durable record for recovery")?;
     if record.worker_pid != Some(std::process::id()) {
         bail!("durable record does not identify this worker");
