@@ -1386,6 +1386,35 @@ fn spawn_workload(
     }
     unsafe {
         command.pre_exec(move || {
+            // A worker can be launched from an embedded, multi-threaded host
+            // whose spawning thread blocks signals or whose process ignores
+            // them. Both states survive fork, and ignored dispositions even
+            // survive exec. Give the workload the same clean signal baseline
+            // it would get from a normal interactive shell instead of leaking
+            // host-library policy into the session.
+            let mut default_action: libc::sigaction = std::mem::zeroed();
+            default_action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut default_action.sa_mask);
+            for signal in 1..=libc::SIGRTMAX() {
+                if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                    continue;
+                }
+                if libc::sigaction(signal, &default_action, std::ptr::null_mut()) != 0 {
+                    let error = io::Error::last_os_error();
+                    // glibc reserves a couple of real-time signal numbers for
+                    // NPTL and rejects attempts to change them.
+                    if error.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(error);
+                    }
+                }
+            }
+            let mut empty_mask: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut empty_mask) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
             libc::close(master_fd);
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
