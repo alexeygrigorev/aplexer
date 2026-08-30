@@ -2584,6 +2584,18 @@ fn wait_for_scope_cgroup(
     systemctl: &Path,
     timeout: Duration,
 ) -> Result<PathBuf> {
+    wait_for_scope_cgroup_with(id, unit, systemctl, timeout, |path| {
+        validate_recorded_cgroup(id, path, Some(identity))
+    })
+}
+
+fn wait_for_scope_cgroup_with(
+    id: Uuid,
+    unit: &str,
+    systemctl: &Path,
+    timeout: Duration,
+    mut validate: impl FnMut(&Path) -> Result<Option<PathBuf>>,
+) -> Result<PathBuf> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut command = Command::new(systemctl);
@@ -2599,9 +2611,15 @@ fn wait_for_scope_cgroup(
         if output.status.success() {
             let value = std::str::from_utf8(&output.stdout)
                 .context("decode systemd ControlGroup output")?;
-            let path = control_group_locator(id, value)?;
-            if let Some(path) = validate_recorded_cgroup(id, &path, Some(identity))? {
-                return Ok(path);
+            // systemd may publish the unit before assigning its ControlGroup.
+            // Empty and root are transient "not assigned yet" values; every
+            // other malformed, escaping, or wrong-session value is hostile
+            // evidence and must fail closed rather than being retried.
+            if !matches!(value.trim(), "" | "/") {
+                let path = control_group_locator(id, value)?;
+                if let Some(path) = validate(&path)? {
+                    return Ok(path);
+                }
             }
         }
         if Instant::now() >= deadline {
@@ -3285,6 +3303,39 @@ mod tests {
             &format!("/user.slice/aplexer-workload-{}.scope", Uuid::new_v4())
         )
         .is_err());
+    }
+
+    #[test]
+    fn scope_wait_retries_empty_control_group_then_accepts_valid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = dir.path().join("systemctl");
+        let id = Uuid::new_v4();
+        let unit = format!("aplexer-workload-{id}");
+        let reported = format!("/user.slice/{unit}.scope");
+        fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nif [ ! -e \"$0.seen\" ]; then : > \"$0.seen\"; printf '\\n'; else printf '%s\\n' '{}'; fi\n",
+                reported
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut validations = 0;
+        let path =
+            wait_for_scope_cgroup_with(id, &unit, &systemctl, Duration::from_secs(1), |path| {
+                validations += 1;
+                Ok(Some(path.to_path_buf()))
+            })
+            .unwrap();
+
+        assert_eq!(
+            path,
+            Path::new(CGROUP_V2_ROOT).join(reported.trim_start_matches('/'))
+        );
+        assert_eq!(validations, 1, "empty value must not reach validation");
+        assert!(systemctl.with_extension("seen").exists());
     }
 
     #[test]

@@ -181,16 +181,23 @@ fn delegated_cgroups_available() -> bool {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return false;
     }
-    Command::new("systemd-run")
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--collect"])
+        .arg(format!(
+            "--unit=aplexer-test-probe-availability-{}",
+            std::process::id()
+        ))
         .args([
-            "--user",
-            "--scope",
-            "--collect",
-            "--unit=aplexer-test-probe-availability",
             "-p",
             "Delegate=yes",
             "--",
-            "true",
+            "sh",
+            "-c",
+            "cg=$(awk -F: '$1 == \"0\" { print $3 }' /proc/self/cgroup); \
+             test -n \"$cg\" && test \"$cg\" != / && \
+             test -f \"/sys/fs/cgroup$cg/cgroup.controllers\" && \
+             grep -qw memory \"/sys/fs/cgroup$cg/cgroup.controllers\"",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
