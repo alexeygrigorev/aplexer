@@ -65,19 +65,15 @@ fn invalid_start_request(workspace: PathBuf) -> StartRequest {
     }
 }
 
-fn successful_start_request(workspace: PathBuf) -> StartRequest {
+fn successful_start_request(workspace: PathBuf, tag: &str) -> StartRequest {
     StartRequest {
         workspace,
-        tag: "reaping".into(),
+        tag: tag.into(),
         engine: None,
         profile: None,
         cwd: None,
         env: BTreeMap::new(),
-        command: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "sleep 0.1".into(),
-        ],
+        command: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
         memory: None,
         pids: None,
         cpu_quota_us: None,
@@ -92,10 +88,7 @@ fn successful_start_request(workspace: PathBuf) -> StartRequest {
 }
 
 fn exercise_successful_worker_reaping() {
-    install_sigchld(
-        custom_sigchld_handler as *const () as libc::sighandler_t,
-        0,
-    );
+    install_sigchld(custom_sigchld_handler as *const () as libc::sighandler_t, 0);
     let before = sigchld_action();
     let runtime = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
@@ -107,26 +100,43 @@ fn exercise_successful_worker_reaping() {
     };
     paths.ensure().unwrap();
     env::set_var("APLEXER_WORKER", env!("CARGO_BIN_EXE_aplexer"));
-    let ready = start_session(
-        &paths,
-        &successful_start_request(workspace.path().to_path_buf()),
-    )
-    .expect("start short-lived worker through in-process API");
-    let worker_pid = ready.worker_pid.expect("ready worker pid");
+    let threads_before = std::fs::read_dir("/proc/self/task").unwrap().count();
+    let mut sessions = Vec::new();
+    for index in 0..8 {
+        sessions.push(
+            start_session(
+                &paths,
+                &successful_start_request(
+                    workspace.path().to_path_buf(),
+                    &format!("reaping-{index}"),
+                ),
+            )
+            .expect("start short-lived worker through in-process API"),
+        );
+    }
+    let threads_after = std::fs::read_dir("/proc/self/task").unwrap().count();
+    assert!(
+        threads_after <= threads_before + 1,
+        "shared worker reaper created {} threads for 8 sessions",
+        threads_after.saturating_sub(threads_before)
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let record = read_record(&paths.record(ready.id)).expect("read final session record");
-        let worker_reaped = !PathBuf::from(format!("/proc/{worker_pid}")).exists();
-        if matches!(record.phase, Phase::Exited | Phase::Failed) && worker_reaped {
-            break;
+    for ready in sessions {
+        let worker_pid = ready.worker_pid.expect("ready worker pid");
+        loop {
+            let record = read_record(&paths.record(ready.id)).expect("read final session record");
+            let worker_reaped = !PathBuf::from(format!("/proc/{worker_pid}")).exists();
+            if matches!(record.phase, Phase::Exited | Phase::Failed) && worker_reaped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completed in-process worker {worker_pid} remained as a child/zombie; phase={:?}",
+                record.phase
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "completed in-process worker {worker_pid} remained as a child/zombie; phase={:?}",
-            record.phase
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     let after = sigchld_action();

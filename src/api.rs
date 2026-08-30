@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -43,6 +43,37 @@ const STARTUP_CONTAINMENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// RLIMIT_NOFILE budget before any process is stopped.
 const STARTUP_MAX_DESCENDANTS: usize = 4096;
 const STARTUP_FD_RESERVE: u64 = 16;
+const WORKER_REAPER_POLL: Duration = Duration::from_millis(100);
+static WORKER_REAPER: Mutex<Option<mpsc::Sender<Child>>> = Mutex::new(None);
+
+fn worker_reaper_loop(receiver: mpsc::Receiver<Child>) {
+    let mut children: Vec<Child> = Vec::new();
+    loop {
+        let received = if children.is_empty() {
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            receiver.recv_timeout(WORKER_REAPER_POLL)
+        };
+        match received {
+            Ok(child) => children.push(child),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        while let Ok(child) = receiver.try_recv() {
+            children.push(child);
+        }
+        children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(error) => {
+                eprintln!("aplexer: wait for worker {} failed: {error}", child.id());
+                false
+            }
+        });
+    }
+}
 
 /// Owns every artifact created for a session until its worker is ready.
 /// Normal error paths call `rollback` so cleanup failures can be reported;
@@ -74,7 +105,7 @@ impl<'a> StartupGuard<'a> {
             .expect("startup child must be tracked after spawn")
     }
 
-    /// Transfer a successfully-started worker to a detached waiter. The CLI
+    /// Transfer a successfully-started worker to the shared detached waiter. The CLI
     /// normally exits long before the worker, but embedders (notably Python)
     /// can outlive many sessions; merely dropping `Child` there leaves every
     /// completed worker as a zombie owned by the host process.
@@ -88,31 +119,38 @@ impl<'a> StartupGuard<'a> {
             .take()
             .expect("ready worker must still be owned by startup guard");
         let worker_pid = child.id();
-        let (sender, receiver) = mpsc::sync_channel::<Child>(1);
-        let waiter = match thread::Builder::new()
-            .name(format!("aplexer-reap-{worker_pid}"))
-            .spawn(move || {
-                if let Ok(mut child) = receiver.recv() {
-                    if let Err(error) = child.wait() {
-                        eprintln!("aplexer: wait for worker {worker_pid} failed: {error}");
-                    }
+        let mut child = Some(child);
+        let mut reaper = WORKER_REAPER
+            .lock()
+            .map_err(|_| anyhow!("worker reaper registry lock poisoned"))?;
+        for _ in 0..2 {
+            if reaper.is_none() {
+                let (sender, receiver) = mpsc::channel();
+                if let Err(error) = thread::Builder::new()
+                    .name("aplexer-worker-reaper".into())
+                    .spawn(move || worker_reaper_loop(receiver))
+                {
+                    self.child = child.take();
+                    return Err(error).context("spawn worker reaper");
                 }
-            })
-        {
-            Ok(waiter) => waiter,
-            Err(error) => {
-                self.child = Some(child);
-                return Err(error).context("spawn worker reaper");
+                *reaper = Some(sender);
             }
-        };
-        if let Err(error) = sender.send(child) {
-            self.child = Some(error.0);
-            let _ = waiter.join();
-            bail!("worker reaper exited before accepting worker {worker_pid}");
+            let sender = reaper
+                .as_ref()
+                .expect("worker reaper sender was just initialized");
+            match sender.send(child.take().expect("worker child sent only once")) {
+                Ok(()) => {
+                    self.armed = false;
+                    return Ok(());
+                }
+                Err(error) => {
+                    child = Some(error.0);
+                    *reaper = None;
+                }
+            }
         }
-        drop(waiter);
-        self.armed = false;
-        Ok(())
+        self.child = child;
+        bail!("worker reaper exited before accepting worker {worker_pid}")
     }
 
     fn rollback(&mut self) -> Result<()> {
