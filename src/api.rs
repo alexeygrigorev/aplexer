@@ -158,7 +158,7 @@ fn persist_independent_cleanup_proof(record_path: &Path, worker_pid: u32) -> Res
         bail!("startup record worker identity changed before cleanup proof persistence");
     }
     record.phase = Phase::Failed;
-    record.containment_empty = true;
+    record.containment_empty = Some(true);
     record.updated_at_ms = crate::now_ms();
     record.error.get_or_insert_with(|| {
         "worker did not complete startup; launcher independently emptied containment".into()
@@ -1083,7 +1083,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             worker_pid: None,
             workload_pid: None,
             containment_cgroup: None,
-            containment_empty: false,
+            containment_empty: Some(false),
             socket_path: paths.socket(id),
             history_path: paths.history(id),
             exit: None,

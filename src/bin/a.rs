@@ -1349,7 +1349,7 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     let mut current = read_record(&paths.record(record.id)).unwrap_or_else(|_| record.clone());
     current.phase = Phase::Failed;
-    current.containment_empty = true;
+    current.containment_empty = Some(true);
     current.error =
         Some("worker died without recording workload exit; workload killed by `a kill`".into());
     current.updated_at_ms = now_ms();
@@ -4148,7 +4148,7 @@ mod switching_tests {
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
             containment_cgroup: None,
-            containment_empty: false,
+            containment_empty: Some(false),
             // Must exist on disk: check_attachable now checks socket_path
             // (this test binary's own executable is a convenient stand-in
             // for "some file that's there"; only .exists() is probed, never

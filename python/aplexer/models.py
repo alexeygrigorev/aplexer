@@ -46,6 +46,10 @@ class Session:
                 if value.get("containment_cgroup")
                 else None
             ),
-            containment_empty=bool(value.get("containment_empty", bool(exit_info))),
+            containment_empty=(
+                bool(value["containment_empty"])
+                if "containment_empty" in value
+                else bool(exit_info)
+            ),
             exit=exit_info, error=value.get("error"), raw=value,
         )

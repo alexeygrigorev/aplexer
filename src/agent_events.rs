@@ -1262,7 +1262,7 @@ fn dummy_record(engine: &str) -> SessionRecord {
         worker_pid: None,
         workload_pid: None,
         containment_cgroup: None,
-        containment_empty: false,
+        containment_empty: Some(false),
         socket_path: PathBuf::from("/"),
         history_path: PathBuf::from("/"),
         exit: None,

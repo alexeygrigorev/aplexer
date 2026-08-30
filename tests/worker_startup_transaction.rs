@@ -57,7 +57,7 @@ impl Harness {
             worker_pid: None,
             workload_pid: None,
             containment_cgroup: None,
-            containment_empty: false,
+            containment_empty: Some(false),
             socket_path: self.paths.socket(id),
             history_path: self.paths.history(id),
             exit: None,

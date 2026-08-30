@@ -50,3 +50,18 @@ def test_session_containment_proof_fields_and_legacy_exit():
         }
     )
     assert legacy.containment_empty
+
+    explicit_failure = Session.from_dict(
+        {
+            **base,
+            "phase": "failed",
+            "containment_empty": False,
+            "exit": {
+                "code": None,
+                "signal": None,
+                "oom_killed": False,
+                "exited_at_ms": 2,
+            },
+        }
+    )
+    assert not explicit_failure.containment_empty

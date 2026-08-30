@@ -400,8 +400,8 @@ pub struct SessionRecord {
     /// observed the complete containment domain empty. Numeric leader PIDs
     /// are not such proof because descendants may call `setsid` and outlive
     /// both the original process group and the worker.
-    #[serde(default)]
-    pub containment_empty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_empty: Option<bool>,
     pub socket_path: PathBuf,
     pub history_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,12 +433,13 @@ impl SessionRecord {
         format!("{}:{}", self.workspace.display(), self.tag)
     }
 
-    /// New records persist `containment_empty` directly. Before that field
-    /// existed, ExitInfo was written only after the lifecycle loop observed
-    /// the full subreaper/cgroup domain empty, so it remains a valid legacy
-    /// proof. A failed/starting record without either signal stays ambiguous.
+    /// New records persist `containment_empty` explicitly, including `false`.
+    /// Before that field existed, ExitInfo was written only after the lifecycle
+    /// loop observed the full subreaper/cgroup domain empty, so an exit remains
+    /// a valid proof only when the field is absent. Explicit `false` always
+    /// wins: a newer failed lifecycle must not be upgraded by its ExitInfo.
     pub fn containment_proven_empty(&self) -> bool {
-        self.containment_empty || self.exit.is_some()
+        self.containment_empty.unwrap_or_else(|| self.exit.is_some())
     }
 
     /// Whether the worker process is present in `/proc`. This is a cheap,
@@ -2785,7 +2786,7 @@ mod tests {
             worker_pid: Some(pid),
             workload_pid: None,
             containment_cgroup: None,
-            containment_empty: false,
+            containment_empty: Some(false),
             socket_path: state_dir.join("control.sock"),
             history_path: state_dir.join("history.bin"),
             exit: None,
@@ -3003,6 +3004,13 @@ mod tests {
         );
         let terminal: SessionRecord = serde_json::from_value(value.clone()).unwrap();
         assert!(terminal.containment_proven_empty());
+
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("containment_empty".into(), serde_json::json!(false));
+        let explicit_failure: SessionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert!(!explicit_failure.containment_proven_empty());
 
         value.as_object_mut().unwrap().remove("exit");
         value

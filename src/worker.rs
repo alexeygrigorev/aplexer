@@ -952,7 +952,7 @@ impl StartupGuard {
         }
 
         self.failure_record.phase = Phase::Failed;
-        self.failure_record.containment_empty = cleanup_failures.is_empty();
+        self.failure_record.containment_empty = Some(cleanup_failures.is_empty());
         self.failure_record.error = Some(if cleanup_failures.is_empty() {
             message
         } else {
@@ -963,7 +963,7 @@ impl StartupGuard {
         });
         self.failure_record.updated_at_ms = now_ms();
         match atomic_write_json(&self.record_path, &self.failure_record) {
-            Ok(()) if self.failure_record.containment_empty => {
+            Ok(()) if self.failure_record.containment_empty == Some(true) => {
                 if let Some(cgroup) = self.cgroup.take() {
                     cgroup.cleanup();
                 }
@@ -1539,7 +1539,7 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         } else {
             Phase::Exited
         };
-        r.containment_empty = containment_empty;
+        r.containment_empty = Some(containment_empty);
         r.exit = Some(exit.clone());
         r.error = error;
     });
