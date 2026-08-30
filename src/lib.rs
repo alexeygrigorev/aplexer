@@ -4390,6 +4390,32 @@ mod tests {
     }
 
     #[test]
+    fn history_corrupt_v2_pair_never_falls_back_to_stale_raw_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"prior").unwrap();
+        history.flush().unwrap();
+        history.append(b"-newest").unwrap();
+        history.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"prior-newest");
+
+        fs::write(history_commit_path(&path, 0), b"{torn-newest").unwrap();
+        fs::write(history_commit_path(&path, 1), b"{torn-prior").unwrap();
+        let read_error = read_persisted_history_tail(&path, None).unwrap_err();
+        assert!(
+            format!("{read_error:#}").contains("no valid committed history generation"),
+            "{read_error:#}"
+        );
+        assert!(History::open(path.clone(), 16).is_err());
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"prior-newest",
+            "fail-closed v2 recovery mutated the raw compatibility evidence"
+        );
+    }
+
+    #[test]
     fn history_compaction_is_bounded_and_amortized_by_new_output() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.bin");
