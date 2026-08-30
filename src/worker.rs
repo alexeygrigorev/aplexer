@@ -6,7 +6,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -40,6 +40,7 @@ const MAX_CLIENT_CONNECTIONS: usize = 128;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+const CONTROL_SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const HISTORY_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1188,8 +1189,9 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     let record_path = paths.record(id);
     let mut record = read_record(&record_path)?;
     ensure_private_dir(&paths.runtime_session(id))?;
-    let _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
+    let mut _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;
+    let mut worker_lock_identity = trusted_lock_identity(&paths.worker_lock(id))?;
     let legacy_environment = LaunchEnvironment(std::mem::take(&mut record.env));
     record.env = session_metadata_env(&legacy_environment.0);
     let mut startup = StartupGuard::new(&paths, &record);
@@ -1284,7 +1286,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         start_worker_threads(Arc::clone(&runtime), master_read, Arc::clone(&child_slot))?;
         Ok((listener, runtime))
     })();
-    let (listener, runtime) = match setup {
+    let (mut listener, runtime) = match setup {
         Ok(value) => value,
         Err(error) => {
             startup.rollback(&error);
@@ -1295,8 +1297,8 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
 
     let mut accept_retry = ACCEPT_RETRY_INITIAL;
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
+        match poll_control_connection(&listener, CONTROL_SOCKET_CHECK_INTERVAL) {
+            Ok(Some((stream, _))) => {
                 accept_retry = ACCEPT_RETRY_INITIAL;
                 let Some(permit) = try_acquire_connection(&runtime.active_connections) else {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -1315,6 +1317,28 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
                     eprintln!("aplexer worker: spawn client thread: {error}");
                 }
             }
+            Ok(None) => {
+                if !control_socket_matches_listener(&listener, &runtime.socket_path) {
+                    match recover_control_socket(&runtime, worker_lock_identity) {
+                        Ok((replacement, replacement_lock, replacement_lock_identity)) => {
+                            listener = replacement;
+                            if let Some(replacement_lock) = replacement_lock {
+                                _worker_lock = replacement_lock;
+                            }
+                            worker_lock_identity = replacement_lock_identity;
+                            eprintln!(
+                                "aplexer worker: recovered control socket {}",
+                                runtime.socket_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "aplexer worker: control socket recovery deferred: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if transient_accept_error(&error) => {
                 eprintln!(
@@ -1327,6 +1351,122 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             Err(error) => return Err(error).context("accept control connection"),
         }
     }
+}
+
+fn poll_control_connection(
+    listener: &UnixListener,
+    timeout: Duration,
+) -> io::Result<Option<(UnixStream, std::os::unix::net::SocketAddr)>> {
+    let mut poll_fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    if poll_fd.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    if poll_fd.revents & libc::POLLIN == 0 {
+        return Ok(None);
+    }
+    listener.accept().map(Some)
+}
+
+fn control_socket_matches_listener(listener: &UnixListener, path: &std::path::Path) -> bool {
+    let Ok(path_metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !path_metadata.file_type().is_socket()
+        || path_metadata.uid() != unsafe { libc::geteuid() }
+        || path_metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return false;
+    }
+    let mut listener_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(listener.as_raw_fd(), &mut listener_stat) } != 0 {
+        return false;
+    }
+    path_metadata.dev() == listener_stat.st_dev && path_metadata.ino() == listener_stat.st_ino
+}
+
+/// Recreate reachability metadata after cleanup software removes a live
+/// worker's private runtime session directory. Durable PID identity is the
+/// trust anchor: never recreate runtime artifacts if it has disappeared or
+/// no longer proves that this process is the recorded worker.
+fn trusted_lock_identity(path: &std::path::Path) -> Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect worker lock {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        bail!(
+            "worker lock {} is not a trusted private file",
+            path.display()
+        );
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn recover_control_socket(
+    runtime: &WorkerRuntime,
+    held_lock_identity: (u64, u64),
+) -> Result<(UnixListener, Option<FileLock>, (u64, u64))> {
+    let record = read_record(&runtime.record_path).context("read durable record for recovery")?;
+    if record.worker_pid != Some(std::process::id()) {
+        bail!("durable record does not identify this worker");
+    }
+    signal_recorded_worker(&record, 0).context("validate durable worker identity")?;
+
+    ensure_private_dir(&runtime.runtime_session_dir)?;
+    let lock_path = runtime.paths.worker_lock(record.id);
+    let current_lock_identity = match trusted_lock_identity(&lock_path) {
+        Ok(identity) => Some(identity),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let (replacement_lock, lock_identity) = if current_lock_identity == Some(held_lock_identity) {
+        (None, held_lock_identity)
+    } else {
+        let lock =
+            FileLock::exclusive(&lock_path, true).context("reacquire recovered worker lock")?;
+        let identity = trusted_lock_identity(&lock_path)?;
+        (Some(lock), identity)
+    };
+    match fs::symlink_metadata(&runtime.socket_path) {
+        Ok(metadata)
+            if metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() } =>
+        {
+            fs::remove_file(&runtime.socket_path).context("remove displaced control socket")?;
+        }
+        Ok(_) => bail!(
+            "refusing to replace untrusted control socket path {}",
+            runtime.socket_path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect control socket path for recovery"),
+    }
+    let listener = UnixListener::bind(&runtime.socket_path)
+        .with_context(|| format!("rebind {}", runtime.socket_path.display()))?;
+    if let Err(error) = fs::set_permissions(&runtime.socket_path, fs::Permissions::from_mode(0o600))
+    {
+        let _ = fs::remove_file(&runtime.socket_path);
+        return Err(error).context("secure recovered control socket");
+    }
+    Ok((listener, replacement_lock, lock_identity))
 }
 
 fn spawn_workload(
