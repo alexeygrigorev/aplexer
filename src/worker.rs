@@ -1195,7 +1195,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     let legacy_environment = LaunchEnvironment(std::mem::take(&mut record.env));
     record.env = session_metadata_env(&legacy_environment.0);
     let mut startup = StartupGuard::new(&paths, &record);
-    let setup = (|| -> Result<(UnixListener, Arc<WorkerRuntime>)> {
+    let setup = (|| -> Result<(UnixListener, (u64, u64), Arc<WorkerRuntime>)> {
         startup_checkpoint("after_worker_lock")?;
         let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
         let launch_environment =
@@ -1215,6 +1215,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let socket_identity = trusted_socket_identity(&socket_path)?;
         startup_checkpoint("after_control_socket")?;
 
         let requested_size = initial_size.unwrap_or((24, 80));
@@ -1284,9 +1285,9 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             last_activity_ms: AtomicU64::new(0),
         });
         start_worker_threads(Arc::clone(&runtime), master_read, Arc::clone(&child_slot))?;
-        Ok((listener, runtime))
+        Ok((listener, socket_identity, runtime))
     })();
-    let (mut listener, runtime) = match setup {
+    let (mut listener, mut control_socket_identity, runtime) = match setup {
         Ok(value) => value,
         Err(error) => {
             startup.rollback(&error);
@@ -1318,10 +1319,16 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
                 }
             }
             Ok(None) => {
-                if !control_socket_matches_listener(&listener, &runtime.socket_path) {
+                if !control_socket_matches_identity(&runtime.socket_path, control_socket_identity) {
                     match recover_control_socket(&runtime, worker_lock_identity) {
-                        Ok((replacement, replacement_lock, replacement_lock_identity)) => {
+                        Ok((
+                            replacement,
+                            replacement_socket_identity,
+                            replacement_lock,
+                            replacement_lock_identity,
+                        )) => {
                             listener = replacement;
+                            control_socket_identity = replacement_socket_identity;
                             if let Some(replacement_lock) = replacement_lock {
                                 _worker_lock = replacement_lock;
                             }
@@ -1379,21 +1386,26 @@ fn poll_control_connection(
     listener.accept().map(Some)
 }
 
-fn control_socket_matches_listener(listener: &UnixListener, path: &std::path::Path) -> bool {
+fn control_socket_matches_identity(path: &std::path::Path, identity: (u64, u64)) -> bool {
+    trusted_socket_identity(path).is_ok_and(|current| current == identity)
+}
+
+/// The filesystem socket node and the open listener descriptor do not share
+/// an inode on Linux. Capture the pathname's identity immediately after bind
+/// and compare later pathname metadata against that stable identity instead
+/// of comparing `lstat(path)` with `fstat(listener)` (which always differs and
+/// caused an unnecessary rebind every idle health-check interval).
+fn trusted_socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
     let Ok(path_metadata) = fs::symlink_metadata(path) else {
-        return false;
+        bail!("control socket path is missing");
     };
     if !path_metadata.file_type().is_socket()
         || path_metadata.uid() != unsafe { libc::geteuid() }
         || path_metadata.permissions().mode() & 0o777 != 0o600
     {
-        return false;
+        bail!("control socket path is not a trusted private socket");
     }
-    let mut listener_stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(listener.as_raw_fd(), &mut listener_stat) } != 0 {
-        return false;
-    }
-    path_metadata.dev() == listener_stat.st_dev && path_metadata.ino() == listener_stat.st_ino
+    Ok((path_metadata.dev(), path_metadata.ino()))
 }
 
 /// Recreate reachability metadata after cleanup software removes a live
@@ -1418,7 +1430,7 @@ fn trusted_lock_identity(path: &std::path::Path) -> Result<(u64, u64)> {
 fn recover_control_socket(
     runtime: &WorkerRuntime,
     held_lock_identity: (u64, u64),
-) -> Result<(UnixListener, Option<FileLock>, (u64, u64))> {
+) -> Result<(UnixListener, (u64, u64), Option<FileLock>, (u64, u64))> {
     let record = read_record(&runtime.record_path).context("read durable record for recovery")?;
     if record.worker_pid != Some(std::process::id()) {
         bail!("durable record does not identify this worker");
@@ -1466,7 +1478,8 @@ fn recover_control_socket(
         let _ = fs::remove_file(&runtime.socket_path);
         return Err(error).context("secure recovered control socket");
     }
-    Ok((listener, replacement_lock, lock_identity))
+    let socket_identity = trusted_socket_identity(&runtime.socket_path)?;
+    Ok((listener, socket_identity, replacement_lock, lock_identity))
 }
 
 fn spawn_workload(

@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -104,6 +104,25 @@ fn live_worker_recreates_deleted_private_runtime_socket() {
     let identity_path = durable_session.join("worker.identity.json");
     let identity_before = fs::read(&identity_path).unwrap();
     harness.id = Some(id.clone());
+
+    // A healthy listener must remain published under the exact same socket
+    // node across several idle health checks. Linux gives the open listener
+    // fd and its filesystem pathname different inode numbers, so comparing
+    // fstat(listener) with lstat(path) falsely treats every healthy socket as
+    // displaced and continuously rebinds it.
+    let healthy_metadata = fs::symlink_metadata(&socket).unwrap();
+    let healthy_identity = (healthy_metadata.dev(), healthy_metadata.ino());
+    thread::sleep(Duration::from_millis(1_200));
+    for _ in 0..3 {
+        let status = harness.run(&["status", &id, "--json"]);
+        assert!(status.status.success(), "healthy status RPC failed");
+    }
+    let still_healthy = fs::symlink_metadata(&socket).unwrap();
+    assert_eq!(
+        (still_healthy.dev(), still_healthy.ino()),
+        healthy_identity,
+        "idle health checks replaced an untouched control socket"
+    );
 
     fs::remove_dir_all(&runtime_session).unwrap();
 
