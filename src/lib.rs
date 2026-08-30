@@ -433,6 +433,14 @@ impl SessionRecord {
         format!("{}:{}", self.workspace.display(), self.tag)
     }
 
+    /// New records persist `containment_empty` directly. Before that field
+    /// existed, ExitInfo was written only after the lifecycle loop observed
+    /// the full subreaper/cgroup domain empty, so it remains a valid legacy
+    /// proof. A failed/starting record without either signal stays ambiguous.
+    pub fn containment_proven_empty(&self) -> bool {
+        self.containment_empty || self.exit.is_some()
+    }
+
     /// Whether the worker process is present in `/proc`. This is a cheap,
     /// pessimistic check for legacy records. New records also pin the
     /// worker's boot and process start time, so a recycled numeric pid does
@@ -2809,6 +2817,35 @@ mod tests {
         .unwrap();
         signal_cgroup_path_until(dir.path(), 0, Instant::now() + Duration::from_secs(1))
             .expect("pidfd signal-zero probe");
+    }
+
+    #[test]
+    fn legacy_exit_info_remains_a_containment_proof() {
+        let state = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(liveness_record(state.path())).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("containment_cgroup");
+        object.remove("containment_empty");
+        object.insert("phase".into(), serde_json::json!("exited"));
+        object.insert(
+            "exit".into(),
+            serde_json::json!({
+                "code": 0,
+                "signal": null,
+                "oom_killed": false,
+                "exited_at_ms": 2
+            }),
+        );
+        let terminal: SessionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert!(terminal.containment_proven_empty());
+
+        value.as_object_mut().unwrap().remove("exit");
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("phase".into(), serde_json::json!("failed"));
+        let ambiguous: SessionRecord = serde_json::from_value(value).unwrap();
+        assert!(!ambiguous.containment_proven_empty());
     }
 
     #[test]

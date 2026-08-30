@@ -947,7 +947,7 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
     let mut retained_count = 0usize;
     for record in records {
         let workload_alive = record.workload_pid.map(process_alive).unwrap_or(false);
-        if workload_alive || !record.worker_finished() || !record.containment_empty {
+        if workload_alive || !record.worker_finished() || !record.containment_proven_empty() {
             retained_count += 1;
             continue;
         }
@@ -1298,7 +1298,7 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             recover_broken_containment(&record, signal, args.grace_ms)?;
             mark_broken_workload_killed(paths, &record)?;
         } else {
-            if !record.containment_empty {
+            if !record.containment_proven_empty() {
                 recover_broken_containment(&record, signal, args.grace_ms)?;
             }
             remove_session_state(paths, record.id)
@@ -1339,7 +1339,7 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
 /// false cleanup success.
 fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
     let grace = kill_grace_duration(grace_ms)?;
-    if record.containment_empty {
+    if record.containment_proven_empty() {
         return Ok(());
     }
     let Some(locator) = record.containment_cgroup.as_deref() else {

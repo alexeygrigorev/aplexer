@@ -148,7 +148,7 @@ fn reaped_worker_cleanup_confirmed(record_path: &Path, worker_pid: u32) -> bool 
     // Once a worker registered itself, only its explicit empty-domain proof
     // is sufficient. Leader exit, a missing workload pid, and an ExitInfo are
     // all weaker: setsid descendants can survive each of them.
-    record.containment_empty
+    record.containment_proven_empty()
 }
 
 fn persist_independent_cleanup_proof(record_path: &Path, worker_pid: u32) -> Result<()> {
