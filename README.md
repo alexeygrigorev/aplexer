@@ -152,6 +152,15 @@ Records created by older versions with a larger value remain visible and can
 still be inspected, captured, or forgotten; the ceiling applies when a new
 worker would allocate a history ring.
 
+Dirty history is checkpointed at most every 500 ms. Normal checkpoints append
+only new PTY bytes, sync them, and publish a small checksummed generation;
+whole-tail compaction happens only after roughly another ring's worth of
+output. Two alternating data banks and commit records preserve the previous
+valid generation across a torn write. `history.bin` remains a raw compatibility
+view for older clients: it is appended on the same checkpoints, compacted at
+twice the configured cap, and reduced to the exact tail on clean exit. New
+readers use the checksummed generations for crash recovery and dead capture.
+
 Launch a profile explicitly with `a start --engine codex --profile zodex`, or from inside a workspace `a start --profile zodex` (the profile's own `engine` field fills in `--engine`).
 
 ### Shortcuts
@@ -210,7 +219,7 @@ explicit period keeps the 100,000 µs default.
 
 ## Durable lifecycle
 
-Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept within the configured byte bound and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker.
+Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker.
 
 ## Watching events
 

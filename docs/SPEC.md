@@ -1003,6 +1003,25 @@ records from older versions may report a larger configured capacity and remain
 available to list, status, capture, and forget operations, but a new worker
 will not allocate a ring above the current ceiling.
 
+The worker checkpoints dirty history every 500 ms. Each ordinary checkpoint
+appends only the new bytes to both the raw compatibility view (`history.bin`)
+and the active v2 data bank, syncs the data, then atomically publishes a small
+checksummed commit record. Two data banks and two alternating commit slots keep
+the prior valid generation recoverable if an append or metadata publication is
+torn. A bank is compacted from the exact in-memory tail only after its payload
+would exceed twice `history_bytes`, so full-ring writes are amortized by new
+output rather than multiplied by the flush count.
+
+V2 recovery validates fixed size bounds, session/store identity, generation
+and slot bindings, and SHA-256 checksums before selecting the newest valid commit; a
+trailing uncommitted suffix is ignored and a corrupt newest commit falls back
+to the prior one. Once v2 metadata exists, readers never fall back to stale raw
+history. Legacy raw-only files are seek-read from their bounded tail and
+migrated when a worker opens them. The raw compatibility view is itself bounded
+to twice `history_bytes` during a live session and is compacted to the exact
+tail on clean exit. All history artifacts are opened without following links
+or blocking on special files.
+
 The worker also maintains terminal screen state for current-screen attach and
 capture, including alternate-screen behavior. This screen model is separate
 from the authoritative raw history bytes and is not a copy-mode interface.
