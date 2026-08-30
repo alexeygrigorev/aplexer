@@ -21,9 +21,9 @@ its own worker, socket, terminal history, and optional resource limits.
 python -m pip install aplexer
 ```
 
-The package provides the user-facing `a` command and the `aplexer` worker
-executable. Start a tagged session, list sessions by workspace, and attach to
-one with:
+The package provides the user-facing `a` command, the `aplexer` worker
+executable, and the importable `aplexer` Python client. Start a tagged session,
+list sessions by workspace, and attach to one with:
 
 ```bash
 a start --workspace "$PWD" --tag shell -- /bin/bash -l
@@ -42,7 +42,7 @@ available, and `Ctrl-b d` detaches without terminating the workload.
 - Per-session PTY workers and optional cgroup-v2 resource isolation.
 - Byte-preserving send/capture, durable transcripts, and lifecycle watching.
 - `a whoami` plus durable or direct-to-pane inter-agent messaging.
-- In-process Python bindings are available separately from the CLI package.
+- In-process Python bindings are installed alongside the CLI package.
 
 ## Links
 
@@ -52,7 +52,8 @@ available, and `Ctrl-b d` detaches without terminating the workload.
 - [Release notes](https://github.com/alexeygrigorev/aplexer/releases)
 - [Python client bindings](https://pypi.org/project/aplexer-client/)
 ''', content-type = "text/markdown" }
-requires-python = ">=3.8"
+requires-python = ">=3.11"
+dependencies = ["aplexer-client==0.1.1"]
 license = { text = "Apache-2.0" }
 keywords = [
     "agent",
@@ -94,3 +95,6 @@ aplexer_cli = ["bin/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+aplexer-client = { path = "../python" }

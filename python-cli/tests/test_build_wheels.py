@@ -74,6 +74,12 @@ class TestBuildWheel(unittest.TestCase):
                 self.assertIn("aplexer = aplexer_cli._main:main_aplexer", entry_points)
                 self.assertIn("a = aplexer_cli._main:main_a", entry_points)
 
+                metadata = whl.read(
+                    "aplexer-0.1.0.dist-info/METADATA"
+                ).decode("utf-8")
+                self.assertIn("Requires-Python: >=3.11\n", metadata)
+                self.assertIn("Requires-Dist: aplexer-client==0.1.0\n", metadata)
+
     def test_build_windows_wheel_uses_exe_suffix(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             a_path = os.path.join(tmpdir, "a.exe")

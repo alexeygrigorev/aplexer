@@ -5,7 +5,8 @@ Project: **Aplexer**
 CLI executables: `aplexer`, short alias `a`  
 Target platform: **Linux only**  
 Primary implementation language: **Rust**  
-Python package: **`aplexer`** on PyPI
+CLI distribution: **`aplexer`** on PyPI; Python import package: **`aplexer`**,
+provided by **`aplexer-client`**
 
 ## 1. Summary
 
@@ -1323,13 +1324,15 @@ import aplexer
 
 The PyPI wheel/distribution must include or install the Rust binary.
 
-Packaging options to evaluate:
+The published `aplexer` CLI distribution contains the `a` and `aplexer`
+executables and declares an exact-version dependency on `aplexer-client`,
+which provides the `aplexer` import package. Releases publish the client
+wheels before the dependent CLI wheels. Both distributions require Python
+3.11 or newer and currently publish wheels only for Linux x86_64 and aarch64.
 
-- maturin,
-- wheel containing a standalone Rust executable,
-- Python extension/helper package plus binary payload.
-
-The preferred solution is whichever gives reliable Linux wheels and a simple `uv tool install aplexer` experience.
+The CLI uses a wheel containing standalone Rust executables; the client uses
+maturin to build the PyO3 extension. Together they provide the simple
+`uv tool install aplexer` experience described above.
 
 No Python interpreter should be required for the core Rust runtime after installation if avoidable; Python exists for packaging/client integration.
 

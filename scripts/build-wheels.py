@@ -15,10 +15,12 @@ release binaries for that platform:
     aplexer-bins-linux-amd64/aplexer
 Each platform's pair of binaries is packaged into a single wheel (PyPI
 project "aplexer", import package "aplexer_cli"), exposing both as console
-scripts ("a" and "aplexer"). Linux wheels intentionally start with the
-conservative ``linux_<arch>`` tag. Release CI builds the binaries in a pinned
-PyPA manylinux image and uses auditwheel to validate/repair that wheel into
-the advertised ``manylinux_2_28`` tag.
+scripts ("a" and "aplexer"). The wheel depends on the exact same version of
+the ``aplexer-client`` distribution, which provides the public ``aplexer``
+import package. Linux wheels intentionally start with the conservative
+``linux_<arch>`` tag. Release CI builds the binaries in a pinned PyPA manylinux
+image and uses auditwheel to validate/repair that wheel into the advertised
+``manylinux_2_28`` tag.
 
 The default is strict: every target in ``TARGETS`` must be present before any
 wheel is written. Local/manual builds can select one or more ``--platform``
@@ -38,6 +40,7 @@ import zipfile
 
 
 PROJECT_NAME = "aplexer"
+CLIENT_PROJECT_NAME = "aplexer-client"
 IMPORT_PACKAGE = "aplexer_cli"
 
 # This is the release matrix, not a wishlist. Adding a target here makes it a
@@ -177,9 +180,12 @@ Name: {project}
 Version: {version}
 Summary: Prebuilt CLI binaries for aplexer, the daemonless PTY session runtime
 License: Apache-2.0
-Requires-Python: >=3.8
+Requires-Python: >=3.11
+Requires-Dist: {client_project}=={version}
 """.format(
-            project=PROJECT_NAME, version=version
+            project=PROJECT_NAME,
+            client_project=CLIENT_PROJECT_NAME,
+            version=version,
         )
         metadata_data = metadata.encode("utf-8")
         metadata_path = "{dist_info}/METADATA".format(dist_info=dist_info)

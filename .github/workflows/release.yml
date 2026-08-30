@@ -66,6 +66,15 @@ jobs:
                   errors.append(
                       f"{label} version is {version!r}, tag requires {expected_version!r}"
                   )
+          cli_project = tomllib.loads(
+              (root / "python-cli" / "pyproject.toml").read_text(encoding="utf-8")
+          )["project"]
+          expected_dependency = f"aplexer-client=={expected_version}"
+          if cli_project.get("dependencies") != [expected_dependency]:
+              errors.append(
+                  "python-cli/pyproject.toml must have exactly one dependency, "
+                  f"{expected_dependency!r}; found {cli_project.get('dependencies')!r}"
+              )
           if errors:
               print("\n".join(f"::error::{error}" for error in errors))
               sys.exit(1)
@@ -207,7 +216,7 @@ jobs:
           esac
           /opt/python/cp311-cp311/bin/python -m auditwheel show "${client_wheels[0]}"
 
-      - name: Co-install and smoke-test both distributions
+      - name: Cold-install aplexer and smoke-test its client dependency
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
@@ -215,7 +224,8 @@ jobs:
           wheel-test/bin/python -m pip install \
             --disable-pip-version-check \
             --no-index \
-            cli-dist/*.whl client-dist/*.whl
+            --find-links client-dist \
+            cli-dist/*.whl
           wheel-test/bin/python - <<'PY'
           import os
           from importlib.metadata import version
@@ -343,19 +353,29 @@ jobs:
           if len(wheel_paths) != len(expected) or set(paths) != expected:
               print(f"::error::wheel set mismatch: expected {sorted(expected)}, found {sorted(path.name for path in wheel_paths)}")
               sys.exit(1)
-          output = pathlib.Path("dist")
-          output.mkdir()
+          client_output = pathlib.Path("dist/client")
+          cli_output = pathlib.Path("dist/cli")
+          client_output.mkdir(parents=True)
+          cli_output.mkdir(parents=True)
           for name, path in paths.items():
+              output = client_output if name.startswith("aplexer_client-") else cli_output
               shutil.copy2(path, output / name)
           PY
-          uvx --from "twine==${TWINE_VERSION}" twine check dist/*
+          uvx --from "twine==${TWINE_VERSION}" twine check dist/client/* dist/cli/*
 
-      - name: Publish aplexer and aplexer-client to TestPyPI
+      - name: Publish aplexer-client to TestPyPI
         uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
         with:
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
           repository-url: https://test.pypi.org/legacy/
-          packages-dir: dist/
+          packages-dir: dist/client/
+
+      - name: Publish dependent aplexer CLI to TestPyPI
+        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
+        with:
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/cli/
 
   publish-pypi:
     name: Publish both distributions to PyPI
@@ -397,15 +417,24 @@ jobs:
           if len(wheel_paths) != len(expected) or set(paths) != expected:
               print(f"::error::wheel set mismatch: expected {sorted(expected)}, found {sorted(path.name for path in wheel_paths)}")
               sys.exit(1)
-          output = pathlib.Path("dist")
-          output.mkdir()
+          client_output = pathlib.Path("dist/client")
+          cli_output = pathlib.Path("dist/cli")
+          client_output.mkdir(parents=True)
+          cli_output.mkdir(parents=True)
           for name, path in paths.items():
+              output = client_output if name.startswith("aplexer_client-") else cli_output
               shutil.copy2(path, output / name)
           PY
-          uvx --from "twine==${TWINE_VERSION}" twine check dist/*
+          uvx --from "twine==${TWINE_VERSION}" twine check dist/client/* dist/cli/*
 
-      - name: Publish aplexer and aplexer-client to PyPI
+      - name: Publish aplexer-client to PyPI
         uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: dist/
+          packages-dir: dist/client/
+
+      - name: Publish dependent aplexer CLI to PyPI
+        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist/cli/

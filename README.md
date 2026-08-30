@@ -216,8 +216,13 @@ Claude, Codex, and Grok native logs in this pass; `opencode`/`gemini`/`shell` ar
 ## Python client
 
 ```bash
-python3 -m pip install ./python
+python3 -m pip install aplexer
 ```
+
+The `aplexer` distribution installs the CLI binaries and an exact-version
+`aplexer-client` dependency, which provides the `aplexer` import package.
+From a source checkout, `python3 -m pip install ./python` installs just the
+client bindings for development.
 
 ```python
 from aplexer import Client
