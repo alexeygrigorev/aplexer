@@ -1,9 +1,11 @@
 use serde_json::Value;
 use std::fs;
+#[cfg(feature = "startup-test-hooks")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 #[cfg(feature = "startup-test-hooks")]
 use std::process::Stdio;
+use std::process::{Command, Output};
 #[cfg(feature = "startup-test-hooks")]
 use std::thread;
 #[cfg(feature = "startup-test-hooks")]
@@ -106,6 +108,34 @@ fn wait_for_path(path: &Path) {
     assert!(path.exists(), "{} did not appear", path.display());
 }
 
+#[cfg(feature = "startup-test-hooks")]
+fn limit_open_files(command: &mut Command, soft_limit: libc::rlim_t) {
+    unsafe {
+        command.pre_exec(move || {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(soft_limit);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(feature = "startup-test-hooks")]
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
 #[test]
 fn zero_timeout_rolls_back_and_same_tag_can_retry() {
     let harness = Harness::new();
@@ -167,11 +197,12 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
     let marker = harness.runtime_dir.path().join("spawned-workload-pid");
     let marker = marker.to_str().expect("UTF-8 marker path");
-    let descendant_marker = harness.runtime_dir.path().join("spawned-descendant-pid");
+    let descendant_marker = harness.runtime_dir.path().join("spawned-descendant-pids");
     let descendant_marker = descendant_marker
         .to_str()
         .expect("UTF-8 descendant marker path");
 
+    let started = Instant::now();
     let timed_out = harness.run_with_env(
         &[
             "start",
@@ -184,7 +215,7 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
             "--",
             "/bin/sh",
             "-c",
-            "sleep 10 & echo $! > \"$1\"; wait",
+            ": > \"$1\"; i=0; while [ \"$i\" -lt 64 ]; do sleep 10 & echo $! >> \"$1\"; i=$((i + 1)); done; wait",
             "aplexer-startup-test",
             descendant_marker,
         ],
@@ -203,18 +234,25 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
         .expect("marker contains workload PID");
     assert!(!timed_out.status.success(), "paused startup succeeded");
     assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "bounded rollback exceeded its single hard-cleanup deadline"
+    );
+    assert!(
         String::from_utf8_lossy(&timed_out.stderr).contains("within 1000 ms"),
         "unexpected stderr: {}",
         String::from_utf8_lossy(&timed_out.stderr)
     );
 
-    let descendant_pid: u32 = fs::read_to_string(descendant_marker)
+    let descendant_pids = fs::read_to_string(descendant_marker)
         .expect("workload descendant marker was written")
-        .trim()
-        .parse()
-        .expect("descendant marker contains PID");
+        .split_whitespace()
+        .map(|pid| pid.parse::<u32>().expect("descendant marker contains PIDs"))
+        .collect::<Vec<_>>();
+    assert_eq!(descendant_pids.len(), 64, "all descendants were spawned");
     assert_process_exited(workload_pid);
-    assert_process_exited(descendant_pid);
+    for descendant_pid in descendant_pids {
+        assert_process_exited(descendant_pid);
+    }
     harness.assert_no_session_artifacts();
 
     let retry = harness.run(&[
@@ -241,6 +279,81 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
         "retry cleanup kill failed: {}",
         String::from_utf8_lossy(&killed.stderr)
     );
+}
+
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn pidfd_budget_failure_resumes_tree_and_preserves_evidence() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let marker = harness.runtime_dir.path().join("budget-workload-pid");
+    let marker_text = marker.to_str().expect("UTF-8 marker path");
+    let mut command = harness.command_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "pidfd-budget",
+            "--startup-timeout-ms",
+            "1000",
+            "--",
+            "/bin/sh",
+            "-c",
+            "i=0; while [ \"$i\" -lt 32 ]; do sleep 30 & i=$((i + 1)); done; wait",
+        ],
+        &[
+            (
+                "APLEXER_TEST_HANG_WORKER_STARTUP_AT",
+                "after_workload_spawn",
+            ),
+            ("APLEXER_TEST_WORKER_STARTUP_MARKER", marker_text),
+        ],
+    );
+    // This leaves room for normal startup and the worker pidfd, but not for
+    // pinning the hostile tree. The cleanup path must fail closed and resume
+    // everything it stopped instead of exhausting RLIMIT_NOFILE.
+    limit_open_files(&mut command, 24);
+    let output = command.output().expect("run descriptor-limited start");
+    assert!(!output.status.success(), "limited startup succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("safe descendant limit") && stderr.contains("resumed"),
+        "unexpected stderr: {stderr}"
+    );
+
+    let record_path = fs::read_dir(harness.state_dir.path().join("sessions"))
+        .expect("read preserved state sessions")
+        .next()
+        .expect("preserved startup session")
+        .expect("read startup session entry")
+        .path()
+        .join("session.json");
+    let record: Value =
+        serde_json::from_slice(&fs::read(record_path).expect("read record")).expect("parse record");
+    let worker_pid = record["worker_pid"].as_u64().expect("worker pid") as i32;
+    let workload_pid = fs::read_to_string(marker)
+        .expect("read workload marker")
+        .trim()
+        .parse::<i32>()
+        .expect("workload pid");
+    let mut worker_cleanup = ProcessGroupCleanup(Some(worker_pid));
+    let mut workload_cleanup = ProcessGroupCleanup(Some(workload_pid));
+    assert!(!matches!(process_state(worker_pid as u32), Some('T' | 't')));
+    assert!(!matches!(
+        process_state(workload_pid as u32),
+        Some('T' | 't')
+    ));
+
+    unsafe {
+        libc::kill(-workload_pid, libc::SIGKILL);
+        libc::kill(-worker_pid, libc::SIGKILL);
+    }
+    assert_process_exited(workload_pid as u32);
+    assert_process_exited(worker_pid as u32);
+    workload_cleanup.disarm();
+    worker_cleanup.disarm();
 }
 
 #[test]
