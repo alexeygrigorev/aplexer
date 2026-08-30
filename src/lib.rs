@@ -1543,12 +1543,25 @@ pub struct ResolvedLaunch {
 }
 
 pub fn executable_available(program: &str) -> bool {
+    fn is_executable_file(path: &Path) -> bool {
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+    }
+
     let candidate = Path::new(program);
     if candidate.components().count() > 1 {
-        return candidate.is_file();
+        return is_executable_file(candidate);
     }
     env::var_os("PATH")
-        .map(|path| env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+        .map(|path| env::split_paths(&path).any(|dir| is_executable_file(&dir.join(program))))
         .unwrap_or(false)
 }
 
@@ -3622,4 +3635,18 @@ mod tests {
             vec!["--dangerously-skip-permissions".to_string()]
         );
     }
+
+    #[test]
+    fn executable_available_requires_execute_permission() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("tool");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(!executable_available(program.to_str().unwrap()));
+
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(executable_available(program.to_str().unwrap()));
+    }
+
 }
