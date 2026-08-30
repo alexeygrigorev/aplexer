@@ -2181,7 +2181,9 @@ impl Cgroup {
         kill_cgroup_path_until(&self.path, deadline)
     }
     pub fn populated(&self) -> Result<bool> {
-        Ok(read_counter(&self.path.join("cgroup.events"), "populated")? != 0)
+        live_cgroup_populated_with(&self.identity, || {
+            read_counter(&self.path.join("cgroup.events"), "populated")
+        })
     }
     pub fn oom_killed(&self) -> bool {
         read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0)
@@ -2379,17 +2381,37 @@ fn validate_recorded_cgroup(
 fn cgroup_path_populated(path: &Path) -> Result<bool> {
     match read_counter(&path.join("cgroup.events"), "populated") {
         Ok(value) => Ok(value != 0),
-        Err(error)
-            if error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
-            }) =>
-        {
-            Ok(false)
-        }
+        Err(error) if error_is_not_found(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+    })
+}
+
+/// Read live membership only while the cgroup pathname still belongs to the
+/// exact kernel domain captured at creation. A collected scope loses both its
+/// directory and `cgroup.events`; ENOENT therefore means empty, but only when
+/// the domain matches both before and after that observation.
+fn live_cgroup_populated_with(
+    identity: &CgroupIdentity,
+    read_populated: impl FnOnce() -> Result<u64>,
+) -> Result<bool> {
+    verify_recorded_cgroup_identity(Some(identity))
+        .context("validate live cgroup identity before reading membership")?;
+    let populated = match read_populated() {
+        Ok(value) => Some(value != 0),
+        Err(error) if error_is_not_found(&error) => None,
+        Err(error) => return Err(error).context("read live cgroup membership"),
+    };
+    verify_recorded_cgroup_identity(Some(identity))
+        .context("validate live cgroup identity after reading membership")?;
+    Ok(populated.unwrap_or(false))
 }
 
 fn cgroup_path_populated_until(path: &Path, deadline: Instant) -> Result<bool> {
@@ -3196,6 +3218,41 @@ mod tests {
         assert_ne!(identity.cgroup_mount_id, 0);
         assert_ne!(identity.cgroup_root_inode, 0);
         ensure_cgroup2_filesystem(Path::new(CGROUP_V2_ROOT)).unwrap();
+    }
+
+    #[test]
+    fn live_cgroup_disappearance_is_empty_only_in_matching_domain() {
+        let identity = current_cgroup_identity().unwrap();
+        let missing_path =
+            Path::new(CGROUP_V2_ROOT).join(format!("aplexer-workload-{}.scope", Uuid::new_v4()));
+        assert!(!missing_path.exists());
+        let collected = Cgroup {
+            path: missing_path,
+            identity: identity.clone(),
+            anchor: Arc::new(Mutex::new(None)),
+            initial_oom_kill: 0,
+        };
+        assert!(!collected.populated().unwrap());
+
+        assert!(!live_cgroup_populated_with(&identity, || {
+            Err(io::Error::from(io::ErrorKind::NotFound).into())
+        })
+        .unwrap());
+
+        let mut wrong_mount = identity.clone();
+        wrong_mount.cgroup_mount_id ^= 1;
+        let mismatch = live_cgroup_populated_with(&wrong_mount, || {
+            panic!("membership must not be read in a mismatched kernel domain")
+        })
+        .expect_err("mismatched identity must fail closed");
+        assert!(mismatch.to_string().contains("before reading membership"));
+
+        let malformed =
+            live_cgroup_populated_with(&identity, || Err(anyhow!("malformed cgroup.events")))
+                .expect_err("non-ENOENT membership errors must fail closed");
+        assert!(malformed
+            .to_string()
+            .contains("read live cgroup membership"));
     }
 
     #[test]
