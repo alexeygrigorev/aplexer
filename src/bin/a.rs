@@ -2939,6 +2939,16 @@ fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
         .join(" ")
 }
 
+/// Makes plain status-bar data safe to interpolate into terminal output.
+/// Session records and transient errors can contain arbitrary persisted or
+/// remote text; C0/C1 controls (including ESC, BEL, CR, and LF) must never be
+/// allowed to become terminal instructions when the bar is drawn.
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
+}
+
 /// Pads or truncates (by character, not byte, so multi-byte UTF-8 in a tag
 /// name can't split mid-codepoint) to exactly `cols` wide, so the reverse-
 /// video status bar spans the full terminal width like tmux's own.
@@ -3006,7 +3016,7 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((msg, at)) = flash.clone() {
             if at.elapsed() < FLASH_DURATION {
-                return pad_or_truncate(&format!("[{msg}]"), cols);
+                return pad_or_truncate(&sanitize_terminal_text(&format!("[{msg}]")), cols);
             }
             *flash = None;
         }
@@ -3038,7 +3048,7 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         text.push_str("  |  ");
         text.push_str(&siblings);
     }
-    pad_or_truncate(&text, cols)
+    pad_or_truncate(&sanitize_terminal_text(&text), cols)
 }
 
 /// Redraws the reserved bottom row in place: save cursor, jump to the last
@@ -3546,7 +3556,7 @@ fn workspace_summary_regions(
         }
         let start = text.chars().count();
         let state = display_state(&r.phase, r.worker_alive());
-        text.push_str(&format!("{}:{}", i + 1, r.tag));
+        text.push_str(&format!("{}:{}", i + 1, sanitize_terminal_text(&r.tag)));
         if r.id == current_id {
             text.push('*');
         }
@@ -4523,6 +4533,35 @@ mod switching_tests {
             exit: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn terminal_text_sanitizer_replaces_c0_del_and_c1_controls() {
+        let unsafe_text = "plain\x00\x07\x1b\n\r\x7f\u{0085}\u{009b}tail";
+        let safe = sanitize_terminal_text(unsafe_text);
+        assert_eq!(safe, "plain????????tail");
+        assert!(!safe.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn status_bar_sanitizes_record_fields_and_flash_messages() {
+        let ctx = status_ctx_for_test(true);
+        {
+            let mut record = ctx.record.lock().unwrap();
+            record.workspace = PathBuf::from("/ws/\x1b[31mred\nline");
+            record.tag = "tag\x07bell".to_string();
+            record.engine = "engine\rreturn".to_string();
+            record.profile = Some("profile\u{009b}2J".to_string());
+        }
+
+        let rendered = status_bar_text(&ctx, 256);
+        assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+        assert!(!rendered.contains("\x1b[31m"), "{rendered:?}");
+
+        *ctx.flash.lock().unwrap() = Some(("failed\x1b[2J\x07\nnext".to_string(), Instant::now()));
+        let flashed = status_bar_text(&ctx, 80);
+        assert!(!flashed.chars().any(char::is_control), "{flashed:?}");
+        assert!(!flashed.contains("\x1b[2J"), "{flashed:?}");
     }
 
     fn sample_groups() -> Vec<(PathBuf, Vec<SessionRecord>)> {
