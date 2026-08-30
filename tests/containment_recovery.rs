@@ -99,7 +99,18 @@ fn kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant() 
         .trim()
         .parse::<i32>()
         .expect("descendant pid");
-    let _cleanup = ProcessCleanup(vec![descendant_pid, worker_pid]);
+    let mut cleanup = ProcessCleanup(vec![descendant_pid, worker_pid]);
+
+    let live_forget = harness.run(&["forget", id, "--force"]);
+    assert!(
+        !live_forget.status.success(),
+        "forget must refuse a verified-live worker"
+    );
+    assert!(
+        String::from_utf8_lossy(&live_forget.stderr).contains("still has a live worker"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&live_forget.stderr)
+    );
 
     assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -128,5 +139,64 @@ fn kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant() 
     assert!(
         harness.runtime.path().join("sessions").join(id).exists(),
         "runtime evidence was removed"
+    );
+
+    let forgotten = harness.run(&["--json", "forget", id, "--force"]);
+    assert!(
+        forgotten.status.success(),
+        "force-forget failed: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    let report: Value = serde_json::from_slice(&forgotten.stdout).expect("forget JSON");
+    assert_eq!(report["id"], id);
+    assert_eq!(report["forgotten"], true);
+    assert_eq!(report["signalled"], false);
+    assert_eq!(report["containment_proven_empty"], false);
+    assert_eq!(report["workload_may_survive"], true);
+    assert!(
+        String::from_utf8_lossy(&forgotten.stderr).contains("workload processes may survive"),
+        "missing survival warning: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    assert!(
+        !harness.state.path().join("sessions").join(id).exists(),
+        "durable evidence was not forgotten"
+    );
+    assert!(
+        !harness.runtime.path().join("sessions").join(id).exists(),
+        "runtime evidence was not forgotten"
+    );
+    assert!(
+        process_alive(descendant_pid),
+        "forget must not signal a possibly surviving workload"
+    );
+    let snapshot = harness.run(&["snapshot"]);
+    assert!(snapshot.status.success(), "snapshot failed");
+    let snapshot: Value =
+        serde_json::from_slice(&snapshot.stdout).expect("snapshot is always JSON without --json");
+    assert_eq!(snapshot, serde_json::json!([]));
+
+    let restarted = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace_text,
+        "--tag",
+        "broken-setsid",
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    assert!(
+        restarted.status.success(),
+        "forgotten tag was not reusable: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: Value = serde_json::from_slice(&restarted.stdout).expect("restart JSON");
+    cleanup.0.push(
+        restarted["worker_pid"]
+            .as_i64()
+            .expect("restarted worker pid") as i32,
     );
 }

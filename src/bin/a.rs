@@ -56,6 +56,8 @@ enum Commands {
     Status(TargetArgs),
     /// Signal a session's workload and clean up its records.
     Kill(KillArgs),
+    /// Forget a dead session's records without claiming its workloads stopped.
+    Forget(ForgetArgs),
     /// Remove dead, unreclaimable session records and their durable history.
     Prune,
     /// Change a session's tag.
@@ -237,6 +239,14 @@ struct KillArgs {
     signal: String,
     #[arg(long, default_value_t = 2_000)]
     grace_ms: u64,
+}
+#[derive(Args)]
+struct ForgetArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    /// Acknowledge that uncontained workload processes may survive.
+    #[arg(long, required = true)]
+    force: bool,
 }
 #[derive(Args)]
 struct WatchArgs {
@@ -472,7 +482,8 @@ fn run() -> Result<()> {
         .unwrap_or(Commands::List(ListArgs { running: false }));
     match command {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
-        Commands::List(args) | Commands::Snapshot(args) => cmd_list(&paths, args, cli.json),
+        Commands::List(args) => cmd_list(&paths, args, cli.json),
+        Commands::Snapshot(args) => cmd_list(&paths, args, true),
         Commands::Attach(args) => {
             let record = resolve(&paths, &args.target)?;
             attach(&paths, &record, args.history_bytes)
@@ -481,6 +492,7 @@ fn run() -> Result<()> {
         Commands::Capture(args) => cmd_capture(&paths, args, cli.json),
         Commands::Status(target) => cmd_status(&paths, target, cli.json),
         Commands::Kill(args) => cmd_kill(&paths, args, cli.json),
+        Commands::Forget(args) => cmd_forget(&paths, args, cli.json),
         Commands::Prune => cmd_prune(&paths, cli.json),
         Commands::Rename(args) => cmd_rename(&paths, args, cli.json),
         Commands::Engines => cmd_engines(&paths, cli.json),
@@ -974,6 +986,68 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
             println!("removed {id}");
         }
         println!("removed {} session(s)", removed.len());
+    }
+    Ok(())
+}
+
+fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> {
+    if !args.force {
+        bail!("forget requires --force");
+    }
+    let selected = resolve(paths, &args.target)?;
+    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    // Resolve happened before taking the registry lock. Re-read under the
+    // lock so a concurrent rename or lifecycle update cannot make a stale
+    // liveness decision destructive.
+    let current = read_record(&paths.record(selected.id))
+        .with_context(|| format!("re-read session {} before forgetting", selected.id))?;
+    if current.worker_alive() {
+        bail!(
+            "session {} still has a live worker; refusing to forget it",
+            current.id
+        );
+    }
+    if current.worker_phase_active() && current.worker_pid.is_none() {
+        bail!(
+            "session {} has no recorded worker identity; cannot confirm that startup is dead",
+            current.id
+        );
+    }
+
+    let containment_proven_empty = current.containment_proven_empty();
+    match fs::remove_dir_all(paths.runtime_session(current.id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove forgotten session runtime state"),
+    }
+    fs::remove_dir_all(paths.state_session(current.id))
+        .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
+
+    let workload_may_survive = !containment_proven_empty;
+    if workload_may_survive {
+        eprintln!(
+            "a: forgot session {} without signalling any process; containment was not proven empty, so workload processes may survive",
+            current.id
+        );
+    } else {
+        eprintln!(
+            "a: forgot session {} without signalling any process (containment was proven empty)",
+            current.id
+        );
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "id": current.id,
+                "forgotten": true,
+                "signalled": false,
+                "containment_proven_empty": containment_proven_empty,
+                "workload_may_survive": workload_may_survive,
+            }))?
+        );
+    } else {
+        println!("forgotten {}", current.id);
     }
     Ok(())
 }
