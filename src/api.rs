@@ -1202,7 +1202,7 @@ fn probe_worker_ready(
     };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let request = Request::new(Operation::Ping);
+    let request = Request::new(expected_id, Operation::Ping);
     let request_id = request.request_id.clone();
     if write_json(&mut stream, &request).is_err() {
         return Ok(false);

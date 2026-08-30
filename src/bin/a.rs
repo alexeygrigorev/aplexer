@@ -2817,7 +2817,7 @@ fn connect(record: &SessionRecord) -> Result<UnixStream> {
 }
 fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
     let mut stream = connect(record)?;
-    let request = Request::new(operation);
+    let request = Request::new(record.id, operation);
     let id = request.request_id.clone();
     write_json(&mut stream, &request)?;
     if let Some(bytes) = data {
@@ -2836,7 +2836,7 @@ fn rpc_send(record: &SessionRecord, data: &[u8]) -> Result<()> {
 }
 fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
     let mut stream = connect(record)?;
-    let request = Request::new(Operation::Capture { max_bytes: max });
+    let request = Request::new(record.id, Operation::Capture { max_bytes: max });
     let id = request.request_id.clone();
     write_json(&mut stream, &request)?;
     let response: Response =
@@ -2855,7 +2855,7 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
 /// mirrors `rpc_capture`'s shape exactly, against `Operation::CaptureScreen`.
 fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
     let mut stream = connect(record)?;
-    let request = Request::new(Operation::CaptureScreen { plain });
+    let request = Request::new(record.id, Operation::CaptureScreen { plain });
     let id = request.request_id.clone();
     write_json(&mut stream, &request)?;
     let response: Response =
@@ -3609,12 +3609,15 @@ fn establish(
         Some((rows, cols)) => (Some(rows), Some(cols)),
         None => (None, None),
     };
-    let request = Request::new(Operation::Attach {
-        history_bytes: replay_bytes,
-        want_screen,
-        rows,
-        cols,
-    });
+    let request = Request::new(
+        record.id,
+        Operation::Attach {
+            history_bytes: replay_bytes,
+            want_screen,
+            rows,
+            cols,
+        },
+    );
     let id = request.request_id.clone();
     write_json(&mut reader, &request)?;
     let response: Response =

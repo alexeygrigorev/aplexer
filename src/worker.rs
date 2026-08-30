@@ -2355,14 +2355,34 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
         return Ok(());
     }
     let id = request.request_id.clone();
-    match request.operation {
-        Operation::Ping => {
-            let session_id = runtime.record()?.id;
+    let worker_session_id = runtime.record()?.id;
+    match request.session_id {
+        Some(expected) if expected == worker_session_id => {}
+        Some(expected) => {
             write_json(
                 &mut stream,
-                &Response::ok(id, json!({"pong":true,"id":session_id})),
-            )?
+                &Response::error(
+                    id,
+                    format!(
+                        "request targets session {expected}, but this worker owns {worker_session_id}"
+                    ),
+                ),
+            )?;
+            return Ok(());
         }
+        None => {
+            write_json(
+                &mut stream,
+                &Response::error(id, "request omitted session_id; upgrade the aplexer client"),
+            )?;
+            return Ok(());
+        }
+    }
+    match request.operation {
+        Operation::Ping => write_json(
+            &mut stream,
+            &Response::ok(id, json!({"pong":true,"id":worker_session_id})),
+        )?,
         Operation::Status => {
             let mut value = serde_json::to_value(public_session_record(&runtime.record()?))?;
             if let Some(error) = runtime.output.history_persistence_error() {

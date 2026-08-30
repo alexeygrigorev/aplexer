@@ -1712,14 +1712,22 @@ pub fn frame_json<T: for<'de> Deserialize<'de>>(frame: Frame) -> Result<T> {
 pub struct Request {
     pub version: u16,
     pub request_id: String,
+    /// Additive protocol binding for daemonless workers that can outlive a
+    /// client upgrade. New clients always send it; older workers ignore the
+    /// unknown field and remain controllable. New workers reject `None` with
+    /// an explicit upgrade error, so outdated clients cannot issue unbound
+    /// operations to a newly-created session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
     #[serde(flatten)]
     pub operation: Operation,
 }
 impl Request {
-    pub fn new(operation: Operation) -> Self {
+    pub fn new(session_id: Uuid, operation: Operation) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             request_id: Uuid::new_v4().to_string(),
+            session_id: Some(session_id),
             operation,
         }
     }
@@ -3369,6 +3377,25 @@ mod tests {
         assert_eq!(frame.kind, FrameKind::Data);
         assert_eq!(frame.payload, b"a\0b");
     }
+
+    #[test]
+    fn bound_request_remains_readable_by_legacy_workers() {
+        #[derive(Deserialize)]
+        struct LegacyRequest {
+            version: u16,
+            request_id: String,
+            #[serde(flatten)]
+            operation: Operation,
+        }
+
+        let request = Request::new(Uuid::new_v4(), Operation::Ping);
+        let legacy: LegacyRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert_eq!(legacy.version, PROTOCOL_VERSION);
+        assert_eq!(legacy.request_id, request.request_id);
+        assert!(matches!(legacy.operation, Operation::Ping));
+    }
+
     #[test]
     fn bounded_history() {
         let dir = tempfile::tempdir().unwrap();

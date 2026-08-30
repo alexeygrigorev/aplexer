@@ -39,6 +39,7 @@ use aplexer::{
 };
 use serde_json::Value;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime_dir: TempDir,
@@ -236,12 +237,15 @@ fn raw_attach(
     cols: Option<u16>,
 ) -> (UnixStream, Value, Vec<u8>) {
     let mut stream = UnixStream::connect(socket).expect("connect worker control socket");
-    let request = Request::new(Operation::Attach {
-        history_bytes,
-        want_screen,
-        rows,
-        cols,
-    });
+    let request = Request::new(
+        session_id_from_socket(socket),
+        Operation::Attach {
+            history_bytes,
+            want_screen,
+            rows,
+            cols,
+        },
+    );
     let id = request.request_id.clone();
     write_json(&mut stream, &request).expect("write attach request");
     let response_frame = read_frame(&mut stream)
@@ -260,6 +264,16 @@ fn raw_attach(
         "expected initial Data frame"
     );
     (stream, body, data_frame.payload)
+}
+
+fn session_id_from_socket(socket: &Path) -> Uuid {
+    socket
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .expect("socket parent is a UTF-8 session id")
+        .parse()
+        .expect("socket parent is a UUID")
 }
 
 fn send_attached_input(stream: &mut UnixStream, command: &str) {
@@ -597,12 +611,15 @@ fn rejected_attach_does_not_keep_its_requested_geometry() {
         .unwrap();
     write_json(
         &mut rejected,
-        &Request::new(Operation::Attach {
-            history_bytes: Some(0),
-            want_screen: false,
-            rows: Some(10),
-            cols: Some(20),
-        }),
+        &Request::new(
+            session_id_from_socket(&socket),
+            Operation::Attach {
+                history_bytes: Some(0),
+                want_screen: false,
+                rows: Some(10),
+                cols: Some(20),
+            },
+        ),
     )
     .unwrap();
     match read_frame(&mut rejected) {

@@ -91,10 +91,13 @@ fn direct_rename(record: aplexer::SessionRecord, workspace: PathBuf, tag: &str) 
     let mut stream = UnixStream::connect(&record.socket_path).expect("connect worker socket");
     write_json(
         &mut stream,
-        &Request::new(Operation::Rename {
-            workspace,
-            tag: tag.to_string(),
-        }),
+        &Request::new(
+            record.id,
+            Operation::Rename {
+                workspace,
+                tag: tag.to_string(),
+            },
+        ),
     )
     .expect("write direct rename RPC");
     frame_json(
