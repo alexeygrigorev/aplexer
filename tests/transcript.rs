@@ -88,6 +88,13 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::process::Output
 fn write_session(h: &Harness, id: &str, cwd: &Path, engine: &str) {
     let session_dir = h.state_dir.path().join("sessions").join(id);
     fs::create_dir_all(&session_dir).unwrap();
+    let socket_path = h
+        .runtime_dir
+        .path()
+        .join("sessions")
+        .join(id)
+        .join("control.sock");
+    let history_path = session_dir.join("history.bin");
     let record = json!({
         "schema_version": 1,
         "id": id,
@@ -103,8 +110,8 @@ fn write_session(h: &Harness, id: &str, cwd: &Path, engine: &str) {
         "created_at_ms": 1_000,
         "updated_at_ms": 1_000,
         "phase": "running",
-        "socket_path": "/tmp/s",
-        "history_path": "/tmp/h",
+        "socket_path": socket_path,
+        "history_path": history_path,
     });
     fs::write(
         session_dir.join("session.json"),

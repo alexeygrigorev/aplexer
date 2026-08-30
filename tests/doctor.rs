@@ -148,3 +148,37 @@ fn status_and_doctor_report_alive_but_unreachable_workers_separately() {
         .as_str()
         .is_some_and(|error| error.contains("connect")));
 }
+
+#[test]
+fn doctor_reports_corrupt_registry_entry_with_its_path() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let id = Uuid::new_v4();
+    std::fs::create_dir_all(paths.state_session(id)).unwrap();
+    std::fs::write(paths.record(id), b"{truncated").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "doctor hid corrupt registry state"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .unwrap();
+    let detail = sessions["detail"].as_str().unwrap();
+    assert_eq!(sessions["ok"], false);
+    assert!(detail.contains(&id.to_string()), "{detail}");
+    assert!(detail.contains("session.json"), "{detail}");
+    assert!(detail.contains("parse"), "{detail}");
+}

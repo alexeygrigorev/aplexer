@@ -587,6 +587,41 @@ pub fn read_record(path: &Path) -> Result<SessionRecord> {
     Ok(record)
 }
 
+/// Load one record through its registry identity and reject cross-session or
+/// displaced path metadata. `read_record` remains the low-level parser for
+/// startup rollback code that already owns an exact path; registry consumers
+/// should use this function (directly or through `list_records`).
+pub fn read_session_record(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
+    let path = paths.record(id);
+    let record = read_record(&path)?;
+    if record.id != id {
+        bail!(
+            "session record {} contains id {}, expected directory id {id}",
+            path.display(),
+            record.id
+        );
+    }
+    let expected_socket = paths.socket(id);
+    if record.socket_path != expected_socket {
+        bail!(
+            "session record {} contains socket path {}, expected {}",
+            path.display(),
+            record.socket_path.display(),
+            expected_socket.display()
+        );
+    }
+    let expected_history = paths.history(id);
+    if record.history_path != expected_history {
+        bail!(
+            "session record {} contains history path {}, expected {}",
+            path.display(),
+            record.history_path.display(),
+            expected_history.display()
+        );
+    }
+    Ok(record)
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct AtomicTempGuard(PathBuf);
@@ -786,15 +821,36 @@ impl Drop for FileLock {
 pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
     let mut out = Vec::new();
     let root = paths.state_root.join("sessions");
-    for entry in fs::read_dir(root)? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let path = entry.path().join("session.json");
-        if let Ok(record) = read_record(&path) {
-            out.push(record);
+    let entries =
+        fs::read_dir(&root).with_context(|| format!("read session registry {}", root.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", root.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("inspect session registry entry {}", entry_path.display()))?;
+        if !file_type.is_dir() {
+            bail!(
+                "session registry entry {} is not a directory",
+                entry_path.display()
+            );
         }
+        let id_text = entry.file_name().into_string().map_err(|_| {
+            anyhow!(
+                "session registry entry {} is not UTF-8",
+                entry_path.display()
+            )
+        })?;
+        let id = id_text.parse::<Uuid>().with_context(|| {
+            format!(
+                "session registry directory {} is not named by a UUID",
+                entry_path.display()
+            )
+        })?;
+        out.push(
+            read_session_record(paths, id)
+                .with_context(|| format!("load session registry entry {}", entry_path.display()))?,
+        );
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
     Ok(out)
@@ -2994,6 +3050,118 @@ pub fn c_string(path: &Path) -> Result<CString> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn registry_record(paths: &Paths, id: Uuid) -> SessionRecord {
+        SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id,
+            workspace: paths.state_root.clone(),
+            tag: "registry-test".into(),
+            engine: "shell".into(),
+            profile: None,
+            command: vec!["/bin/true".into()],
+            cwd: paths.state_root.clone(),
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: DEFAULT_HISTORY_BYTES,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_activity_ms: None,
+            phase: Phase::Exited,
+            worker_pid: None,
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(true),
+            socket_path: paths.socket(id),
+            history_path: paths.history(id),
+            exit: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn registry_enumeration_reports_corrupt_records() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::new_v4();
+        fs::create_dir(paths.state_session(id)).unwrap();
+        fs::write(paths.record(id), b"{truncated").unwrap();
+
+        let error = list_records(&paths).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&id.to_string()), "{message}");
+        assert!(message.contains("parse"), "{message}");
+    }
+
+    #[test]
+    fn registry_enumeration_reports_unsupported_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::new_v4();
+        fs::create_dir(paths.state_session(id)).unwrap();
+        let mut record = registry_record(&paths, id);
+        record.schema_version = SCHEMA_VERSION + 1;
+        atomic_write_json(&paths.record(id), &record).unwrap();
+
+        let error = list_records(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported session schema"));
+    }
+
+    #[test]
+    fn registry_enumeration_validates_directory_id_and_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::new_v4();
+        fs::create_dir(paths.state_session(id)).unwrap();
+
+        let mut record = registry_record(&paths, id);
+        record.id = Uuid::new_v4();
+        atomic_write_json(&paths.record(id), &record).unwrap();
+        assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("directory id"));
+
+        record = registry_record(&paths, id);
+        record.socket_path = paths.socket(Uuid::new_v4());
+        atomic_write_json(&paths.record(id), &record).unwrap();
+        assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("socket path"));
+
+        record = registry_record(&paths, id);
+        record.history_path = paths.history(Uuid::new_v4());
+        atomic_write_json(&paths.record(id), &record).unwrap();
+        assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("history path"));
+    }
+
+    #[test]
+    fn registry_enumeration_rejects_unexpected_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let unexpected = paths.state_root.join("sessions").join("leftover");
+        fs::write(&unexpected, b"not a session directory").unwrap();
+
+        let error = list_records(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("is not a directory"));
+    }
 
     #[test]
     fn ensure_private_dir_rejects_leaf_symlink_without_chmodding_target() {

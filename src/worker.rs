@@ -1499,7 +1499,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     enable_child_subreaper()?;
     let paths = Paths::discover()?;
     let record_path = paths.record(id);
-    let mut record = read_record(&record_path)?;
+    let mut record = read_session_record(&paths, id)?;
     ensure_private_dir(&paths.runtime_session(id))?;
     let mut _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;

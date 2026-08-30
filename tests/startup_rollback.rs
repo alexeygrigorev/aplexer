@@ -190,6 +190,48 @@ fn zero_timeout_rolls_back_and_same_tag_can_retry() {
 }
 
 #[test]
+fn corrupt_registry_entry_blocks_new_session_start() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let corrupt_id = uuid::Uuid::new_v4();
+    let corrupt_dir = harness
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(corrupt_id.to_string());
+    fs::create_dir_all(&corrupt_dir).unwrap();
+    fs::write(corrupt_dir.join("session.json"), b"{truncated").unwrap();
+
+    let output = harness.run(&[
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        "must-not-bypass-corruption",
+        "--",
+        "/bin/sleep",
+        "30",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "startup bypassed corrupt registry"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&corrupt_id.to_string()), "{stderr}");
+    assert!(stderr.contains("parse"), "{stderr}");
+    assert_eq!(
+        fs::read_dir(harness.state_dir.path().join("sessions"))
+            .unwrap()
+            .count(),
+        1,
+        "startup published a second session despite registry corruption"
+    );
+    assert_directory_empty(&harness.runtime_dir.path().join("sessions"));
+}
+
+#[test]
 fn failed_replacement_preserves_finished_session_evidence() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");

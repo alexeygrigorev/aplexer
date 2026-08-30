@@ -24,8 +24,9 @@ use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json, list_records,
     parse_byte_size, process_start_time_ticks, public_session_record, read_frame, read_record,
-    session_metadata_env, validate_tag, worker_executable, write_json, Config, FileLock, Limits,
-    Operation, Paths, Phase, Request, Response, SessionRecord, PROTOCOL_VERSION, SCHEMA_VERSION,
+    read_session_record, session_metadata_env, validate_tag, worker_executable, write_json, Config,
+    FileLock, Limits, Operation, Paths, Phase, Request, Response, SessionRecord, PROTOCOL_VERSION,
+    SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -1379,26 +1380,23 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                     req.startup_timeout_ms
                 );
             }
-            if let Ok(current) = read_record(&paths.record(id)) {
-                match current.phase {
-                    Phase::Running | Phase::Exiting | Phase::Exited
-                        if current.socket_path.exists() =>
-                    {
-                        let remaining = timeout.saturating_sub(started.elapsed());
-                        let probe_timeout = remaining.min(STARTUP_READY_RPC_SLICE);
-                        if probe_worker_ready(&current, id, probe_timeout)? {
-                            // The Ping response is the readiness commit. Read
-                            // once more so a very short-lived workload can
-                            // return its newest durable phase.
-                            return read_record(&paths.record(id)).or(Ok(current));
-                        }
+            let current = read_session_record(paths, id).context("read worker startup record")?;
+            match current.phase {
+                Phase::Running | Phase::Exiting | Phase::Exited if current.socket_path.exists() => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    let probe_timeout = remaining.min(STARTUP_READY_RPC_SLICE);
+                    if probe_worker_ready(&current, id, probe_timeout)? {
+                        // The Ping response is the readiness commit. Read once
+                        // more so a very short-lived workload can return its
+                        // newest durable phase.
+                        return read_session_record(paths, id).or(Ok(current));
                     }
-                    Phase::Failed => bail!(
-                        "worker startup failed: {}",
-                        current.error.unwrap_or_else(|| "unknown error".into())
-                    ),
-                    _ => {}
                 }
+                Phase::Failed => bail!(
+                    "worker startup failed: {}",
+                    current.error.unwrap_or_else(|| "unknown error".into())
+                ),
+                _ => {}
             }
             if let Some(status) = startup.child_mut().try_wait()? {
                 bail!("worker exited during startup: {status}");
