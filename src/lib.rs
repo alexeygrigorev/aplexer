@@ -23,7 +23,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -439,7 +440,8 @@ impl SessionRecord {
     /// a valid proof only when the field is absent. Explicit `false` always
     /// wins: a newer failed lifecycle must not be upgraded by its ExitInfo.
     pub fn containment_proven_empty(&self) -> bool {
-        self.containment_empty.unwrap_or_else(|| self.exit.is_some())
+        self.containment_empty
+            .unwrap_or_else(|| self.exit.is_some())
     }
 
     /// Whether the worker process is present in `/proc`. This is a cheap,
@@ -1785,16 +1787,24 @@ impl History {
 #[derive(Debug, Clone)]
 pub struct Cgroup {
     path: PathBuf,
-    anchor_pid: u32,
-    /// Shared across clones: the anchor pid must be killed at most once.
-    /// After the first kill the pid is reaped (a background thread waits on
-    /// it) and may be recycled by the kernel for an unrelated process of
-    /// this user, so a second kill(anchor_pid, SIGKILL) -- e.g. from
-    /// Cgroup::cleanup at session end, hours after spawn_workload already
-    /// released the anchor -- could kill an innocent process.
-    anchor_released: std::sync::Arc<AtomicBool>,
+    /// Keep exclusive ownership of the unreaped child until release. An
+    /// unreaped child reserves its pid, so Child::kill cannot be redirected
+    /// to a recycled process; clones serialize the single kill+wait through
+    /// this shared slot.
+    anchor: Arc<Mutex<Option<std::process::Child>>>,
     initial_oom_kill: u64,
 }
+
+fn release_anchor_child(anchor: &mut std::process::Child) -> Result<()> {
+    match anchor.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error).context("kill systemd-run anchor"),
+    }
+    anchor.wait().context("reap systemd-run anchor")?;
+    Ok(())
+}
+
 impl Cgroup {
     // A worker's own ambient cgroup (inherited from whatever spawned `a start`,
     // e.g. a tmux pane or SSH session) is never a safe place to nest a
@@ -1863,33 +1873,25 @@ impl Cgroup {
         // procfs descendant tree. Let the caller preserve recovery evidence
         // until an authoritative cgroup path has been recorded.
         setup_started();
-        let anchor_pid = anchor.id();
-        thread::spawn(move || {
-            let _ = anchor.wait();
-        });
-        let release_on_failure = |anchor_pid: u32| unsafe {
-            libc::kill(anchor_pid as libc::pid_t, libc::SIGKILL);
-        };
         let path = match wait_for_scope_cgroup(&unit, Duration::from_secs(5)) {
             Ok(path) => path,
             Err(error) => {
-                release_on_failure(anchor_pid);
+                let _ = release_anchor_child(&mut anchor);
                 return Err(error.context("limits fail closed"));
             }
         };
         if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
-            release_on_failure(anchor_pid);
+            let _ = release_anchor_child(&mut anchor);
             bail!("systemd did not delegate the memory controller; limits fail closed");
         }
         if limits.pids.is_some() && !path.join("pids.max").exists() {
-            release_on_failure(anchor_pid);
+            let _ = release_anchor_child(&mut anchor);
             bail!("systemd did not delegate the pids controller; limits fail closed");
         }
         let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);
         Ok(Some(Self {
             path,
-            anchor_pid,
-            anchor_released: std::sync::Arc::new(AtomicBool::new(false)),
+            anchor: Arc::new(Mutex::new(Some(anchor))),
             initial_oom_kill,
         }))
     }
@@ -1917,12 +1919,15 @@ impl Cgroup {
     /// alive. Call this only after the real workload pid has been added to
     /// the cgroup, so the cgroup never goes empty (and gets garbage
     /// collected by systemd) before the real workload takes residence.
-    pub fn release_anchor(&self) {
-        if !self.anchor_released.swap(true, Ordering::SeqCst) {
-            unsafe {
-                libc::kill(self.anchor_pid as i32, libc::SIGKILL);
-            }
+    pub fn release_anchor(&self) -> Result<()> {
+        let mut slot = self
+            .anchor
+            .lock()
+            .map_err(|_| anyhow!("systemd-run anchor lock poisoned"))?;
+        if let Some(mut anchor) = slot.take() {
+            release_anchor_child(&mut anchor)?;
         }
+        Ok(())
     }
     pub fn signal_all(&self, signal: i32) -> Result<()> {
         let pids = fs::read_to_string(self.path.join("cgroup.procs"))?;
@@ -1977,7 +1982,7 @@ impl Cgroup {
         })
     }
     pub fn cleanup(&self) {
-        self.release_anchor();
+        let _ = self.release_anchor();
         let _ = fs::remove_dir(&self.path);
     }
 }
@@ -2983,6 +2988,33 @@ mod tests {
         .expect_err("inherited helper pipe must not defeat deadline");
         assert!(error.to_string().contains("timed out waiting"));
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn cgroup_anchor_release_owns_child_through_kill_and_reap() {
+        let anchor = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let anchor_pid = anchor.id();
+        let cgroup = Cgroup {
+            path: PathBuf::from("/does/not/exist"),
+            anchor: Arc::new(Mutex::new(Some(anchor))),
+            initial_oom_kill: 0,
+        };
+        let clone = cgroup.clone();
+
+        cgroup.release_anchor().unwrap();
+        assert!(cgroup.anchor.lock().unwrap().is_none());
+        clone.release_anchor().unwrap();
+
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(anchor_pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1,
+            "anchor must already be reaped exactly once"
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]

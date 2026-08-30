@@ -1301,7 +1301,7 @@ fn spawn_workload(
     drop(slave);
     drop(cgroup_procs);
     if let Some(cgroup) = cgroup {
-        cgroup.release_anchor();
+        cgroup.release_anchor()?;
     }
     Ok(child)
 }
