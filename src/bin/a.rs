@@ -1143,6 +1143,14 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     });
     let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
     let cgroup_stats = raw.get("cgroup").cloned();
+    let history_persistence_error = raw
+        .get("history_persistence_error")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let record_persistence_error = raw
+        .get("record_persistence_error")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     // Live-only (see foreground_command in lib.rs / Operation::Status):
     // never persisted to session.json, so this is only available while the
     // worker is reachable -- absent on a dead/unreachable session, same as
@@ -1159,6 +1167,12 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         }
         if let Some(fg) = &foreground_command {
             value["foreground_command"] = json!(fg);
+        }
+        if let Some(error) = &history_persistence_error {
+            value["history_persistence_error"] = json!(error);
+        }
+        if let Some(error) = &record_persistence_error {
+            value["record_persistence_error"] = json!(error);
         }
         value["worker_alive"] = json!(worker_alive);
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -1213,6 +1227,12 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         }
         if let Some(error) = current.error {
             println!("error: {error}");
+        }
+        if let Some(error) = history_persistence_error {
+            println!("history_persistence_error: {error}");
+        }
+        if let Some(error) = record_persistence_error {
+            println!("record_persistence_error: {error}");
         }
     }
     Ok(())
