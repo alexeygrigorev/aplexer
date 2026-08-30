@@ -34,9 +34,17 @@ class Client:
         runtime_dir: str | os.PathLike[str] | None = None,
         config: str | os.PathLike[str] | None = None,
     ) -> None:
-        self.state_dir = None if state_dir is None else os.fsdecode(state_dir)
-        self.runtime_dir = None if runtime_dir is None else os.fsdecode(runtime_dir)
-        self.config = None if config is None else os.fsdecode(config)
+        # Resolve explicit overrides once. A long-lived client must not silently
+        # switch registries if its process changes working directory later.
+        self.state_dir = self._absolute_override(state_dir)
+        self.runtime_dir = self._absolute_override(runtime_dir)
+        self.config = self._absolute_override(config)
+
+    @staticmethod
+    def _absolute_override(
+        path: str | os.PathLike[str] | None,
+    ) -> str | None:
+        return None if path is None else os.path.abspath(os.fsdecode(path))
 
     def _path_args(self) -> tuple[str | None, str | None, str | None]:
         return self.state_dir, self.runtime_dir, self.config

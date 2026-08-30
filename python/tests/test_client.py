@@ -136,6 +136,61 @@ def test_client_paths_are_instance_local_including_start(monkeypatch, tmp_path):
     assert {key: os.environ[key] for key in ambient} == ambient
 
 
+def test_client_resolves_relative_paths_once_before_chdir(monkeypatch, tmp_path):
+    calls = []
+
+    class Native:
+        @staticmethod
+        def snapshot(running, state_dir, runtime_dir, config):
+            calls.append((state_dir, runtime_dir, config))
+            return "[]"
+
+    monkeypatch.setattr("aplexer.client._native", lambda: Native)
+    original = tmp_path / "original"
+    elsewhere = tmp_path / "elsewhere"
+    original.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(original)
+
+    client = Client(
+        state_dir="state",
+        runtime_dir="runtime",
+        config="config.toml",
+    )
+    expected = tuple(
+        str(original / name) for name in ("state", "runtime", "config.toml")
+    )
+    assert client._path_args() == expected
+
+    client.snapshot()
+    monkeypatch.chdir(elsewhere)
+    client.snapshot()
+    assert calls == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("XDG_RUNTIME_DIR", "relative-runtime"),
+        ("XDG_STATE_HOME", "relative-state"),
+        ("XDG_CONFIG_HOME", "relative-config"),
+    ],
+)
+def test_native_client_rejects_relative_xdg_paths(
+    monkeypatch, tmp_path, variable, value
+):
+    monkeypatch.delenv("APLEXER_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("APLEXER_STATE_DIR", raising=False)
+    monkeypatch.delenv("APLEXER_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(RuntimeError, match=rf"{variable} must be an absolute path"):
+        Client().snapshot()
+
+
 def test_operational_methods_use_native_boundary_and_preserve_bytes(monkeypatch, tmp_path):
     calls = []
     payload = b"\x00\xffA\r\n\x1b[31m"
