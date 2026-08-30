@@ -1991,6 +1991,13 @@ pub fn cleanup_recorded_cgroup(
     cleanup_recorded_cgroup_until(id, locator, signal, grace, deadline)
 }
 
+/// Preflight a durable locator before destroying a broken session's worker
+/// subreaper. This performs no signalling; it only establishes that later
+/// cgroup recovery will operate inside the expected kernel domain.
+pub fn validate_recorded_cgroup_locator(id: Uuid, locator: &Path) -> Result<()> {
+    validate_recorded_cgroup(id, locator).map(|_| ())
+}
+
 /// Deadline-sharing variant for startup rollback, where cgroup recovery must
 /// consume the same wall-clock budget as procfs discovery and pidfd cleanup.
 pub fn cleanup_recorded_cgroup_until(

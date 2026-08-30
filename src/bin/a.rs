@@ -1281,7 +1281,21 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             return Err(error);
         }
         if socket_missing {
+            preflight_broken_containment_recovery(&record)?;
             force_kill_stale_worker(&record)?;
+            if record.containment_proven_empty() {
+                remove_session_state(paths, record.id)
+                    .with_context(|| format!("remove stale session {}", record.id))?;
+                eprintln!(
+                    "a: removed session {} after stopping unreachable worker pid {}",
+                    record.id,
+                    record.worker_pid.unwrap_or(0),
+                );
+                if json_output {
+                    println!("{}", json!({"id":record.id,"signal":signal}));
+                }
+                return Ok(());
+            }
             recover_broken_containment(&record, signal, args.grace_ms)?;
             mark_broken_workload_killed(paths, &record)?;
             eprintln!(
@@ -1314,6 +1328,20 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         println!("{}", json!({"id":record.id,"signal":signal}));
     }
     Ok(())
+}
+
+fn preflight_broken_containment_recovery(record: &SessionRecord) -> Result<()> {
+    if record.containment_proven_empty() {
+        return Ok(());
+    }
+    let Some(locator) = record.containment_cgroup.as_deref() else {
+        bail!(
+            "session {} has no authoritative containment locator; refusing to stop its worker or remove runtime evidence",
+            record.id
+        );
+    };
+    validate_recorded_cgroup_locator(record.id, locator)
+        .context("validate recorded cgroup before stopping unreachable worker")
 }
 
 /// Record that the client killed an orphaned workload after its worker died.
@@ -4368,11 +4396,11 @@ mod switching_tests {
     /// `a kill` against a record whose worker_pid is alive but whose control
     /// socket is gone may stop that verified worker, but without a cgroup it
     /// cannot prove that a setsid descendant did not escape. It must preserve
-    /// the record and report the ambiguity rather than claiming success.
+    /// the worker and record, keeping the only remaining subreaper boundary.
     /// Uses a real throwaway child process as the stand-in worker_pid
     /// (never the test process's own pid, which `mk_record` defaults to --
-    /// this test's whole point is that the pid now DOES get signalled, so
-    /// reusing the test runner's pid here would kill the test runner).
+    /// this test also proves the containment preflight happens before any
+    /// signal is sent.
     #[test]
     fn cmd_kill_preserves_stale_socket_record_without_containment_proof() {
         let state_dir = tempfile::tempdir().unwrap();
@@ -4390,11 +4418,10 @@ mod switching_tests {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         record.worker_pid = Some(child.id());
         record.history_path = paths.history(record.id);
-        // Runtime session dir is deliberately never created -- this is the
-        // race being simulated: the record claims a socket that isn't
-        // there.
+        // Preserve runtime evidence while leaving the control socket absent.
         record.socket_path = paths.socket(record.id);
         fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
         atomic_write_json(&paths.record(record.id), &record).unwrap();
         let start_time = process_start_time_ticks(child.id()).unwrap();
         let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
@@ -4427,17 +4454,20 @@ mod switching_tests {
             paths.state_session(record.id).exists(),
             "ambiguous stale record must be preserved"
         );
-        // Reap before checking liveness: a just-SIGKILLed child is a zombie
-        // (still "alive" to a bare kill(pid, 0) probe) until waited on.
-        let status = child.wait().unwrap();
         assert!(
-            !status.success(),
-            "child should have died from a signal, not exited cleanly"
+            paths.runtime_session(record.id).exists(),
+            "ambiguous runtime evidence must be preserved"
         );
         assert!(
-            !process_alive(record.worker_pid.unwrap()),
-            "the unreachable worker_pid should have been force-killed, not left untouched"
+            child.try_wait().unwrap().is_none(),
+            "unreachable worker was destroyed before recovery was proven"
         );
+        assert!(
+            process_alive(record.worker_pid.unwrap()),
+            "unreachable worker must remain the subreaper boundary"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
