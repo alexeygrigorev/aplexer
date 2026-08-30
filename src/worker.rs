@@ -698,6 +698,30 @@ mod tests {
         assert_eq!(runtime.record().unwrap().tag, "before");
         assert!(runtime.record_persistence_error.lock().unwrap().is_some());
     }
+
+    #[test]
+    fn startup_history_node_must_be_regular_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        assert!(validate_existing_history_node(&missing).is_ok());
+
+        let regular = dir.path().join("regular.bin");
+        fs::write(&regular, b"history").unwrap();
+        assert!(validate_existing_history_node(&regular).is_ok());
+
+        let directory = dir.path().join("directory.bin");
+        fs::create_dir(&directory).unwrap();
+        assert!(validate_existing_history_node(&directory).is_err());
+
+        let symlink = dir.path().join("symlink.bin");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert!(validate_existing_history_node(&symlink).is_err());
+
+        let fifo = dir.path().join("fifo.bin");
+        let fifo_c = c_string(&fifo).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(validate_existing_history_node(&fifo).is_err());
+    }
 }
 
 #[derive(Debug)]
@@ -1543,17 +1567,15 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         atomic_write_json(&record_path, &record)?;
         after_workload_spawn_checkpoint(pid)?;
 
+        startup_checkpoint("before_history_open")?;
+        validate_existing_history_node(&record.history_path)?;
+        let history = History::open(record.history_path.clone(), record.history_bytes)?;
+        startup_checkpoint("before_output_hub")?;
+        let output = OutputHub::new(history, rows, cols, paths.screen_txt(id))?;
         record.phase = Phase::Running;
         record.updated_at_ms = now_ms();
         record.error = None;
         startup.failure_record = record.clone();
-        atomic_write_json(&record_path, &record)?;
-        startup_checkpoint("after_running_record")?;
-
-        startup_checkpoint("before_history_open")?;
-        let history = History::open(record.history_path.clone(), record.history_bytes)?;
-        startup_checkpoint("before_output_hub")?;
-        let output = OutputHub::new(history, rows, cols, paths.screen_txt(id))?;
         let runtime = Arc::new(WorkerRuntime {
             paths: paths.clone(),
             record_path: record_path.clone(),
@@ -1579,7 +1601,15 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
         });
-        start_worker_threads(Arc::clone(&runtime), master_read, Arc::clone(&child_slot))?;
+        start_worker_threads(
+            Arc::clone(&runtime),
+            master_read,
+            Arc::clone(&child_slot),
+            || {
+                atomic_write_json(&record_path, &record)?;
+                startup_checkpoint("after_running_record")
+            },
+        )?;
         Ok((listener, socket_identity, runtime))
     })();
     let (mut listener, mut control_socket_identity, runtime) = match setup {
@@ -1931,6 +1961,7 @@ fn start_worker_threads(
     runtime: Arc<WorkerRuntime>,
     master_read: File,
     child_slot: Arc<Mutex<Option<Child>>>,
+    commit_ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let gate = Arc::new((Mutex::new(ThreadStart::Pending), Condvar::new()));
     let mut handles = Vec::new();
@@ -1987,6 +2018,10 @@ fn start_worker_threads(
             run_termination_monitor(termination_runtime)
         })?;
         startup_checkpoint("after_thread_setup")?;
+        // Every required thread now exists but is still held behind `gate`.
+        // Publish Running only at this commit point; a failed commit aborts
+        // and joins the complete pending set before any thread can act.
+        commit_ready()?;
         Ok(())
     })();
     if let Err(error) = setup {
@@ -1998,6 +2033,23 @@ fn start_worker_threads(
     }
     release_startup_threads(&gate, ThreadStart::Run);
     Ok(())
+}
+
+/// History is durable local state, not an IPC endpoint. Reject accidental
+/// FIFOs, directories, devices, and symlinks before `History::open` can block
+/// or consume an unrelated file while worker startup is still in flight.
+fn validate_existing_history_node(path: &std::path::Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => bail!(
+            "history path {} exists but is not a regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect history path {}", path.display()))
+        }
+    }
 }
 
 fn run_periodic_flush(runtime: Arc<WorkerRuntime>) {
@@ -2304,7 +2356,13 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
     }
     let id = request.request_id.clone();
     match request.operation {
-        Operation::Ping => write_json(&mut stream, &Response::ok(id, json!({"pong":true})))?,
+        Operation::Ping => {
+            let session_id = runtime.record()?.id;
+            write_json(
+                &mut stream,
+                &Response::ok(id, json!({"pong":true,"id":session_id})),
+            )?
+        }
         Operation::Status => {
             let mut value = serde_json::to_value(public_session_record(&runtime.record()?))?;
             if let Some(error) = runtime.output.history_persistence_error() {
