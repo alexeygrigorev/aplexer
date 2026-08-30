@@ -182,3 +182,58 @@ fn doctor_reports_corrupt_registry_entry_with_its_path() {
     assert!(detail.contains("session.json"), "{detail}");
     assert!(detail.contains("parse"), "{detail}");
 }
+
+#[test]
+fn optional_cgroup_capability_is_explicit_and_never_makes_clean_doctor_fatal() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], true);
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "cgroup_limits")
+        .expect("doctor must report optional limit capability");
+    assert_eq!(check["required"], false);
+    assert!(check["available"].is_boolean());
+    assert!(check["prerequisites"]["cgroup_v2"].is_boolean());
+    assert!(check["prerequisites"]["controllers"]["ok"].is_boolean());
+    assert!(check["prerequisites"]["controllers"]["required"].is_array());
+    assert!(check["prerequisites"]["controllers"]["available"].is_array());
+    assert!(check["prerequisites"]["delegated_systemd_user_scope"]["ok"].is_boolean());
+    assert_eq!(
+        check["prerequisites"]["delegated_systemd_user_scope"]["method"],
+        "temporary_scope_via_launch_path"
+    );
+    assert!(check["prerequisites"]["delegated_systemd_user_scope"]["verifies"].is_array());
+
+    if check["available"] == true {
+        assert_eq!(check["ok"], true);
+        assert_eq!(check["severity"], "ok");
+        assert_eq!(report["warnings"], 0);
+        assert_eq!(check["prerequisites"]["cgroup_v2"], true);
+        assert_eq!(check["prerequisites"]["controllers"]["ok"], true);
+        assert_eq!(
+            check["prerequisites"]["delegated_systemd_user_scope"]["ok"],
+            true
+        );
+    } else {
+        assert_eq!(check["ok"], false);
+        assert_eq!(check["severity"], "warning");
+        assert!(report["warnings"].as_u64().unwrap() >= 1);
+        assert!(check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("unlimited sessions still work"));
+    }
+}

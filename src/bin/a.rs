@@ -1809,6 +1809,158 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct CgroupLimitProbe {
+    cgroup_v2: bool,
+    controllers: Vec<String>,
+    delegated_scope: bool,
+    detail: String,
+}
+
+fn probe_cgroup_limits() -> CgroupLimitProbe {
+    if let Err(error) = current_cgroup_identity() {
+        return CgroupLimitProbe {
+            cgroup_v2: false,
+            controllers: Vec::new(),
+            delegated_scope: false,
+            detail: format!("cgroup v2 unavailable: {error:#}"),
+        };
+    }
+
+    let controllers_path = Path::new("/sys/fs/cgroup/cgroup.controllers");
+    let controllers: Vec<String> = match fs::read_to_string(controllers_path) {
+        Ok(value) => value.split_whitespace().map(str::to_string).collect(),
+        Err(error) => {
+            return CgroupLimitProbe {
+                cgroup_v2: true,
+                controllers: Vec::new(),
+                delegated_scope: false,
+                detail: format!("cannot read {}: {error}", controllers_path.display()),
+            };
+        }
+    };
+    let required_controllers = ["cpu", "memory", "pids"];
+    let missing: Vec<&str> = required_controllers
+        .into_iter()
+        .filter(|required| !controllers.iter().any(|found| found == required))
+        .collect();
+    if !missing.is_empty() {
+        return CgroupLimitProbe {
+            cgroup_v2: true,
+            controllers,
+            delegated_scope: false,
+            detail: format!(
+                "cgroup v2 is mounted but required controller(s) are absent: {}",
+                missing.join(", ")
+            ),
+        };
+    }
+
+    // Exercise the exact launch implementation with a short-lived placeholder
+    // scope: trusted systemd-run/systemctl/sleep discovery, the systemd --user
+    // manager, Delegate=yes, all three supported controllers, and write-open
+    // access to cgroup.procs. The scope contains only the probe's `sleep`
+    // process and is cleaned immediately; no existing cgroup or workload is
+    // modified.
+    let probe_limits = Limits {
+        memory_bytes: Some(64 * 1024 * 1024),
+        pids: Some(16),
+        cpu_quota_us: Some(10_000),
+        cpu_period_us: Some(100_000),
+    };
+    let probe_result = Cgroup::create(Uuid::new_v4(), &probe_limits, || {});
+    match probe_result {
+        Ok(Some(cgroup)) => {
+            let validation = (|| -> Result<()> {
+                let _procs = cgroup.open_procs()?;
+                for controller_file in ["memory.max", "pids.max", "cpu.max"] {
+                    let path = cgroup.locator().join(controller_file);
+                    if !path.is_file() {
+                        bail!("delegated scope is missing {}", path.display());
+                    }
+                }
+                Ok(())
+            })();
+            cgroup.cleanup();
+            match validation {
+                Ok(()) => CgroupLimitProbe {
+                    cgroup_v2: true,
+                    controllers,
+                    delegated_scope: true,
+                    detail: "verified a temporary delegated systemd --user scope with memory, pids, and cpu controls".into(),
+                },
+                Err(error) => CgroupLimitProbe {
+                    cgroup_v2: true,
+                    controllers,
+                    delegated_scope: false,
+                    detail: format!("delegated scope validation failed: {error:#}"),
+                },
+            }
+        }
+        Ok(None) => CgroupLimitProbe {
+            cgroup_v2: true,
+            controllers,
+            delegated_scope: false,
+            detail: "limit probe unexpectedly created no cgroup".into(),
+        },
+        Err(error) => CgroupLimitProbe {
+            cgroup_v2: true,
+            controllers,
+            delegated_scope: false,
+            detail: format!("delegated systemd --user scope probe failed: {error:#}"),
+        },
+    }
+}
+
+fn cgroup_limits_check(probe: CgroupLimitProbe) -> Value {
+    let required_controllers = ["cpu", "memory", "pids"];
+    let controllers_ok = required_controllers
+        .iter()
+        .all(|required| probe.controllers.iter().any(|found| found == required));
+    let available = probe.cgroup_v2 && controllers_ok && probe.delegated_scope;
+    let detail = if available {
+        probe.detail.clone()
+    } else {
+        format!(
+            "{}; resource limits unavailable, but unlimited sessions still work",
+            probe.detail
+        )
+    };
+    json!({
+        "name": "cgroup_limits",
+        "ok": available,
+        "severity": if available { "ok" } else { "warning" },
+        "required": false,
+        "available": available,
+        "detail": detail,
+        "prerequisites": {
+            "cgroup_v2": probe.cgroup_v2,
+            "controllers": {
+                "ok": controllers_ok,
+                "required": required_controllers,
+                "available": probe.controllers,
+            },
+            "delegated_systemd_user_scope": {
+                "ok": probe.delegated_scope,
+                "detail": probe.detail,
+                "method": "temporary_scope_via_launch_path",
+                "verifies": [
+                    "trusted_systemd_run_systemctl_sleep",
+                    "systemd_user_manager",
+                    "delegate_yes",
+                    "writable_cgroup_procs",
+                ],
+            },
+        },
+    })
+}
+
+fn doctor_checks_ok(checks: &[Value]) -> bool {
+    checks
+        .iter()
+        .all(|check| check["ok"].as_bool().unwrap_or(false) || check["severity"] == "warning")
+}
+
 fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let mut checks = Vec::<Value>::new();
     checks.push(json!({"name":"linux","ok":true,"detail":std::env::consts::OS}));
@@ -1816,8 +1968,7 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     checks.push(path_check("state_root", &paths.state_root));
     let sample = paths.socket(Uuid::nil());
     checks.push(json!({"name":"unix_socket_path","ok":sample.as_os_str().len()<108,"detail":sample.display().to_string()}));
-    let cgv2 = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-    checks.push(json!({"name":"cgroup_v2","ok":cgv2,"detail":if cgv2{"mounted"}else{"not mounted; unlimited sessions still work"}}));
+    checks.push(cgroup_limits_check(probe_cgroup_limits()));
     match Config::load(paths){Ok(config)=>checks.push(json!({"name":"config","ok":true,"detail":format!("{} engines, {} profiles",config.engines.len(),config.profiles.len())})),Err(e)=>checks.push(json!({"name":"config","ok":false,"detail":format!("{e:#}")}))}
     match list_records(paths) {
         Ok(records) => {
@@ -1872,21 +2023,28 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
             "broken_sessions": [],
         })),
     }
-    let ok = checks.iter().all(|v| v["ok"].as_bool().unwrap_or(false));
+    let warnings = checks
+        .iter()
+        .filter(|check| check["severity"] == "warning")
+        .count();
+    let ok = doctor_checks_ok(&checks);
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"ok":ok,"checks":checks}))?
+            serde_json::to_string_pretty(&json!({"ok":ok,"warnings":warnings,"checks":checks}))?
         );
     } else {
         for check in &checks {
+            let label = if check["severity"] == "warning" {
+                "WARN"
+            } else if check["ok"].as_bool().unwrap_or(false) {
+                "OK"
+            } else {
+                "FAIL"
+            };
             println!(
                 "{:<5} {:<20} {}",
-                if check["ok"].as_bool().unwrap() {
-                    "OK"
-                } else {
-                    "FAIL"
-                },
+                label,
                 check["name"].as_str().unwrap(),
                 check["detail"].as_str().unwrap_or("")
             );
@@ -4672,6 +4830,44 @@ mod switching_tests {
         let safe = sanitize_terminal_text(unsafe_text);
         assert_eq!(safe, "plain????????tail");
         assert!(!safe.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn cgroup_capability_requires_delegation_but_is_optional_when_missing() {
+        let warning = cgroup_limits_check(CgroupLimitProbe {
+            cgroup_v2: true,
+            controllers: vec!["cpu".into(), "memory".into(), "pids".into()],
+            delegated_scope: false,
+            detail: "user manager unavailable".into(),
+        });
+        assert_eq!(warning["available"], false);
+        assert_eq!(warning["ok"], false);
+        assert_eq!(warning["severity"], "warning");
+        assert_eq!(warning["required"], false);
+        assert!(warning["detail"]
+            .as_str()
+            .unwrap()
+            .contains("unlimited sessions still work"));
+        assert!(doctor_checks_ok(&[warning]));
+
+        let no_cgroup_v2 = cgroup_limits_check(CgroupLimitProbe {
+            cgroup_v2: false,
+            controllers: Vec::new(),
+            delegated_scope: false,
+            detail: "cgroup v2 unavailable".into(),
+        });
+        assert_eq!(no_cgroup_v2["severity"], "warning");
+        assert!(doctor_checks_ok(&[no_cgroup_v2]));
+
+        let supported = cgroup_limits_check(CgroupLimitProbe {
+            cgroup_v2: true,
+            controllers: vec!["cpu".into(), "memory".into(), "pids".into()],
+            delegated_scope: true,
+            detail: "verified".into(),
+        });
+        assert_eq!(supported["available"], true);
+        assert_eq!(supported["ok"], true);
+        assert_eq!(supported["severity"], "ok");
     }
 
     #[test]
