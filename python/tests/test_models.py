@@ -35,6 +35,7 @@ def test_session_containment_proof_fields_and_legacy_exit():
                 "cgroup_namespace_inode": 10,
                 "mount_namespace_device": 4,
                 "mount_namespace_inode": 11,
+                "cgroup_mount_id": 12,
                 "cgroup_root_device": 28,
                 "cgroup_root_inode": 1,
             },

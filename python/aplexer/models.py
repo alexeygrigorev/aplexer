@@ -17,6 +17,7 @@ class CgroupIdentity:
     cgroup_namespace_inode: int
     mount_namespace_device: int
     mount_namespace_inode: int
+    cgroup_mount_id: int
     cgroup_root_device: int
     cgroup_root_inode: int
 

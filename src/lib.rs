@@ -382,6 +382,7 @@ pub struct CgroupIdentity {
     pub cgroup_namespace_inode: u64,
     pub mount_namespace_device: u64,
     pub mount_namespace_inode: u64,
+    pub cgroup_mount_id: u64,
     pub cgroup_root_device: u64,
     pub cgroup_root_inode: u64,
 }
@@ -1849,12 +1850,24 @@ fn ensure_cgroup2_filesystem(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn mount_id_for_file(file: &File) -> Result<u64> {
+    let path = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
+    let info = fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .map(str::trim)
+        .ok_or_else(|| anyhow!("{path} has no mount identity"))?
+        .parse()
+        .with_context(|| format!("parse mount identity from {path}"))
+}
+
 /// Capture the kernel domain that gives a persisted cgroup locator meaning.
 /// The root checks also keep resource-limit setup from accepting a lookalike
 /// directory mounted at `/sys/fs/cgroup`.
 pub fn current_cgroup_identity() -> Result<CgroupIdentity> {
     let root = Path::new(CGROUP_V2_ROOT);
-    let root_metadata = fs::metadata(root).context("inspect cgroup-v2 root")?;
+    let root_handle = File::open(root).context("open cgroup-v2 root")?;
+    let root_metadata = root_handle.metadata().context("inspect cgroup-v2 root")?;
     if !root_metadata.is_dir() {
         bail!("{CGROUP_V2_ROOT} is not a directory");
     }
@@ -1879,6 +1892,7 @@ pub fn current_cgroup_identity() -> Result<CgroupIdentity> {
         cgroup_namespace_inode,
         mount_namespace_device,
         mount_namespace_inode,
+        cgroup_mount_id: mount_id_for_file(&root_handle)?,
         cgroup_root_device: root_metadata.dev(),
         cgroup_root_inode: root_metadata.ino(),
     })
@@ -3172,6 +3186,7 @@ mod tests {
         assert_eq!(identity.boot_id, linux_boot_id().unwrap());
         assert_ne!(identity.cgroup_namespace_inode, 0);
         assert_ne!(identity.mount_namespace_inode, 0);
+        assert_ne!(identity.cgroup_mount_id, 0);
         assert_ne!(identity.cgroup_root_inode, 0);
         ensure_cgroup2_filesystem(Path::new(CGROUP_V2_ROOT)).unwrap();
     }
@@ -3225,6 +3240,12 @@ mod tests {
         wrong_boot.boot_id = Uuid::new_v4().to_string();
         let mismatch = validate_recorded_cgroup(id, &locator, Some(&wrong_boot))
             .expect_err("cross-boot locator must not prove emptiness");
+        assert!(mismatch.to_string().contains("does not match"));
+
+        let mut wrong_mount = current_cgroup_identity().unwrap();
+        wrong_mount.cgroup_mount_id = wrong_mount.cgroup_mount_id.saturating_add(1);
+        let mismatch = validate_recorded_cgroup(id, &locator, Some(&wrong_mount))
+            .expect_err("replacement mount must not prove emptiness");
         assert!(mismatch.to_string().contains("does not match"));
 
         let identity = current_cgroup_identity().unwrap();
