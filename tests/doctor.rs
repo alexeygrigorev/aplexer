@@ -150,6 +150,38 @@ fn status_and_doctor_report_alive_but_unreachable_workers_separately() {
 }
 
 #[test]
+fn doctor_reports_strict_config_errors_with_field_context() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    std::fs::write(
+        &paths.config_file,
+        "version = 1\n[profiles.review]\nhistroy_bytes = 1024\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "doctor hid invalid config");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let config = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "config")
+        .unwrap();
+    assert_eq!(config["ok"], false);
+    let detail = config["detail"].as_str().unwrap();
+    assert!(detail.contains("unknown field"), "{detail}");
+    assert!(detail.contains("histroy_bytes"), "{detail}");
+}
+
+#[test]
 fn doctor_reports_corrupt_registry_entry_with_its_path() {
     let temp = TempDir::new().unwrap();
     let paths = test_paths(&temp);

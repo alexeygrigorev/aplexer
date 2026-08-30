@@ -388,6 +388,7 @@ pub fn validate_tag(tag: &str) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
@@ -403,6 +404,31 @@ impl Limits {
     pub fn requested(&self) -> bool {
         self.memory_bytes.is_some() || self.pids.is_some() || self.cpu_quota_us.is_some()
     }
+}
+
+fn validate_limits(limits: &Limits, context: &str) -> Result<()> {
+    for (name, value) in [
+        ("memory_bytes", limits.memory_bytes),
+        ("pids", limits.pids),
+        ("cpu_quota_us", limits.cpu_quota_us),
+        ("cpu_period_us", limits.cpu_period_us),
+    ] {
+        if value == Some(0) {
+            bail!("{context} {name} must be greater than zero");
+        }
+    }
+    match (limits.cpu_quota_us, limits.cpu_period_us) {
+        (None, Some(_)) => bail!("{context} cpu_period_us requires cpu_quota_us"),
+        (Some(quota), period) => {
+            let period = period.unwrap_or(100_000);
+            let percent = (u128::from(quota) * 100).div_ceil(u128::from(period));
+            if percent > u128::from(u64::MAX) {
+                bail!("{context} cpu_quota_us/cpu_period_us ratio is too large");
+            }
+        }
+        (None, None) => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1061,6 +1087,7 @@ pub fn resolve_record(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     pub command: Vec<String>,
     #[serde(default)]
@@ -1093,6 +1120,7 @@ impl EngineConfig {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     #[serde(default)]
     pub engine: Option<String>,
@@ -1114,12 +1142,14 @@ pub struct ProfileConfig {
     pub limits: Limits,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ShortcutConfig {
     pub engine: String,
     #[serde(default)]
     pub profile: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_config_version")]
     pub version: u32,
@@ -1354,6 +1384,94 @@ fn ordered_env_unset_union(extra: &[String]) -> Vec<String> {
 }
 
 impl Config {
+    fn validate(&self) -> Result<()> {
+        if let Some(name) = &self.default_engine {
+            if !self.engines.contains_key(name) {
+                bail!("default_engine {name:?} does not reference a configured engine");
+            }
+        }
+        if let Some(name) = &self.default_profile {
+            if !self.profiles.contains_key(name) {
+                bail!("default_profile {name:?} does not reference a configured profile");
+            }
+        }
+
+        for (name, engine) in &self.engines {
+            if name.is_empty() {
+                bail!("engine name must not be empty");
+            }
+            if engine.command.is_empty() {
+                bail!("engine {name:?} command must not be empty");
+            }
+            if engine.command[0].is_empty() {
+                bail!("engine {name:?} command executable must not be empty");
+            }
+        }
+
+        for (name, profile) in &self.profiles {
+            if name.is_empty() {
+                bail!("profile name must not be empty");
+            }
+            if let Some(engine) = &profile.engine {
+                if !self.engines.contains_key(engine) {
+                    bail!(
+                        "profile {name:?} engine {engine:?} does not reference a configured engine"
+                    );
+                }
+            }
+            if profile.executable.as_deref() == Some("") {
+                bail!("profile {name:?} executable must not be empty");
+            }
+            if let Some(command) = &profile.command {
+                if command.is_empty() {
+                    bail!("profile {name:?} command must not be empty");
+                }
+                if command[0].is_empty() {
+                    bail!("profile {name:?} command executable must not be empty");
+                }
+                if profile.executable.is_some() {
+                    bail!("profile {name:?} cannot set both command and executable");
+                }
+                if !profile.args.is_empty() {
+                    bail!("profile {name:?} cannot set both command and args");
+                }
+            }
+            if let Some(history_bytes) = profile.history_bytes {
+                validate_history_bytes(history_bytes)
+                    .with_context(|| format!("profile {name:?} history_bytes"))?;
+            }
+            validate_limits(&profile.limits, &format!("profile {name:?} limits"))?;
+        }
+
+        for (name, shortcut) in &self.shortcuts {
+            if name.is_empty() {
+                bail!("shortcut name must not be empty");
+            }
+            if !self.engines.contains_key(&shortcut.engine) {
+                bail!(
+                    "shortcut {name:?} engine {:?} does not reference a configured engine",
+                    shortcut.engine
+                );
+            }
+            if let Some(profile_name) = &shortcut.profile {
+                let profile = self.profiles.get(profile_name).ok_or_else(|| {
+                    anyhow!(
+                        "shortcut {name:?} profile {profile_name:?} does not reference a configured profile"
+                    )
+                })?;
+                if let Some(profile_engine) = &profile.engine {
+                    if profile_engine != &shortcut.engine {
+                        bail!(
+                            "shortcut {name:?} selects engine {:?}, but profile {profile_name:?} selects engine {profile_engine:?}",
+                            shortcut.engine
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(paths: &Paths) -> Result<Self> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut config = Config {
@@ -1464,27 +1582,6 @@ impl Config {
                 profile: None,
             },
         );
-        config.shortcuts.insert(
-            "clz".into(),
-            ShortcutConfig {
-                engine: "claude".into(),
-                profile: Some("zlaude".into()),
-            },
-        );
-        config.shortcuts.insert(
-            "coz".into(),
-            ShortcutConfig {
-                engine: "codex".into(),
-                profile: Some("zodex".into()),
-            },
-        );
-        config.shortcuts.insert(
-            "cog".into(),
-            ShortcutConfig {
-                engine: "codex".into(),
-                profile: Some("godex".into()),
-            },
-        );
         if paths.config_file.exists() {
             let text = fs::read_to_string(&paths.config_file)?;
             let user: Config = toml::from_str(&text)
@@ -1502,12 +1599,26 @@ impl Config {
             config.profiles.extend(user.profiles);
             config.shortcuts.extend(user.shortcuts);
         }
-        for (name, profile) in &config.profiles {
-            if let Some(history_bytes) = profile.history_bytes {
-                validate_history_bytes(history_bytes)
-                    .with_context(|| format!("profile {name:?} history_bytes"))?;
+        // Profile-specific built-ins are useful only when discovery or user
+        // config supplied their target profile. Insert them after merging so
+        // they never create dangling references, while an explicit user
+        // shortcut with the same id still wins.
+        for (shortcut, engine, profile) in [
+            ("clz", "claude", "zlaude"),
+            ("coz", "codex", "zodex"),
+            ("cog", "codex", "godex"),
+        ] {
+            if config.profiles.contains_key(profile) {
+                config
+                    .shortcuts
+                    .entry(shortcut.into())
+                    .or_insert_with(|| ShortcutConfig {
+                        engine: engine.into(),
+                        profile: Some(profile.into()),
+                    });
             }
         }
+        config.validate()?;
         Ok(config)
     }
 
@@ -1585,6 +1696,7 @@ impl Config {
         if limits.cpu_period_us.is_some() {
             merged_limits.cpu_period_us = limits.cpu_period_us;
         }
+        validate_limits(&merged_limits, "resolved launch limits")?;
         let launch_cwd = cwd
             .map(Path::to_path_buf)
             .or_else(|| profile.and_then(|p| p.cwd.clone()))
@@ -3083,6 +3195,17 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    fn load_config_text(text: &str) -> Result<Config> {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        fs::write(&paths.config_file, text).unwrap();
+        Config::load(&paths)
+    }
+
     fn registry_record(paths: &Paths, id: Uuid) -> SessionRecord {
         SessionRecord {
             schema_version: SCHEMA_VERSION,
@@ -3482,6 +3605,184 @@ mod tests {
             "{message}"
         );
     }
+
+    #[test]
+    fn config_schema_rejects_unknown_fields_at_every_level() {
+        for (label, text, unknown) in [
+            (
+                "root",
+                "version = 1\ndefualt_engine = \"shell\"\n",
+                "defualt_engine",
+            ),
+            (
+                "engine",
+                "version = 1\n[engines.custom]\ncommand = [\"true\"]\ncomand = [\"false\"]\n",
+                "comand",
+            ),
+            (
+                "profile",
+                "version = 1\n[profiles.review]\nhistroy_bytes = 1024\n",
+                "histroy_bytes",
+            ),
+            (
+                "profile limits",
+                "version = 1\n[profiles.review.limits]\nmemroy_bytes = 1024\n",
+                "memroy_bytes",
+            ),
+            (
+                "shortcut",
+                "version = 1\n[shortcuts.review]\nengine = \"shell\"\nprofiel = \"review\"\n",
+                "profiel",
+            ),
+        ] {
+            let message = format!("{:#}", load_config_text(text).unwrap_err());
+            assert!(message.contains("unknown field"), "{label}: {message}");
+            assert!(message.contains(unknown), "{label}: {message}");
+        }
+    }
+
+    #[test]
+    fn config_semantics_reject_dangling_references_and_invalid_commands() {
+        for (label, text, expected) in [
+            (
+                "default engine",
+                "version = 1\ndefault_engine = \"missing\"\n",
+                "default_engine \"missing\"",
+            ),
+            (
+                "default profile",
+                "version = 1\ndefault_profile = \"missing\"\n",
+                "default_profile \"missing\"",
+            ),
+            (
+                "profile engine",
+                "version = 1\n[profiles.review]\nengine = \"missing\"\n",
+                "profile \"review\" engine \"missing\"",
+            ),
+            (
+                "shortcut engine",
+                "version = 1\n[shortcuts.review]\nengine = \"missing\"\n",
+                "shortcut \"review\" engine \"missing\"",
+            ),
+            (
+                "shortcut profile",
+                "version = 1\n[shortcuts.review]\nengine = \"shell\"\nprofile = \"missing\"\n",
+                "shortcut \"review\" profile \"missing\"",
+            ),
+            (
+                "shortcut profile engine",
+                "version = 1\n[profiles.review]\nengine = \"claude\"\n[shortcuts.review]\nengine = \"codex\"\nprofile = \"review\"\n",
+                "selects engine \"codex\", but profile \"review\" selects engine \"claude\"",
+            ),
+            (
+                "empty engine command",
+                "version = 1\n[engines.shell]\ncommand = []\n",
+                "engine \"shell\" command must not be empty",
+            ),
+            (
+                "empty profile command",
+                "version = 1\n[profiles.review]\ncommand = []\n",
+                "profile \"review\" command must not be empty",
+            ),
+            (
+                "empty profile executable",
+                "version = 1\n[profiles.review]\nexecutable = \"\"\n",
+                "profile \"review\" executable must not be empty",
+            ),
+            (
+                "ignored profile executable",
+                "version = 1\n[profiles.review]\ncommand = [\"true\"]\nexecutable = \"false\"\n",
+                "cannot set both command and executable",
+            ),
+            (
+                "ignored profile args",
+                "version = 1\n[profiles.review]\ncommand = [\"true\"]\nargs = [\"--ignored\"]\n",
+                "cannot set both command and args",
+            ),
+        ] {
+            let message = format!("{:#}", load_config_text(text).unwrap_err());
+            assert!(message.contains(expected), "{label}: {message}");
+        }
+    }
+
+    #[test]
+    fn config_semantics_reject_invalid_numeric_limits() {
+        for (label, field, expected) in [
+            ("memory", "memory_bytes = 0", "memory_bytes must be greater"),
+            ("pids", "pids = 0", "pids must be greater"),
+            ("quota", "cpu_quota_us = 0", "cpu_quota_us must be greater"),
+            (
+                "period",
+                "cpu_quota_us = 1\ncpu_period_us = 0",
+                "cpu_period_us must be greater",
+            ),
+            (
+                "orphan period",
+                "cpu_period_us = 100000",
+                "cpu_period_us requires cpu_quota_us",
+            ),
+        ] {
+            let text = format!("version = 1\n[profiles.review.limits]\n{field}\n");
+            let message = format!("{:#}", load_config_text(&text).unwrap_err());
+            assert!(message.contains(expected), "{label}: {message}");
+        }
+
+        let config = load_config_text("version = 1\n").unwrap();
+        let error = config
+            .resolve(
+                vec!["/bin/true".into()],
+                Some("shell"),
+                None,
+                Path::new("/tmp"),
+                None,
+                &BTreeMap::new(),
+                &Limits {
+                    pids: Some(0),
+                    ..Limits::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("resolved launch limits pids"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn valid_config_references_commands_and_limits_still_load() {
+        let config = load_config_text(
+            "version = 1\n\
+             default_engine = \"custom\"\n\
+             default_profile = \"review\"\n\
+             [engines.custom]\n\
+             command = [\"/bin/sh\", \"-l\"]\n\
+             env_unset = [\"CUSTOM_SECRET\"]\n\
+             [profiles.review]\n\
+             engine = \"custom\"\n\
+             args = [\"--review\"]\n\
+             history_bytes = 0\n\
+             [profiles.review.limits]\n\
+             memory_bytes = 1048576\n\
+             pids = 4\n\
+             cpu_quota_us = 50000\n\
+             cpu_period_us = 100000\n\
+             [shortcuts.rev]\n\
+             engine = \"custom\"\n\
+             profile = \"review\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.default_engine.as_deref(), Some("custom"));
+        assert_eq!(config.default_profile.as_deref(), Some("review"));
+        for (name, shortcut) in &config.shortcuts {
+            assert!(config.engines.contains_key(&shortcut.engine), "{name}");
+            if let Some(profile) = &shortcut.profile {
+                assert!(config.profiles.contains_key(profile), "{name}");
+            }
+        }
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);

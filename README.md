@@ -142,7 +142,9 @@ Launch a profile explicitly with `a start --engine codex --profile zodex`, or fr
 
 ### Shortcuts
 
-Built-in defaults, resolving `a - <id>` to an (engine, profile) pair:
+Built-in defaults, resolving `a - <id>` to an (engine, profile) pair. The
+plain engine shortcuts are always present; profile shortcuts are added only
+when discovery or user configuration provides their referenced profile:
 
 ```toml
 [shortcuts.cl]
@@ -178,10 +180,19 @@ profile = "review"   # the [profiles.review] example above
 ```
 
 Inspect effective discovery/resolution any time with `a engines`, `a profiles`, and `a doctor`.
+Configuration is strict: unknown keys, empty commands, dangling
+engine/profile references, contradictory profile command fields, and invalid
+numeric limits fail at load time with their config context. Existing documented
+keys retain their meaning; this intentionally turns previously ignored typos
+into actionable errors.
 
 ## Resource isolation
 
 When any limit is requested, the worker creates a per-session cgroup-v2 leaf and moves the workload into it before releasing the child from a pre-exec launch gate. If the current cgroup is not delegated to the user, launch fails rather than silently running without the requested limit. `kill` serializes termination and uses the cgroup for descendant-wide signaling and escalation.
+
+Configured memory, PID, CPU quota, and CPU period values must be greater than
+zero. `cpu_period_us` is meaningful only with `cpu_quota_us`; a quota without an
+explicit period keeps the 100,000 µs default.
 
 ## Durable lifecycle
 
