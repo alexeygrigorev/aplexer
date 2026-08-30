@@ -717,7 +717,10 @@ patch branch.
   keypad/cursor keys.
 - Resize (worker-side model resize + geometry-carrying attach).
 - Multi-client attach (snapshot is a stateless render; each subscriber
-  gets its own, under the same lock discipline as today).
+  gets its own, under the same lock discipline as today). Input and output
+  are shared, and PTY geometry follows tmux's default `window-size=latest`
+  policy: attach, input, or resize activity makes that sized client latest;
+  detaching it falls back to the most recently active remaining client.
 
 **Approximate / accepted v1 limitations** (each is strictly no worse than
 today's byte replay, which gets all of them wrong *and* the screen too):

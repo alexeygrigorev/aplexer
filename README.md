@@ -25,7 +25,7 @@ cargo build --release --bins
 install -m 0755 target/release/a target/release/aplexer ~/.local/bin/
 ```
 
-Rust 1.78 or newer is recommended. Runtime state defaults to `$XDG_RUNTIME_DIR/aplexer`; durable records and bounded output history default to `$XDG_STATE_HOME/aplexer` (or `~/.local/state/aplexer`). Override these with `APLEXER_RUNTIME_DIR`, `APLEXER_STATE_DIR`, and `APLEXER_CONFIG`.
+Rust 1.85 or newer is recommended. Runtime state defaults to `$XDG_RUNTIME_DIR/aplexer`; durable records and bounded output history default to `$XDG_STATE_HOME/aplexer` (or `~/.local/state/aplexer`). Override these with `APLEXER_RUNTIME_DIR`, `APLEXER_STATE_DIR`, and `APLEXER_CONFIG`.
 
 ## Shell completions
 
@@ -58,6 +58,8 @@ a attach --workspace "$PWD" --tag shell
 The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
 
 **Reattach repaints the live screen, tmux-style.** The worker feeds every PTY byte through a terminal-state model continuously — attached or not — so `a attach` renders *the screen as it is right now* (cursor position, colors, alternate screen, bracketed paste and mouse modes, scroll margins) rather than replaying a tail of raw byte history. Reattaching to a running full-screen agent TUI puts it back exactly where the agent thinks it is, instead of leaving a stale cursor and a half-drawn frame, and the payload is a few hundred bytes to a few KB instead of a fixed 32 KB. `a attach --history-bytes N` is the escape hatch back to the old raw-tail replay (byte-exact scripted consumers, or seeding your terminal's native scrollback). See [docs/terminal-state-design.md](docs/terminal-state-design.md).
+
+**Concurrent attaches share one live terminal.** Input from every attached device goes to the same PTY, and every byte the workload emits is fanned out to every attached device, so text entered on device B is visible on device A. For differently sized devices, aplexer follows tmux's default `window-size=latest` policy: the newly attached, most recently typing, or most recently resized device controls the PTY size; when it detaches, the most recently active remaining device takes over. Unlike tmux, aplexer does not yet render a clipped/padded viewport separately for each inactive client, so a passive differently sized terminal may look clipped until it becomes active and the workload handles `SIGWINCH`.
 
 ```bash
 a send --workspace "$PWD" --tag shell --enter 'printf "hello\\n"'
