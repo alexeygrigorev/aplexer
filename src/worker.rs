@@ -38,6 +38,8 @@ const MAX_SUBSCRIBERS: usize = 64;
 /// but never let a same-UID peer create worker threads without bound.
 const MAX_CLIENT_CONNECTIONS: usize = 128;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -159,6 +161,17 @@ fn try_acquire_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionPermit>
     Some(ConnectionPermit {
         active: Arc::clone(active),
     })
+}
+
+/// Resource pressure must not tear down the worker: doing so also closes the
+/// PTY master and can SIGHUP an otherwise healthy workload. Existing client
+/// threads may release descriptors while the listener backs off, after which
+/// accepting can resume normally.
+fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    )
 }
 
 fn bounded_history_limit(requested: Option<usize>) -> usize {
@@ -512,6 +525,16 @@ mod tests {
             }
         });
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn descriptor_pressure_accept_errors_are_retriable() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(transient_accept_error(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!transient_accept_error(&io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
     }
 }
 
@@ -1191,9 +1214,11 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     };
     startup.disarm();
 
+    let mut accept_retry = ACCEPT_RETRY_INITIAL;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                accept_retry = ACCEPT_RETRY_INITIAL;
                 let Some(permit) = try_acquire_connection(&runtime.active_connections) else {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
@@ -1212,6 +1237,14 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if transient_accept_error(&error) => {
+                eprintln!(
+                    "aplexer worker: transient control accept failure: {error}; retrying in {}ms",
+                    accept_retry.as_millis()
+                );
+                thread::sleep(accept_retry);
+                accept_retry = accept_retry.saturating_mul(2).min(ACCEPT_RETRY_MAX);
+            }
             Err(error) => return Err(error).context("accept control connection"),
         }
     }
