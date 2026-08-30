@@ -2246,9 +2246,36 @@ fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Resu
     Ok(())
 }
 
+#[cfg(not(test))]
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+
+fn set_control_deadlines(stream: &UnixStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(CONTROL_RPC_TIMEOUT))
+        .context("set worker response deadline")?;
+    stream
+        .set_write_timeout(Some(CONTROL_RPC_TIMEOUT))
+        .context("set worker request deadline")?;
+    Ok(())
+}
+
+fn clear_streaming_deadlines(stream: &UnixStream) -> Result<()> {
+    stream
+        .set_read_timeout(None)
+        .context("clear attach streaming read deadline")?;
+    stream
+        .set_write_timeout(None)
+        .context("clear attach streaming write deadline")?;
+    Ok(())
+}
+
 fn connect(record: &SessionRecord) -> Result<UnixStream> {
-    UnixStream::connect(&record.socket_path)
-        .with_context(|| format!("connect {}", record.socket_path.display()))
+    let stream = UnixStream::connect(&record.socket_path)
+        .with_context(|| format!("connect {}", record.socket_path.display()))?;
+    set_control_deadlines(&stream)?;
+    Ok(stream)
 }
 fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
     let mut stream = connect(record)?;
@@ -3020,6 +3047,9 @@ fn establish(
     if initial.kind != FrameKind::Data {
         bail!("expected history data");
     }
+    // Only the handshake is an RPC. Once subscribed, silence is a normal
+    // state for an interactive terminal and must not detach the client.
+    clear_streaming_deadlines(&reader)?;
     Ok(AttachHandshake {
         reader,
         initial: initial.payload,
