@@ -12,6 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -73,10 +74,45 @@ impl<'a> StartupGuard<'a> {
             .expect("startup child must be tracked after spawn")
     }
 
-    fn disarm(&mut self) {
+    /// Transfer a successfully-started worker to a detached waiter. The CLI
+    /// normally exits long before the worker, but embedders (notably Python)
+    /// can outlive many sessions; merely dropping `Child` there leaves every
+    /// completed worker as a zombie owned by the host process.
+    ///
+    /// Keep the child in this guard until the waiter has been created and has
+    /// accepted it. If either step fails, rollback still owns the process and
+    /// can terminate it instead of leaking an unreapable child handle.
+    fn hand_off_to_reaper(&mut self) -> Result<()> {
+        let child = self
+            .child
+            .take()
+            .expect("ready worker must still be owned by startup guard");
+        let worker_pid = child.id();
+        let (sender, receiver) = mpsc::sync_channel::<Child>(1);
+        let waiter = match thread::Builder::new()
+            .name(format!("aplexer-reap-{worker_pid}"))
+            .spawn(move || {
+                if let Ok(mut child) = receiver.recv() {
+                    if let Err(error) = child.wait() {
+                        eprintln!("aplexer: wait for worker {worker_pid} failed: {error}");
+                    }
+                }
+            })
+        {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                self.child = Some(child);
+                return Err(error).context("spawn worker reaper");
+            }
+        };
+        if let Err(error) = sender.send(child) {
+            self.child = Some(error.0);
+            let _ = waiter.join();
+            bail!("worker reaper exited before accepting worker {worker_pid}");
+        }
+        drop(waiter);
         self.armed = false;
-        // Dropping Child leaves a successfully-started worker running.
-        self.child.take();
+        Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
@@ -1174,7 +1210,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
 
     match result {
         Ok(record) => {
-            startup.disarm();
+            startup.hand_off_to_reaper()?;
             Ok(record)
         }
         Err(start_error) => match startup.rollback() {

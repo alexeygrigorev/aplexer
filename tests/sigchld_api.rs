@@ -3,7 +3,7 @@
 //! process-wide.
 
 use aplexer::api::{start_session, StartRequest};
-use aplexer::{Cgroup, Limits, Paths};
+use aplexer::{read_record, Cgroup, Limits, Paths, Phase};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
@@ -65,6 +65,75 @@ fn invalid_start_request(workspace: PathBuf) -> StartRequest {
     }
 }
 
+fn successful_start_request(workspace: PathBuf) -> StartRequest {
+    StartRequest {
+        workspace,
+        tag: "reaping".into(),
+        engine: None,
+        profile: None,
+        cwd: None,
+        env: BTreeMap::new(),
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 0.1".into(),
+        ],
+        memory: None,
+        pids: None,
+        cpu_quota_us: None,
+        cpu_period_us: 100_000,
+        history_bytes: None,
+        no_skip_permissions: false,
+        startup_timeout_ms: 3_000,
+        worker_rows: None,
+        worker_cols: None,
+        python: None,
+    }
+}
+
+fn exercise_successful_worker_reaping() {
+    install_sigchld(
+        custom_sigchld_handler as *const () as libc::sighandler_t,
+        0,
+    );
+    let before = sigchld_action();
+    let runtime = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let paths = Paths {
+        runtime_root: runtime.path().to_path_buf(),
+        state_root: state.path().to_path_buf(),
+        config_file: state.path().join("config.toml"),
+    };
+    paths.ensure().unwrap();
+    env::set_var("APLEXER_WORKER", env!("CARGO_BIN_EXE_aplexer"));
+    let ready = start_session(
+        &paths,
+        &successful_start_request(workspace.path().to_path_buf()),
+    )
+    .expect("start short-lived worker through in-process API");
+    let worker_pid = ready.worker_pid.expect("ready worker pid");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let record = read_record(&paths.record(ready.id)).expect("read final session record");
+        let worker_reaped = !PathBuf::from(format!("/proc/{worker_pid}")).exists();
+        if matches!(record.phase, Phase::Exited | Phase::Failed) && worker_reaped {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "completed in-process worker {worker_pid} remained as a child/zombie; phase={:?}",
+            record.phase
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let after = sigchld_action();
+    assert_eq!(after.sa_sigaction, before.sa_sigaction);
+    assert_eq!(after.sa_flags, before.sa_flags);
+}
+
 fn exercise_child(mode: &str) {
     let (handler, flags) = match mode {
         "custom" => (custom_sigchld_handler as *const () as libc::sighandler_t, 0),
@@ -124,12 +193,16 @@ fn exercise_child(mode: &str) {
 #[test]
 fn in_process_api_preserves_or_rejects_sigchld_without_mutating_it() {
     if let Ok(mode) = env::var(CHILD_MODE) {
+        if mode == "reaping" {
+            exercise_successful_worker_reaping();
+            return;
+        }
         exercise_child(&mode);
         return;
     }
 
     let current_test = env::current_exe().expect("current test executable");
-    for mode in ["custom", "ignored", "no-cld-wait"] {
+    for mode in ["custom", "ignored", "no-cld-wait", "reaping"] {
         let output = Command::new(&current_test)
             .env(CHILD_MODE, mode)
             .args([
