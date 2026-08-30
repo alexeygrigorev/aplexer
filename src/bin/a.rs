@@ -1679,7 +1679,7 @@ fn cmd_hotkeys() -> Result<()> {
     println!();
     println!("  n / p    next / previous session in this workspace");
     println!("  N / P    next / previous session, across all workspaces");
-    println!("  Ctrl-1..9 jump to that number from the status bar");
+    println!("  Ctrl-b 1..9 jumps to that number from the status bar");
     println!("  1-9      jump to that number after Ctrl-b");
     println!("  l        toggle back to the last session you were on");
     println!("  d        detach");
@@ -2876,7 +2876,7 @@ enum SwitchTarget {
     PrevGlobal,
     /// `Ctrl-b l`: toggle back to whatever was attached before this one.
     Last,
-    /// `Ctrl-b 1`..`9` or direct `Ctrl-1`..`Ctrl-9`: the Nth session
+    /// `Ctrl-b 1`..`9`: the Nth session
     /// (1-based) of the current workspace, no skipping -- must mean exactly
     /// what the status bar shows.
     Index(usize),
@@ -3268,7 +3268,7 @@ enum InputAction {
     Forward(Vec<u8>),
     /// `Ctrl-b d`.
     Detach,
-    /// `Ctrl-b n/p/N/P/l/1-9` or direct `Ctrl-1`..`Ctrl-9`.
+    /// `Ctrl-b n/p/N/P/l/1-9`.
     Switch(SwitchTarget),
 }
 
@@ -3287,8 +3287,7 @@ struct InputScanner {
 impl InputScanner {
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
     /// `Ctrl-b d` detaches; `n p N P l 1-9`
-    /// are consumed after a pending `Ctrl-b`; direct `Ctrl-1`..`9`
-    /// shortcuts are consumed on their own. Anything else pending is "not a
+    /// are consumed after a pending `Ctrl-b`. Anything else pending is "not a
     /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
     /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
     /// still pass through to the workload untouched.
@@ -3332,22 +3331,6 @@ impl InputScanner {
             }
             if byte == 0x02 {
                 self.pending_ctrl_b = true;
-                i += 1;
-                continue;
-            }
-            // Terminals that expose direct control-number shortcuts encode
-            // Ctrl-1..Ctrl-9 as the corresponding ASCII digit masked to the
-            // C0 control range: b'1' & 0x1f through b'9' & 0x1f (0x11..0x19).
-            // Keep this outside the Ctrl-b prefix branch so the existing
-            // prefix commands and its literal-input fallthrough are
-            // unchanged.
-            if (0x11..=0x19).contains(&byte) {
-                if !out.is_empty() {
-                    actions.push(InputAction::Forward(std::mem::take(&mut out)));
-                }
-                actions.push(InputAction::Switch(SwitchTarget::Index(
-                    (byte - 0x10) as usize,
-                )));
                 i += 1;
                 continue;
             }
@@ -3561,7 +3544,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // effect) is exactly the fix for the original corruption, where the
         // banner landed inside a live TUI's input box. A real status-bar
         // flash slot for this is future work (section 6.3 step 6).
-        eprintln!("[aplexer attached; Ctrl-b d detaches; Ctrl-1..9 or Ctrl-b n/p/1-9/l switches]");
+        eprintln!("[aplexer attached; Ctrl-b d detaches; Ctrl-b n/p/1-9/l switches]");
     }
     // Scanned before the bar is drawn: the snapshot re-emits the workload's
     // DECSTBM sub-range as its last bytes (design doc section 6.2 step 3), so
@@ -3603,7 +3586,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
         // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
-        // Ctrl-b n/p/N/P/l/1-9 and direct Ctrl-1..9 switch sessions,
+        // Ctrl-b n/p/N/P/l/1-9 switch sessions,
         // anything else pending is not a real prefix (both bytes forward to
         // the workload). See
         // `InputScanner` for the byte-level rules and why this needs to
@@ -3972,34 +3955,19 @@ mod switching_tests {
     }
 
     #[test]
-    fn scan_direct_ctrl_digits_switch_to_matching_index() {
+    fn scan_ctrl_q_through_ctrl_y_are_forwarded() {
         let mut s = InputScanner::default();
-        for (byte, index) in (0x11u8..=0x19).zip(1usize..=9) {
+        for byte in 0x11u8..=0x19 {
             let actions = s.scan(&[byte]);
-            assert!(matches!(
-                actions.as_slice(),
-                [InputAction::Switch(SwitchTarget::Index(n))] if *n == index
-            ));
+            assert_eq!(bytes(&actions), vec![byte]);
         }
     }
 
     #[test]
-    fn scan_direct_ctrl_digit_preserves_input_order() {
+    fn scan_control_bytes_preserve_input_order() {
         let mut s = InputScanner::default();
         let actions = s.scan(&[b'a', 0x13, b'z']);
-        assert_eq!(actions.len(), 3);
-        match &actions[0] {
-            InputAction::Forward(bytes) => assert_eq!(bytes, b"a"),
-            _ => panic!("expected Forward"),
-        }
-        assert!(matches!(
-            &actions[1],
-            InputAction::Switch(SwitchTarget::Index(3))
-        ));
-        match &actions[2] {
-            InputAction::Forward(bytes) => assert_eq!(bytes, b"z"),
-            _ => panic!("expected Forward"),
-        }
+        assert_eq!(bytes(&actions), vec![b'a', 0x13, b'z']);
     }
 
     #[test]
