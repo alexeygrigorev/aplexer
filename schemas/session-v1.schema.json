@@ -103,6 +103,15 @@
         "null"
       ]
     },
+    "containment_cgroup": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "containment_empty": {
+      "type": "boolean"
+    },
     "socket_path": {
       "type": "string"
     },

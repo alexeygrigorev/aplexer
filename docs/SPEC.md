@@ -720,6 +720,8 @@ attached_clients
 foreground_pid
 foreground_exe
 observed_engine
+containment_cgroup
+containment_empty
 exit_code
 exit_signal
 exit_reason
