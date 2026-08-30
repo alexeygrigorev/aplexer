@@ -18,12 +18,27 @@ use anyhow::{bail, Result};
 /// keeping each session's model within a defensible fixed bound.
 pub const MAX_SCREEN_CELLS: usize = 256 * 1024;
 
+/// Conventional geometry used when a PTY exists but its kernel winsize has
+/// not been initialized. Linux reports that state as `0x0`; feeding the
+/// zeros (or a `1x1` clamp) to vt100 leaves several parser operations with a
+/// degenerate grid that real terminals never use.
+pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
+pub const DEFAULT_TERMINAL_COLS: u16 = 80;
+
 /// Normalize the protocol's zero dimensions and reject grids that would
 /// exceed the worker's fixed cell budget. `checked_mul` keeps this correct if
 /// the dimension types are widened in the future.
 pub fn validate_size(rows: u16, cols: u16) -> Result<(u16, u16)> {
-    let rows = rows.max(1);
-    let cols = cols.max(1);
+    let rows = if rows == 0 {
+        DEFAULT_TERMINAL_ROWS
+    } else {
+        rows
+    };
+    let cols = if cols == 0 {
+        DEFAULT_TERMINAL_COLS
+    } else {
+        cols
+    };
     let cells = usize::from(rows)
         .checked_mul(usize::from(cols))
         .ok_or_else(|| anyhow::anyhow!("terminal dimensions overflow"))?;
@@ -543,8 +558,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_dimensions_use_a_non_degenerate_terminal_fallback() {
+        assert_eq!(
+            validate_size(0, 0).unwrap(),
+            (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+        );
+        assert_eq!(validate_size(0, 132).unwrap(), (DEFAULT_TERMINAL_ROWS, 132));
+        assert_eq!(validate_size(43, 0).unwrap(), (43, DEFAULT_TERMINAL_COLS));
+
+        let mut tracker = ScreenTracker::try_new(0, 0).unwrap();
+        tracker.process(b"fallback remains interactive\r\n");
+        assert!(tracker.contents().contains("fallback remains interactive"));
+    }
+
+    #[test]
     fn screen_dimensions_are_bounded_and_overflow_safe() {
-        assert_eq!(validate_size(0, 0).unwrap(), (1, 1));
+        assert_eq!(
+            validate_size(0, 0).unwrap(),
+            (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+        );
         assert_eq!(validate_size(512, 512).unwrap(), (512, 512));
         assert!(validate_size(513, 512).is_err());
         assert!(validate_size(u16::MAX, u16::MAX).is_err());
