@@ -46,7 +46,9 @@ IMPORT_PACKAGE = "aplexer_cli"
 # This is the release matrix, not a wishlist. Adding a target here makes it a
 # required input to a default build and therefore must be paired with a build
 # job in .github/workflows/release.yml.
-# (platform key, conservative pre-audit wheel platform tag, binary suffix)
+# Artifact keys use the common amd64/arm64 labels. PyPA wheel tags use the
+# platform architecture spellings x86_64/aarch64.
+# (artifact platform key, conservative pre-audit wheel platform tag, suffix)
 TARGETS = [
     ("linux-amd64", "linux_x86_64", ""),
     ("linux-arm64", "linux_aarch64", ""),

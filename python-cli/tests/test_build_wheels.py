@@ -80,30 +80,14 @@ class TestBuildWheel(unittest.TestCase):
                 self.assertIn("Requires-Python: >=3.11\n", metadata)
                 self.assertIn("Requires-Dist: aplexer-client==0.1.0\n", metadata)
 
-    def test_build_windows_wheel_uses_exe_suffix(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            a_path = os.path.join(tmpdir, "a.exe")
-            aplexer_path = os.path.join(tmpdir, "aplexer.exe")
-            with open(a_path, "wb") as f:
-                f.write(b"MZ-fake-exe")
-            with open(aplexer_path, "wb") as f:
-                f.write(b"MZ-fake-exe")
-
-            output_dir = os.path.join(tmpdir, "dist")
-            os.makedirs(output_dir)
-
-            wheel_path = build_wheels.build_wheel(
-                binary_paths={"a": a_path, "aplexer": aplexer_path},
-                platform_tag="win_amd64",
-                suffix=".exe",
-                version="0.1.0",
-                output_dir=output_dir,
-            )
-
-            with zipfile.ZipFile(wheel_path, "r") as whl:
-                names = whl.namelist()
-                self.assertIn("aplexer_cli/bin/a.exe", names)
-                self.assertIn("aplexer_cli/bin/aplexer.exe", names)
+    def test_release_targets_are_linux_only_with_matching_architecture_tags(self):
+        self.assertEqual(
+            build_wheels.TARGETS,
+            [
+                ("linux-amd64", "linux_x86_64", ""),
+                ("linux-arm64", "linux_aarch64", ""),
+            ],
+        )
 
 
 class TestMainMatrixEnforcement(unittest.TestCase):

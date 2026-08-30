@@ -7,31 +7,21 @@ under ``bin/``, not on ``$PATH``.
 
 import os
 import platform
-import subprocess
 import sys
 
 
-# Map (sys.platform, platform.machine()) to the binary suffix used inside
-# the package. platform.machine() returns values like 'x86_64', 'AMD64',
-# 'aarch64', 'arm64'.
+# Release wheels exist only for Linux x86_64 and Linux aarch64. Linux normally
+# reports the latter as "aarch64", but accept "arm64" as an equivalent machine
+# spelling when locating the same bundled binary.
 _PLATFORM_MAP = {
     ("linux", "x86_64"): "",
     ("linux", "aarch64"): "",
-    ("darwin", "x86_64"): "",
-    ("darwin", "arm64"): "",
-    ("win32", "AMD64"): ".exe",
-    ("win32", "x86_64"): ".exe",
-    ("win32", "ARM64"): ".exe",
-    ("win32", "aarch64"): ".exe",
+    ("linux", "arm64"): "",
 }
 
 _SUPPORTED_PLATFORMS = [
-    "linux x86_64 (amd64)",
-    "linux aarch64 (arm64)",
-    "macOS x86_64 (amd64)",
-    "macOS arm64 (Apple Silicon)",
-    "Windows AMD64",
-    "Windows ARM64",
+    "Linux x86_64",
+    "Linux aarch64 (arm64)",
 ]
 
 
@@ -75,16 +65,7 @@ def _run(name):
 
     args = [binary_path] + sys.argv[1:]
 
-    if sys.platform == "win32":
-        # On Windows, os.execvp is not reliable; use subprocess instead.
-        try:
-            result = subprocess.run(args)
-            sys.exit(result.returncode)
-        except KeyboardInterrupt:
-            sys.exit(130)  # Standard exit code for Ctrl+C (128 + SIGINT)
-    else:
-        # On Unix, replace the current process with the binary.
-        os.execvp(binary_path, args)
+    os.execvp(binary_path, args)
 
 
 def main_a():
