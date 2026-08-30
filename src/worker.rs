@@ -863,20 +863,31 @@ impl StartupGuard {
         }
         self.armed = false;
 
+        let mut cleanup_failures = Vec::new();
         if let Some(cgroup) = &self.cgroup {
             if let Err(error) = cgroup.kill_all() {
-                eprintln!("aplexer worker: rollback cgroup kill: {error:#}");
+                cleanup_failures.push(format!("kill startup cgroup: {error:#}"));
             }
         } else if let Err(error) = signal_descendants(std::process::id(), libc::SIGKILL) {
-            eprintln!("aplexer worker: rollback descendant kill: {error:#}");
+            cleanup_failures.push(format!("kill startup descendants: {error:#}"));
         }
 
         if let Some(slot) = &self.child {
-            if let Ok(mut slot) = slot.lock() {
-                if let Some(mut child) = slot.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+            match slot.lock() {
+                Ok(mut slot) => {
+                    if let Some(mut child) = slot.take() {
+                        if let Err(error) = child.kill() {
+                            if error.kind() != io::ErrorKind::InvalidInput {
+                                cleanup_failures
+                                    .push(format!("kill startup workload leader: {error}"));
+                            }
+                        }
+                        if let Err(error) = child.wait() {
+                            cleanup_failures.push(format!("reap startup workload leader: {error}"));
+                        }
+                    }
                 }
+                Err(_) => cleanup_failures.push("startup child lock poisoned".into()),
             }
         }
 
@@ -886,26 +897,67 @@ impl StartupGuard {
         // for live processes.
         let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
         loop {
-            let _ = reap_adopted_children();
-            let remaining = descendant_pids(std::process::id()).unwrap_or_default();
-            if remaining.is_empty() || Instant::now() >= deadline {
+            if let Err(error) = reap_adopted_children() {
+                cleanup_failures.push(format!("reap startup descendants: {error:#}"));
+            }
+            match descendant_pids(std::process::id()) {
+                Ok(remaining) if remaining.is_empty() => break,
+                Ok(_) if Instant::now() >= deadline => {
+                    cleanup_failures.push("timed out proving startup descendants empty".into());
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    cleanup_failures.push(format!("inspect startup descendants: {error:#}"));
+                    break;
+                }
+            }
+            if let Err(error) = signal_descendants(std::process::id(), libc::SIGKILL) {
+                cleanup_failures.push(format!("kill remaining startup descendants: {error:#}"));
                 break;
             }
-            let _ = signal_descendants(std::process::id(), libc::SIGKILL);
             thread::sleep(DESCENDANT_POLL_INTERVAL);
         }
 
-        if let Some(cgroup) = self.cgroup.take() {
-            cgroup.cleanup();
+        if let Some(cgroup) = &self.cgroup {
+            let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
+            loop {
+                match cgroup.populated() {
+                    Ok(false) => break,
+                    Ok(true) if Instant::now() >= deadline => {
+                        cleanup_failures.push("timed out proving startup cgroup empty".into());
+                        break;
+                    }
+                    Ok(true) => thread::sleep(DESCENDANT_POLL_INTERVAL),
+                    Err(error) => {
+                        cleanup_failures.push(format!("inspect startup cgroup: {error:#}"));
+                        break;
+                    }
+                }
+            }
         }
-        let _ = fs::remove_file(&self.socket_path);
-        let _ = fs::remove_dir_all(&self.runtime_session_dir);
 
         self.failure_record.phase = Phase::Failed;
-        self.failure_record.error = Some(message);
+        self.failure_record.containment_empty = cleanup_failures.is_empty();
+        self.failure_record.error = Some(if cleanup_failures.is_empty() {
+            message
+        } else {
+            format!(
+                "{message}; containment cleanup unproven: {}",
+                cleanup_failures.join("; ")
+            )
+        });
         self.failure_record.updated_at_ms = now_ms();
-        if let Err(error) = atomic_write_json(&self.record_path, &self.failure_record) {
-            eprintln!("aplexer worker: persist startup rollback: {error:#}");
+        match atomic_write_json(&self.record_path, &self.failure_record) {
+            Ok(()) if self.failure_record.containment_empty => {
+                if let Some(cgroup) = self.cgroup.take() {
+                    cgroup.cleanup();
+                }
+                let _ = fs::remove_file(&self.socket_path);
+                let _ = fs::remove_dir_all(&self.runtime_session_dir);
+            }
+            Ok(()) => {}
+            Err(error) => eprintln!("aplexer worker: persist startup rollback: {error:#}"),
         }
     }
 }
@@ -1009,6 +1061,10 @@ enum LifeEvent {
 /// race for the case where the size is already known at spawn time.
 pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     install_termination_handlers()?;
+    // This is process-wide and must precede every helper or workload spawn.
+    // In particular, Cgroup::create invokes systemd-run and a waiter thread;
+    // enabling the subreaper afterwards leaves a startup-time escape window.
+    enable_child_subreaper()?;
     let paths = Paths::discover()?;
     let record_path = paths.record(id);
     let mut record = read_record(&record_path)?;
@@ -1044,9 +1100,11 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         let (rows, cols) = screen::validate_size(requested_size.0, requested_size.1)?;
         let cgroup = Cgroup::create(id, &record.limits)?;
         startup.cgroup = cgroup.clone();
+        record.containment_cgroup = cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
+        startup.failure_record = record.clone();
+        atomic_write_json(&record_path, &record)?;
         startup_checkpoint("after_cgroup")?;
         let (master_read, slave) = open_pty(rows, cols)?;
-        enable_child_subreaper()?;
         let master_write = master_read.try_clone()?;
         let child_result = spawn_workload(
             &record,
@@ -1065,6 +1123,10 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         startup.child = Some(Arc::clone(&child_slot));
         record.workload_pid = Some(pid);
         startup.failure_record = record.clone();
+        // Publish the leader and cgroup locator before any injected or real
+        // post-spawn failure. The launcher must never have to infer a
+        // containment domain from an unpersisted in-memory PID.
+        atomic_write_json(&record_path, &record)?;
         after_workload_spawn_checkpoint(pid)?;
 
         record.phase = Phase::Running;
@@ -1386,6 +1448,7 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     let mut pty_eof = false;
     let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
     let mut fatal: Option<String> = None;
+    let mut containment_empty = false;
     loop {
         match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
             Ok(event) => match event {
@@ -1426,6 +1489,7 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
                         state.running = populated;
                     }
                     if pty_eof && !populated {
+                        containment_empty = true;
                         break;
                     }
                 }
@@ -1459,6 +1523,7 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         } else {
             Phase::Exited
         };
+        r.containment_empty = containment_empty;
         r.exit = Some(exit.clone());
         r.error = error;
     });
