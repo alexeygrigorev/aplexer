@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_record_persistence_does_not_publish_candidate() {
+    fn failed_record_persistence_does_not_publish_and_idle_activity_retries() {
         let dir = tempfile::tempdir().unwrap();
         let id = Uuid::new_v4();
         let record_path = dir.path().join("session.json");
@@ -697,6 +697,21 @@ mod tests {
             .is_err());
         assert_eq!(runtime.record().unwrap().tag, "before");
         assert!(runtime.record_persistence_error.lock().unwrap().is_some());
+
+        runtime.last_activity_ms.store(123, Ordering::Relaxed);
+        let mut persisted_activity_ms = 0;
+        assert!(persist_activity_checkpoint(&runtime, &mut persisted_activity_ms).is_err());
+        assert_eq!(persisted_activity_ms, 0, "failed write advanced checkpoint");
+        assert_eq!(runtime.record().unwrap().last_activity_ms, None);
+
+        // No new activity occurs between attempts. Once the transient
+        // destination failure is removed, the unchanged timestamp must still
+        // be retried and published by the next tick.
+        fs::remove_dir(&runtime.record_path).unwrap();
+        persist_activity_checkpoint(&runtime, &mut persisted_activity_ms).unwrap();
+        assert_eq!(persisted_activity_ms, 123);
+        assert_eq!(runtime.record().unwrap().last_activity_ms, Some(123));
+        assert!(runtime.record_persistence_error.lock().unwrap().is_none());
     }
 
     #[test]
@@ -2062,14 +2077,26 @@ fn run_periodic_flush(runtime: Arc<WorkerRuntime>) {
         if let Err(error) = runtime.output.flush() {
             eprintln!("aplexer worker: flush history: {error:#}");
         }
-        let current = runtime.last_activity_ms.load(Ordering::Relaxed);
-        if current != 0 && current != persisted_activity_ms {
-            persisted_activity_ms = current;
-            if let Err(error) = runtime.update_record(|r| r.last_activity_ms = Some(current)) {
-                eprintln!("aplexer worker: persist activity: {error:#}");
-            }
+        if let Err(error) = persist_activity_checkpoint(&runtime, &mut persisted_activity_ms) {
+            eprintln!("aplexer worker: persist activity: {error:#}");
         }
     }
+}
+
+/// Publish the debounce checkpoint only after the matching record update is
+/// durable. Leaving `persisted_activity_ms` unchanged on failure makes the
+/// next periodic tick retry even when no further PTY output arrives.
+fn persist_activity_checkpoint(
+    runtime: &WorkerRuntime,
+    persisted_activity_ms: &mut u64,
+) -> Result<()> {
+    let current = runtime.last_activity_ms.load(Ordering::Relaxed);
+    if current == 0 || current == *persisted_activity_ms {
+        return Ok(());
+    }
+    runtime.update_record(|record| record.last_activity_ms = Some(current))?;
+    *persisted_activity_ms = current;
+    Ok(())
 }
 
 fn run_termination_monitor(runtime: Arc<WorkerRuntime>) {
