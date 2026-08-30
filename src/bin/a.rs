@@ -1324,21 +1324,30 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
     } else {
         match rpc_capture(&record, args.bytes) {
             Ok(data) => data,
-            // No live worker to ask -- capture still has a sensible fallback
-            // here (unlike attach/send), since a dead session's last-known
-            // output is still sitting in its persisted history file. Only when
-            // that ALSO comes up empty (e.g. the session never produced any
-            // output before exiting) is there truly nothing to show; in that
-            // case, give the same clear reason attach/send would rather than
-            // the raw filesystem error from the failed read.
-            Err(_) => match read_history_tail(&record.history_path, args.bytes) {
-                Ok(bytes) => bytes,
-                Err(read_error) => {
-                    check_attachable(&record)?;
-                    return Err(read_error)
-                        .context("worker unavailable and persisted history cannot be read");
+            // Persisted history is authoritative post-mortem data only once
+            // the record is terminal or the worker process is known gone. A
+            // live process returning an RPC error may merely be wedged or
+            // temporarily unreachable; silently returning an older file in
+            // that case makes stale output look current and hides the actual
+            // operational failure.
+            Err(_)
+                if matches!(record.phase, Phase::Exited | Phase::Failed)
+                    || !record.worker_alive() =>
+            {
+                match read_history_tail(&record.history_path, args.bytes) {
+                    Ok(bytes) => bytes,
+                    Err(read_error) => {
+                        check_attachable(&record)?;
+                        return Err(read_error)
+                            .context("worker unavailable and persisted history cannot be read");
+                    }
                 }
-            },
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "capture RPC failed while the worker process is still alive; refusing to return potentially stale persisted history",
+                );
+            }
         }
     };
     if let Some(path) = args.output {
