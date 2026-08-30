@@ -1823,6 +1823,12 @@ impl History {
 
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+const TRUSTED_HELPER_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/run/current-system/sw/bin",
+];
 
 fn namespace_coordinates(path: &Path, label: &str) -> Result<(u64, u64)> {
     let metadata = fs::metadata(path).with_context(|| format!("inspect {label} namespace"))?;
@@ -1893,6 +1899,80 @@ fn verify_recorded_cgroup_identity(recorded: Option<&CgroupIdentity>) -> Result<
     Ok(current)
 }
 
+fn validate_trusted_helper(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("helper path is not absolute: {}", path.display());
+    }
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("resolve helper executable {}", path.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("inspect helper executable {}", canonical.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!(
+            "untrusted helper executable {} (must be root-owned, executable, and not group/world writable)",
+            canonical.display()
+        );
+    }
+    let mut parent = canonical.parent();
+    while let Some(directory) = parent {
+        let metadata = fs::metadata(directory)
+            .with_context(|| format!("inspect helper directory {}", directory.display()))?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "untrusted helper directory {} (must be root-owned and not group/world writable)",
+                directory.display()
+            );
+        }
+        parent = directory.parent();
+    }
+    Ok(canonical)
+}
+
+fn trusted_system_helper(name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') {
+        bail!("invalid system helper name {name:?}");
+    }
+    let mut failures = Vec::new();
+    for directory in TRUSTED_HELPER_DIRS {
+        let candidate = Path::new(directory).join(name);
+        match validate_trusted_helper(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error:#}", candidate.display())),
+        }
+    }
+    bail!(
+        "no trusted absolute {name} helper was found; {}",
+        failures.join("; ")
+    )
+}
+
+fn control_group_locator(id: Uuid, value: &str) -> Result<PathBuf> {
+    let value = value.trim();
+    let reported = Path::new(value);
+    if value.is_empty() || value == "/" || !reported.is_absolute() {
+        bail!("systemd returned invalid ControlGroup value {value:?}");
+    }
+    let mut relative = PathBuf::new();
+    for component in reported.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => relative.push(value),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                bail!("systemd ControlGroup escapes cgroup root: {value:?}")
+            }
+        }
+    }
+    let expected = format!("aplexer-workload-{id}.scope");
+    if relative.file_name() != Some(OsStr::new(&expected)) {
+        bail!("systemd ControlGroup does not belong to session {id}: {value:?}");
+    }
+    Ok(Path::new(CGROUP_V2_ROOT).join(relative))
+}
+
 #[derive(Debug, Clone)]
 pub struct Cgroup {
     path: PathBuf,
@@ -1952,8 +2032,14 @@ impl Cgroup {
         }
         normalize_sigchld_for_child_management()?;
         let identity = current_cgroup_identity()?;
+        // Resolve every executable before starting the scope. Ambient PATH is
+        // intentionally irrelevant: a user-controlled shadow helper must not
+        // choose or fabricate the containment domain we later trust.
+        let systemd_run = trusted_system_helper("systemd-run")?;
+        let systemctl = trusted_system_helper("systemctl")?;
+        let sleep = trusted_system_helper("sleep")?;
         let unit = format!("aplexer-workload-{id}");
-        let mut command = Command::new("systemd-run");
+        let mut command = Command::new(systemd_run);
         command
             .arg("--user")
             .arg("--scope")
@@ -1981,7 +2067,7 @@ impl Cgroup {
         }
         command
             .arg("--")
-            .arg("sleep")
+            .arg(sleep)
             .arg("infinity")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1993,15 +2079,16 @@ impl Cgroup {
         // procfs descendant tree. Let the caller preserve recovery evidence
         // until an authoritative cgroup path has been recorded.
         setup_started();
-        let path = match wait_for_scope_cgroup(&unit, Duration::from_secs(5)) {
-            Ok(path) => path,
-            Err(error) => {
-                return Err(cleanup_anchor_after_failure(
-                    &mut anchor,
-                    error.context("limits fail closed"),
-                ));
-            }
-        };
+        let path =
+            match wait_for_scope_cgroup(id, &unit, &identity, &systemctl, Duration::from_secs(5)) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(cleanup_anchor_after_failure(
+                        &mut anchor,
+                        error.context("limits fail closed"),
+                    ));
+                }
+            };
         if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
             return Err(cleanup_anchor_after_failure(
                 &mut anchor,
@@ -2443,10 +2530,16 @@ fn kill_cgroup_path_until(path: &Path, deadline: Instant) -> Result<()> {
         signal_cgroup_path_until(path, libc::SIGKILL, deadline)
     }
 }
-fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
+fn wait_for_scope_cgroup(
+    id: Uuid,
+    unit: &str,
+    identity: &CgroupIdentity,
+    systemctl: &Path,
+    timeout: Duration,
+) -> Result<PathBuf> {
     let deadline = Instant::now() + timeout;
     loop {
-        let mut command = Command::new("systemctl");
+        let mut command = Command::new(systemctl);
         command.args([
             "--user",
             "show",
@@ -2457,12 +2550,11 @@ fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
         ]);
         let output = command_output_until(&mut command, deadline, "query systemd scope")?;
         if output.status.success() {
-            let relative = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !relative.is_empty() && relative != "/" {
-                let path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-                if path.join("cgroup.procs").exists() {
-                    return Ok(path);
-                }
+            let value = std::str::from_utf8(&output.stdout)
+                .context("decode systemd ControlGroup output")?;
+            let path = control_group_locator(id, value)?;
+            if let Some(path) = validate_recorded_cgroup(id, &path, Some(identity))? {
+                return Ok(path);
             }
         }
         if Instant::now() >= deadline {
@@ -3090,6 +3182,41 @@ mod tests {
         assert_ne!(identity.mount_namespace_inode, 0);
         assert_ne!(identity.cgroup_root_inode, 0);
         ensure_cgroup2_filesystem(Path::new(CGROUP_V2_ROOT)).unwrap();
+    }
+
+    #[test]
+    fn control_group_locator_is_uuid_bound_and_cannot_escape_root() {
+        let id = Uuid::new_v4();
+        let valid = format!("/user.slice/user-1000.slice/aplexer-workload-{id}.scope");
+        assert_eq!(
+            control_group_locator(id, &valid).unwrap(),
+            Path::new(CGROUP_V2_ROOT).join(valid.trim_start_matches('/'))
+        );
+        assert!(
+            control_group_locator(id, &format!("/user.slice/../aplexer-workload-{id}.scope"))
+                .is_err()
+        );
+        assert!(control_group_locator(id, "relative.scope").is_err());
+        assert!(control_group_locator(
+            id,
+            &format!("/user.slice/aplexer-workload-{}.scope", Uuid::new_v4())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn system_helpers_resolve_without_ambient_path() {
+        for helper in ["systemd-run", "systemctl", "sleep"] {
+            let path = trusted_system_helper(helper).unwrap();
+            assert!(path.is_absolute());
+            assert_eq!(fs::metadata(path).unwrap().uid(), 0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shadow = dir.path().join("systemctl");
+        fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&shadow, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_trusted_helper(&shadow).is_err());
     }
 
     #[test]
