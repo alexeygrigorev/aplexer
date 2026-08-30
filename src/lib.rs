@@ -1782,7 +1782,6 @@ pub struct History {
     cap: usize,
     bytes: VecDeque<u8>,
     dirty: bool,
-    last_flush: Instant,
 }
 impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
@@ -1794,16 +1793,11 @@ impl History {
             cap,
             bytes,
             dirty: false,
-            last_flush: Instant::now(),
         })
     }
-    /// Appends to the in-memory ring and persists at most once per
-    /// HISTORY_FLUSH_INTERVAL. Persisting on every append rewrote the whole
-    /// file (up to `cap` bytes) with two fsyncs for every PTY read of at
-    /// most 32KB -- measured >100x write amplification whose backpressure
-    /// throttled the workload itself to ~150KB/s of terminal output (11x
-    /// slower than with persistence disabled). Callers must arrange a final
-    /// flush() when output ends.
+    /// Appends only to the in-memory ring. Persisting from this hot path can
+    /// both throttle PTY output and turn a disk failure into a PTY failure,
+    /// so the worker owns periodic and final `flush()` attempts separately.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         if self.cap == 0 {
             return Ok(());
@@ -1819,9 +1813,6 @@ impl History {
             }
         }
         self.dirty = true;
-        if self.last_flush.elapsed() >= HISTORY_FLUSH_INTERVAL {
-            self.flush()?;
-        }
         Ok(())
     }
     pub fn flush(&mut self) -> Result<()> {
@@ -1831,7 +1822,6 @@ impl History {
         let contiguous: Vec<u8> = self.bytes.iter().copied().collect();
         atomic_write_bytes(&self.path, &contiguous)?;
         self.dirty = false;
-        self.last_flush = Instant::now();
         Ok(())
     }
     pub fn snapshot(&self, max: Option<usize>) -> Vec<u8> {

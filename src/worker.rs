@@ -40,6 +40,8 @@ const MAX_CLIENT_CONNECTIONS: usize = 128;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+const HISTORY_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -196,6 +198,9 @@ enum AttachPayload {
 
 struct HubInner {
     history: History,
+    history_persistence_error: Option<String>,
+    history_retry_at: Instant,
+    history_retry_delay: Duration,
     screen: screen::ScreenTracker,
     subscribers: HashMap<u64, SubscriberSender>,
     next_id: u64,
@@ -270,6 +275,9 @@ impl OutputHub {
         Ok(Self {
             inner: Mutex::new(HubInner {
                 history,
+                history_persistence_error: None,
+                history_retry_at: Instant::now(),
+                history_retry_delay: HISTORY_RETRY_INITIAL,
                 screen: screen::ScreenTracker::try_new(rows, cols)?,
                 subscribers: HashMap::new(),
                 next_id: 1,
@@ -321,12 +329,41 @@ impl OutputHub {
     fn set_size(&self, rows: u16, cols: u16) -> Result<()> {
         lock(&self.inner)?.screen.try_set_size(rows, cols)
     }
-    /// Persists any history bytes the debounced append path hasn't written
-    /// yet; driven by a periodic thread so an idle session's tail doesn't
-    /// stay memory-only indefinitely, and called on finish for the final
-    /// state.
+    /// Persists dirty history without ever coupling failure back into PTY
+    /// delivery. Repeated failures use capped backoff; `force` is reserved
+    /// for the final lifecycle attempt.
     fn flush(&self) -> Result<()> {
-        lock(&self.inner)?.history.flush()
+        self.flush_history(false)
+    }
+    fn flush_history(&self, force: bool) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        if !force && Instant::now() < inner.history_retry_at {
+            return Ok(());
+        }
+        match inner.history.flush() {
+            Ok(()) => {
+                inner.history_persistence_error = None;
+                inner.history_retry_at = Instant::now();
+                inner.history_retry_delay = HISTORY_RETRY_INITIAL;
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                inner.history_persistence_error = Some(message.clone());
+                inner.history_retry_at = Instant::now() + inner.history_retry_delay;
+                inner.history_retry_delay = inner
+                    .history_retry_delay
+                    .saturating_mul(2)
+                    .min(HISTORY_RETRY_MAX);
+                Err(anyhow!(message))
+            }
+        }
+    }
+    fn history_persistence_error(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.history_persistence_error.clone())
     }
     fn subscribe(&self, payload: AttachPayload) -> Result<(u64, Vec<u8>, OutputReceiver)> {
         let mut inner = lock(&self.inner)?;
@@ -376,6 +413,7 @@ impl OutputHub {
                 .clone();
             if let Err(error) = inner.history.flush() {
                 eprintln!("aplexer worker: flush history at exit: {error:#}");
+                inner.history_persistence_error = Some(format!("{error:#}"));
             }
             // Cheap post-mortem "what was on screen when it died" fallback
             // for `a capture --screen` on a dead session (design doc
@@ -505,6 +543,35 @@ mod tests {
     }
 
     #[test]
+    fn history_failure_does_not_interrupt_live_output_and_can_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_path = dir.path().join("history.bin");
+        fs::create_dir(&history_path).unwrap();
+        let hub = OutputHub::new(
+            History::open(history_path.clone(), 1024).unwrap(),
+            24,
+            80,
+            dir.path().join("screen.txt"),
+        )
+        .unwrap();
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        hub.append(b"still-live").unwrap();
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Data(data) if data == b"still-live"
+        ));
+        assert_eq!(hub.snapshot(None).unwrap(), b"still-live");
+        assert!(hub.flush_history(true).is_err());
+        assert!(hub.history_persistence_error().is_some());
+
+        fs::remove_dir(&history_path).unwrap();
+        hub.flush_history(true).unwrap();
+        assert!(hub.history_persistence_error().is_none());
+        assert_eq!(fs::read(history_path).unwrap(), b"still-live");
+    }
+
+    #[test]
     fn connection_permits_are_bounded_and_release_on_drop() {
         let active = Arc::new(AtomicUsize::new(0));
         let permits: Vec<_> = (0..MAX_CLIENT_CONNECTIONS)
@@ -555,6 +622,9 @@ struct WorkerRuntime {
     cgroup: Mutex<Option<Cgroup>>,
     kill_gate: Mutex<()>,
     output: OutputHub,
+    /// Most recent failure to durably write the session record. Kept live so
+    /// status remains truthful while the lifecycle retries final evidence.
+    record_persistence_error: Mutex<Option<String>>,
     /// Connections currently being served; the lifecycle thread drains this
     /// (with a timeout) before exiting the worker so in-flight responses
     /// (e.g. the reply to the `kill` that ended the workload) are not lost.
@@ -580,8 +650,16 @@ impl WorkerRuntime {
         let mut record = lock(&self.record)?;
         update(&mut record);
         record.updated_at_ms = now_ms();
-        atomic_write_json(&self.record_path, &*record)?;
-        Ok(record.clone())
+        match atomic_write_json(&self.record_path, &*record) {
+            Ok(()) => {
+                *lock(&self.record_persistence_error)? = None;
+                Ok(record.clone())
+            }
+            Err(error) => {
+                *lock(&self.record_persistence_error)? = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
     }
     fn send(&self, data: &[u8]) -> Result<()> {
         if !lock(&self.workload)?.running {
@@ -1199,6 +1277,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             cgroup: Mutex::new(cgroup),
             kill_gate: Mutex::new(()),
             output,
+            record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
         });
@@ -1635,17 +1714,42 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         oom_killed: oom,
         exited_at_ms: now_ms(),
     };
+    if let Err(history_error) = runtime.output.flush_history(true) {
+        let message = format!("persist final history: {history_error:#}");
+        fatal = Some(match fatal {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    }
     let error = fatal.clone();
-    let _ = runtime.update_record(|r| {
-        r.phase = if error.is_some() {
-            Phase::Failed
-        } else {
-            Phase::Exited
-        };
-        r.containment_empty = Some(containment_empty);
-        r.exit = Some(exit.clone());
-        r.error = error;
-    });
+    let mut record_retry = HISTORY_RETRY_INITIAL;
+    loop {
+        let final_error = error.clone();
+        match runtime.update_record(|r| {
+            r.phase = if final_error.is_some() {
+                Phase::Failed
+            } else {
+                Phase::Exited
+            };
+            r.containment_empty = Some(containment_empty);
+            r.exit = Some(exit.clone());
+            r.error = final_error;
+        }) {
+            Ok(_) => break,
+            Err(persist_error) => {
+                // Never exit with a durable record that still claims this
+                // worker/workload is running. Keep the control socket alive
+                // so Status can expose `record_persistence_error` while the
+                // lifecycle retries.
+                eprintln!(
+                    "aplexer worker: persist final session state: {persist_error:#}; retrying in {}ms",
+                    record_retry.as_millis()
+                );
+                thread::sleep(record_retry);
+                record_retry = record_retry.saturating_mul(2).min(HISTORY_RETRY_MAX);
+            }
+        }
+    }
     if !containment_empty {
         runtime
             .output
@@ -1726,6 +1830,12 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
         Operation::Ping => write_json(&mut stream, &Response::ok(id, json!({"pong":true})))?,
         Operation::Status => {
             let mut value = serde_json::to_value(public_session_record(&runtime.record()?))?;
+            if let Some(error) = runtime.output.history_persistence_error() {
+                value["history_persistence_error"] = json!(error);
+            }
+            if let Some(error) = lock(&runtime.record_persistence_error)?.clone() {
+                value["record_persistence_error"] = json!(error);
+            }
             if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
                 value["cgroup"] = cgroup.stats();
             }
