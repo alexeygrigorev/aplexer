@@ -626,6 +626,78 @@ mod tests {
             libc::EBADF
         )));
     }
+
+    #[test]
+    fn failed_record_persistence_does_not_publish_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let record_path = dir.path().join("session.json");
+        // Atomic rename onto a directory deterministically fails after the
+        // candidate was serialized, exercising the publish boundary.
+        fs::create_dir(&record_path).unwrap();
+        let record = SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id,
+            workspace: dir.path().to_path_buf(),
+            tag: "before".into(),
+            engine: "shell".into(),
+            profile: None,
+            command: vec!["/bin/sh".into()],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: 1024,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_activity_ms: None,
+            phase: Phase::Running,
+            worker_pid: None,
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(false),
+            socket_path: dir.path().join("control.sock"),
+            history_path: dir.path().join("history.bin"),
+            exit: None,
+            error: None,
+        };
+        let runtime = WorkerRuntime {
+            paths: Paths {
+                runtime_root: dir.path().join("runtime"),
+                state_root: dir.path().join("state"),
+                config_file: dir.path().join("config.toml"),
+            },
+            record_path,
+            runtime_session_dir: dir.path().join("runtime-session"),
+            socket_path: dir.path().join("control.sock"),
+            record: Mutex::new(record),
+            pty_write: Mutex::new(Some(File::open("/dev/null").unwrap())),
+            workload: Mutex::new(WorkloadState {
+                running: true,
+                pgid: 1,
+            }),
+            terminal: Mutex::new(TerminalState {
+                rows: 24,
+                cols: 80,
+                clients: HashMap::new(),
+                next_client_id: 1,
+                activity_clock: 0,
+            }),
+            cgroup: Mutex::new(None),
+            kill_gate: Mutex::new(()),
+            output: test_hub(&dir),
+            record_persistence_error: Mutex::new(None),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            last_activity_ms: AtomicU64::new(0),
+        };
+
+        assert!(runtime
+            .update_record(|candidate| candidate.tag = "after".into())
+            .is_err());
+        assert_eq!(runtime.record().unwrap().tag, "before");
+        assert!(runtime.record_persistence_error.lock().unwrap().is_some());
+    }
 }
 
 #[derive(Debug)]
@@ -691,12 +763,17 @@ impl WorkerRuntime {
         F: FnOnce(&mut SessionRecord),
     {
         let mut record = lock(&self.record)?;
-        update(&mut record);
-        record.updated_at_ms = now_ms();
-        match atomic_write_json(&self.record_path, &*record) {
+        // Persist a candidate before publishing it. Otherwise a failed Rename
+        // can leak into live Status and an unrelated later activity write can
+        // commit that rejected selector outside the registry lock.
+        let mut candidate = record.clone();
+        update(&mut candidate);
+        candidate.updated_at_ms = now_ms();
+        match atomic_write_json(&self.record_path, &candidate) {
             Ok(()) => {
+                *record = candidate.clone();
                 *lock(&self.record_persistence_error)? = None;
-                Ok(record.clone())
+                Ok(candidate)
             }
             Err(error) => {
                 *lock(&self.record_persistence_error)? = Some(format!("{error:#}"));
