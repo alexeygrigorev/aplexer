@@ -190,15 +190,29 @@ fn initialize_workspace_dir(mp: &MessagePaths, canonical_workspace: &Path) -> Re
     Ok(())
 }
 
-fn json_files_equal(left: &Path, right: &Path) -> Result<bool> {
-    let left_bytes = fs::read(left).with_context(|| format!("read {}", left.display()))?;
-    let right_bytes = fs::read(right).with_context(|| format!("read {}", right.display()))?;
+fn json_files_equal(left: &Path, right: &Path, label: &str, cap: usize) -> Result<bool> {
+    let left_bytes = read_bounded_regular_file(left, label, cap)?
+        .ok_or_else(|| anyhow!("{label} disappeared during migration: {}", left.display()))?;
+    let right_bytes = read_bounded_regular_file(right, label, cap)?
+        .ok_or_else(|| anyhow!("{label} disappeared during migration: {}", right.display()))?;
     if left_bytes == right_bytes {
         return Ok(true);
     }
     let left_json = serde_json::from_slice::<Value>(&left_bytes);
     let right_json = serde_json::from_slice::<Value>(&right_bytes);
     Ok(matches!((left_json, right_json), (Ok(left), Ok(right)) if left == right))
+}
+
+fn mailbox_json_files_equal(left: &Path, right: &Path) -> Result<bool> {
+    let is_cursor = left
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "cursors");
+    if is_cursor {
+        json_files_equal(left, right, "mailbox cursor", MAX_MAILBOX_STATE_BYTES)
+    } else {
+        json_files_equal(left, right, "mailbox message", MAX_ENVELOPE_BYTES)
+    }
 }
 
 fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -267,7 +281,7 @@ fn plan_mailbox_merge(
                 .ok_or_else(|| anyhow!("{} has no file name", source.display()))?,
         );
         if destination.exists() {
-            if !json_files_equal(&source, &destination)? {
+            if !mailbox_json_files_equal(&source, &destination)? {
                 bail!(
                     "mailbox message collision: {} and {} have different content",
                     source.display(),
@@ -301,21 +315,17 @@ fn plan_mailbox_merge(
             });
             continue;
         }
-        if json_files_equal(&source, &destination)? {
+        if mailbox_json_files_equal(&source, &destination)? {
             actions.push(MailboxMigration::RemoveDuplicate {
                 source,
                 destination,
             });
             continue;
         }
-        let source_cursor: Cursor = serde_json::from_slice(
-            &fs::read(&source).with_context(|| format!("read {}", source.display()))?,
-        )
-        .with_context(|| format!("parse colliding cursor {}", source.display()))?;
-        let destination_cursor: Cursor = serde_json::from_slice(
-            &fs::read(&destination).with_context(|| format!("read {}", destination.display()))?,
-        )
-        .with_context(|| format!("parse colliding cursor {}", destination.display()))?;
+        let source_cursor = read_cursor_file(&source)
+            .with_context(|| format!("parse colliding cursor {}", source.display()))?;
+        let destination_cursor = read_cursor_file(&destination)
+            .with_context(|| format!("parse colliding cursor {}", destination.display()))?;
         actions.push(MailboxMigration::MergeCursor {
             source,
             destination,
@@ -336,7 +346,7 @@ fn apply_mailbox_merge(actions: Vec<MailboxMigration>) -> Result<()> {
                 match fs::hard_link(&source, &destination) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        if !json_files_equal(&source, &destination)? {
+                        if !mailbox_json_files_equal(&source, &destination)? {
                             bail!(
                                 "mailbox migration destination appeared with different content: {}",
                                 destination.display()
@@ -358,7 +368,7 @@ fn apply_mailbox_merge(actions: Vec<MailboxMigration>) -> Result<()> {
                 source,
                 destination,
             } => {
-                if !json_files_equal(&source, &destination)? {
+                if !mailbox_json_files_equal(&source, &destination)? {
                     bail!(
                         "mailbox duplicate changed during migration: {}",
                         source.display()
@@ -1527,6 +1537,31 @@ mod tests {
         write_message_file(&legacy, &test_message(workspace, Uuid::from_u128(4)));
         ensure_workspace(&paths, workspace).unwrap();
         assert_eq!(list_messages(&paths, workspace).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn legacy_merge_rejects_special_file_cursor_collisions_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-mailbox-special-cursor-collision");
+        let stable = ensure_workspace(&paths, workspace).unwrap();
+        let legacy = create_legacy_mailbox(&paths, workspace);
+        let consumer_id = Uuid::from_u128(101);
+        let cursor_name = format!("{consumer_id}.json");
+        atomic_write_json(&legacy.cursors_dir.join(&cursor_name), &Cursor::default()).unwrap();
+
+        let fifo_path = root.path().join("cursor-fifo");
+        let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        symlink(&fifo_path, stable.cursors_dir.join(&cursor_name)).unwrap();
+
+        let error = ensure_workspace(&paths, workspace)
+            .expect_err("legacy merge must reject a special-file cursor collision");
+        assert!(
+            format!("{error:#}").contains("open mailbox cursor"),
+            "unexpected error: {error:#}"
+        );
+        assert!(legacy.cursors_dir.join(cursor_name).exists());
     }
 
     #[test]
