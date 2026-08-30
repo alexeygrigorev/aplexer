@@ -3,12 +3,13 @@
 //! process-wide.
 
 use aplexer::api::{start_session, StartRequest};
-use aplexer::Paths;
+use aplexer::{Cgroup, Limits, Paths};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 const CHILD_MODE: &str = "APLEXER_SIGCHLD_API_TEST_MODE";
 
@@ -98,6 +99,20 @@ fn exercise_child(mode: &str) {
             message.contains("SA_NOCLDWAIT"),
             "unexpected error: {message}"
         ),
+        _ => unreachable!(),
+    }
+
+    let cgroup = Cgroup::create(Uuid::new_v4(), &Limits::default(), || {});
+    match mode {
+        "custom" => assert!(cgroup.unwrap().is_none()),
+        "ignored" => assert!(
+            format!("{:#}", cgroup.expect_err("SIG_IGN must be rejected")).contains("SIG_IGN")
+        ),
+        "no-cld-wait" => assert!(format!(
+            "{:#}",
+            cgroup.expect_err("SA_NOCLDWAIT must be rejected")
+        )
+        .contains("SA_NOCLDWAIT")),
         _ => unreachable!(),
     }
 

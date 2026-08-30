@@ -2074,6 +2074,7 @@ impl Cgroup {
     where
         F: FnOnce(),
     {
+        ensure_sigchld_compatible_for_child_management()?;
         if !limits.requested() {
             return Ok(None);
         }
