@@ -13,7 +13,7 @@ mod python;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
@@ -32,6 +32,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CGROUP_RECOVERY_MEMBERS: usize = 4096;
+const MAX_CGROUP_PROCS_BYTES: u64 = 128 * 1024;
+const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 /// Long enough for graceful shutdown, but bounded so an authenticated local
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
@@ -1973,37 +1976,75 @@ pub fn cleanup_recorded_cgroup(
     signal: i32,
     grace: Duration,
 ) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(grace)
+        .and_then(|deadline| deadline.checked_add(Duration::from_secs(2)))
+        .ok_or_else(|| anyhow!("cgroup cleanup deadline overflow"))?;
+    cleanup_recorded_cgroup_until(id, locator, signal, grace, deadline)
+}
+
+/// Deadline-sharing variant for startup rollback, where cgroup recovery must
+/// consume the same wall-clock budget as procfs discovery and pidfd cleanup.
+pub fn cleanup_recorded_cgroup_until(
+    id: Uuid,
+    locator: &Path,
+    signal: i32,
+    grace: Duration,
+    deadline: Instant,
+) -> Result<()> {
+    check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
     let Some(path) = validate_recorded_cgroup(id, locator)? else {
+        check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
         return Ok(());
     };
+    check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
 
     if signal == libc::SIGKILL {
-        kill_cgroup_path(&path)?;
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+        kill_cgroup_path_until(&path, deadline)?;
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
     } else {
-        signal_cgroup_path(&path, signal)?;
-        let deadline = Instant::now()
+        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup")?;
+        signal_cgroup_path_until(&path, signal, deadline)?;
+        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup")?;
+        let grace_deadline = Instant::now()
             .checked_add(grace)
-            .ok_or_else(|| anyhow!("cgroup cleanup grace deadline overflow"))?;
-        while cgroup_path_populated(&path)? && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
+            .ok_or_else(|| anyhow!("cgroup cleanup grace deadline overflow"))?
+            .min(deadline);
+        while cgroup_path_populated_until(&path, deadline)? && Instant::now() < grace_deadline {
+            sleep_until_cgroup_deadline(grace_deadline, "waiting for recorded cgroup grace")?;
         }
-        if cgroup_path_populated(&path)? {
-            kill_cgroup_path(&path)?;
+        if cgroup_path_populated_until(&path, deadline)? {
+            check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+            kill_cgroup_path_until(&path, deadline)?;
+            check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while cgroup_path_populated(&path)? {
-        if Instant::now() >= deadline {
-            bail!("timed out proving recorded cgroup {} empty", path.display());
-        }
+    while cgroup_path_populated_until(&path, deadline)? {
         // Older cgroup-v2 mounts may not expose cgroup.kill. Repeat the
-        // pidfd-less cgroup.procs fallback so a member that forked between
-        // the first read and signal cannot make cleanup appear complete.
-        kill_cgroup_path(&path)?;
-        thread::sleep(Duration::from_millis(25));
+        // identity-pinned cgroup.procs fallback so a member that forked
+        // between the first read and signal cannot escape cleanup.
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+        kill_cgroup_path_until(&path, deadline)?;
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+        sleep_until_cgroup_deadline(deadline, "proving recorded cgroup empty")?;
     }
     Ok(())
+}
+
+fn check_cgroup_cleanup_deadline(deadline: Instant, operation: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        bail!("timed out {operation}");
+    }
+    Ok(())
+}
+
+fn sleep_until_cgroup_deadline(deadline: Instant, operation: &str) -> Result<()> {
+    check_cgroup_cleanup_deadline(deadline, operation)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    thread::sleep(Duration::from_millis(25).min(remaining));
+    check_cgroup_cleanup_deadline(deadline, operation)
 }
 
 fn validate_recorded_cgroup(id: Uuid, locator: &Path) -> Result<Option<PathBuf>> {
@@ -2063,37 +2104,155 @@ fn cgroup_path_populated(path: &Path) -> Result<bool> {
     }
 }
 
-fn signal_cgroup_path(path: &Path, signal: i32) -> Result<()> {
+fn cgroup_path_populated_until(path: &Path, deadline: Instant) -> Result<bool> {
+    check_cgroup_cleanup_deadline(deadline, "inspecting recorded cgroup")?;
+    let populated = cgroup_path_populated(path)?;
+    check_cgroup_cleanup_deadline(deadline, "inspecting recorded cgroup")?;
+    Ok(populated)
+}
+
+fn read_cgroup_pids_until(path: &Path, deadline: Instant) -> Result<BTreeSet<i32>> {
+    check_cgroup_cleanup_deadline(deadline, "reading recorded cgroup members")?;
     let procs = path.join("cgroup.procs");
-    let pids = match fs::read_to_string(&procs) {
-        Ok(pids) => pids,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+    let file = match File::open(&procs) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(error) => return Err(error).with_context(|| format!("read {}", procs.display())),
     };
-    for text in pids.lines() {
-        let pid = text
+    let mut bytes = Vec::new();
+    file.take(MAX_CGROUP_PROCS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", procs.display()))?;
+    check_cgroup_cleanup_deadline(deadline, "reading recorded cgroup members")?;
+    if bytes.len() as u64 > MAX_CGROUP_PROCS_BYTES {
+        bail!("recorded cgroup member list exceeds safe byte limit of {MAX_CGROUP_PROCS_BYTES}");
+    }
+    let text =
+        std::str::from_utf8(&bytes).with_context(|| format!("decode {}", procs.display()))?;
+    let mut pids = BTreeSet::new();
+    for value in text.lines() {
+        check_cgroup_cleanup_deadline(deadline, "parsing recorded cgroup members")?;
+        if pids.len() >= MAX_CGROUP_RECOVERY_MEMBERS {
+            bail!("recorded cgroup exceeds safe member limit of {MAX_CGROUP_RECOVERY_MEMBERS}");
+        }
+        let pid = value
             .parse::<i32>()
             .with_context(|| format!("parse pid in {}/cgroup.procs", path.display()))?;
-        if unsafe { libc::kill(pid, signal) } != 0 {
+        if pid <= 0 {
+            bail!("invalid pid {pid} in {}/cgroup.procs", path.display());
+        }
+        pids.insert(pid);
+    }
+    Ok(pids)
+}
+
+struct CgroupMemberHandle {
+    pid: i32,
+    pidfd: File,
+}
+
+fn signal_cgroup_path_until(path: &Path, signal: i32, deadline: Instant) -> Result<()> {
+    let candidates = read_cgroup_pids_until(path, deadline)?;
+    let capacity = cgroup_recovery_pidfd_capacity(deadline)?;
+    if candidates.len() > capacity {
+        bail!(
+            "recorded cgroup has {} members but only {capacity} pidfds can be opened safely",
+            candidates.len()
+        );
+    }
+    let mut members = Vec::with_capacity(candidates.len());
+    for pid in candidates {
+        check_cgroup_cleanup_deadline(deadline, "pinning recorded cgroup members")?;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error).with_context(|| format!("open pidfd for cgroup member {pid}"));
+        }
+        members.push(CgroupMemberHandle {
+            pid,
+            pidfd: unsafe { File::from_raw_fd(fd) },
+        });
+    }
+
+    // A pidfd pins process identity; this second membership snapshot ensures
+    // each pinned identity still belongs to the recorded domain before it is
+    // signalled. New forks are handled by the repeated populated/kill loop.
+    let current = read_cgroup_pids_until(path, deadline)?;
+    for member in members {
+        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup members")?;
+        if !current.contains(&member.pid) {
+            continue;
+        }
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                member.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).with_context(|| format!("signal cgroup member {pid}"));
+                return Err(error).with_context(|| format!("signal cgroup member {}", member.pid));
             }
         }
+        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup members")?;
     }
     Ok(())
 }
 
-fn kill_cgroup_path(path: &Path) -> Result<()> {
+fn cgroup_recovery_pidfd_capacity(deadline: Instant) -> Result<usize> {
+    check_cgroup_cleanup_deadline(deadline, "preflighting cgroup recovery descriptors")?;
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error()).context("read RLIMIT_NOFILE for cgroup recovery");
+    }
+    check_cgroup_cleanup_deadline(deadline, "preflighting cgroup recovery descriptors")?;
+    let descriptors = fs::read_dir("/proc/self/fd").context("count open recovery descriptors")?;
+    let mut open = 0_u64;
+    for descriptor in descriptors {
+        check_cgroup_cleanup_deadline(deadline, "counting open recovery descriptors")?;
+        descriptor.context("enumerate open recovery descriptors")?;
+        open = open
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("open recovery descriptor count overflow"))?;
+    }
+    let soft_limit = if limit.rlim_cur == libc::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit.rlim_cur
+    };
+    Ok(cgroup_recovery_pidfd_capacity_from_counts(soft_limit, open))
+}
+
+fn cgroup_recovery_pidfd_capacity_from_counts(soft_limit: u64, open: u64) -> usize {
+    let available = soft_limit
+        .saturating_sub(open)
+        .saturating_sub(CGROUP_RECOVERY_FD_RESERVE);
+    usize::try_from(available)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CGROUP_RECOVERY_MEMBERS)
+}
+
+fn kill_cgroup_path_until(path: &Path, deadline: Instant) -> Result<()> {
+    check_cgroup_cleanup_deadline(deadline, "checking recorded cgroup kill support")?;
     let kill = path.join("cgroup.kill");
     if kill.exists() {
-        match fs::write(&kill, "1") {
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+        let result = match fs::write(&kill, "1") {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).with_context(|| format!("write {}", kill.display())),
-        }
+        };
+        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
+        result
     } else {
-        signal_cgroup_path(path, libc::SIGKILL)
+        signal_cgroup_path_until(path, libc::SIGKILL, deadline)
     }
 }
 fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
@@ -2591,6 +2750,65 @@ mod tests {
         assert!(read_counter(&events, "populated").is_err());
         fs::write(&events, "populated 1\n").unwrap();
         assert_eq!(read_counter(&events, "populated").unwrap(), 1);
+    }
+
+    #[test]
+    fn recorded_cgroup_cleanup_checks_deadline_before_locator_io() {
+        let id = Uuid::new_v4();
+        let locator = PathBuf::from(format!("/sys/fs/cgroup/aplexer-workload-{id}.scope"));
+        let error = cleanup_recorded_cgroup_until(
+            id,
+            &locator,
+            libc::SIGKILL,
+            Duration::ZERO,
+            Instant::now(),
+        )
+        .expect_err("expired cleanup must stop before locator inspection");
+        assert!(error.to_string().contains("timed out validating"));
+    }
+
+    #[test]
+    fn recorded_cgroup_cleanup_rejects_untrusted_locator() {
+        let id = Uuid::new_v4();
+        let error = cleanup_recorded_cgroup_until(
+            id,
+            Path::new("/tmp/not-a-cgroup"),
+            libc::SIGKILL,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("untrusted locator must fail closed");
+        assert!(error
+            .to_string()
+            .contains("untrusted recorded cgroup locator"));
+    }
+
+    #[test]
+    fn cgroup_recovery_pidfds_preserve_descriptor_reserve() {
+        assert_eq!(
+            cgroup_recovery_pidfd_capacity_from_counts(CGROUP_RECOVERY_FD_RESERVE, 0),
+            0
+        );
+        assert_eq!(
+            cgroup_recovery_pidfd_capacity_from_counts(CGROUP_RECOVERY_FD_RESERVE + 7, 3),
+            4
+        );
+        assert_eq!(
+            cgroup_recovery_pidfd_capacity_from_counts(u64::MAX, 0),
+            MAX_CGROUP_RECOVERY_MEMBERS
+        );
+    }
+
+    #[test]
+    fn cgroup_member_fallback_uses_identity_pinned_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        signal_cgroup_path_until(dir.path(), 0, Instant::now() + Duration::from_secs(1))
+            .expect("pidfd signal-zero probe");
     }
 
     #[test]

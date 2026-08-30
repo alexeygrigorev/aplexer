@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::{
-    atomic_write_json, canonical_workspace, command_exists, ensure_private_dir, list_records,
-    parse_byte_size, process_start_time_ticks, public_session_record, read_record,
-    session_metadata_env, validate_tag, worker_executable, Config, FileLock, Limits, Paths, Phase,
-    SessionRecord, SCHEMA_VERSION,
+    atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
+    ensure_private_dir, list_records, parse_byte_size, process_start_time_ticks,
+    public_session_record, read_record, session_metadata_env, validate_tag, worker_executable,
+    Config, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -145,13 +145,24 @@ fn reaped_worker_cleanup_confirmed(record_path: &Path, worker_pid: u32) -> bool 
     if record.worker_pid != Some(worker_pid) {
         return false;
     }
-    // An ordinary (non-cgroup) startup failure written with no workload pid
-    // proves there was no workload containment to leak. A terminal lifecycle
-    // record's ExitInfo is written only after the fail-closed containment-empty
-    // check. Limited startup failures remain ambiguous because the systemd
-    // scope can exist before workload_pid is assigned.
-    (record.phase == Phase::Failed && record.workload_pid.is_none() && !record.limits.requested())
-        || (matches!(record.phase, Phase::Exited | Phase::Failed) && record.exit.is_some())
+    // Once a worker registered itself, only its explicit empty-domain proof
+    // is sufficient. Leader exit, a missing workload pid, and an ExitInfo are
+    // all weaker: setsid descendants can survive each of them.
+    record.containment_empty
+}
+
+fn persist_independent_cleanup_proof(record_path: &Path, worker_pid: u32) -> Result<()> {
+    let mut record = read_record(record_path)?;
+    if record.worker_pid.is_some() && record.worker_pid != Some(worker_pid) {
+        bail!("startup record worker identity changed before cleanup proof persistence");
+    }
+    record.phase = Phase::Failed;
+    record.containment_empty = true;
+    record.updated_at_ms = crate::now_ms();
+    record.error.get_or_insert_with(|| {
+        "worker did not complete startup; launcher independently emptied containment".into()
+    });
+    atomic_write_json(record_path, &record).context("persist independent containment proof")
 }
 
 fn reaped_startup_child_result(
@@ -226,8 +237,17 @@ fn terminate_and_reap_startup_child(
         )),
     }
 
-    match hard_cleanup_startup_child(child) {
-        Ok(()) => true,
+    match hard_cleanup_startup_child(child, record_path) {
+        Ok(()) => match persist_independent_cleanup_proof(record_path, child.id()) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!(
+                    "persist independent cleanup proof for worker {}: {error:#}",
+                    child.id()
+                ));
+                false
+            }
+        },
         Err(error) => {
             failures.push(format!(
                 "independently clean worker {} containment: {error:#}",
@@ -713,12 +733,20 @@ fn resume_stopped_startup_tree(
     }
 }
 
-fn hard_cleanup_startup_child(child: &mut Child) -> Result<()> {
+fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) -> Result<()> {
     // All discovery, handle acquisition, signalling, and waits share this one
     // deadline. A large/forking tree cannot multiply the timeout by phases or
     // by the number of processes it creates.
     let deadline = CleanupDeadline::after(STARTUP_CONTAINMENT_TIMEOUT);
     let worker_pid = child.id();
+    deadline.check("reading startup containment record")?;
+    let record = read_record(record_path).context("read startup containment record")?;
+    deadline.check("reading startup containment record")?;
+    if record.worker_pid.is_some() && record.worker_pid != Some(worker_pid) {
+        bail!("startup record no longer belongs to worker {worker_pid}");
+    }
+    let missing_required_cgroup = record.limits.requested() && record.containment_cgroup.is_none();
+    let recorded_cgroup = record.containment_cgroup;
     let max_descendants = safe_startup_descendant_capacity(deadline)?;
     // Opening a worker pidfd and exercising pidfd_send_signal(2) with signal
     // zero proves both required syscalls and permissions before SIGSTOP can
@@ -731,6 +759,7 @@ fn hard_cleanup_startup_child(child: &mut Child) -> Result<()> {
     let worker_start_time = worker.start_time_ticks;
     let mut descendants = BTreeMap::new();
     let mut worker_stopped = false;
+    let mut worker_destroyed = false;
 
     let cleanup = (|| -> Result<()> {
         deadline.check("stopping startup worker for containment inspection")?;
@@ -752,6 +781,21 @@ fn hard_cleanup_startup_child(child: &mut Child) -> Result<()> {
         }
         wait_for_descendant_exit(&descendants, deadline)?;
 
+        // systemd owns limited-session scope members, so they need not remain
+        // descendants of the worker subreaper. With the worker and its known
+        // tree stopped, the recorded cgroup is the authoritative second
+        // containment domain. It shares the same deadline as pidfd cleanup.
+        if let Some(locator) = &recorded_cgroup {
+            cleanup_recorded_cgroup_until(
+                record.id,
+                locator,
+                libc::SIGKILL,
+                Duration::ZERO,
+                deadline.0,
+            )
+            .context("empty recorded startup cgroup")?;
+        }
+
         // No stopped descendant can fork, and every pinned descendant has
         // exited. A final bounded walk proves no unpinned process was missed
         // before destroying the subreaper root that makes the tree visible.
@@ -763,9 +807,15 @@ fn hard_cleanup_startup_child(child: &mut Child) -> Result<()> {
 
         signal_startup_descendant(&worker, libc::SIGKILL, deadline)
             .with_context(|| format!("kill startup worker {worker_pid}"))?;
+        worker_destroyed = true;
         loop {
             deadline.check("reaping startup worker after SIGKILL")?;
             match child.try_wait() {
+                Ok(Some(_)) if missing_required_cgroup => {
+                    bail!(
+                        "limited startup had no recorded cgroup locator; local process tree was killed but complete containment cleanup is unproven"
+                    )
+                }
                 Ok(Some(_)) => return Ok(()),
                 Ok(None) => {}
                 Err(error) => {
@@ -778,14 +828,16 @@ fn hard_cleanup_startup_child(child: &mut Child) -> Result<()> {
 
     match cleanup {
         Ok(()) => Ok(()),
-        Err(error) if worker_stopped => match resume_stopped_startup_tree(&worker, &descendants) {
-            Ok(()) => Err(error.context(
-                "hard startup cleanup failed; resumed the pinned process tree for TERM rollback",
-            )),
-            Err(recovery_error) => Err(error.context(format!(
-                "hard startup cleanup failed and stopped-tree recovery also failed: {recovery_error:#}"
-            ))),
-        },
+        Err(error) if worker_stopped && !worker_destroyed => {
+            match resume_stopped_startup_tree(&worker, &descendants) {
+                Ok(()) => Err(error.context(
+                    "hard startup cleanup failed; resumed the pinned process tree for TERM rollback",
+                )),
+                Err(recovery_error) => Err(error.context(format!(
+                    "hard startup cleanup failed and stopped-tree recovery also failed: {recovery_error:#}"
+                ))),
+            }
+        }
         Err(error) => Err(error),
     }
 }
