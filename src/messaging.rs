@@ -272,9 +272,15 @@ fn merged_cursor(left: &Cursor, right: &Cursor, retained_ids: &BTreeSet<Uuid>) -
 fn plan_mailbox_merge(
     stable: &MessagePaths,
     legacy: &MessagePaths,
+    canonical_workspace: &Path,
 ) -> Result<Vec<MailboxMigration>> {
     let mut actions = Vec::new();
     for source in json_files(&legacy.msgs_dir)? {
+        // Validate every source before scheduling any move. Unique files must
+        // not bypass the same schema, identity, workspace, type, and size
+        // checks applied to collisions and normal inbox reads.
+        load_message_file(&source, canonical_workspace)
+            .with_context(|| format!("validate legacy mailbox message {}", source.display()))?;
         let destination = stable.msgs_dir.join(
             source
                 .file_name()
@@ -303,6 +309,8 @@ fn plan_mailbox_merge(
     let mut retained_ids = retained_message_ids(&stable.msgs_dir)?;
     retained_ids.extend(retained_message_ids(&legacy.msgs_dir)?);
     for source in json_files(&legacy.cursors_dir)? {
+        let source_cursor = read_cursor_file(&source)
+            .with_context(|| format!("validate legacy mailbox cursor {}", source.display()))?;
         let destination = stable.cursors_dir.join(
             source
                 .file_name()
@@ -322,8 +330,6 @@ fn plan_mailbox_merge(
             });
             continue;
         }
-        let source_cursor = read_cursor_file(&source)
-            .with_context(|| format!("parse colliding cursor {}", source.display()))?;
         let destination_cursor = read_cursor_file(&destination)
             .with_context(|| format!("parse colliding cursor {}", destination.display()))?;
         actions.push(MailboxMigration::MergeCursor {
@@ -424,8 +430,12 @@ fn remove_drained_legacy_cursor_locks(legacy: &MessagePaths) -> Result<()> {
     Ok(())
 }
 
-fn merge_legacy_mailbox(stable: &MessagePaths, legacy: &MessagePaths) -> Result<()> {
-    let actions = plan_mailbox_merge(stable, legacy)?;
+fn merge_legacy_mailbox(
+    stable: &MessagePaths,
+    legacy: &MessagePaths,
+    canonical_workspace: &Path,
+) -> Result<()> {
+    let actions = plan_mailbox_merge(stable, legacy, canonical_workspace)?;
     apply_mailbox_merge(actions)?;
     remove_drained_legacy_cursor_locks(legacy)
 }
@@ -479,7 +489,7 @@ pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<Mes
             verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
             ensure_private_dir(&legacy_mp.msgs_dir)?;
             ensure_private_dir(&legacy_mp.cursors_dir)?;
-            merge_legacy_mailbox(&mp, &legacy_mp)?;
+            merge_legacy_mailbox(&mp, &legacy_mp, canonical_workspace)?;
         }
     }
     initialize_workspace_dir(&mp, canonical_workspace)?;
@@ -1562,6 +1572,49 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(legacy.cursors_dir.join(cursor_name).exists());
+    }
+
+    #[test]
+    fn legacy_merge_validates_unique_sources_before_moving_any_file() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-mailbox-invalid-unique-legacy-source");
+        let stable = ensure_workspace(&paths, workspace).unwrap();
+        let legacy = create_legacy_mailbox(&paths, workspace);
+        let valid_id = Uuid::from_u128(102);
+        let oversized_id = Uuid::from_u128(103);
+        let valid_path = legacy.cursors_dir.join(format!("{valid_id}.json"));
+        let oversized_path = legacy.cursors_dir.join(format!("{oversized_id}.json"));
+        atomic_write_json(&valid_path, &Cursor::default()).unwrap();
+        let oversized = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&oversized_path)
+            .unwrap();
+        oversized
+            .set_len(MAX_MAILBOX_STATE_BYTES as u64 + 1)
+            .unwrap();
+        drop(oversized);
+
+        let error = ensure_workspace(&paths, workspace)
+            .expect_err("unique oversized legacy cursor must fail preflight");
+        assert!(
+            format!("{error:#}").contains("exceeds the"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            valid_path.exists(),
+            "preflight must not move an earlier file"
+        );
+        assert!(
+            oversized_path.exists(),
+            "invalid source must remain recoverable"
+        );
+        assert!(!stable.cursors_dir.join(format!("{valid_id}.json")).exists());
+        assert!(!stable
+            .cursors_dir
+            .join(format!("{oversized_id}.json"))
+            .exists());
     }
 
     #[test]
