@@ -250,7 +250,10 @@ fn failed_replacement_preserves_finished_session_evidence() {
         "/bin/sleep",
         "30",
     ]);
-    assert!(!replacement.status.success(), "replacement unexpectedly started");
+    assert!(
+        !replacement.status.success(),
+        "replacement unexpectedly started"
+    );
     assert!(String::from_utf8_lossy(&replacement.stderr).contains("within 0 ms"));
 
     let capture_after = harness.run(&["capture", old_id]);
@@ -286,8 +289,7 @@ fn failed_replacement_preserves_finished_session_evidence() {
         "successful replacement failed: {}",
         String::from_utf8_lossy(&successful.stderr)
     );
-    let successful: Value =
-        serde_json::from_slice(&successful.stdout).expect("replacement JSON");
+    let successful: Value = serde_json::from_slice(&successful.stdout).expect("replacement JSON");
     assert!(
         !harness
             .state_dir
@@ -307,6 +309,44 @@ fn failed_replacement_preserves_finished_session_evidence() {
         "0",
     ]);
     assert!(killed.status.success(), "replacement cleanup failed");
+}
+
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn persisted_running_without_verified_ping_is_not_startup_success() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+
+    let output = harness.run_with_env(
+        &[
+            "start",
+            "--startup-timeout-ms",
+            "3000",
+            "--workspace",
+            workspace,
+            "--tag",
+            "not-ready",
+            "--",
+            "/bin/sleep",
+            "30",
+        ],
+        &[(
+            "APLEXER_TEST_FAIL_WORKER_STARTUP_AT",
+            "after_running_record",
+        )],
+    );
+
+    assert!(
+        !output.status.success(),
+        "launcher accepted Running without a successful Ping"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("after_running_record"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    harness.assert_no_session_artifacts();
 }
 
 #[test]

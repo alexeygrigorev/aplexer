@@ -120,7 +120,18 @@ impl Harness {
 #[test]
 fn post_spawn_and_partial_thread_failures_kill_workload_and_clean_runtime() {
     let harness = Harness::new();
-    for point in ["after_workload_spawn", "thread_3"] {
+    for point in [
+        "after_workload_spawn",
+        "before_history_open",
+        "before_output_hub",
+        "thread_1",
+        "thread_2",
+        "thread_3",
+        "thread_4",
+        "thread_5",
+        "after_thread_setup",
+        "after_running_record",
+    ] {
         let failed = harness.fail_at(point);
         let pid = failed
             .workload_pid
