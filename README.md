@@ -134,6 +134,10 @@ memory_bytes = 2147483648
 pids = 256
 ```
 
+`history_bytes` may be `0` through `16777216` (16 MiB) per session; larger
+values are rejected before a worker is spawned because the ring is held in
+worker memory and its readable capture payload is bounded to the same size.
+
 Launch a profile explicitly with `a start --engine codex --profile zodex`, or from inside a workspace `a start --profile zodex` (the profile's own `engine` field fills in `--engine`).
 
 ### Shortcuts

@@ -33,12 +33,25 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Global per-session raw-history ceiling. The ring is resident in every
+/// worker and periodically copied for atomic persistence, while protocol and
+/// post-mortem capture can expose at most one frame, so retaining more than a
+/// maximum-sized frame adds memory/write amplification without a usable read
+/// path.
+pub const MAX_HISTORY_BYTES: usize = MAX_FRAME_BYTES;
 const MAX_CGROUP_RECOVERY_MEMBERS: usize = 4096;
 const MAX_CGROUP_PROCS_BYTES: u64 = 128 * 1024;
 const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 /// Long enough for graceful shutdown, but bounded so an authenticated local
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
+
+pub fn validate_history_bytes(value: usize) -> Result<usize> {
+    if value > MAX_HISTORY_BYTES {
+        bail!("history_bytes {value} exceeds the maximum of {MAX_HISTORY_BYTES} bytes (16 MiB)");
+    }
+    Ok(value)
+}
 
 /// Restore the standalone process contract needed by `std::process::Child`.
 /// This changes a process-wide disposition and is therefore reserved for the
@@ -619,6 +632,8 @@ pub fn read_session_record(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
             expected_history.display()
         );
     }
+    validate_history_bytes(record.history_bytes)
+        .with_context(|| format!("validate session record {}", path.display()))?;
     Ok(record)
 }
 
@@ -1487,6 +1502,12 @@ impl Config {
             config.profiles.extend(user.profiles);
             config.shortcuts.extend(user.shortcuts);
         }
+        for (name, profile) in &config.profiles {
+            if let Some(history_bytes) = profile.history_bytes {
+                validate_history_bytes(history_bytes)
+                    .with_context(|| format!("profile {name:?} history_bytes"))?;
+            }
+        }
         Ok(config)
     }
 
@@ -1578,6 +1599,10 @@ impl Config {
         // apply this list at spawn time (see worker.rs's spawn_workload),
         // not just report it.
         let env_unset = ordered_env_unset_union(&engine.env_unset);
+        let history_bytes = history_bytes
+            .or_else(|| profile.and_then(|p| p.history_bytes))
+            .unwrap_or(DEFAULT_HISTORY_BYTES);
+        validate_history_bytes(history_bytes)?;
         Ok(ResolvedLaunch {
             engine: selected_engine,
             profile: selected_profile,
@@ -1587,9 +1612,7 @@ impl Config {
             env_unset,
             skip_permissions_argv: engine.skip_permissions_argv.clone(),
             limits: merged_limits,
-            history_bytes: history_bytes
-                .or_else(|| profile.and_then(|p| p.history_bytes))
-                .unwrap_or(DEFAULT_HISTORY_BYTES),
+            history_bytes,
         })
     }
 }
@@ -1881,6 +1904,7 @@ pub struct History {
 }
 impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
+        validate_history_bytes(cap)?;
         let existing = fs::read(&path).unwrap_or_default();
         let start = existing.len().saturating_sub(cap);
         let bytes = existing[start..].iter().copied().collect();
@@ -3153,6 +3177,11 @@ mod tests {
         record.history_path = paths.history(Uuid::new_v4());
         atomic_write_json(&paths.record(id), &record).unwrap();
         assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("history path"));
+
+        record = registry_record(&paths, id);
+        record.history_bytes = MAX_HISTORY_BYTES + 1;
+        atomic_write_json(&paths.record(id), &record).unwrap();
+        assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("history_bytes"));
     }
 
     #[test]
@@ -3402,6 +3431,56 @@ mod tests {
         let mut h = History::open(dir.path().join("h"), 4).unwrap();
         h.append(b"abcdef").unwrap();
         assert_eq!(h.snapshot(None), b"cdef");
+    }
+
+    #[test]
+    fn history_capacity_has_one_global_limit_and_zero_stays_disabled() {
+        for value in [0, 1, DEFAULT_HISTORY_BYTES, MAX_HISTORY_BYTES] {
+            assert_eq!(validate_history_bytes(value).unwrap(), value);
+        }
+        for value in [MAX_HISTORY_BYTES + 1, usize::MAX] {
+            let error = validate_history_bytes(value).unwrap_err().to_string();
+            assert!(error.contains("history_bytes"), "{error}");
+            assert!(error.contains(&MAX_HISTORY_BYTES.to_string()), "{error}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disabled-history.bin");
+        let mut history = History::open(path.clone(), 0).unwrap();
+        history.append(b"not retained").unwrap();
+        history.flush().unwrap();
+        assert!(history.snapshot(None).is_empty());
+        assert!(!path.exists());
+        assert!(History::open(dir.path().join("too-large"), MAX_HISTORY_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn config_rejects_oversized_profile_history() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        fs::write(
+            &paths.config_file,
+            format!(
+                "version = 1\n[profiles.too_large]\nhistory_bytes = {}\n",
+                MAX_HISTORY_BYTES + 1
+            ),
+        )
+        .unwrap();
+
+        let error = Config::load(&paths).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("profile \"too_large\" history_bytes"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&MAX_HISTORY_BYTES.to_string()),
+            "{message}"
+        );
     }
     #[test]
     fn sizes() {
