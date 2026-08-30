@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -2973,19 +2975,28 @@ fn sanitize_terminal_text(text: &str) -> String {
         .collect()
 }
 
-/// Pads or truncates (by character, not byte, so multi-byte UTF-8 in a tag
-/// name can't split mid-codepoint) to exactly `cols` wide, so the reverse-
-/// video status bar spans the full terminal width like tmux's own.
+fn terminal_display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Pads or truncates to exactly `cols` terminal display cells without
+/// splitting an extended grapheme cluster. This keeps wide glyphs, combining
+/// sequences, and emoji aligned while the reverse-video bar spans the full
+/// terminal width like tmux's own.
 fn pad_or_truncate(text: &str, cols: usize) -> String {
     let cols = cols.max(1);
-    let len = text.chars().count();
-    if len >= cols {
-        text.chars().take(cols).collect()
-    } else {
-        let mut s = text.to_string();
-        s.push_str(&" ".repeat(cols - len));
-        s
+    let mut rendered = String::new();
+    let mut width = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = terminal_display_width(grapheme);
+        if grapheme_width > cols.saturating_sub(width) {
+            break;
+        }
+        rendered.push_str(grapheme);
+        width += grapheme_width;
     }
+    rendered.push_str(&" ".repeat(cols - width));
+    rendered
 }
 
 /// Everything a status-bar redraw needs, cloned into each thread that might
@@ -3530,7 +3541,7 @@ fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
 }
 
 /// A clickable span of the rendered status-bar line
-/// (docs/clickable-status-bar-design.md section 4.1), in 0-based character
+/// (docs/clickable-status-bar-design.md section 4.1), in 0-based display-cell
 /// columns `[start, end)` -- the same units `pad_or_truncate` counts in, so
 /// a click's 1-based `Cx` maps in with a single `- 1`.
 ///
@@ -3578,7 +3589,7 @@ fn workspace_summary_regions(
         if i > 0 {
             text.push(' ');
         }
-        let start = text.chars().count();
+        let start = terminal_display_width(&text);
         let state = display_state(&r.phase, r.worker_alive());
         text.push_str(&format!("{}:{}", i + 1, sanitize_terminal_text(&r.tag)));
         if r.id == current_id {
@@ -3587,7 +3598,7 @@ fn workspace_summary_regions(
         if state != "running" {
             text.push_str(&format!("({state})"));
         }
-        let end = text.chars().count();
+        let end = terminal_display_width(&text);
         regions.push(BarRegion {
             cols: start..end,
             action: BarClick::Sibling(i + 1),
@@ -4589,6 +4600,23 @@ mod switching_tests {
     }
 
     #[test]
+    fn status_padding_uses_display_cells_and_preserves_graphemes() {
+        let combining = "e\u{301}";
+        let emoji = "👩‍💻";
+
+        assert_eq!(pad_or_truncate("界x", 1), " ");
+        assert_eq!(pad_or_truncate("界x", 2), "界");
+        assert_eq!(pad_or_truncate("界x", 3), "界x");
+        assert_eq!(pad_or_truncate(&format!("{combining}x"), 1), combining);
+        assert_eq!(pad_or_truncate(&format!("{emoji}x"), 2), emoji);
+
+        for (text, cols) in [("界x", 4), (combining, 3), (emoji, 5)] {
+            let rendered = pad_or_truncate(text, cols);
+            assert_eq!(terminal_display_width(&rendered), cols, "{rendered:?}");
+        }
+    }
+
+    #[test]
     fn terminal_reset_disables_every_snapshot_input_mode_variant() {
         let mouse_modes: &[&[u8]] = &[b"\x1b[?9h", b"\x1b[?1000h", b"\x1b[?1002h", b"\x1b[?1003h"];
         let mouse_encodings: &[&[u8]] = &[b"\x1b[?1005h", b"\x1b[?1006h"];
@@ -4667,9 +4695,9 @@ mod switching_tests {
     }
 
     #[test]
-    fn summary_regions_unicode_tag_uses_char_offsets_not_byte_offsets() {
+    fn summary_regions_unicode_tag_uses_display_cells_not_byte_offsets() {
         // A multi-byte tag must not desync the column map -- offsets are
-        // char counts (matching pad_or_truncate), not byte counts.
+        // display cells (matching pad_or_truncate), not byte counts.
         let a = mk_record("/ws/u", "café", Phase::Running);
         let b = mk_record("/ws/u", "b", Phase::Running);
         let current = a.id;
@@ -4679,6 +4707,17 @@ mod switching_tests {
         let chars: Vec<char> = text.chars().collect();
         let second: String = chars[regions[1].cols.clone()].iter().collect();
         assert_eq!(second, "2:b");
+    }
+
+    #[test]
+    fn summary_regions_count_wide_tags_in_terminal_cells() {
+        let a = mk_record("/ws/u", "界", Phase::Running);
+        let b = mk_record("/ws/u", "b", Phase::Running);
+        let current = a.id;
+        let (text, regions) = workspace_summary_regions(&[a, b], current);
+        assert_eq!(text, "1:界* 2:b");
+        assert_eq!(regions[0].cols, 0..5);
+        assert_eq!(regions[1].cols, 6..9);
     }
 
     #[test]
