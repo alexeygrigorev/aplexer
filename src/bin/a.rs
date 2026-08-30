@@ -575,6 +575,11 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
 }
 
 fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
+    if json_output && args.attach {
+        bail!(
+            "--json cannot be combined with `start --attach`: JSON session metadata and terminal bytes cannot share stdout; run `a --json start ...` and `a attach SESSION` separately"
+        );
+    }
     let env = parse_env(&args.env)?;
     let command = args
         .command
