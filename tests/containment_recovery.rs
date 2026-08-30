@@ -1,5 +1,6 @@
 //! Product-path regressions for fail-closed broken-session recovery.
 
+use aplexer::{atomic_write_json, read_record, FileLock, Phase};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -199,4 +200,87 @@ fn kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant() 
             .as_i64()
             .expect("restarted worker pid") as i32,
     );
+}
+
+#[test]
+fn forget_fences_pre_pid_startup_and_refuses_held_worker_lock() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace_text = workspace.path().to_str().expect("UTF-8 workspace");
+    let started = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace_text,
+        "--tag",
+        "pre-pid",
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 0.1",
+    ]);
+    assert!(started.status.success(), "start failed");
+    let started: Value = serde_json::from_slice(&started.stdout).expect("start JSON");
+    let id = started["id"].as_str().expect("session id");
+    let worker_pid = started["worker_pid"].as_i64().expect("worker pid") as i32;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_alive(worker_pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process_alive(worker_pid), "worker did not exit");
+
+    let id = uuid::Uuid::parse_str(id).expect("UUID");
+    let paths = aplexer::Paths {
+        runtime_root: harness.runtime.path().to_path_buf(),
+        state_root: harness.state.path().to_path_buf(),
+        config_file: harness.config.clone(),
+    };
+    let mut record = read_record(&paths.record(id)).expect("read finished record");
+    record.phase = Phase::Starting;
+    record.worker_pid = None;
+    record.workload_pid = None;
+    record.exit = None;
+    record.error = None;
+    record.containment_empty = Some(false);
+    atomic_write_json(&paths.record(id), &record).expect("write stale Starting record");
+    fs::create_dir_all(paths.runtime_session(id)).expect("recreate stale runtime dir");
+    fs::write(paths.worker_lock(id), b"").expect("create historical worker lock");
+
+    let held_lock = FileLock::exclusive(&paths.worker_lock(id), true).expect("hold worker lock");
+    let refused = harness.run(&["forget", &id.to_string(), "--force"]);
+    assert!(!refused.status.success(), "held worker lock was ignored");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("still has a worker holding"),
+        "unexpected refusal: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    drop(held_lock);
+    fs::remove_file(paths.worker_lock(id)).expect("remove historical worker lock");
+
+    let forgotten = harness.run(&["forget", &id.to_string(), "--force"]);
+    assert!(
+        forgotten.status.success(),
+        "missing lock could not be safely fenced and reclaimed: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    let restarted = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace_text,
+        "--tag",
+        "pre-pid",
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    assert!(
+        restarted.status.success(),
+        "reclaimed pre-PID tag was not reusable: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: Value = serde_json::from_slice(&restarted.stdout).expect("restart JSON");
+    let restarted_worker = restarted["worker_pid"].as_i64().expect("worker pid") as i32;
+    let _cleanup = ProcessCleanup(vec![restarted_worker]);
 }

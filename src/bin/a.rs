@@ -1007,12 +1007,38 @@ fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> 
             current.id
         );
     }
-    if current.worker_phase_active() && current.worker_pid.is_none() {
-        bail!(
-            "session {} has no recorded worker identity; cannot confirm that startup is dead",
-            current.id
-        );
-    }
+    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
+        let lock_path = paths.worker_lock(current.id);
+        // This lock is also a fence against the spawn-to-worker-lock gap. If
+        // a worker was spawned but has not reached its first required lock
+        // yet, it will fail that acquisition and cannot proceed after we
+        // remove the record. Keep our lock through both directory removals.
+        match FileLock::exclusive(&lock_path, true) {
+            Ok(lock) => Some(lock),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error)
+                    .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
+            {
+                bail!(
+                    "session {} still has a worker holding {}; refusing to forget it",
+                    current.id,
+                    lock_path.display()
+                )
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot fence session {}'s pre-PID worker; refusing to forget it",
+                        current.id
+                    )
+                })
+            }
+        }
+    } else {
+        None
+    };
 
     let containment_proven_empty = current.containment_proven_empty();
     match fs::remove_dir_all(paths.runtime_session(current.id)) {
