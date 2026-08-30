@@ -14,7 +14,7 @@ cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --all-targets
 cargo test --features startup-test-hooks \
-  --test startup_rollback --test worker_startup_transaction
+  --test startup_rollback --test worker_startup_transaction --test lifecycle_failure
 
 if [ -d python ]; then
   printf '==> Python syntax and tests\n'

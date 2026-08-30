@@ -1041,6 +1041,7 @@ fn load_launch_environment(
 enum LifeEvent {
     PtyEof,
     PtyError(String),
+    WaiterError(String),
     ChildExit {
         code: Option<i32>,
         signal: Option<i32>,
@@ -1367,6 +1368,20 @@ fn start_worker_threads(
                 }
             };
             if let Some(child) = child {
+                #[cfg(feature = "startup-test-hooks")]
+                if let Some(marker) = env::var_os("APLEXER_TEST_FAIL_WAITER_AFTER_FILE") {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let marker = std::path::PathBuf::from(marker);
+                    while !marker.exists() && Instant::now() < deadline {
+                        thread::sleep(DESCENDANT_POLL_INTERVAL);
+                    }
+                    drop(child);
+                    let _ = waiter_tx.send(LifeEvent::WaiterError(format!(
+                        "injected workload waiter failure after {}",
+                        marker.display()
+                    )));
+                    return;
+                }
                 run_child_waiter(child, waiter_tx);
             }
         })?;
@@ -1458,9 +1473,37 @@ fn run_child_waiter(mut child: Child, tx: mpsc::Sender<LifeEvent>) {
             code: status.code(),
             signal: status.signal(),
         },
-        Err(error) => LifeEvent::PtyError(format!("wait workload: {error}")),
+        Err(error) => LifeEvent::WaiterError(format!("wait workload: {error}")),
     };
     let _ = tx.send(event);
+}
+
+/// A waiter failure means nobody owns the tracked Child any longer. Before
+/// the subreaper is allowed to exit, repeatedly kill, reap, and inspect its
+/// complete containment domain. Only an observed empty domain is proof.
+fn cleanup_after_lifecycle_failure(runtime: &WorkerRuntime) -> Result<()> {
+    let _serialized = lock(&runtime.kill_gate)?;
+    let cgroup = lock(&runtime.cgroup)?.clone();
+    let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
+    loop {
+        if let Some(cgroup) = &cgroup {
+            cgroup.kill_all().context("kill failed lifecycle cgroup")?;
+        } else {
+            signal_descendants(std::process::id(), libc::SIGKILL)
+                .context("kill failed lifecycle descendants")?;
+        }
+        reap_adopted_children().context("reap failed lifecycle descendants")?;
+        if !runtime.workload_populated()? {
+            if let Ok(mut state) = runtime.workload.lock() {
+                state.running = false;
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out proving failed lifecycle containment empty");
+        }
+        thread::sleep(DESCENDANT_POLL_INTERVAL);
+    }
 }
 
 fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
@@ -1484,6 +1527,14 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
                         *pty = None;
                     }
                     runtime.output.fail_subscribers(message);
+                }
+                LifeEvent::WaiterError(message) => {
+                    fatal = Some(message.clone());
+                    if let Ok(mut pty) = runtime.pty_write.lock() {
+                        *pty = None;
+                    }
+                    runtime.output.fail_subscribers(message);
+                    break;
                 }
                 LifeEvent::ChildExit { code, signal } => {
                     child_exit = Some((code, signal));
@@ -1520,11 +1571,23 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
             }
         }
     }
+    if !containment_empty && fatal.is_some() {
+        match cleanup_after_lifecycle_failure(&runtime) {
+            Ok(()) => containment_empty = true,
+            Err(error) => {
+                let message = format!("containment cleanup unproven: {error:#}");
+                fatal = Some(match fatal {
+                    Some(existing) => format!("{existing}; {message}"),
+                    None => message,
+                });
+            }
+        }
+    }
     let (code, signal) = child_exit.unwrap_or((None, None));
-    let (oom, cg) = match runtime.cgroup.lock() {
+    let (oom, mut cg) = match runtime.cgroup.lock() {
         Ok(mut g) => {
-            let cg = g.take();
-            let oom = cg.as_ref().map(Cgroup::oom_killed).unwrap_or(false);
+            let oom = g.as_ref().map(Cgroup::oom_killed).unwrap_or(false);
+            let cg = if containment_empty { g.take() } else { None };
             (oom, cg)
         }
         Err(_) => (false, None),
@@ -1546,6 +1609,41 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         r.exit = Some(exit.clone());
         r.error = error;
     });
+    if !containment_empty {
+        runtime
+            .output
+            .fail_subscribers(fatal.unwrap_or_else(|| "containment cleanup was not proven".into()));
+        // Retain the worker as the subreaper boundary, along with its socket,
+        // cgroup handle, and runtime evidence. A later `a kill` can retry;
+        // this monitor will finalize only after it independently observes the
+        // resulting domain empty and durably records that proof.
+        loop {
+            if let Err(error) = reap_adopted_children() {
+                eprintln!("aplexer worker: reap after lifecycle failure: {error:#}");
+            }
+            match runtime.workload_populated() {
+                Ok(false) => {
+                    if let Err(error) =
+                        runtime.update_record(|record| record.containment_empty = Some(true))
+                    {
+                        eprintln!("aplexer worker: persist delayed containment proof: {error:#}");
+                    } else {
+                        cg = runtime
+                            .cgroup
+                            .lock()
+                            .ok()
+                            .and_then(|mut cgroup| cgroup.take());
+                        break;
+                    }
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    eprintln!("aplexer worker: inspect failed lifecycle containment: {error:#}")
+                }
+            }
+            thread::sleep(DESCENDANT_POLL_INTERVAL);
+        }
+    }
     runtime.output.finish(exit.clone());
     if let Some(cg) = cg {
         cg.cleanup();
