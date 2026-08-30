@@ -3898,6 +3898,23 @@ mod switching_tests {
     use super::*;
 
     #[test]
+    fn control_deadline_bounds_a_silent_worker_and_streaming_can_clear_it() {
+        let (mut client, _silent_worker) = UnixStream::pair().unwrap();
+        set_control_deadlines(&client).unwrap();
+        let started = Instant::now();
+        let error = client.read(&mut [0u8; 1]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        clear_streaming_deadlines(&client).unwrap();
+        assert_eq!(client.read_timeout().unwrap(), None);
+        assert_eq!(client.write_timeout().unwrap(), None);
+    }
+
+    #[test]
     fn persisted_history_tail_is_seeked_and_frame_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.bin");
