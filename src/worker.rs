@@ -10,7 +10,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,9 +51,92 @@ type RecoveredControlSocket = (UnixListener, FileIdentity, Option<FileLock>, Fil
 
 static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static TERMINATION_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
+
+fn notify_termination_event(fd: RawFd) {
+    let value = 1u64;
+    unsafe {
+        libc::write(
+            fd,
+            (&value as *const u64).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        );
+    }
+}
 
 extern "C" fn request_worker_termination(_: libc::c_int) {
     TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+    let fd = TERMINATION_EVENT_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // `write(2)` is async-signal-safe. A nonblocking eventfd coalesces
+        // repeated TERM/INT delivery into one readable counter without a
+        // mutex, allocator, or periodic polling in the monitor thread.
+        notify_termination_event(fd);
+    }
+}
+
+fn create_termination_event() -> Result<RawFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("create worker termination eventfd");
+    }
+    Ok(fd)
+}
+
+fn wait_for_termination_event(fd: RawFd) -> Result<()> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("wait for worker termination event");
+        }
+        if pollfd.revents & libc::POLLIN != 0 {
+            let mut value = 0u64;
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    (&mut value as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) {
+                    continue;
+                }
+                return Err(error).context("read worker termination event");
+            }
+            bail!("short read from worker termination eventfd: {read}");
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            bail!("worker termination eventfd became invalid");
+        }
+    }
+}
+
+fn wait_for_termination_request() -> Result<()> {
+    while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+        let fd = TERMINATION_EVENT_FD.load(Ordering::SeqCst);
+        if fd < 0 {
+            bail!("worker termination eventfd is not installed");
+        }
+        wait_for_termination_event(fd)?;
+    }
+    Ok(())
 }
 
 /// The launcher blocks TERM/INT before exec so no timeout signal can land in
@@ -62,6 +145,8 @@ extern "C" fn request_worker_termination(_: libc::c_int) {
 /// startup cancellation whose guard can unwind all resources.
 fn install_termination_handlers() -> Result<()> {
     TERMINATION_REQUESTED.store(false, Ordering::SeqCst);
+    let event_fd = create_termination_event()?;
+    TERMINATION_EVENT_FD.store(event_fd, Ordering::SeqCst);
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = request_worker_termination as *const () as usize;
@@ -69,6 +154,8 @@ fn install_termination_handlers() -> Result<()> {
         libc::sigemptyset(&mut action.sa_mask);
         for signal in [libc::SIGTERM, libc::SIGINT] {
             if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                TERMINATION_EVENT_FD.store(-1, Ordering::SeqCst);
+                libc::close(event_fd);
                 return Err(io::Error::last_os_error())
                     .with_context(|| format!("install signal handler {signal}"));
             }
@@ -79,6 +166,8 @@ fn install_termination_handlers() -> Result<()> {
         libc::sigaddset(&mut unblocked, libc::SIGINT);
         let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblocked, std::ptr::null_mut());
         if rc != 0 {
+            TERMINATION_EVENT_FD.store(-1, Ordering::SeqCst);
+            libc::close(event_fd);
             return Err(io::Error::from_raw_os_error(rc))
                 .context("unblock worker termination signals");
         }
@@ -116,9 +205,7 @@ fn after_workload_spawn_checkpoint(pid: u32) -> Result<()> {
     }
     #[cfg(feature = "startup-test-hooks")]
     if env::var("APLEXER_TEST_PAUSE_WORKER_STARTUP_AT").as_deref() == Ok("after_workload_spawn") {
-        while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_termination_request()?;
     }
     #[cfg(not(feature = "startup-test-hooks"))]
     let _ = pid;
@@ -457,6 +544,30 @@ mod tests {
             dir.path().join("screen.txt"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn termination_event_blocks_without_timer_and_wakes_on_notification() {
+        let fd = create_termination_event().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(wait_for_termination_event(fd)).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        notify_termination_event(fd);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("eventfd notification did not wake waiter")
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     #[test]
@@ -2100,8 +2211,9 @@ fn persist_activity_checkpoint(
 }
 
 fn run_termination_monitor(runtime: Arc<WorkerRuntime>) {
-    while !TERMINATION_REQUESTED.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(10));
+    if let Err(error) = wait_for_termination_request() {
+        eprintln!("aplexer worker: wait for termination request: {error:#}");
+        return;
     }
     if let Err(error) = runtime.kill(libc::SIGTERM, 500) {
         eprintln!("aplexer worker: terminate contained workload: {error:#}");
