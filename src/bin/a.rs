@@ -458,6 +458,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // `a` is a standalone process, so it can safely repair an inherited
+    // auto-reaping SIGCHLD disposition before any subcommand spawns a child.
+    // The embeddable Rust/Python API only validates and preserves its host.
+    normalize_sigchld_for_child_management()?;
     let args = rewrite_quick_attach_args(std::env::args().collect());
     let cli = Cli::parse_from(args);
     let paths = Paths::discover()?;

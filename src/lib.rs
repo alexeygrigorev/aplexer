@@ -40,10 +40,9 @@ const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
 
-/// Child ownership through `std::process::Child` requires the normal
-/// SIGCHLD disposition. In particular, an inherited SIG_IGN/SA_NOCLDWAIT can
-/// make the kernel auto-reap children before `Child::wait`, destroying both
-/// exit reporting and the worker's subreaper containment boundary.
+/// Restore the standalone process contract needed by `std::process::Child`.
+/// This changes a process-wide disposition and is therefore reserved for the
+/// CLI and worker binaries, never the embeddable Rust/Python API.
 pub fn normalize_sigchld_for_child_management() -> Result<()> {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -52,6 +51,29 @@ pub fn normalize_sigchld_for_child_management() -> Result<()> {
         libc::sigemptyset(&mut action.sa_mask);
         if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0 {
             return Err(io::Error::last_os_error()).context("restore SIGCHLD default disposition");
+        }
+    }
+    Ok(())
+}
+
+/// Validate, without changing it, the embedding process's SIGCHLD contract.
+/// Custom handlers remain installed. SIG_IGN and SA_NOCLDWAIT are rejected
+/// because either may auto-reap a worker before the API can wait for it.
+pub fn ensure_sigchld_compatible_for_child_management() -> Result<()> {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) != 0 {
+            return Err(io::Error::last_os_error()).context("inspect SIGCHLD disposition");
+        }
+        if action.sa_sigaction == libc::SIG_IGN {
+            bail!(
+                "SIGCHLD disposition is SIG_IGN; in-process session startup requires child wait ownership"
+            );
+        }
+        if action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            bail!(
+                "SIGCHLD disposition uses SA_NOCLDWAIT; in-process session startup requires child wait ownership"
+            );
         }
     }
     Ok(())
@@ -2055,7 +2077,6 @@ impl Cgroup {
         if !limits.requested() {
             return Ok(None);
         }
-        normalize_sigchld_for_child_management()?;
         let identity = current_cgroup_identity()?;
         // Resolve every executable before starting the scope. Ambient PATH is
         // intentionally irrelevant: a user-controlled shadow helper must not
