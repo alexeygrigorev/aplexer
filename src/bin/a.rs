@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::CString;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -1378,7 +1378,7 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
                 if matches!(record.phase, Phase::Exited | Phase::Failed)
                     || !record.worker_alive() =>
             {
-                match read_history_tail(&record.history_path, args.bytes) {
+                match read_persisted_history_tail(&record.history_path, args.bytes) {
                     Ok(bytes) => bytes,
                     Err(read_error) => {
                         check_attachable(&record)?;
@@ -1402,30 +1402,6 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
         io::stdout().write_all(&data)?;
     }
     Ok(())
-}
-
-/// Read only the tail that can fit in one protocol frame. Persisted history
-/// may come from an older configuration with a much larger cap, so loading
-/// the whole file before slicing would let a dead-session capture exhaust the
-/// CLI process even though the equivalent live RPC is frame-bounded.
-fn read_history_tail(path: &Path, requested: Option<usize>) -> Result<Vec<u8>> {
-    let limit = requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let length = file
-        .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?
-        .len();
-    let count = length.min(limit as u64);
-    file.seek(SeekFrom::Start(length - count))
-        .with_context(|| format!("seek {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(count as usize);
-    file.take(count)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read tail of {}", path.display()))?;
-    Ok(bytes)
 }
 
 /// Deletes a session's full on-disk state: the state dir holding
@@ -4543,13 +4519,16 @@ mod switching_tests {
         let path = dir.path().join("history.bin");
         let mut file = fs::File::create(&path).unwrap();
         file.set_len(1024 * 1024 * 1024).unwrap();
-        file.seek(SeekFrom::End(-4)).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::End(-4)).unwrap();
         file.write_all(b"tail").unwrap();
         drop(file);
 
-        assert_eq!(read_history_tail(&path, Some(4)).unwrap(), b"tail");
+        assert_eq!(
+            read_persisted_history_tail(&path, Some(4)).unwrap(),
+            b"tail"
+        );
 
-        let bounded = read_history_tail(&path, Some(usize::MAX)).unwrap();
+        let bounded = read_persisted_history_tail(&path, Some(usize::MAX)).unwrap();
         assert_eq!(bounded.len(), MAX_FRAME_BYTES);
         assert_eq!(&bounded[bounded.len() - 4..], b"tail");
     }

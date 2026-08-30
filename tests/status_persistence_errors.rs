@@ -131,6 +131,13 @@ fn live_history_degradation_is_visible_without_stopping_the_workload() {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
     fs::create_dir(&history).unwrap();
+    for slot in 0..2 {
+        let commit = history.with_file_name(format!("history.bin.v2.commit.{slot}"));
+        if let Err(error) = fs::remove_file(&commit) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+        fs::create_dir(&commit).unwrap();
+    }
 
     let marker = "still-responsive-after-history-error";
     let sent = command(&runtime, &state, &config)

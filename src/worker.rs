@@ -502,7 +502,7 @@ impl OutputHub {
                 .terminal
                 .get_or_insert_with(|| OutputEvent::Exit(exit.clone()))
                 .clone();
-            if let Err(error) = inner.history.flush() {
+            if let Err(error) = inner.history.flush_final() {
                 eprintln!("aplexer worker: flush history at exit: {error:#}");
                 inner.history_persistence_error = Some(format!("{error:#}"));
             }
@@ -687,7 +687,6 @@ mod tests {
     fn history_failure_does_not_interrupt_live_output_and_can_recover() {
         let dir = tempfile::tempdir().unwrap();
         let history_path = dir.path().join("history.bin");
-        fs::create_dir(&history_path).unwrap();
         let hub = OutputHub::new(
             History::open(history_path.clone(), 1024).unwrap(),
             24,
@@ -703,13 +702,18 @@ mod tests {
             OutputEvent::Data(data) if data == b"still-live"
         ));
         assert_eq!(hub.snapshot(None).unwrap(), b"still-live");
+        let blocked_bank = dir.path().join("history.bin.v2.data.0");
+        fs::create_dir(&blocked_bank).unwrap();
         assert!(hub.flush_history(true).is_err());
         assert!(hub.history_persistence_error().is_some());
 
-        fs::remove_dir(&history_path).unwrap();
+        fs::remove_dir(&blocked_bank).unwrap();
         hub.flush_history(true).unwrap();
         assert!(hub.history_persistence_error().is_none());
-        assert_eq!(fs::read(history_path).unwrap(), b"still-live");
+        assert_eq!(
+            read_persisted_history_tail(&history_path, None).unwrap(),
+            b"still-live"
+        );
     }
 
     #[test]

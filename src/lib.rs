@@ -13,11 +13,12 @@ mod python;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -2001,6 +2002,414 @@ pub enum AttachControl {
 /// much of the tail.
 pub const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+const HISTORY_FORMAT_VERSION: u32 = 2;
+const HISTORY_BANK_MAGIC: &[u8; 8] = b"APLXH2D\0";
+const HISTORY_BANK_HEADER_PREFIX_BYTES: usize = 72;
+const HISTORY_BANK_HEADER_BYTES: usize = HISTORY_BANK_HEADER_PREFIX_BYTES + 32;
+const HISTORY_COMMIT_MAX_BYTES: usize = 4096;
+const HISTORY_BANK_COUNT: u8 = 2;
+const HISTORY_COMMIT_COUNT: u8 = 2;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn history_sidecar_path(path: &Path, kind: &str, slot: u8) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("history.bin"))
+        .to_os_string();
+    name.push(format!(".v2.{kind}.{slot}"));
+    path.with_file_name(name)
+}
+
+fn history_data_path(path: &Path, slot: u8) -> PathBuf {
+    history_sidecar_path(path, "data", slot)
+}
+
+fn history_commit_path(path: &Path, slot: u8) -> PathBuf {
+    history_sidecar_path(path, "commit", slot)
+}
+
+fn history_session_id(path: &Path) -> Uuid {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse().ok())
+        .unwrap_or_else(Uuid::nil)
+}
+
+fn validate_optional_history_node(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => bail!("{label} {} is not a regular file", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {label} {}", path.display())),
+    }
+}
+
+fn open_optional_history_file(path: &Path, label: &str, write: bool) -> Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {label} {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("{label} {} is not a trusted regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+fn validate_history_artifacts(path: &Path) -> Result<()> {
+    validate_optional_history_node(path, "legacy history")?;
+    for slot in 0..HISTORY_BANK_COUNT {
+        let data_path = history_data_path(path, slot);
+        if validate_optional_history_node(&data_path, "history data bank")? {
+            let length = fs::symlink_metadata(&data_path)?.len();
+            let hard_cap = HISTORY_BANK_HEADER_BYTES as u64 + 2 * MAX_HISTORY_BYTES as u64;
+            if length > hard_cap {
+                bail!(
+                    "history data bank {} exceeds the {}-byte hard cap",
+                    data_path.display(),
+                    hard_cap
+                );
+            }
+        }
+    }
+    for slot in 0..HISTORY_COMMIT_COUNT {
+        validate_optional_history_node(&history_commit_path(path, slot), "history commit")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HistoryCommit {
+    format_version: u32,
+    store_id: Uuid,
+    session_id: Uuid,
+    commit_generation: u64,
+    bank_generation: u64,
+    data_slot: u8,
+    capacity: u64,
+    committed_len: u64,
+    stream_end: u64,
+    data_sha256: String,
+    metadata_sha256: String,
+}
+
+impl HistoryCommit {
+    fn seal(mut self) -> Result<Self> {
+        self.metadata_sha256.clear();
+        self.metadata_sha256 = sha256_hex(&serde_json::to_vec(&self)?);
+        Ok(self)
+    }
+
+    fn validate(&self, path: &Path, metadata_slot: u8) -> Result<()> {
+        if self.format_version != HISTORY_FORMAT_VERSION {
+            bail!("unsupported history format {}", self.format_version);
+        }
+        if self.data_slot >= HISTORY_BANK_COUNT {
+            bail!("history commit names invalid data slot {}", self.data_slot);
+        }
+        if self.commit_generation % HISTORY_COMMIT_COUNT as u64 != metadata_slot as u64 {
+            bail!("history commit is stored in the wrong metadata slot");
+        }
+        if self.session_id != history_session_id(path) {
+            bail!("history commit belongs to a different session");
+        }
+        if self.commit_generation == 0 || self.bank_generation == 0 {
+            bail!("history generation counters must be positive");
+        }
+        let capacity = usize::try_from(self.capacity).context("history capacity does not fit")?;
+        validate_history_bytes(capacity)?;
+        let max_payload = self
+            .capacity
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("history bank size overflow"))?;
+        if self.committed_len > max_payload {
+            bail!("history committed length exceeds its bounded bank size");
+        }
+        if self.committed_len > self.stream_end {
+            bail!("history committed length exceeds its logical stream position");
+        }
+        if self.data_sha256.len() != 64
+            || !self
+                .data_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("history commit has an invalid data checksum");
+        }
+        let mut unsigned = self.clone();
+        let supplied = std::mem::take(&mut unsigned.metadata_sha256);
+        let expected = sha256_hex(&serde_json::to_vec(&unsigned)?);
+        if supplied != expected {
+            bail!("history commit metadata checksum mismatch");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryBankHeader {
+    store_id: Uuid,
+    session_id: Uuid,
+    bank_generation: u64,
+    data_slot: u8,
+    capacity: u64,
+}
+
+impl HistoryBankHeader {
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HISTORY_BANK_HEADER_BYTES);
+        bytes.extend_from_slice(HISTORY_BANK_MAGIC);
+        bytes.extend_from_slice(&HISTORY_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(HISTORY_BANK_HEADER_BYTES as u32).to_le_bytes());
+        bytes.extend_from_slice(self.store_id.as_bytes());
+        bytes.extend_from_slice(self.session_id.as_bytes());
+        bytes.extend_from_slice(&self.bank_generation.to_le_bytes());
+        bytes.push(self.data_slot);
+        bytes.extend_from_slice(&[0; 7]);
+        bytes.extend_from_slice(&self.capacity.to_le_bytes());
+        debug_assert_eq!(bytes.len(), HISTORY_BANK_HEADER_PREFIX_BYTES);
+        let checksum = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != HISTORY_BANK_HEADER_BYTES {
+            bail!("history bank header has the wrong length");
+        }
+        if &bytes[..8] != HISTORY_BANK_MAGIC {
+            bail!("history bank magic mismatch");
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != HISTORY_FORMAT_VERSION {
+            bail!("unsupported history bank format {version}");
+        }
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        if header_len != HISTORY_BANK_HEADER_BYTES {
+            bail!("history bank header length is invalid");
+        }
+        let expected = Sha256::digest(&bytes[..HISTORY_BANK_HEADER_PREFIX_BYTES]);
+        if expected.as_slice() != &bytes[HISTORY_BANK_HEADER_PREFIX_BYTES..] {
+            bail!("history bank header checksum mismatch");
+        }
+        let store_id = Uuid::from_slice(&bytes[16..32]).context("parse history store id")?;
+        let session_id = Uuid::from_slice(&bytes[32..48]).context("parse history session id")?;
+        let bank_generation = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+        let data_slot = bytes[56];
+        if bytes[57..64].iter().any(|byte| *byte != 0) {
+            bail!("history bank reserved header bytes are nonzero");
+        }
+        let capacity = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        Ok(Self {
+            store_id,
+            session_id,
+            bank_generation,
+            data_slot,
+            capacity,
+        })
+    }
+}
+
+struct RecoveredHistory {
+    commit: HistoryCommit,
+    tail: Vec<u8>,
+    data_hasher: Sha256,
+}
+
+fn read_history_commit(path: &Path, slot: u8) -> Result<Option<HistoryCommit>> {
+    let commit_path = history_commit_path(path, slot);
+    let Some(file) = open_optional_history_file(&commit_path, "history commit", false)? else {
+        return Ok(None);
+    };
+    let length = file.metadata()?.len();
+    if length > HISTORY_COMMIT_MAX_BYTES as u64 {
+        bail!(
+            "history commit {} exceeds the {}-byte cap",
+            commit_path.display(),
+            HISTORY_COMMIT_MAX_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(HISTORY_COMMIT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read history commit {}", commit_path.display()))?;
+    if bytes.len() > HISTORY_COMMIT_MAX_BYTES {
+        bail!("history commit {} exceeds its cap", commit_path.display());
+    }
+    let commit: HistoryCommit = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse history commit {}", commit_path.display()))?;
+    commit
+        .validate(path, slot)
+        .with_context(|| format!("validate history commit {}", commit_path.display()))?;
+    Ok(Some(commit))
+}
+
+fn recover_history_candidate(
+    path: &Path,
+    commit: HistoryCommit,
+    tail_limit: usize,
+) -> Result<RecoveredHistory> {
+    let data_path = history_data_path(path, commit.data_slot);
+    let mut file = open_optional_history_file(&data_path, "history data bank", false)?
+        .ok_or_else(|| anyhow!("history data bank is missing: {}", data_path.display()))?;
+    let physical_len = file.metadata()?.len();
+    let max_payload = commit
+        .capacity
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("history bank size overflow"))?;
+    let max_physical = (HISTORY_BANK_HEADER_BYTES as u64)
+        .checked_add(max_payload)
+        .ok_or_else(|| anyhow!("history physical size overflow"))?;
+    let committed_physical = (HISTORY_BANK_HEADER_BYTES as u64)
+        .checked_add(commit.committed_len)
+        .ok_or_else(|| anyhow!("history committed size overflow"))?;
+    if physical_len < committed_physical {
+        bail!("history data bank is shorter than its committed prefix");
+    }
+    if physical_len > max_physical {
+        bail!("history data bank exceeds its bounded physical size");
+    }
+    let mut header_bytes = vec![0; HISTORY_BANK_HEADER_BYTES];
+    file.read_exact(&mut header_bytes)
+        .context("read history bank header")?;
+    let header = HistoryBankHeader::decode(&header_bytes)?;
+    if header.store_id != commit.store_id
+        || header.session_id != commit.session_id
+        || header.bank_generation != commit.bank_generation
+        || header.data_slot != commit.data_slot
+        || header.capacity != commit.capacity
+    {
+        bail!("history data bank does not match its commit metadata");
+    }
+    let committed_len = usize::try_from(commit.committed_len)
+        .context("history committed length does not fit memory")?;
+    let mut payload = Vec::with_capacity(committed_len);
+    file.take(commit.committed_len)
+        .read_to_end(&mut payload)
+        .context("read committed history payload")?;
+    if payload.len() != committed_len {
+        bail!("history data bank ended inside its committed prefix");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    if format!("{:x}", hasher.clone().finalize()) != commit.data_sha256 {
+        bail!("history data checksum mismatch");
+    }
+    let count = tail_limit.min(commit.capacity as usize).min(payload.len());
+    let tail = payload[payload.len() - count..].to_vec();
+    Ok(RecoveredHistory {
+        commit,
+        tail,
+        data_hasher: hasher,
+    })
+}
+
+fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<Option<RecoveredHistory>> {
+    validate_history_artifacts(path)?;
+    let mut metadata_seen = false;
+    let mut valid = Vec::new();
+    let mut failures = Vec::new();
+    for slot in 0..HISTORY_COMMIT_COUNT {
+        match read_history_commit(path, slot) {
+            Ok(Some(commit)) => {
+                metadata_seen = true;
+                match recover_history_candidate(path, commit, tail_limit) {
+                    Ok(candidate) => valid.push(candidate),
+                    Err(error) => failures.push(format!("commit slot {slot}: {error:#}")),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                metadata_seen = true;
+                failures.push(format!("commit slot {slot}: {error:#}"));
+            }
+        }
+    }
+    if valid.is_empty() {
+        if metadata_seen {
+            bail!(
+                "no valid committed history generation remains: {}",
+                failures.join("; ")
+            );
+        }
+        return Ok(None);
+    }
+    valid.sort_by_key(|candidate| candidate.commit.commit_generation);
+    if valid.len() >= 2 {
+        let newest = &valid[valid.len() - 1];
+        let previous = &valid[valid.len() - 2];
+        if newest.commit.commit_generation == previous.commit.commit_generation
+            && newest.commit != previous.commit
+        {
+            bail!("conflicting history commits have the same generation");
+        }
+    }
+    Ok(valid.pop())
+}
+
+struct LegacyHistory {
+    tail: Vec<u8>,
+    total_len: u64,
+    present: bool,
+}
+
+fn read_legacy_history_tail(path: &Path, limit: usize) -> Result<LegacyHistory> {
+    let Some(mut file) = open_optional_history_file(path, "legacy history", false)? else {
+        return Ok(LegacyHistory {
+            tail: Vec::new(),
+            total_len: 0,
+            present: false,
+        });
+    };
+    let total_len = file.metadata()?.len();
+    let count = total_len.min(limit as u64);
+    file.seek(SeekFrom::Start(total_len - count))
+        .with_context(|| format!("seek legacy history {}", path.display()))?;
+    let mut tail = Vec::with_capacity(count as usize);
+    file.take(count)
+        .read_to_end(&mut tail)
+        .with_context(|| format!("read legacy history tail {}", path.display()))?;
+    Ok(LegacyHistory {
+        tail,
+        total_len,
+        present: true,
+    })
+}
+
+/// Read a byte-exact, frame-bounded persisted tail from either the v2
+/// generation store or a legacy raw `history.bin`. Once any v2 commit exists,
+/// corruption fails closed instead of falling back to potentially stale raw
+/// bytes.
+pub fn read_persisted_history_tail(path: &Path, requested: Option<usize>) -> Result<Vec<u8>> {
+    let limit = requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES);
+    if let Some(recovered) = recover_v2_history(path, limit)? {
+        return Ok(recovered.tail);
+    }
+    Ok(read_legacy_history_tail(path, limit)?.tail)
+}
+
 /// A raw byte log -- no line/wrap-flag structure, and it must stay that way.
 /// If a future feature wants to render captured history at a specific width,
 /// implement it by replaying these bytes into a *fresh* `vt100::Parser`
@@ -2012,38 +2421,101 @@ pub struct History {
     path: PathBuf,
     cap: usize,
     bytes: VecDeque<u8>,
+    pending: VecDeque<u8>,
     dirty: bool,
+    observed_end: u64,
+    durable_end: u64,
+    persisted: Option<RecoveredHistory>,
+    #[cfg(test)]
+    data_bytes_written: u64,
 }
 impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
         validate_history_bytes(cap)?;
-        let existing = fs::read(&path).unwrap_or_default();
-        let start = existing.len().saturating_sub(cap);
-        let bytes = existing[start..].iter().copied().collect();
-        Ok(Self {
+        let recovered = recover_v2_history(&path, cap)?;
+        let legacy = if recovered.is_none() {
+            Some(read_legacy_history_tail(&path, cap)?)
+        } else {
+            None
+        };
+        let (bytes, observed_end, persisted, legacy_present, legacy_total_len) =
+            if let Some(recovered) = recovered {
+                let stream_end = recovered.commit.stream_end;
+                (
+                    recovered.tail.iter().copied().collect(),
+                    stream_end,
+                    Some(recovered),
+                    false,
+                    0,
+                )
+            } else {
+                let legacy = legacy.expect("legacy state is loaded without v2 metadata");
+                (
+                    legacy.tail.iter().copied().collect(),
+                    legacy.total_len,
+                    None,
+                    legacy.present,
+                    legacy.total_len,
+                )
+            };
+        let mut history = Self {
             path,
             cap,
             bytes,
+            pending: VecDeque::new(),
             dirty: false,
-        })
+            observed_end,
+            durable_end: observed_end,
+            persisted,
+            #[cfg(test)]
+            data_bytes_written: 0,
+        };
+        let needs_capacity_migration = history
+            .persisted
+            .as_ref()
+            .is_some_and(|persisted| persisted.commit.capacity != cap as u64);
+        if legacy_present || needs_capacity_migration {
+            history.publish_compaction()?;
+        }
+        let compatibility_len = fs::symlink_metadata(&history.path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.len())
+            .unwrap_or(legacy_total_len);
+        if compatibility_len > cap as u64 {
+            history.write_legacy_compatibility()?;
+        }
+        Ok(history)
     }
     /// Appends only to the in-memory ring. Persisting from this hot path can
     /// both throttle PTY output and turn a disk failure into a PTY failure,
     /// so the worker owns periodic and final `flush()` attempts separately.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
-        if self.cap == 0 {
-            return Ok(());
-        }
-        if data.len() >= self.cap {
-            self.bytes.clear();
-            self.bytes
-                .extend(data[data.len() - self.cap..].iter().copied());
-        } else {
-            self.bytes.extend(data.iter().copied());
-            while self.bytes.len() > self.cap {
-                self.bytes.pop_front();
+        let added = u64::try_from(data.len()).context("history append length does not fit u64")?;
+        let next_end = self
+            .observed_end
+            .checked_add(added)
+            .ok_or_else(|| anyhow!("history stream position overflow"))?;
+        if self.cap > 0 {
+            if data.len() >= self.cap {
+                self.bytes.clear();
+                self.bytes
+                    .extend(data[data.len() - self.cap..].iter().copied());
+                self.pending.clear();
+                self.pending
+                    .extend(data[data.len() - self.cap..].iter().copied());
+            } else {
+                self.bytes.extend(data.iter().copied());
+                self.pending.extend(data.iter().copied());
+                while self.bytes.len() > self.cap {
+                    self.bytes.pop_front();
+                }
+                while self.pending.len() > self.cap {
+                    self.pending.pop_front();
+                }
             }
         }
+        self.observed_end = next_end;
         self.dirty = true;
         Ok(())
     }
@@ -2051,11 +2523,202 @@ impl History {
         if !self.dirty {
             return Ok(());
         }
+        let Some(persisted) = self.persisted.as_ref() else {
+            return self.publish_compaction();
+        };
+        let pending_span = self
+            .observed_end
+            .checked_sub(self.durable_end)
+            .ok_or_else(|| anyhow!("history durable position exceeds observed position"))?;
+        let pending_is_contiguous = self.cap == 0 || pending_span == self.pending.len() as u64;
+        let resulting_len = persisted
+            .commit
+            .committed_len
+            .checked_add(self.pending.len() as u64)
+            .ok_or_else(|| anyhow!("history committed length overflow"))?;
+        if !pending_is_contiguous || resulting_len > (self.cap as u64).saturating_mul(2) {
+            return self.publish_compaction();
+        }
+        self.publish_append()
+    }
+
+    /// Finalize v2 first, then publish one raw tail snapshot for older clients
+    /// that know only `history.bin`. This full-tail write happens once at a
+    /// clean terminal transition, never on the 500 ms periodic path.
+    pub fn flush_final(&mut self) -> Result<()> {
+        self.flush()?;
+        self.write_legacy_compatibility()
+    }
+
+    fn write_legacy_compatibility(&self) -> Result<()> {
+        validate_optional_history_node(&self.path, "legacy history")?;
         let contiguous: Vec<u8> = self.bytes.iter().copied().collect();
-        atomic_write_bytes(&self.path, &contiguous)?;
+        atomic_write_bytes(&self.path, &contiguous)
+            .with_context(|| format!("publish legacy history tail {}", self.path.display()))
+    }
+
+    fn next_commit_generation(&self) -> Result<u64> {
+        self.persisted
+            .as_ref()
+            .map(|persisted| {
+                persisted
+                    .commit
+                    .commit_generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("history commit generation overflow"))
+            })
+            .unwrap_or(Ok(1))
+    }
+
+    fn publish_commit(&self, commit: HistoryCommit) -> Result<HistoryCommit> {
+        let commit = commit.seal()?;
+        let slot = (commit.commit_generation % HISTORY_COMMIT_COUNT as u64) as u8;
+        let path = history_commit_path(&self.path, slot);
+        validate_optional_history_node(&path, "history commit")?;
+        let serialized = serde_json::to_vec(&commit)?;
+        if serialized.len() > HISTORY_COMMIT_MAX_BYTES {
+            bail!("history commit exceeds its bounded metadata size");
+        }
+        atomic_write_json(&path, &commit)
+            .with_context(|| format!("publish history commit {}", path.display()))?;
+        Ok(commit)
+    }
+
+    fn publish_append(&mut self) -> Result<()> {
+        let persisted = self
+            .persisted
+            .as_ref()
+            .ok_or_else(|| anyhow!("history append has no committed bank"))?;
+        let data_path = history_data_path(&self.path, persisted.commit.data_slot);
+        let mut file = open_optional_history_file(&data_path, "history data bank", true)?
+            .ok_or_else(|| anyhow!("history data bank disappeared: {}", data_path.display()))?;
+        let committed_physical = (HISTORY_BANK_HEADER_BYTES as u64)
+            .checked_add(persisted.commit.committed_len)
+            .ok_or_else(|| anyhow!("history append offset overflow"))?;
+        let physical_len = file.metadata()?.len();
+        if physical_len < committed_physical {
+            bail!("history data bank is shorter than its committed prefix");
+        }
+        let max_physical = (HISTORY_BANK_HEADER_BYTES as u64)
+            .checked_add((self.cap as u64).saturating_mul(2))
+            .ok_or_else(|| anyhow!("history bank bound overflow"))?;
+        if physical_len > max_physical {
+            bail!("history data bank exceeds its bounded physical size");
+        }
+        if physical_len != committed_physical {
+            file.set_len(committed_physical)
+                .context("discard uncommitted history suffix")?;
+        }
+        file.seek(SeekFrom::Start(committed_physical))?;
+        let pending: Vec<u8> = self.pending.iter().copied().collect();
+        file.write_all(&pending).context("append history payload")?;
+        file.sync_data().context("sync appended history payload")?;
+
+        let mut hasher = persisted.data_hasher.clone();
+        hasher.update(&pending);
+        let committed_len = persisted
+            .commit
+            .committed_len
+            .checked_add(pending.len() as u64)
+            .ok_or_else(|| anyhow!("history committed length overflow"))?;
+        let commit = HistoryCommit {
+            format_version: HISTORY_FORMAT_VERSION,
+            store_id: persisted.commit.store_id,
+            session_id: persisted.commit.session_id,
+            commit_generation: self.next_commit_generation()?,
+            bank_generation: persisted.commit.bank_generation,
+            data_slot: persisted.commit.data_slot,
+            capacity: self.cap as u64,
+            committed_len,
+            stream_end: self.observed_end,
+            data_sha256: format!("{:x}", hasher.clone().finalize()),
+            metadata_sha256: String::new(),
+        };
+        let commit = self.publish_commit(commit)?;
+        #[cfg(test)]
+        {
+            self.data_bytes_written = self.data_bytes_written.saturating_add(pending.len() as u64);
+        }
+        self.persisted = Some(RecoveredHistory {
+            commit,
+            tail: Vec::new(),
+            data_hasher: hasher,
+        });
+        self.durable_end = self.observed_end;
+        self.pending.clear();
         self.dirty = false;
         Ok(())
     }
+
+    fn publish_compaction(&mut self) -> Result<()> {
+        let store_id = self
+            .persisted
+            .as_ref()
+            .map(|persisted| persisted.commit.store_id)
+            .unwrap_or_else(Uuid::new_v4);
+        let bank_generation = self
+            .persisted
+            .as_ref()
+            .map(|persisted| {
+                persisted
+                    .commit
+                    .bank_generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("history bank generation overflow"))
+            })
+            .unwrap_or(Ok(1))?;
+        let data_slot = self
+            .persisted
+            .as_ref()
+            .map(|persisted| (persisted.commit.data_slot + 1) % HISTORY_BANK_COUNT)
+            .unwrap_or(0);
+        let header = HistoryBankHeader {
+            store_id,
+            session_id: history_session_id(&self.path),
+            bank_generation,
+            data_slot,
+            capacity: self.cap as u64,
+        };
+        let snapshot: Vec<u8> = self.bytes.iter().copied().collect();
+        let mut bank = header.encode();
+        bank.extend_from_slice(&snapshot);
+        let data_path = history_data_path(&self.path, data_slot);
+        validate_optional_history_node(&data_path, "history data bank")?;
+        atomic_write_bytes(&data_path, &bank)
+            .with_context(|| format!("publish history data bank {}", data_path.display()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&snapshot);
+        let commit = HistoryCommit {
+            format_version: HISTORY_FORMAT_VERSION,
+            store_id,
+            session_id: header.session_id,
+            commit_generation: self.next_commit_generation()?,
+            bank_generation,
+            data_slot,
+            capacity: self.cap as u64,
+            committed_len: snapshot.len() as u64,
+            stream_end: self.observed_end,
+            data_sha256: format!("{:x}", hasher.clone().finalize()),
+            metadata_sha256: String::new(),
+        };
+        let commit = self.publish_commit(commit)?;
+        #[cfg(test)]
+        {
+            self.data_bytes_written = self
+                .data_bytes_written
+                .saturating_add(snapshot.len() as u64);
+        }
+        self.persisted = Some(RecoveredHistory {
+            commit,
+            tail: Vec::new(),
+            data_hasher: hasher,
+        });
+        self.durable_end = self.observed_end;
+        self.pending.clear();
+        self.dirty = false;
+        Ok(())
+    }
+
     pub fn snapshot(&self, max: Option<usize>) -> Vec<u8> {
         let count = max.unwrap_or(self.bytes.len()).min(self.bytes.len());
         self.bytes
@@ -3573,6 +4236,141 @@ mod tests {
     }
 
     #[test]
+    fn history_incremental_flush_writes_only_delta_and_recovers_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 8).unwrap();
+
+        history.append(b"abcdef").unwrap();
+        history.flush().unwrap();
+        assert_eq!(history.data_bytes_written, 6);
+        history.append(b"\0g").unwrap();
+        history.flush().unwrap();
+        assert_eq!(history.data_bytes_written, 8);
+        history.append(b"hi").unwrap();
+        history.flush().unwrap();
+        assert_eq!(history.data_bytes_written, 10);
+        assert_eq!(history.snapshot(None), b"cdef\0ghi");
+
+        let reopened = History::open(path.clone(), 8).unwrap();
+        assert_eq!(reopened.snapshot(None), b"cdef\0ghi");
+        assert_eq!(
+            read_persisted_history_tail(&path, None).unwrap(),
+            b"cdef\0ghi"
+        );
+    }
+
+    #[test]
+    fn history_uncommitted_suffix_is_ignored_and_truncated_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"safe").unwrap();
+        history.flush().unwrap();
+
+        let data_path = history_data_path(&path, 0);
+        OpenOptions::new()
+            .append(true)
+            .open(&data_path)
+            .unwrap()
+            .write_all(b"torn")
+            .unwrap();
+        let mut reopened = History::open(path.clone(), 16).unwrap();
+        assert_eq!(reopened.snapshot(None), b"safe");
+        reopened.append(b"-next").unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(
+            History::open(path, 16).unwrap().snapshot(None),
+            b"safe-next"
+        );
+    }
+
+    #[test]
+    fn history_corrupt_newest_commit_recovers_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 16).unwrap();
+        history.append(b"prior").unwrap();
+        history.flush().unwrap();
+        history.append(b"-newest").unwrap();
+        history.flush().unwrap();
+
+        fs::write(history_commit_path(&path, 0), b"{torn").unwrap();
+        let reopened = History::open(path.clone(), 16).unwrap();
+        assert_eq!(reopened.snapshot(None), b"prior");
+        assert_eq!(read_persisted_history_tail(&path, None).unwrap(), b"prior");
+    }
+
+    #[test]
+    fn history_compaction_is_bounded_and_amortized_by_new_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut history = History::open(path.clone(), 4).unwrap();
+        history.append(b"abcd").unwrap();
+        history.flush().unwrap();
+        history.append(b"efgh").unwrap();
+        history.flush().unwrap();
+        history.append(b"i").unwrap();
+        history.flush().unwrap();
+
+        assert_eq!(history.snapshot(None), b"fghi");
+        assert_eq!(history.data_bytes_written, 12);
+        for slot in 0..HISTORY_BANK_COUNT {
+            let data_path = history_data_path(&path, slot);
+            if let Ok(metadata) = fs::metadata(data_path) {
+                assert!(
+                    metadata.len() <= HISTORY_BANK_HEADER_BYTES as u64 + 2 * history.cap as u64
+                );
+            }
+        }
+        assert_eq!(History::open(path, 4).unwrap().snapshot(None), b"fghi");
+    }
+
+    #[test]
+    fn history_legacy_migration_and_capacity_changes_keep_only_exact_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        fs::write(&path, b"0123456789").unwrap();
+
+        let mut migrated = History::open(path.clone(), 4).unwrap();
+        assert_eq!(migrated.snapshot(None), b"6789");
+        assert_eq!(fs::read(&path).unwrap(), b"6789");
+        migrated.append(b"AB").unwrap();
+        migrated.flush().unwrap();
+        assert_eq!(read_persisted_history_tail(&path, None).unwrap(), b"89AB");
+        assert_eq!(fs::read(&path).unwrap(), b"6789");
+        migrated.flush_final().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"89AB");
+
+        let shrunk = History::open(path.clone(), 3).unwrap();
+        assert_eq!(shrunk.snapshot(None), b"9AB");
+        let mut grown = History::open(path.clone(), 6).unwrap();
+        assert_eq!(grown.snapshot(None), b"9AB");
+        grown.append(b"CD").unwrap();
+        grown.flush().unwrap();
+        assert_eq!(History::open(path, 6).unwrap().snapshot(None), b"9ABCD");
+    }
+
+    #[test]
+    fn history_special_files_fail_without_becoming_persistence_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"unrelated").unwrap();
+        let legacy = dir.path().join("history.bin");
+        symlink(&target, &legacy).unwrap();
+        assert!(History::open(legacy.clone(), 8).is_err());
+        assert!(read_persisted_history_tail(&legacy, None).is_err());
+        fs::remove_file(&legacy).unwrap();
+
+        let commit = history_commit_path(&legacy, 0);
+        let commit_c = CString::new(commit.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(commit_c.as_ptr(), 0o600) }, 0);
+        assert!(History::open(legacy.clone(), 8).is_err());
+        assert!(read_persisted_history_tail(&legacy, None).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unrelated");
+    }
+
+    #[test]
     fn history_capacity_has_one_global_limit_and_zero_stays_disabled() {
         for value in [0, 1, DEFAULT_HISTORY_BYTES, MAX_HISTORY_BYTES] {
             assert_eq!(validate_history_bytes(value).unwrap(), value);
@@ -3590,6 +4388,7 @@ mod tests {
         history.flush().unwrap();
         assert!(history.snapshot(None).is_empty());
         assert!(!path.exists());
+        assert!(read_persisted_history_tail(&path, None).unwrap().is_empty());
         assert!(History::open(dir.path().join("too-large"), MAX_HISTORY_BYTES + 1).is_err());
     }
 

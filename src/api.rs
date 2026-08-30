@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -24,10 +24,10 @@ use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json,
     kill_grace_duration, list_records, parse_byte_size, process_start_time_ticks,
-    public_session_record, read_frame, read_record, read_session_record, resolve_record,
-    session_metadata_env, validate_tag, worker_executable, write_frame, write_json, Config,
-    FileLock, FrameKind, Limits, Operation, Paths, Phase, Request, Response, SessionRecord,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, SCHEMA_VERSION,
+    public_session_record, read_frame, read_persisted_history_tail, read_record,
+    read_session_record, resolve_record, session_metadata_env, validate_tag, worker_executable,
+    write_frame, write_json, Config, FileLock, FrameKind, Limits, Operation, Paths, Phase, Request,
+    Response, SessionRecord, MAX_FRAME_BYTES, PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -1198,26 +1198,6 @@ fn rpc_capture(record: &SessionRecord, max_bytes: Option<usize>) -> Result<Vec<u
     Ok(frame.payload)
 }
 
-fn read_history_tail(path: &Path, requested: Option<usize>) -> Result<Vec<u8>> {
-    let limit = requested.unwrap_or(MAX_FRAME_BYTES).min(MAX_FRAME_BYTES);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let length = file
-        .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?
-        .len();
-    let count = length.min(limit as u64);
-    file.seek(SeekFrom::Start(length - count))
-        .with_context(|| format!("seek {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(count as usize);
-    file.take(count)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read tail of {}", path.display()))?;
-    Ok(bytes)
-}
-
 /// Capture live history bytes, falling back to the bounded persisted tail only
 /// when the worker is terminal or known gone.
 pub fn capture_bytes(paths: &Paths, selector: &str, max_bytes: Option<usize>) -> Result<Vec<u8>> {
@@ -1225,7 +1205,7 @@ pub fn capture_bytes(paths: &Paths, selector: &str, max_bytes: Option<usize>) ->
     match rpc_capture(&record, max_bytes) {
         Ok(data) => Ok(data),
         Err(_) if record.worker_finished() || !record.worker_alive() => {
-            read_history_tail(&record.history_path, max_bytes)
+            read_persisted_history_tail(&record.history_path, max_bytes)
                 .context("worker unavailable and persisted history cannot be read")
         }
         Err(error) => Err(error).context(
