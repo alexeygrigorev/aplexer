@@ -1,3 +1,4 @@
+use aplexer::read_persisted_history_tail;
 use serde_json::Value;
 use std::fs;
 #[cfg(feature = "startup-test-hooks")]
@@ -450,6 +451,11 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
     assert!(archived.join("session.json").exists());
     assert_eq!(
         fs::read(archived.join("history.bin")).expect("read archived history"),
+        b"archived-evidence\r\n"
+    );
+    assert_eq!(
+        read_persisted_history_tail(&archived.join("history.bin"), None)
+            .expect("recover archived v2 history"),
         b"archived-evidence\r\n"
     );
     assert!(!harness

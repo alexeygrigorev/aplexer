@@ -706,10 +706,12 @@ mod tests {
         fs::create_dir(&blocked_bank).unwrap();
         assert!(hub.flush_history(true).is_err());
         assert!(hub.history_persistence_error().is_some());
+        assert_eq!(fs::read(&history_path).unwrap(), b"still-live");
 
         fs::remove_dir(&blocked_bank).unwrap();
         hub.flush_history(true).unwrap();
         assert!(hub.history_persistence_error().is_none());
+        assert_eq!(fs::read(&history_path).unwrap(), b"still-live");
         assert_eq!(
             read_persisted_history_tail(&history_path, None).unwrap(),
             b"still-live"

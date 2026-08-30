@@ -2425,6 +2425,9 @@ pub struct History {
     dirty: bool,
     observed_end: u64,
     durable_end: u64,
+    compatibility_end: u64,
+    compatibility_len: u64,
+    compatibility_known: bool,
     persisted: Option<RecoveredHistory>,
     #[cfg(test)]
     data_bytes_written: u64,
@@ -2433,6 +2436,7 @@ impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
         validate_history_bytes(cap)?;
         let recovered = recover_v2_history(&path, cap)?;
+        let had_v2 = recovered.is_some();
         let legacy = if recovered.is_none() {
             Some(read_legacy_history_tail(&path, cap)?)
         } else {
@@ -2466,6 +2470,9 @@ impl History {
             dirty: false,
             observed_end,
             durable_end: observed_end,
+            compatibility_end: if legacy_present { observed_end } else { 0 },
+            compatibility_len: if legacy_present { legacy_total_len } else { 0 },
+            compatibility_known: !had_v2,
             persisted,
             #[cfg(test)]
             data_bytes_written: 0,
@@ -2474,16 +2481,17 @@ impl History {
             .persisted
             .as_ref()
             .is_some_and(|persisted| persisted.commit.capacity != cap as u64);
+        if legacy_present && legacy_total_len > cap as u64 {
+            history.repair_legacy_compatibility()?;
+        }
         if legacy_present || needs_capacity_migration {
             history.publish_compaction()?;
         }
-        let compatibility_len = fs::symlink_metadata(&history.path)
-            .ok()
-            .filter(|metadata| metadata.file_type().is_file())
-            .map(|metadata| metadata.len())
-            .unwrap_or(legacy_total_len);
-        if compatibility_len > cap as u64 {
-            history.write_legacy_compatibility()?;
+        if had_v2 {
+            // V2 is authoritative after a crash or partial compatibility
+            // write. Rebuild the raw view once at worker restart so an old
+            // client cannot observe a duplicated or stale suffix.
+            history.repair_legacy_compatibility()?;
         }
         Ok(history)
     }
@@ -2523,6 +2531,11 @@ impl History {
         if !self.dirty {
             return Ok(());
         }
+        // Publish and sync the old-client raw view before committing v2. If
+        // this fails, v2 remains at the prior generation and dirty state is
+        // retained for retry. If v2 then fails, compatibility_end prevents a
+        // retry from appending the same bytes twice.
+        self.flush_legacy_compatibility()?;
         let Some(persisted) = self.persisted.as_ref() else {
             return self.publish_compaction();
         };
@@ -2547,14 +2560,89 @@ impl History {
     /// clean terminal transition, never on the 500 ms periodic path.
     pub fn flush_final(&mut self) -> Result<()> {
         self.flush()?;
-        self.write_legacy_compatibility()
+        self.repair_legacy_compatibility()
     }
 
-    fn write_legacy_compatibility(&self) -> Result<()> {
-        validate_optional_history_node(&self.path, "legacy history")?;
+    fn repair_legacy_compatibility(&mut self) -> Result<()> {
+        let present = validate_optional_history_node(&self.path, "legacy history")?;
+        if self.cap == 0 {
+            if present {
+                fs::remove_file(&self.path).with_context(|| {
+                    format!("remove disabled legacy history {}", self.path.display())
+                })?;
+                if let Some(parent) = self.path.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
+            }
+            self.compatibility_end = self.observed_end;
+            self.compatibility_len = 0;
+            self.compatibility_known = true;
+            return Ok(());
+        }
         let contiguous: Vec<u8> = self.bytes.iter().copied().collect();
-        atomic_write_bytes(&self.path, &contiguous)
-            .with_context(|| format!("publish legacy history tail {}", self.path.display()))
+        let result = atomic_write_bytes(&self.path, &contiguous)
+            .with_context(|| format!("publish legacy history tail {}", self.path.display()));
+        match result {
+            Ok(()) => {
+                self.compatibility_end = self.observed_end;
+                self.compatibility_len = contiguous.len() as u64;
+                self.compatibility_known = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.compatibility_known = false;
+                Err(error)
+            }
+        }
+    }
+
+    fn flush_legacy_compatibility(&mut self) -> Result<()> {
+        let delta = self
+            .observed_end
+            .checked_sub(self.compatibility_end)
+            .ok_or_else(|| anyhow!("legacy history position exceeds observed history"))?;
+        if delta == 0 && self.compatibility_known {
+            return Ok(());
+        }
+        if self.cap == 0 {
+            return self.repair_legacy_compatibility();
+        }
+        let delta_len = usize::try_from(delta).unwrap_or(usize::MAX);
+        let resulting_len = self.compatibility_len.checked_add(delta);
+        if !self.compatibility_known
+            || delta_len > self.bytes.len()
+            || resulting_len.is_none_or(|length| length > (self.cap as u64).saturating_mul(2))
+            || !validate_optional_history_node(&self.path, "legacy history")?
+        {
+            return self.repair_legacy_compatibility();
+        }
+        let mut file = open_optional_history_file(&self.path, "legacy history", true)?
+            .ok_or_else(|| anyhow!("legacy history disappeared: {}", self.path.display()))?;
+        if file.metadata()?.len() != self.compatibility_len {
+            return self.repair_legacy_compatibility();
+        }
+        let bytes: Vec<u8> = self
+            .bytes
+            .iter()
+            .skip(self.bytes.len() - delta_len)
+            .copied()
+            .collect();
+        file.seek(SeekFrom::End(0))?;
+        let result = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_data())
+            .with_context(|| format!("append legacy history {}", self.path.display()));
+        match result {
+            Ok(()) => {
+                self.compatibility_end = self.observed_end;
+                self.compatibility_len += delta;
+                Ok(())
+            }
+            Err(error) => {
+                self.compatibility_known = false;
+                Err(error)
+            }
+        }
     }
 
     fn next_commit_generation(&self) -> Result<u64> {
@@ -4315,6 +4403,7 @@ mod tests {
 
         assert_eq!(history.snapshot(None), b"fghi");
         assert_eq!(history.data_bytes_written, 12);
+        assert_eq!(fs::read(&path).unwrap(), b"fghi");
         for slot in 0..HISTORY_BANK_COUNT {
             let data_path = history_data_path(&path, slot);
             if let Ok(metadata) = fs::metadata(data_path) {
@@ -4338,7 +4427,7 @@ mod tests {
         migrated.append(b"AB").unwrap();
         migrated.flush().unwrap();
         assert_eq!(read_persisted_history_tail(&path, None).unwrap(), b"89AB");
-        assert_eq!(fs::read(&path).unwrap(), b"6789");
+        assert_eq!(fs::read(&path).unwrap(), b"6789AB");
         migrated.flush_final().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"89AB");
 
