@@ -3790,6 +3790,19 @@ fn take_pending_switch(
     }
 }
 
+/// Ends the current attach from the input side. Sending the polite control
+/// frame lets the worker release its subscriber immediately; shutting down
+/// our socket locally guarantees the main frame loop wakes even if the peer
+/// cannot read the control frame. This is shared by explicit detach, stdin
+/// EOF, and terminal read/write failure so none can strand `attach()` in its
+/// blocking socket read.
+fn detach_attached_client(writer: &Arc<Mutex<UnixStream>>, active: &Arc<AtomicBool>) {
+    let _ = send_control(writer, &AttachControl::Detach);
+    active.store(false, Ordering::Relaxed);
+    let stream = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     check_attachable(record)?;
     let explicit_history = history_bytes.is_some();
@@ -3952,13 +3965,20 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let mut scanner = InputScanner::default();
         'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    detach_attached_client(&input_writer, &input_active);
+                    break;
+                }
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(_) => {
+                    detach_attached_client(&input_writer, &input_active);
+                    break;
+                }
             };
             if !tty {
                 if send_data(&input_writer, &buffer[..n]).is_err() {
+                    detach_attached_client(&input_writer, &input_active);
                     break;
                 }
                 continue;
@@ -3972,12 +3992,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // automatically, because perform_switch swapped the
                         // stream inside input_writer's mutex.
                         if send_data(&input_writer, &bytes).is_err() {
+                            detach_attached_client(&input_writer, &input_active);
                             break 'outer;
                         }
                     }
                     InputAction::Detach => {
-                        let _ = send_control(&input_writer, &AttachControl::Detach);
-                        input_active.store(false, Ordering::Relaxed);
+                        detach_attached_client(&input_writer, &input_active);
                         break 'outer;
                     }
                     InputAction::Switch(target) => {

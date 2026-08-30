@@ -71,10 +71,11 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
-        assert!(
-            Instant::now() < deadline,
-            "attach did not exit after signal"
-        );
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("attach did not exit after its termination condition");
+        }
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -144,4 +145,30 @@ fn termination_signals_restore_real_pty_termios_and_terminal_ui() {
 
         let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
     }
+}
+
+#[test]
+fn stdin_eof_detaches_without_ending_the_session() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().unwrap();
+    let id = harness.start(workspace.path(), "stdin-eof");
+
+    let mut command = harness.command();
+    command.args(["attach", &id]);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+
+    drop(child.stdin.take());
+    let status = wait_for_exit(&mut child);
+    assert!(status.success(), "attach failed after stdin EOF: {status}");
+
+    let output = harness.output(&["status", &id, "--json"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["phase"], "running");
+    assert_eq!(value["worker_alive"], true);
+
+    let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
 }
