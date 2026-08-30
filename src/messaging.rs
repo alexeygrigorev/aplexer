@@ -17,10 +17,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -589,7 +590,14 @@ fn write_message_with_limits(
     // mean that exact id is still durable when this function returns. If an
     // old file cannot be removed, roll this append back and report failure
     // instead of returning success with the mailbox above its hard limits.
-    if let Err(error) = prune_workspace_locked(&mp, Some(&path), max_messages, max_bytes, false) {
+    if let Err(error) = prune_workspace_locked(
+        &mp,
+        &envelope.workspace,
+        Some(&path),
+        max_messages,
+        max_bytes,
+        false,
+    ) {
         let _ = fs::remove_file(&path);
         let _ = fs::File::open(&mp.msgs_dir).and_then(|dir| dir.sync_all());
         return Err(error).context("enforce mailbox quota after append");
@@ -604,14 +612,108 @@ pub fn read_message(
 ) -> Result<MessageEnvelope> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let path = mp.msgs_dir.join(format!("{id}.json"));
-    let bytes = fs::read(&path).with_context(|| format!("no such message {id}"))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    load_message_file(&path, canonical_workspace)
+        .with_context(|| format!("read mailbox message {id}"))
+}
+
+fn message_id_from_path(path: &Path) -> Result<Uuid> {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "mailbox message has no UTF-8 filename UUID: {}",
+                path.display()
+            )
+        })?;
+    Uuid::parse_str(stem).with_context(|| {
+        format!(
+            "parse mailbox message filename UUID from {}",
+            path.display()
+        )
+    })
+}
+
+/// Open an existing mailbox entry without following a final-component
+/// symlink. O_NONBLOCK keeps an accidental FIFO from hanging the caller before
+/// its descriptor can be inspected; it has no effect on regular-file reads.
+fn open_message_file(path: &Path) -> Result<(File, u64)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open mailbox message {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect mailbox message {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("mailbox message is not a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_ENVELOPE_BYTES as u64 {
+        bail!(
+            "mailbox message {} exceeds the {MAX_ENVELOPE_BYTES}-byte envelope cap (got {} bytes)",
+            path.display(),
+            metadata.len()
+        );
+    }
+    Ok((file, metadata.len()))
+}
+
+fn load_open_message_file(
+    file: File,
+    path: &Path,
+    expected_workspace: &Path,
+) -> Result<MessageEnvelope> {
+    let expected_id = message_id_from_path(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ENVELOPE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read mailbox message {}", path.display()))?;
+    // Recheck after reading so a regular file that grows after fstat remains
+    // bounded and is rejected instead of being parsed from a truncated prefix.
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        bail!(
+            "mailbox message {} exceeds the {MAX_ENVELOPE_BYTES}-byte envelope cap",
+            path.display()
+        );
+    }
+    let envelope: MessageEnvelope = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse mailbox message {}", path.display()))?;
+    if envelope.schema_version != MESSAGE_SCHEMA_VERSION {
+        bail!(
+            "unsupported mailbox message schema {} in {}",
+            envelope.schema_version,
+            path.display()
+        );
+    }
+    if envelope.id != expected_id {
+        bail!(
+            "mailbox message id {} does not match filename id {} in {}",
+            envelope.id,
+            expected_id,
+            path.display()
+        );
+    }
+    if envelope.workspace != expected_workspace {
+        bail!(
+            "mailbox message {} belongs to workspace {}, expected {}",
+            envelope.id,
+            envelope.workspace.display(),
+            expected_workspace.display()
+        );
+    }
+    Ok(envelope)
+}
+
+fn load_message_file(path: &Path, expected_workspace: &Path) -> Result<MessageEnvelope> {
+    let (file, _) = open_message_file(path)?;
+    load_open_message_file(file, path, expected_workspace)
 }
 
 /// Lists every message currently on disk for a workspace, in id (= time)
-/// order. Files that fail to parse (should not happen given atomic writes,
-/// but a partial/corrupt file must never wedge every other read) are
-/// silently skipped rather than failing the whole listing.
+/// order. Invalid `.json` entries fail the read rather than being silently
+/// reinterpreted or hidden: cursor acknowledgement identity depends on the
+/// filename, envelope id, and mailbox workspace agreeing exactly.
 pub fn list_messages(paths: &Paths, canonical_workspace: &Path) -> Result<Vec<MessageEnvelope>> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let mut out = Vec::new();
@@ -620,16 +722,13 @@ pub fn list_messages(paths: &Paths, canonical_workspace: &Path) -> Result<Vec<Me
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e.into()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.with_context(|| format!("enumerate {}", mp.msgs_dir.display()))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(bytes) = fs::read(&path) {
-            if let Ok(envelope) = serde_json::from_slice::<MessageEnvelope>(&bytes) {
-                out.push(envelope);
-            }
-        }
+        out.push(load_message_file(&path, canonical_workspace)?);
     }
     // Uuid's Ord is a byte-wise compare of the 128-bit value; for UUIDv7 the
     // 48-bit millisecond timestamp occupies the top bits, so this is also
@@ -701,10 +800,16 @@ fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
     };
     let mut ids = BTreeSet::new();
     for entry in entries {
-        let path = entry?.path();
+        let entry = entry.with_context(|| format!("enumerate {}", msgs_dir.display()))?;
+        let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
+        // Cursor maintenance must not bless an unexpected mailbox entry as a
+        // retained message id merely because its filename looks like a UUID.
+        // Use the same bounded, no-follow regular-file check as actual loads;
+        // parsing the full envelope remains the list/show operation's job.
+        let _ = open_message_file(&path)?;
         if let Some(id) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -795,7 +900,11 @@ struct MailboxEntry {
     size: u64,
 }
 
-fn mailbox_entries(mp: &MessagePaths, read_created_at: bool) -> Result<Vec<MailboxEntry>> {
+fn mailbox_entries(
+    mp: &MessagePaths,
+    expected_workspace: &Path,
+    read_created_at: bool,
+) -> Result<Vec<MailboxEntry>> {
     let mut entries = Vec::new();
     let dir = match fs::read_dir(&mp.msgs_dir) {
         Ok(dir) => dir,
@@ -809,17 +918,13 @@ fn mailbox_entries(mp: &MessagePaths, read_created_at: bool) -> Result<Vec<Mailb
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        // Count malformed legacy/corrupt JSON files toward hard quotas too;
-        // otherwise corruption would become a disk-cap bypass. Only valid
-        // envelopes participate in TTL expiration.
-        let size = fs::metadata(&path)
-            .with_context(|| format!("inspect {}", path.display()))?
-            .len();
+        // Even when append quota enforcement needs only the size, use the
+        // same no-follow/non-regular/oversize preflight as envelope reads.
+        // Explicit TTL GC additionally parses and validates the envelope from
+        // this exact open descriptor, avoiding a second path lookup.
+        let (file, size) = open_message_file(&path)?;
         let created_at = if read_created_at {
-            fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<MessageEnvelope>(&bytes).ok())
-                .map(|envelope| envelope.created_at)
+            Some(load_open_message_file(file, &path, expected_workspace)?.created_at)
         } else {
             None
         };
@@ -862,12 +967,13 @@ fn remove_mailbox_entry(
 /// itself merely because its UUID sorts before an older committed writer.
 fn prune_workspace_locked(
     mp: &MessagePaths,
+    expected_workspace: &Path,
     protected: Option<&Path>,
     max_messages: usize,
     max_bytes: u64,
     expire: bool,
 ) -> Result<GcReport> {
-    let mut entries = mailbox_entries(mp, expire)?;
+    let mut entries = mailbox_entries(mp, expected_workspace, expire)?;
     let mut total: u64 = entries.iter().map(|entry| entry.size).sum();
     let mut removed = 0usize;
     let mut directory_changed = false;
@@ -1072,6 +1178,7 @@ pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcRepor
     let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
     let report = prune_workspace_locked(
         &mp,
+        canonical_workspace,
         None,
         MAX_MESSAGES_PER_WORKSPACE,
         MAX_WORKSPACE_BYTES,
@@ -1209,6 +1316,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs::{FileTimes, OpenOptions};
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1680,6 +1788,100 @@ mod tests {
             .msgs_dir
             .join(format!("{}.json", message.id))
             .exists());
+    }
+
+    #[test]
+    fn message_loader_validates_schema_filename_id_and_workspace() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-message-invariants-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let filename_id = Uuid::from_u128(1);
+        let path = mp.msgs_dir.join(format!("{filename_id}.json"));
+
+        let mut message = test_message(workspace, filename_id);
+        message.schema_version = MESSAGE_SCHEMA_VERSION + 1;
+        atomic_write_bytes(&path, &serialized_envelope(&message).unwrap()).unwrap();
+        let schema_error = read_message(&paths, workspace, filename_id)
+            .expect_err("an unsupported message schema must fail closed");
+        assert!(
+            format!("{schema_error:#}").contains("unsupported mailbox message schema"),
+            "unexpected error: {schema_error:#}"
+        );
+
+        message.schema_version = MESSAGE_SCHEMA_VERSION;
+        message.id = Uuid::from_u128(2);
+        atomic_write_bytes(&path, &serialized_envelope(&message).unwrap()).unwrap();
+        let id_error = read_message(&paths, workspace, filename_id)
+            .expect_err("the envelope id must match its filename");
+        assert!(
+            format!("{id_error:#}").contains("does not match filename id"),
+            "unexpected error: {id_error:#}"
+        );
+
+        message.id = filename_id;
+        message.workspace = PathBuf::from("/tmp/a-different-mailbox-workspace");
+        atomic_write_bytes(&path, &serialized_envelope(&message).unwrap()).unwrap();
+        let workspace_error = list_messages(&paths, workspace)
+            .expect_err("an envelope from another workspace must fail closed");
+        assert!(
+            format!("{workspace_error:#}").contains("belongs to workspace"),
+            "unexpected error: {workspace_error:#}"
+        );
+    }
+
+    #[test]
+    fn message_loader_rejects_symlink_non_regular_and_oversized_entries() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-message-file-type-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let id = Uuid::from_u128(1);
+        let path = mp.msgs_dir.join(format!("{id}.json"));
+        let outside = root.path().join("outside-message.json");
+        fs::write(
+            &outside,
+            serialized_envelope(&test_message(workspace, id)).unwrap(),
+        )
+        .unwrap();
+        symlink(&outside, &path).unwrap();
+
+        let symlink_error =
+            list_messages(&paths, workspace).expect_err("a mailbox symlink must not be followed");
+        assert!(
+            format!("{symlink_error:#}").contains("open mailbox message"),
+            "unexpected error: {symlink_error:#}"
+        );
+        let cursor_error = read_cursor(&paths, workspace, Uuid::from_u128(100))
+            .expect_err("cursor maintenance must not retain a symlink by filename alone");
+        assert!(
+            format!("{cursor_error:#}").contains("open mailbox message"),
+            "unexpected error: {cursor_error:#}"
+        );
+        fs::remove_file(&path).unwrap();
+
+        fs::create_dir(&path).unwrap();
+        let type_error = list_messages(&paths, workspace)
+            .expect_err("a non-regular mailbox entry must be rejected");
+        assert!(
+            format!("{type_error:#}").contains("is not a regular file"),
+            "unexpected error: {type_error:#}"
+        );
+        fs::remove_dir(&path).unwrap();
+
+        let oversized = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        oversized.set_len(MAX_ENVELOPE_BYTES as u64 + 1).unwrap();
+        drop(oversized);
+        let size_error = list_messages(&paths, workspace)
+            .expect_err("an oversized pre-existing envelope must be rejected before reading");
+        assert!(
+            format!("{size_error:#}").contains("envelope cap"),
+            "unexpected error: {size_error:#}"
+        );
     }
 
     #[test]
