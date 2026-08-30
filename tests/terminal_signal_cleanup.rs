@@ -139,7 +139,7 @@ fn termination_signals_restore_real_pty_termios_and_terminal_ui() {
         read_until(
             &mut master,
             &mut bytes,
-            b"\x1b[?1049l\x1b[r\x1b[2J\x1b[H\x1b[?25h",
+            b"\x1b[?1049l\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
         );
 
         let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);

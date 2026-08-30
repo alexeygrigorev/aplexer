@@ -2782,6 +2782,23 @@ fn reset_workload_margins(
 /// the status bar) just sits in the user's terminal after attach() returns.
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
+const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
+\x1b[?1049l\
+\x1b>\
+\x1b[?1l\
+\x1b[?2004l\
+\x1b[?9l\
+\x1b[?1000l\
+\x1b[?1002l\
+\x1b[?1003l\
+\x1b[?1005l\
+\x1b[?1006l\
+\x1b[r\
+\x1b[0m\
+\x1b[2J\
+\x1b[H\
+\x1b[?25h";
+
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): if
     // the session was on the alternate screen -- whether entered by a
@@ -2794,6 +2811,13 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // *enters* the alt screen for itself; this only ever *exits* one that
     // the workload's own live behavior put the host into.
     //
+    // The snapshot path also reproduces every input mode tracked by vt100.
+    // Disable all of their possible variants unconditionally: application
+    // keypad/cursor, bracketed paste, the four mouse protocols, and both
+    // non-default mouse encodings. Sending the resets is harmless when a
+    // mode was already off and avoids leaving the user's shell consuming
+    // application key or mouse reports after any attach exit.
+    //
     // `\x1b[?25h` (DECTCEM show cursor) is included unconditionally: a
     // full-screen TUI in the workload (htop, vim, an agent CLI's spinner,
     // ...) commonly hides the cursor with `\x1b[?25l` while it owns the
@@ -2804,7 +2828,7 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // happened to hide it. Showing an already-visible cursor is a no-op, so
     // this is safe to send regardless of what state the workload (or our
     // own status-bar redraw, which never hides the cursor) left it in.
-    let _ = write_locked(stdout, b"\x1b[?1049l\x1b[r\x1b[2J\x1b[H\x1b[?25h");
+    let _ = write_locked(stdout, TERMINAL_RESET_SEQUENCE);
 }
 
 /// RAII guard that runs `reset_terminal` on every exit path out of attach()
@@ -4562,6 +4586,34 @@ mod switching_tests {
         let flashed = status_bar_text(&ctx, 80);
         assert!(!flashed.chars().any(char::is_control), "{flashed:?}");
         assert!(!flashed.contains("\x1b[2J"), "{flashed:?}");
+    }
+
+    #[test]
+    fn terminal_reset_disables_every_snapshot_input_mode_variant() {
+        let mouse_modes: &[&[u8]] = &[b"\x1b[?9h", b"\x1b[?1000h", b"\x1b[?1002h", b"\x1b[?1003h"];
+        let mouse_encodings: &[&[u8]] = &[b"\x1b[?1005h", b"\x1b[?1006h"];
+
+        for mode in mouse_modes {
+            for encoding in mouse_encodings {
+                let mut parser = vt100::Parser::new(24, 80, 0);
+                parser.process(b"\x1b[?1049h\x1b=\x1b[?1h\x1b[?2004h\x1b[?25l");
+                parser.process(mode);
+                parser.process(encoding);
+                parser.process(TERMINAL_RESET_SEQUENCE);
+
+                let screen = parser.screen();
+                assert!(!screen.alternate_screen());
+                assert!(!screen.application_keypad());
+                assert!(!screen.application_cursor());
+                assert!(!screen.bracketed_paste());
+                assert_eq!(screen.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+                assert_eq!(
+                    screen.mouse_protocol_encoding(),
+                    vt100::MouseProtocolEncoding::Default
+                );
+                assert!(!screen.hide_cursor());
+            }
+        }
     }
 
     fn sample_groups() -> Vec<(PathBuf, Vec<SessionRecord>)> {
