@@ -355,6 +355,123 @@ fn failed_replacement_preserves_finished_session_evidence() {
 
 #[test]
 #[cfg(feature = "startup-test-hooks")]
+fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+
+    let old = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'archived-evidence\\n'",
+    ]);
+    assert!(
+        old.status.success(),
+        "old session failed: {}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let old: Value = serde_json::from_slice(&old.stdout).expect("old session JSON");
+    let old_id = old["id"].as_str().expect("old session id");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = harness.run(&["snapshot"]);
+        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+        if records.as_array().is_some_and(|records| {
+            records.iter().any(|record| {
+                record["id"] == old_id
+                    && record["phase"] == "exited"
+                    && record["worker_alive"] == false
+            })
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "old session did not finish");
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let replacement = harness.run_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "daily",
+            "--",
+            "/bin/sleep",
+            "30",
+        ],
+        &[("APLEXER_TEST_FAIL_SUPERSEDED_CLEANUP", "1")],
+    );
+    assert!(
+        !replacement.status.success(),
+        "replacement ignored cleanup failure"
+    );
+    let stderr = String::from_utf8_lossy(&replacement.stderr);
+    assert!(stderr.contains("ready and manageable by UUID"), "{stderr}");
+    assert!(stderr.contains(old_id), "{stderr}");
+    assert!(stderr.contains("retired-sessions"), "{stderr}");
+
+    let snapshot = harness.run(&["snapshot"]);
+    assert!(
+        snapshot.status.success(),
+        "registry became unreadable: {}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+    let matching = records
+        .as_array()
+        .expect("snapshot array")
+        .iter()
+        .filter(|record| record["workspace"] == workspace && record["tag"] == "daily")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "replacement left duplicate selectors");
+    let replacement_id = matching[0]["id"].as_str().expect("replacement session id");
+    assert_ne!(replacement_id, old_id);
+
+    let status = harness.run(&["status", replacement_id, "--json"]);
+    assert!(
+        status.status.success(),
+        "replacement is not manageable: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let archived = harness
+        .state_dir
+        .path()
+        .join("retired-sessions")
+        .join(old_id);
+    assert!(archived.join("session.json").exists());
+    assert_eq!(
+        fs::read(archived.join("history.bin")).expect("read archived history"),
+        b"archived-evidence\r\n"
+    );
+    assert!(!harness
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(old_id)
+        .exists());
+
+    let killed = harness.run(&[
+        "kill",
+        replacement_id,
+        "--signal",
+        "KILL",
+        "--grace-ms",
+        "0",
+    ]);
+    assert!(killed.status.success(), "replacement cleanup failed");
+}
+
+#[test]
+#[cfg(feature = "startup-test-hooks")]
 fn persisted_running_without_verified_ping_is_not_startup_success() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");

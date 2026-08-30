@@ -43,6 +43,7 @@ impl Drop for LaunchEnvironmentGuard {
 const STARTUP_TERM_GRACE: Duration = Duration::from_secs(3);
 const STARTUP_REAP_POLL: Duration = Duration::from_millis(10);
 const STARTUP_CONTAINMENT_TIMEOUT: Duration = Duration::from_secs(2);
+const RETIRED_SESSIONS_DIR: &str = "retired-sessions";
 /// A corrupt or hostile startup tree must not consume every descriptor in the
 /// launcher. The actual limit is reduced further to fit the launcher's live
 /// RLIMIT_NOFILE budget before any process is stopped.
@@ -1485,6 +1486,67 @@ fn probe_worker_ready(
     Ok(true)
 }
 
+fn archive_superseded_session(paths: &Paths, id: Uuid) -> Result<PathBuf> {
+    let retired_root = paths.state_root.join(RETIRED_SESSIONS_DIR);
+    ensure_private_dir(&retired_root)?;
+    let source = paths.state_session(id);
+    let archived = retired_root.join(id.to_string());
+    if archived.try_exists()? {
+        bail!(
+            "cannot retire superseded session {id}: archive {} already exists",
+            archived.display()
+        );
+    }
+    fs::rename(&source, &archived).with_context(|| {
+        format!(
+            "atomically retire superseded session {id} from {} to {}",
+            source.display(),
+            archived.display()
+        )
+    })?;
+    if let Err(error) = (|| -> Result<()> {
+        File::open(paths.state_root.join("sessions"))?.sync_all()?;
+        File::open(&retired_root)?.sync_all()?;
+        Ok(())
+    })() {
+        return match restore_superseded_session(paths, id, &archived) {
+            Ok(()) => Err(error).context("sync retired predecessor transaction"),
+            Err(restore_error) => Err(anyhow!(
+                "sync retired predecessor transaction: {error:#}; restore also failed: {restore_error:#}"
+            )),
+        };
+    }
+    Ok(archived)
+}
+
+fn restore_superseded_session(paths: &Paths, id: Uuid, archived: &Path) -> Result<()> {
+    let destination = paths.state_session(id);
+    fs::rename(archived, &destination).with_context(|| {
+        format!(
+            "restore superseded session {id} from {} to {}",
+            archived.display(),
+            destination.display()
+        )
+    })?;
+    File::open(paths.state_root.join("sessions"))?.sync_all()?;
+    if let Some(parent) = archived.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn cleanup_superseded_archive(path: &Path) -> Result<()> {
+    #[cfg(feature = "startup-test-hooks")]
+    if std::env::var_os("APLEXER_TEST_FAIL_SUPERSEDED_CLEANUP").is_some() {
+        bail!("injected superseded-session cleanup failure");
+    }
+    fs::remove_dir_all(path).with_context(|| format!("remove archive {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     ensure_sigchld_compatible_for_child_management()?;
     validate_tag(&req.tag)?;
@@ -1656,20 +1718,54 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
 
     match result {
         Ok(record) => {
-            startup.hand_off_to_reaper()?;
-            // Keep a finished predecessor's post-mortem evidence until the
-            // replacement has completed startup and its worker is safely
-            // owned by the detached reaper. A failed replacement therefore
-            // cannot destroy history, final screen, or transcript bindings.
-            if let Some(existing) = superseded {
-                if let Err(error) = fs::remove_dir_all(paths.state_session(existing.id)) {
-                    eprintln!(
-                        "aplexer: replacement {} is ready, but superseded session {} could not be removed: {error}",
-                        record.id, existing.id
-                    );
-                } else {
-                    let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
+            // Move the predecessor out of the active registry atomically
+            // before handing off the replacement. Until this succeeds the
+            // startup guard can still roll the new worker back without ever
+            // exposing two durable records for one selector.
+            let archived = if let Some(existing) = &superseded {
+                match archive_superseded_session(paths, existing.id) {
+                    Ok(path) => Some(path),
+                    Err(retire_error) => {
+                        return match startup.rollback() {
+                            Ok(()) => Err(retire_error),
+                            Err(rollback_error) => Err(anyhow!(
+                                "retire predecessor failed: {retire_error:#}; replacement rollback also failed: {rollback_error:#}"
+                            )),
+                        };
+                    }
                 }
+            } else {
+                None
+            };
+
+            if let Err(handoff_error) = startup.hand_off_to_reaper() {
+                let restore_error = match (&superseded, &archived) {
+                    (Some(existing), Some(archived)) => {
+                        restore_superseded_session(paths, existing.id, archived).err()
+                    }
+                    _ => None,
+                };
+                let rollback_error = startup.rollback().err();
+                let mut message = format!("hand off replacement worker: {handoff_error:#}");
+                if let Some(error) = restore_error {
+                    message.push_str(&format!("; restore predecessor failed: {error:#}"));
+                }
+                if let Some(error) = rollback_error {
+                    message.push_str(&format!("; replacement rollback failed: {error:#}"));
+                }
+                bail!(message);
+            }
+
+            if let (Some(existing), Some(archived)) = (superseded, archived) {
+                if let Err(error) = cleanup_superseded_archive(&archived) {
+                    bail!(
+                        "replacement {} is ready and manageable by UUID, but superseded session {} cleanup failed; its remaining evidence is retained at {}: {error:#}",
+                        record.id,
+                        existing.id,
+                        archived.display()
+                    );
+                }
+                let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
             }
             Ok(record)
         }
