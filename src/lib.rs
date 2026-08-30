@@ -1805,6 +1805,18 @@ fn release_anchor_child(anchor: &mut std::process::Child) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_anchor_after_failure(
+    anchor: &mut std::process::Child,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match release_anchor_child(anchor) {
+        Ok(()) => error,
+        Err(cleanup_error) => {
+            anyhow!("{error:#}; systemd-run anchor cleanup failed: {cleanup_error:#}")
+        }
+    }
+}
+
 impl Cgroup {
     // A worker's own ambient cgroup (inherited from whatever spawned `a start`,
     // e.g. a tmux pane or SSH session) is never a safe place to nest a
@@ -1876,17 +1888,23 @@ impl Cgroup {
         let path = match wait_for_scope_cgroup(&unit, Duration::from_secs(5)) {
             Ok(path) => path,
             Err(error) => {
-                let _ = release_anchor_child(&mut anchor);
-                return Err(error.context("limits fail closed"));
+                return Err(cleanup_anchor_after_failure(
+                    &mut anchor,
+                    error.context("limits fail closed"),
+                ));
             }
         };
         if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
-            let _ = release_anchor_child(&mut anchor);
-            bail!("systemd did not delegate the memory controller; limits fail closed");
+            return Err(cleanup_anchor_after_failure(
+                &mut anchor,
+                anyhow!("systemd did not delegate the memory controller; limits fail closed"),
+            ));
         }
         if limits.pids.is_some() && !path.join("pids.max").exists() {
-            let _ = release_anchor_child(&mut anchor);
-            bail!("systemd did not delegate the pids controller; limits fail closed");
+            return Err(cleanup_anchor_after_failure(
+                &mut anchor,
+                anyhow!("systemd did not delegate the pids controller; limits fail closed"),
+            ));
         }
         let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);
         Ok(Some(Self {
@@ -1924,8 +1942,9 @@ impl Cgroup {
             .anchor
             .lock()
             .map_err(|_| anyhow!("systemd-run anchor lock poisoned"))?;
-        if let Some(mut anchor) = slot.take() {
-            release_anchor_child(&mut anchor)?;
+        if let Some(anchor) = slot.as_mut() {
+            release_anchor_child(anchor)?;
+            *slot = None;
         }
         Ok(())
     }
