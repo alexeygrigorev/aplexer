@@ -57,7 +57,7 @@ Field-by-field:
 | `launch.argv` | `command` | full argv, program first |
 | `launch.skip_permissions_argv` | `skip_permissions_argv` | direct port (added aplexer-side in Phase 0 item 0.3) |
 | `launch.env.set` | `env` | direct port |
-| `launch.env.unset` | `env_unset` | direct port, **but** see below -- aplexer forces a union with a hardcoded list regardless of this field |
+| `launch.env.unset` | `env_unset` | direct port, **but** see below -- aplexer forces a union with a hardcoded list for agent engine ids; the literal `shell` engine uses only its configured list |
 | `launch.profile_env` | *(none)* | aplexer has no `profile_env` concept on `EngineConfig` itself; a profile's own `env` map sets the config-dir var directly (e.g. `CLAUDE_CONFIG_DIR = "..."`), see profiles below |
 | `family`, `label`, `provider_mark`, `usage_provider` | *(none)* | presentation-only fields the plan doc (0.5) deliberately keeps out of aplexer's scope; a pocketshell-side overlay is expected to supply these when consuming `a engines --json` |
 | `enabled` | *(none)* | aplexer has no enable/disable; omit the engine entirely from `config.toml` to the same effect (it just won't exist in `a engines --json`) |
@@ -67,13 +67,16 @@ Field-by-field:
 sides.** PocketShell's `LaunchSpec.__post_init__` already unions any
 config-supplied `env_unset` with its own hardcoded
 `PROVIDER_ENV_UNSET_VARS` (`_ordered_env_unset_union`); aplexer's
-`Config::resolve` does the exact same thing with its own ported copy of
-that same list (`PROVIDER_ENV_UNSET_VARS` in `src/lib.rs`). So an
+`Config::resolve` does the exact same thing for agent engine ids with its own
+ported copy of that same list (`PROVIDER_ENV_UNSET_VARS` in `src/lib.rs`). So an
 `engines.yaml` entry's `launch.env.unset` list and an aplexer
 `[engines.*]` entry's `env_unset` list both mean the same thing: "vars to
 strip *in addition to* the built-in provider-key list" -- neither side
 lets you shrink that built-in list. No migration adjustment needed here
-beyond copying the list verbatim.
+beyond copying the list verbatim. Aplexer's exact `shell` id is deliberately
+outside that agent policy: its list is literal, allowing shell commands and
+explicit `--env` values to retain provider/cloud variables unless shell config
+names them for removal.
 
 ## `profiles.yaml` -> `[profiles.*]`
 

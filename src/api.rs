@@ -992,7 +992,7 @@ pub fn engines_json(paths: &Paths) -> Result<Value> {
         .engines
         .iter()
         .map(|(name, e)| {
-            let env_unset = e.resolved_env_unset();
+            let env_unset = e.resolved_env_unset(name);
             json!({
                 "name": name,
                 "command": e.command,

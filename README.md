@@ -104,6 +104,13 @@ command = ["grok"]
 
 Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703).
 
+Agent engine ids (every id except the literal `shell` engine) always add the
+built-in provider/cloud credential list to `env_unset`, preserving the
+subscription-auth policy. `shell` is intentionally different: it applies only
+its configured `env_unset`, so ordinary commands and explicit `a start
+--engine shell --env NAME=value` overrides keep their environment. Add a name
+to `[engines.shell].env_unset` when a shell-specific removal is desired.
+
 ### Profiles
 
 Only claude and codex currently support profiles. Zero-config auto-discovery (ported from PocketShell's `tools/pocketshell/src/pocketshell/profiles.py`, spec.md 9.2/23) scans the top level of `$HOME` for `~/.<name>` directories that: aren't the engine's own default dir (`~/.claude` / `~/.codex`), have a name containing a hint for that engine (claude: `claude`/`laude`; codex: `codex`/`odex` — catching swaps like `zlaude`), and carry a real marker file (claude: `.claude.json` or `settings.json`; codex: `config.toml` or `auth.json`). A match becomes a profile named after its own directory stem — never a humanized display name, since `[profiles.*]` is one flat namespace shared by every engine and two engines' same-sounding profiles (e.g. both called "zai") would otherwise clobber each other. On a machine with a Z.AI-routed codex account at `~/.zodex`, discovery derives the equivalent of:

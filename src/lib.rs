@@ -1092,13 +1092,10 @@ pub struct EngineConfig {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Additional vars to unset at spawn time, on top of the forced
-    /// `PROVIDER_ENV_UNSET_VARS` union computed in `Config::resolve` -- a
-    /// user-configured engine in `~/.config/aplexer/config.toml` can only
-    /// ADD to that union, never opt out of it (see `Config::resolve` doc
-    /// comment for why this is load-bearing, ported from PocketShell's
-    /// `tools/pocketshell/src/pocketshell/engines.py::LaunchSpec.env_unset`
-    /// / `_ordered_env_unset_union`).
+    /// Additional vars to unset at spawn time. Agent engines add these to the
+    /// forced `PROVIDER_ENV_UNSET_VARS` union; the literal `shell` engine uses
+    /// exactly this configured list so ordinary shell commands retain their
+    /// ambient/provider environment unless the user explicitly opts out.
     #[serde(default)]
     pub env_unset: Vec<String>,
     /// Argv appended after `command` when skip-permissions is requested
@@ -1110,13 +1107,15 @@ pub struct EngineConfig {
     pub skip_permissions_argv: Vec<String>,
 }
 impl EngineConfig {
-    /// The forced provider-key union this engine's launches will actually
-    /// get (see `Config::resolve`'s doc comment) -- exposed so `a engines
-    /// --json` (pocketshell-integration-plan.md 0.5) can report it without
-    /// needing a full `Config::resolve` call (which requires a
-    /// workspace/cwd that a plain engine listing has no reason to invent).
-    pub fn resolved_env_unset(&self) -> Vec<String> {
-        ordered_env_unset_union(&self.env_unset)
+    /// Effective unset policy for one named engine. `shell` is the deliberate
+    /// non-agent exception; all other built-in and custom engine ids retain
+    /// the subscription-auth provider stripping policy.
+    pub fn resolved_env_unset(&self, engine_name: &str) -> Vec<String> {
+        if engine_name == "shell" {
+            ordered_unique_env_names(std::iter::empty(), &self.env_unset)
+        } else {
+            ordered_unique_env_names(PROVIDER_ENV_UNSET_VARS.iter().copied(), &self.env_unset)
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1282,9 +1281,10 @@ fn discover_profiles() -> BTreeMap<String, ProfileConfig> {
 /// `tools/pocketshell/src/pocketshell/engines.py::PROVIDER_ENV_UNSET_VARS`
 /// (maintainer decision, pocketshell issue #703 -- subscription billing
 /// across the board for codex/claude/opencode). `Config::resolve` unions
-/// this with each engine's own `EngineConfig.env_unset`; the union is
-/// forced (see that function's doc comment) -- a user config can only add
-/// to this list, never remove from it.
+/// this with each agent engine's own `EngineConfig.env_unset`; the union is
+/// forced for every engine id except the literal `shell` engine (see that
+/// function's doc comment) -- an agent config can only add to this list,
+/// never remove from it.
 const PROVIDER_ENV_UNSET_VARS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -1359,26 +1359,28 @@ const PROVIDER_ENV_UNSET_VARS: &[&str] = &[
     "GEMINI_API_KEY",
 ];
 
-/// Union `PROVIDER_ENV_UNSET_VARS` with an engine's own `env_unset`
-/// additions, preserving first-seen order and dropping blanks -- ports
-/// `engines.py::_ordered_env_unset_union`. The forced list always comes
-/// first and is always present in the result; callers cannot construct a
-/// smaller list by only passing `extra`.
-fn ordered_env_unset_union(extra: &[String]) -> Vec<String> {
+/// Preserve first-seen order and drop blanks/duplicates across the policy
+/// prefix and configured additions.
+fn ordered_unique_env_names<'a>(
+    prefix: impl IntoIterator<Item = &'a str>,
+    extra: &[String],
+) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for name in PROVIDER_ENV_UNSET_VARS
-        .iter()
-        .map(|s| s.to_string())
-        .chain(extra.iter().cloned())
-    {
+    let mut push = |name: &str| {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            continue;
+            return;
         }
         if seen.insert(trimmed.to_string()) {
             out.push(trimmed.to_string());
         }
+    };
+    for name in prefix {
+        push(name);
+    }
+    for name in extra {
+        push(name);
     }
     out
 }
@@ -1701,16 +1703,13 @@ impl Config {
             .map(Path::to_path_buf)
             .or_else(|| profile.and_then(|p| p.cwd.clone()))
             .unwrap_or_else(|| workspace.to_path_buf());
-        // Forced provider-key union (pocketshell-integration-plan.md 1.4/0.2):
-        // `PROVIDER_ENV_UNSET_VARS` always comes first and is always
-        // present, regardless of what `engine.env_unset` (sourced from
-        // `~/.config/aplexer/config.toml`, possibly a fully user-defined
-        // custom engine) contains -- a custom engine can only ADD names to
-        // this list, never remove or replace it. Callers (`a start`, and
-        // later `a launch-spec`/`a launch-exec`) are expected to actually
-        // apply this list at spawn time (see worker.rs's spawn_workload),
-        // not just report it.
-        let env_unset = ordered_env_unset_union(&engine.env_unset);
+        // Forced provider-key union (pocketshell-integration-plan.md 1.4/0.2)
+        // for agent engines: `PROVIDER_ENV_UNSET_VARS` comes first regardless
+        // of a custom engine's additions. The exact `shell` engine id is the
+        // deliberate exception: literal shells use only their configured
+        // env_unset list, so explicit shell --env values are not silently
+        // removed. Callers apply this after env_set at workload spawn.
+        let env_unset = engine.resolved_env_unset(&selected_engine);
         let history_bytes = history_bytes
             .or_else(|| profile.and_then(|p| p.history_bytes))
             .unwrap_or(DEFAULT_HISTORY_BYTES);
@@ -1736,12 +1735,10 @@ pub struct ResolvedLaunch {
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
-    /// Forced union of `PROVIDER_ENV_UNSET_VARS` with the engine's own
-    /// `env_unset` -- vars that must be absent from the spawned workload's
-    /// environment, applied AFTER `env` at spawn time (an unset always wins
-    /// over a set, matching pocketshell's `agents.py::build_env` ordering:
-    /// the provider-key strip runs last so it beats even a profile that
-    /// tries to inject one).
+    /// Effective vars that must be absent from the spawned workload, applied
+    /// AFTER `env` at spawn time. Agent engines receive the forced provider
+    /// union; the `shell` engine receives only its explicitly configured
+    /// `env_unset` entries.
     pub env_unset: Vec<String>,
     /// Argv to append to `command` when skip-permissions is requested (see
     /// `EngineConfig::skip_permissions_argv`). `a start` appends this by
@@ -4198,6 +4195,55 @@ mod tests {
             "union must be exactly the forced list plus the one new custom name"
         );
     }
+
+    #[test]
+    fn shell_env_unset_preserves_provider_overrides_and_configured_removals() {
+        let config = load_config_text(
+            "version = 1\n\
+             [engines.shell]\n\
+             command = [\"/bin/sh\", \"-l\"]\n\
+             env_unset = [\"SHELL_SECRET\", \"SHELL_SECRET\"]\n",
+        )
+        .unwrap();
+        let overrides = BTreeMap::from([
+            ("OPENAI_API_KEY".into(), "literal-shell-value".into()),
+            ("SHELL_SECRET".into(), "remove-me".into()),
+        ]);
+        let launch = config
+            .resolve(
+                vec!["/bin/true".into()],
+                Some("shell"),
+                None,
+                Path::new("/tmp"),
+                None,
+                &overrides,
+                &Limits::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("literal-shell-value")
+        );
+        assert_eq!(launch.env_unset, vec!["SHELL_SECRET"]);
+        assert!(!launch.env_unset.iter().any(|name| name == "OPENAI_API_KEY"));
+
+        let agent = config
+            .resolve(
+                vec!["/bin/true".into()],
+                Some("codex"),
+                None,
+                Path::new("/tmp"),
+                None,
+                &overrides,
+                &Limits::default(),
+                None,
+            )
+            .unwrap();
+        assert!(agent.env_unset.iter().any(|name| name == "OPENAI_API_KEY"));
+    }
+
     #[test]
     fn skip_permissions_argv_ported_values() {
         let config = Config {

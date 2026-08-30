@@ -193,7 +193,7 @@ The original Phase 0 list, item by item:
 | Original blocker | Status on 2026-08-30 |
 | --- | --- |
 | `a engines --json` | **Resolved at the aplexer layer.** It lists `shell`, `codex`, `claude`, `gemini`, `grok`, and `opencode`, including availability plus effective `env_unset` names/counts. PocketShell's richer `EngineManifest` still carries presentation and policy fields (`family`, `label`, `provider_mark`, `usage_provider`, `enabled`). The recommended integration remains a thin PocketShell overlay rather than moving UI metadata into aplexer; that ownership boundary is a product decision, not a missing runtime capability. |
-| Provider-key `env_unset` forced union | **Resolved.** `EngineConfig.env_unset` is merged with aplexer's provider-key list during `Config::resolve`, so custom engine config may add removals but cannot opt out of the safeguard. |
+| Provider-key `env_unset` forced union | **Resolved.** Agent `EngineConfig.env_unset` is merged with aplexer's provider-key list during `Config::resolve`, so custom agent config may add removals but cannot opt out of the safeguard. The literal `shell` engine is intentionally exempt and uses only its configured removals. |
 | `a profiles --json` | **Materially resolved.** Discovery is ported from `profiles.py` (same markers, hints, conservatism). Shape differences to adapt in the Python shim remain: aplexer's namespace is flat and keyed by directory stem (`"zlaude"`, `"godex"`) rather than per-engine `Profile.name`, and there is no `default` flag. Public profile/session JSON now filters environment metadata to recognized config-directory variables rather than exposing arbitrary launch environment. |
 | Launch-resolution command (`a launch-spec --json` / `a launch-exec`) | **Resolved.** Both hidden integration commands use `Config::resolve`, return/apply `env_set` and `env_unset`, select `skip_permissions_argv` by default, and accept `--no-skip-permissions`. The in-process Python client exposes the same resolver as `launch_spec()`. |
 | Config migration `~/.config/pocketshell/{engines,profiles}.yaml` → aplexer TOML | Not done; but the target shape is no longer speculative (`EngineConfig`/`ProfileConfig`/`ShortcutConfig` in `src/lib.rs`). Small documentation-plus-converter task. |
@@ -236,7 +236,7 @@ work:
 | Step | Status | Notes |
 | --- | --- | --- |
 | 0.1 `opencode` built-in engine | **Complete** | Included in `a engines --json` alongside aplexer's other built-ins. |
-| 0.2 `env_unset` + forced-union provider-key list | **Complete** | Enforced during resolution for built-in and custom engines. |
+| 0.2 `env_unset` + forced-union provider-key list | **Complete** | Enforced during resolution for built-in and custom agent engines; literal `shell` launches preserve their ambient/explicit environment except for configured shell removals. |
 | 0.3 `a launch-spec ... --json` | **Complete** | Hidden integration command; includes resolved argv, cwd, `env_set`, and `env_unset`. |
 | 0.4 `a launch-exec ...` | **Complete** | Hidden integration command using the same resolution path. |
 | 0.5 Engines JSON ownership | **Product/integration decision** | Recommended: keep aplexer's shape runtime-focused and let PocketShell overlay UI metadata (`label`, `provider_mark`, `family`). |
@@ -546,7 +546,7 @@ Example lines:
    push feed, `usage`/`quse` — out of aplexer scope by spec §27; their tmux dependence outlives
    Phase C unless separately rehomed.
 9. **Provider-key safeguard ownership:** the forced `env_unset` union is implemented and custom
-   config cannot opt out. The remaining maintenance decision is which project owns the
+   agent config cannot opt out (`shell` is the deliberate non-agent exception). The remaining maintenance decision is which project owns the
    provider-key inventory and how drift against PocketShell's list is detected as providers add
    new credentials.
 10. **Desktop helper-version pinning:** pocketshell-electron pins its launch-line construction
