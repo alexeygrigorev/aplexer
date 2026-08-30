@@ -169,23 +169,23 @@ impl Paths {
     pub fn discover() -> Result<Self> {
         let uid = unsafe { libc::geteuid() };
         let runtime_root = if let Some(value) = env::var_os("APLEXER_RUNTIME_DIR") {
-            PathBuf::from(value)
+            absolute_override_path(PathBuf::from(value), "APLEXER_RUNTIME_DIR")?
         } else if let Some(value) = env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(value).join("aplexer")
+            absolute_xdg_path(PathBuf::from(value), "XDG_RUNTIME_DIR")?.join("aplexer")
         } else {
             PathBuf::from(format!("/tmp/aplexer-{uid}"))
         };
         let state_root = if let Some(value) = env::var_os("APLEXER_STATE_DIR") {
-            PathBuf::from(value)
+            absolute_override_path(PathBuf::from(value), "APLEXER_STATE_DIR")?
         } else if let Some(value) = env::var_os("XDG_STATE_HOME") {
-            PathBuf::from(value).join("aplexer")
+            absolute_xdg_path(PathBuf::from(value), "XDG_STATE_HOME")?.join("aplexer")
         } else {
             home_dir()?.join(".local/state/aplexer")
         };
         let config_file = if let Some(value) = env::var_os("APLEXER_CONFIG") {
-            PathBuf::from(value)
+            absolute_override_path(PathBuf::from(value), "APLEXER_CONFIG")?
         } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
-            PathBuf::from(value).join("aplexer/config.toml")
+            absolute_xdg_path(PathBuf::from(value), "XDG_CONFIG_HOME")?.join("aplexer/config.toml")
         } else {
             home_dir()?.join(".config/aplexer/config.toml")
         };
@@ -233,6 +233,25 @@ impl Paths {
     pub fn registry_lock(&self) -> PathBuf {
         self.state_root.join("registry.lock")
     }
+}
+
+fn absolute_override_path(path: PathBuf, variable: &str) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(env::current_dir()
+        .with_context(|| format!("resolve relative {variable}"))?
+        .join(path))
+}
+
+fn absolute_xdg_path(path: PathBuf, variable: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!(
+            "{variable} must be an absolute path, got {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -3649,4 +3668,20 @@ mod tests {
         assert!(executable_available(program.to_str().unwrap()));
     }
 
+    #[test]
+    fn explicit_relative_path_overrides_are_resolved_once() {
+        let resolved = absolute_override_path(PathBuf::from("state"), "APLEXER_STATE_DIR").unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, env::current_dir().unwrap().join("state"));
+    }
+
+    #[test]
+    fn xdg_paths_must_be_absolute() {
+        let error = absolute_xdg_path(PathBuf::from("runtime"), "XDG_RUNTIME_DIR").unwrap_err();
+        assert!(error.to_string().contains("must be an absolute path"));
+        assert_eq!(
+            absolute_xdg_path(PathBuf::from("/run/user/1000"), "XDG_RUNTIME_DIR").unwrap(),
+            PathBuf::from("/run/user/1000")
+        );
+    }
 }
