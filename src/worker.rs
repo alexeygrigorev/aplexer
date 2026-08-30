@@ -571,6 +571,32 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_wait_blocks_until_an_event_before_cleanup_is_needed() {
+        let (life_tx, life_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let woke_for_event = matches!(
+                wait_for_lifecycle_wake(&life_rx, false),
+                LifecycleWake::Event(LifeEvent::PtyEof)
+            );
+            done_tx.send(woke_for_event).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        life_tx.send(LifeEvent::PtyEof).unwrap();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lifecycle event did not wake waiter"));
+        waiter.join().unwrap();
+    }
+
+    #[test]
     fn lagging_subscriber_is_evicted_when_queue_fills() {
         let dir = tempfile::tempdir().unwrap();
         let hub = test_hub(&dir);
@@ -2290,14 +2316,46 @@ fn cleanup_after_lifecycle_failure(runtime: &WorkerRuntime) -> Result<()> {
     }
 }
 
+enum LifecycleWake {
+    Event(LifeEvent),
+    CleanupPoll,
+    Disconnected,
+}
+
+/// Block indefinitely while the tracked child is still running (or while a
+/// post-exit PTY is still held open by a descendant). Timed containment scans
+/// are needed only after both the leader exit and PTY EOF are known: at that
+/// point an adopted descendant can exit without producing another LifeEvent.
+fn wait_for_lifecycle_wake(rx: &mpsc::Receiver<LifeEvent>, cleanup_polling: bool) -> LifecycleWake {
+    if !cleanup_polling {
+        return match rx.recv() {
+            Ok(event) => LifecycleWake::Event(event),
+            Err(_) => LifecycleWake::Disconnected,
+        };
+    }
+    match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
+        Ok(event) => LifecycleWake::Event(event),
+        Err(mpsc::RecvTimeoutError::Timeout) => LifecycleWake::CleanupPoll,
+        // Once both producer threads have ended the channel remains
+        // permanently disconnected, so recv_timeout returns immediately.
+        // Retain the intended cleanup cadence instead of turning that state
+        // into a busy loop while adopted descendants drain.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            thread::sleep(DESCENDANT_POLL_INTERVAL);
+            LifecycleWake::CleanupPoll
+        }
+    }
+}
+
 fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     let mut pty_eof = false;
     let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
     let mut fatal: Option<String> = None;
     let mut containment_empty = false;
     loop {
-        match rx.recv_timeout(DESCENDANT_POLL_INTERVAL) {
-            Ok(event) => match event {
+        let cleanup_polling = child_exit.is_some() && pty_eof;
+        match wait_for_lifecycle_wake(&rx, cleanup_polling) {
+            LifecycleWake::Event(event) => match event {
                 LifeEvent::PtyEof => {
                     pty_eof = true;
                     if let Ok(mut pty) = runtime.pty_write.lock() {
@@ -2325,9 +2383,8 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
                     let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) if child_exit.is_some() => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            LifecycleWake::CleanupPoll => {}
+            LifecycleWake::Disconnected => {
                 fatal = Some("workload lifecycle channel disconnected".into());
                 break;
             }
