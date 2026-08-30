@@ -187,7 +187,7 @@ def test_native_client_rejects_relative_xdg_paths(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv(variable, value)
 
-    with pytest.raises(RuntimeError, match=rf"{variable} must be an absolute path"):
+    with pytest.raises(AplexerError, match=rf"{variable} must be an absolute path"):
         Client().snapshot()
 
 
