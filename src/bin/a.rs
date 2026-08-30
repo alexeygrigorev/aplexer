@@ -4933,6 +4933,20 @@ mod switching_tests {
             "force=true must always be a real write, even with unchanged text"
         );
     }
+
+    #[test]
+    fn real_zero_sized_pty_uses_conventional_geometry() {
+        use std::os::fd::AsRawFd;
+
+        let (_master, slave) = aplexer::open_pty(0, 0).unwrap();
+        assert_eq!(
+            terminal_size(slave.as_raw_fd()),
+            Some((
+                aplexer::screen::DEFAULT_TERMINAL_ROWS,
+                aplexer::screen::DEFAULT_TERMINAL_COLS,
+            ))
+        );
+    }
 }
 
 fn send_data(writer: &Arc<Mutex<UnixStream>>, data: &[u8]) -> Result<()> {
@@ -4978,7 +4992,22 @@ fn terminal_size(fd: i32) -> Option<(u16, u16)> {
         return None;
     }
     let ws = unsafe { ws.assume_init() };
-    Some((ws.ws_row.max(1), ws.ws_col.max(1)))
+    // A newly-created or deliberately-unsized PTY reports 0x0. Treat it as
+    // "geometry unknown", using the same conventional fallback as the
+    // worker's screen model; 1x1 is a degenerate vt100 grid and is not a
+    // useful representation of any interactive terminal.
+    Some((
+        if ws.ws_row == 0 {
+            aplexer::screen::DEFAULT_TERMINAL_ROWS
+        } else {
+            ws.ws_row
+        },
+        if ws.ws_col == 0 {
+            aplexer::screen::DEFAULT_TERMINAL_COLS
+        } else {
+            ws.ws_col
+        },
+    ))
 }
 
 fn parse_signal(raw: &str) -> Result<i32> {
