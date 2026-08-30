@@ -658,8 +658,11 @@ pub fn read_session_record(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
             expected_history.display()
         );
     }
-    validate_history_bytes(record.history_bytes)
-        .with_context(|| format!("validate session record {}", path.display()))?;
+    // Do not apply the current worker-allocation ceiling while enumerating
+    // durable records. Older releases could persist larger rings; those
+    // sessions must remain addressable for status, capture, and forget after
+    // an upgrade. Config resolution and `History::open` enforce the ceiling
+    // before every new worker allocation.
     Ok(record)
 }
 
@@ -3297,11 +3300,27 @@ mod tests {
         record.history_path = paths.history(Uuid::new_v4());
         atomic_write_json(&paths.record(id), &record).unwrap();
         assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("history path"));
+    }
 
-        record = registry_record(&paths, id);
+    #[test]
+    fn registry_enumeration_grandfathers_legacy_history_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::new_v4();
+        fs::create_dir(paths.state_session(id)).unwrap();
+
+        let mut record = registry_record(&paths, id);
         record.history_bytes = MAX_HISTORY_BYTES + 1;
         atomic_write_json(&paths.record(id), &record).unwrap();
-        assert!(format!("{:#}", list_records(&paths).unwrap_err()).contains("history_bytes"));
+
+        let records = list_records(&paths).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].history_bytes, MAX_HISTORY_BYTES + 1);
     }
 
     #[test]

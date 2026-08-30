@@ -998,7 +998,10 @@ decode `data` according to `encoding` for the byte-authoritative result.
 The worker maintains and persists a byte-exact PTY history ring. Per-session
 `history_bytes` is configurable from `0` through `16777216` bytes (16 MiB);
 larger values are rejected before worker startup. Raw capture and post-mortem
-capture are bounded by the same 16 MiB protocol-frame ceiling.
+capture are bounded by the same 16 MiB protocol-frame ceiling. Persisted
+records from older versions may report a larger configured capacity and remain
+available to list, status, capture, and forget operations, but a new worker
+will not allocate a ring above the current ceiling.
 
 The worker also maintains terminal screen state for current-screen attach and
 capture, including alternate-screen behavior. This screen model is separate

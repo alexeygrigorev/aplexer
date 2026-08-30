@@ -1,9 +1,12 @@
 use aplexer::api::{start_session, StartRequest};
-use aplexer::{Paths, MAX_HISTORY_BYTES};
+use aplexer::{atomic_write_json, read_record, Paths, MAX_HISTORY_BYTES};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Harness {
@@ -32,6 +35,16 @@ impl Harness {
         };
         paths.ensure().unwrap();
         paths
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_a"))
+            .env("APLEXER_RUNTIME_DIR", self.runtime.path())
+            .env("APLEXER_STATE_DIR", self.state.path())
+            .env("APLEXER_CONFIG", &self.config)
+            .args(args)
+            .output()
+            .expect("run CLI")
     }
 
     fn assert_no_session_artifacts(&self) {
@@ -107,4 +120,78 @@ fn embedded_api_rejects_usize_max_before_worker_spawn() {
         "{message}"
     );
     harness.assert_no_session_artifacts();
+}
+
+#[test]
+fn terminal_legacy_oversized_record_remains_recoverable() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace");
+    let paths = harness.paths();
+    let started = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "--tag",
+        "legacy",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'legacy-history\\n'",
+    ]);
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started.stdout).expect("start JSON");
+    let id = started["id"].as_str().expect("session id");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = harness.run(&["snapshot"]);
+        assert!(snapshot.status.success());
+        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+        if records.as_array().is_some_and(|records| {
+            records.iter().any(|record| {
+                record["id"] == id && record["phase"] == "exited" && record["worker_alive"] == false
+            })
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "session did not become terminal");
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let mut record = read_record(&paths.record(id.parse().unwrap())).expect("read record");
+    record.history_bytes = MAX_HISTORY_BYTES + 1;
+    atomic_write_json(&paths.record(record.id), &record).expect("write legacy record");
+
+    let snapshot = harness.run(&["snapshot"]);
+    assert!(
+        snapshot.status.success(),
+        "legacy record hid registry: {}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let status = harness.run(&["status", id, "--json"]);
+    assert!(
+        status.status.success(),
+        "legacy status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let capture = harness.run(&["capture", id]);
+    assert!(
+        capture.status.success(),
+        "legacy capture failed: {}",
+        String::from_utf8_lossy(&capture.stderr)
+    );
+    assert_eq!(capture.stdout, b"legacy-history\r\n");
+
+    let forgotten = harness.run(&["forget", id, "--force"]);
+    assert!(
+        forgotten.status.success(),
+        "legacy forget failed: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    assert!(!paths.state_session(record.id).exists());
 }

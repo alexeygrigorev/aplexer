@@ -148,6 +148,9 @@ pids = 256
 `history_bytes` may be `0` through `16777216` (16 MiB) per session; larger
 values are rejected before a worker is spawned because the ring is held in
 worker memory and its readable capture payload is bounded to the same size.
+Records created by older versions with a larger value remain visible and can
+still be inspected, captured, or forgotten; the ceiling applies when a new
+worker would allocate a history ring.
 
 Launch a profile explicitly with `a start --engine codex --profile zodex`, or from inside a workspace `a start --profile zodex` (the profile's own `engine` field fills in `--engine`).
 
