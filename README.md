@@ -55,7 +55,11 @@ a attach --workspace "$PWD" --tag shell
 # Ctrl-b d detaches without terminating the workload.
 ```
 
-The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. The full CLI surface is `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
+The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. Core commands include `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `forget`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
+
+`a snapshot --json` returns a bare array in stable newest-first creation order.
+It has no enclosing object or global generation, and it is not an atomic view
+across independently updating session workers.
 
 **Reattach repaints the live screen, tmux-style.** The worker feeds every PTY byte through a terminal-state model continuously — attached or not — so `a attach` renders *the screen as it is right now* (cursor position, colors, alternate screen, bracketed paste and mouse modes, scroll margins) rather than replaying a tail of raw byte history. Reattaching to a running full-screen agent TUI puts it back exactly where the agent thinks it is, instead of leaving a stale cursor and a half-drawn frame, and the payload is a few hundred bytes to a few KB instead of a fixed 32 KB. `a attach --history-bytes N` is the escape hatch back to the old raw-tail replay (byte-exact scripted consumers, or seeding your terminal's native scrollback). See [docs/terminal-state-design.md](docs/terminal-state-design.md).
 
@@ -245,6 +249,10 @@ The `aplexer` distribution installs the CLI binaries and an exact-version
 `aplexer-client` dependency, which provides the `aplexer` import package.
 From a source checkout, `python3 -m pip install ./python` installs just the
 client bindings for development.
+
+Published `aplexer` and `aplexer-client` wheels require Python 3.11 or newer
+and currently target Linux x86_64 and aarch64. macOS and Windows wheels are not
+published.
 
 ```python
 from aplexer import Client

@@ -977,10 +977,14 @@ Example:
 
 ```bash
 a capture .:review
-a capture .:review --lines 500
+a capture .:review --bytes 500
+a capture .:review --screen
+a capture .:review --screen --plain
 ```
 
-V1 may expose bounded raw terminal output/history rather than a full tmux-style terminal screen model.
+Raw capture returns a tail of the session's byte-preserving PTY history.
+`--screen` instead returns the worker's rendered current-screen snapshot;
+`--screen --plain` returns its plain-text contents.
 
 JSON capture is lossless for arbitrary PTY bytes. Its payload shape is
 `{"id":"...","bytes":N,"encoding":"base64","data":"..."}`. A redundant
@@ -991,25 +995,14 @@ decode `data` according to `encoding` for the byte-authoritative result.
 
 ## 17. Terminal history
 
-The worker sees all PTY output and may maintain bounded history.
+The worker maintains and persists a byte-exact PTY history ring. Per-session
+`history_bytes` is configurable from `0` through `16777216` bytes (16 MiB);
+larger values are rejected before worker startup. Raw capture and post-mortem
+capture are bounded by the same 16 MiB protocol-frame ceiling.
 
-V1 should not require implementing a full terminal emulator.
-
-Initial design:
-
-- bounded byte/line history,
-- configurable limit,
-- available through `capture`,
-- optionally persisted.
-
-Later, Aplexer may integrate a terminal-state parser for:
-
-- proper screen snapshots,
-- alternate-screen semantics,
-- copy mode,
-- richer PocketShell previews.
-
-Do not block the core runtime on this.
+The worker also maintains terminal screen state for current-screen attach and
+capture, including alternate-screen behavior. This screen model is separate
+from the authoritative raw history bytes and is not a copy-mode interface.
 
 ---
 
@@ -1025,28 +1018,34 @@ At minimum:
 a snapshot --json
 ```
 
-should return authoritative structured state.
+returns a bare JSON array of session records in stable newest-first order
+(`created_at_ms` descending). There is no enclosing object and no global
+snapshot generation. The array is a registry scan of independently updated
+session records, not an atomic point-in-time view across all workers.
 
-Example:
+Representative element (additional persisted fields may also be present):
 
 ```json
-{
-  "schema_version": 1,
-  "generation": 1842,
-  "sessions": [
-    {
-      "id": "019d...",
-      "workspace": "/home/alexey/git/pocketshell",
-      "tag": "main",
-      "kind": "agent",
-      "engine": "claude",
-      "profile": "default",
-      "state": "running",
-      "created_at": 1787738302,
-      "activity_at": 1787738821
-    }
-  ]
-}
+[
+  {
+    "schema_version": 1,
+    "id": "7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716",
+    "workspace": "/home/alexey/git/pocketshell",
+    "tag": "main",
+    "engine": "claude",
+    "command": ["claude"],
+    "cwd": "/home/alexey/git/pocketshell",
+    "history_bytes": 4194304,
+    "created_at_ms": 1787738302000,
+    "updated_at_ms": 1787738821000,
+    "phase": "running",
+    "worker_pid": 12345,
+    "workload_pid": 12352,
+    "socket_path": "/run/user/1000/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/control.sock",
+    "history_path": "/home/alexey/.local/state/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/history.bin",
+    "worker_alive": true
+  }
+]
 ```
 
 The schema must support deterministic reverse lookups by:
@@ -1083,7 +1082,9 @@ Examples:
 
 The event schema should be designed early even if event streaming lands after v1 attach/list.
 
-Events should include a monotonically increasing generation/sequence where practical so clients can detect gaps and fall back to a full snapshot.
+Event streams carry their own sequence/generation where practical so clients
+can detect gaps and fall back to a full snapshot. That stream-local cursor is
+not a global generation attached to `a snapshot --json`.
 
 ---
 
@@ -1154,12 +1155,8 @@ from aplexer import Client
 
 client = Client()
 
-sessions = client.sessions(
-    workspace="/home/alexey/git/pocketshell",
-    engine="codex",
-)
-
-profiles = client.profiles(engine="codex")
+sessions = client.list()
+profiles = client.profiles()
 
 session = client.start(
     workspace="/home/alexey/git/pocketshell",
@@ -1167,21 +1164,26 @@ session = client.start(
     engine="codex",
     profile="zai",
 )
+
+status = client.status(session.id)
+client.send(session.id, b"printf 'hello\\n'\n")
+raw_output = client.capture(session.id, max_bytes=4096)
+client.kill(session.id, signal=15, grace_ms=2000)
+# After status reports that the worker is gone:
+client.forget(session.id, force=True)
 ```
 
-### 21.1 Initial transport
+`send()` and `capture()` preserve arbitrary bytes without text decoding.
+`forget()` is force-gated and removes only a dead session's records; it does
+not signal a process.
 
-The Python client may initially call the Aplexer binary with a stable JSON protocol.
+### 21.1 Native transport
 
-Prefer an explicit machine/RPC command rather than scraping regular CLI output.
-
-Example internal concept:
-
-```text
-aplexer rpc <request>
-```
-
-Longer term, Python should connect directly to an Aplexer control socket if/when a control process is introduced.
+The `aplexer-client` distribution provides the `aplexer` import package as a
+PyO3 extension plus a typed Python facade. It calls the Rust library in-process
+and does not spawn or scrape the `a` executable. Rust owns configuration,
+session resolution/startup, control-protocol framing, PTY byte transport,
+lifecycle checks, and durable-state mutation.
 
 The public Python API should be designed so the underlying transport can change without breaking callers.
 
@@ -1309,12 +1311,15 @@ Target user experience:
 
 ```bash
 uv tool install aplexer
+pipx install aplexer
 ```
 
-or:
+These tool installers expose `a` and `aplexer` from an isolated environment.
+Applications that also import the client install the same distribution into
+their Python environment:
 
 ```bash
-pipx install aplexer
+python -m pip install aplexer
 ```
 
 This should install:
@@ -1324,7 +1329,7 @@ aplexer
 a
 ```
 
-and the Python module:
+and, within that installed environment, the Python module:
 
 ```python
 import aplexer
@@ -1342,43 +1347,31 @@ The CLI uses a wheel containing standalone Rust executables; the client uses
 maturin to build the PyO3 extension. Together they provide the simple
 `uv tool install aplexer` experience described above.
 
-No Python interpreter should be required for the core Rust runtime after installation if avoidable; Python exists for packaging/client integration.
+The bundled Rust executables do not embed Python. PyPI installations use thin
+Python console-script launchers to locate and execute those binaries.
 
 ---
 
 ## 25. Configuration
 
-Possible user-level config:
+The user configuration file is `~/.config/aplexer/config.toml` by default
+(`APLEXER_CONFIG` overrides it). The schema is versioned and rejects unknown
+fields and invalid engine/profile/shortcut references. For example:
 
 ```toml
-[resources]
-default_memory_max = "24G"
-default_memory_high = "20G"
-default_swap_max = "8G"
-aggregate_memory_max = "56G"
+version = 1
+default_engine = "shell"
 
-[terminal]
-history_lines = 10000
+[profiles.review]
+engine = "codex"
+history_bytes = 4194304
+
+[profiles.review.limits]
+memory_bytes = 2147483648
+pids = 256
 ```
 
-Workspace-level config may be stored in a project file.
-
-Potential names:
-
-```text
-aplexer.toml
-.aplexer.toml
-pyproject.toml [tool.aplexer]
-```
-
-A final choice should balance language neutrality with compatibility with Python-heavy workspaces.
-
-Recommended initial approach:
-
-- user config: `~/.config/aplexer/config.toml`
-- optional workspace config: `.aplexer.toml`
-
-Avoid making `pyproject.toml` the only project configuration mechanism because Aplexer is language-neutral.
+There is currently no workspace-local configuration layer.
 
 ---
 
@@ -1726,7 +1719,8 @@ These should be resolved during the first implementation milestone:
 11. whether an exited/OOM session remains addressable until explicitly removed.
 12. whether a workload OOM automatically starts a shell, remains stopped, or requires explicit restart.
 13. whether the first control process exists in v1 or only after benchmarking.
-14. exact event sequence/generation contract.
+14. exact event-stream sequence/generation contract (snapshots deliberately
+    have no global generation).
 
 None of these should change the core failure-domain model.
 
