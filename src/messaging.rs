@@ -892,7 +892,7 @@ fn prune_workspace_locked(
     while entries.len() > max_messages || total > max_bytes {
         let Some(index) = entries
             .iter()
-            .position(|entry| !protected.is_some_and(|protected| entry.path == protected))
+            .position(|entry| protected.is_none_or(|protected| entry.path != protected))
         else {
             bail!(
                 "mailbox quota cannot retain the protected message ({} messages, {total} bytes)",

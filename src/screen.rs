@@ -677,7 +677,7 @@ mod tests {
     fn margin_tracker_oversized_params_discarded() {
         let mut t = MarginTracker::new(24);
         let mut seq = b"\x1b[".to_vec();
-        seq.extend(std::iter::repeat(b'1').take(64));
+        seq.extend(std::iter::repeat_n(b'1', 64));
         seq.push(b'r');
         let event = t.scan(&seq);
         assert!(!event.margins_reset);
