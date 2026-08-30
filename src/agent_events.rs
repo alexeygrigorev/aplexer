@@ -1261,6 +1261,8 @@ fn dummy_record(engine: &str) -> SessionRecord {
         phase: crate::Phase::Running,
         worker_pid: None,
         workload_pid: None,
+        containment_cgroup: None,
+        containment_empty: false,
         socket_path: PathBuf::from("/"),
         history_path: PathBuf::from("/"),
         exit: None,

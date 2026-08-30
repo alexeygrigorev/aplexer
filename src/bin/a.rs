@@ -947,7 +947,7 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
     let mut retained_count = 0usize;
     for record in records {
         let workload_alive = record.workload_pid.map(process_alive).unwrap_or(false);
-        if workload_alive || !record.worker_finished() {
+        if workload_alive || !record.worker_finished() || !record.containment_empty {
             retained_count += 1;
             continue;
         }
@@ -1282,10 +1282,10 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         }
         if socket_missing {
             force_kill_stale_worker(&record)?;
-            remove_session_state(paths, record.id)
-                .with_context(|| format!("remove stale session {}", record.id))?;
+            recover_broken_containment(&record, signal, args.grace_ms)?;
+            mark_broken_workload_killed(paths, &record)?;
             eprintln!(
-                "a: killed session {} (worker pid {} was unreachable; force-killed and removed)",
+                "a: killed session {} (worker pid {} was unreachable; containment cleanup confirmed)",
                 record.id,
                 record.worker_pid.unwrap_or(0),
             );
@@ -1295,9 +1295,12 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             return Ok(());
         }
         if !record.worker_finished() {
-            kill_broken_workload(&record, signal, args.grace_ms)?;
+            recover_broken_containment(&record, signal, args.grace_ms)?;
             mark_broken_workload_killed(paths, &record)?;
         } else {
+            if !record.containment_empty {
+                recover_broken_containment(&record, signal, args.grace_ms)?;
+            }
             remove_session_state(paths, record.id)
                 .with_context(|| format!("remove finished session {}", record.id))?;
             eprintln!(
@@ -1318,6 +1321,7 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     let mut current = read_record(&paths.record(record.id)).unwrap_or_else(|_| record.clone());
     current.phase = Phase::Failed;
+    current.containment_empty = true;
     current.error =
         Some("worker died without recording workload exit; workload killed by `a kill`".into());
     current.updated_at_ms = now_ms();
@@ -1326,55 +1330,26 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
     Ok(())
 }
 
-/// Signals a broken session's surviving workload process group directly.
-/// The recorded workload pid could in principle have been recycled since
-/// the worker died, so before signalling anything the pid's identity is
-/// verified against the APLEXER_SESSION_ID environment variable the worker
-/// stamped into the workload at spawn; on any mismatch this fails closed.
-fn kill_broken_workload(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
+/// Recover a session whose worker can no longer perform containment cleanup.
+/// A leader PID or process group is intentionally insufficient: a workload
+/// may daemonize through `setsid`, and after the subreaper worker dies there
+/// is no complete process-tree root left to inspect. Resource-limited
+/// sessions retain an authoritative cgroup locator; every other broken
+/// session is preserved for manual investigation rather than reporting a
+/// false cleanup success.
+fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
     let grace = kill_grace_duration(grace_ms)?;
-    let Some(pid) = record.workload_pid else {
-        return Ok(());
-    };
-    if !process_alive(pid) {
+    if record.containment_empty {
         return Ok(());
     }
-    if !workload_identity_matches(pid, record.id) {
+    let Some(locator) = record.containment_cgroup.as_deref() else {
         bail!(
-            "session {} is broken (worker dead) and pid {} no longer looks like its workload; \
-             refusing to signal it",
-            record.id,
-            pid
+            "session {} has no authoritative containment locator; refusing to claim cleanup or remove its runtime evidence",
+            record.id
         );
-    }
-    let pgid = pid as i32;
-    if unsafe { libc::kill(-pgid, signal) } != 0 {
-        return Err(io::Error::last_os_error()).context("signal workload process group");
-    }
-    if signal != libc::SIGKILL {
-        let deadline = Instant::now()
-            .checked_add(grace)
-            .ok_or_else(|| anyhow!("kill grace deadline overflow"))?;
-        while process_alive(pid) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-        }
-        if process_alive(pid) && workload_identity_matches(pid, record.id) {
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn workload_identity_matches(pid: u32, id: Uuid) -> bool {
-    let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else {
-        return false;
     };
-    let needle = format!("APLEXER_SESSION_ID={id}");
-    environ
-        .split(|b| *b == 0)
-        .any(|entry| entry == needle.as_bytes())
+    cleanup_recorded_cgroup(record.id, locator, signal, grace)
+        .context("recover recorded cgroup containment")
 }
 
 fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
@@ -1758,7 +1733,7 @@ fn phase_name(phase: &Phase) -> &'static str {
 /// which reads like a bug rather than "this session is done". `a kill` is
 /// deliberately exempt: for a terminal-phase session it now has a real
 /// action to take (removing the state, see cmd_kill), and it already
-/// handles the broken case itself via `kill_broken_workload`.
+/// handles the broken case itself via `recover_broken_containment`.
 ///
 /// A third, rarer case: `phase` is non-terminal and `worker_pid` is alive,
 /// but `socket_path` doesn't exist on disk. This happens when the worker's
@@ -4144,6 +4119,8 @@ mod switching_tests {
             phase,
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
+            containment_cgroup: None,
+            containment_empty: false,
             // Must exist on disk: check_attachable now checks socket_path
             // (this test binary's own executable is a convenient stand-in
             // for "some file that's there"; only .exists() is probed, never
@@ -4388,17 +4365,16 @@ mod switching_tests {
         assert!(err.contains("worker is not running"), "{err}");
     }
 
-    /// `a kill` against a record whose worker_pid is alive but whose
-    /// control socket is gone (the exact bug scenario this task fixes)
-    /// must force-kill that unreachable worker_pid directly and fully
-    /// remove the record, rather than refusing with the raw connect error
-    /// OR leaving the pid untouched with a "clean it up yourself" message.
+    /// `a kill` against a record whose worker_pid is alive but whose control
+    /// socket is gone may stop that verified worker, but without a cgroup it
+    /// cannot prove that a setsid descendant did not escape. It must preserve
+    /// the record and report the ambiguity rather than claiming success.
     /// Uses a real throwaway child process as the stand-in worker_pid
     /// (never the test process's own pid, which `mk_record` defaults to --
     /// this test's whole point is that the pid now DOES get signalled, so
     /// reusing the test runner's pid here would kill the test runner).
     #[test]
-    fn cmd_kill_force_kills_and_removes_stale_socket_record() {
+    fn cmd_kill_preserves_stale_socket_record_without_containment_proof() {
         let state_dir = tempfile::tempdir().unwrap();
         let runtime_dir = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -4441,10 +4417,15 @@ mod switching_tests {
             signal: "TERM".to_string(),
             grace_ms: 50,
         };
-        cmd_kill(&paths, args, false).expect("force-kill-and-remove should succeed, not error");
+        let error = cmd_kill(&paths, args, false)
+            .expect_err("missing containment proof must prevent cleanup success");
         assert!(
-            !paths.state_session(record.id).exists(),
-            "stale record should have been fully removed"
+            format!("{error:#}").contains("no authoritative containment locator"),
+            "{error:#}"
+        );
+        assert!(
+            paths.state_session(record.id).exists(),
+            "ambiguous stale record must be preserved"
         );
         // Reap before checking liveness: a just-SIGKILLed child is a zombie
         // (still "alive" to a bare kill(pid, 0) probe) until waited on.

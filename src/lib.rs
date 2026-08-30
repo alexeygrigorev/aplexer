@@ -388,6 +388,17 @@ pub struct SessionRecord {
     pub worker_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_pid: Option<u32>,
+    /// Kernel containment domain for resource-limited sessions. Recovery
+    /// code must validate this path against the session id before using it;
+    /// an absent locator is never equivalent to an empty domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_cgroup: Option<PathBuf>,
+    /// Durable proof that the worker (or an independent cgroup recovery)
+    /// observed the complete containment domain empty. Numeric leader PIDs
+    /// are not such proof because descendants may call `setsid` and outlive
+    /// both the original process group and the worker.
+    #[serde(default)]
+    pub containment_empty: bool,
     pub socket_path: PathBuf,
     pub history_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1880,6 +1891,9 @@ impl Cgroup {
             .open(self.path.join("cgroup.procs"))
             .with_context(|| format!("open {}/cgroup.procs", self.path.display()))
     }
+    pub fn locator(&self) -> &Path {
+        &self.path
+    }
     /// Kills the placeholder process that was keeping the delegated scope
     /// alive. Call this only after the real workload pid has been added to
     /// the cgroup, so the cgroup never goes empty (and gets garbage
@@ -1946,6 +1960,140 @@ impl Cgroup {
     pub fn cleanup(&self) {
         self.release_anchor();
         let _ = fs::remove_dir(&self.path);
+    }
+}
+
+/// Validate and recover a resource-limited session through its recorded
+/// kernel containment domain. A path that has disappeared after it was
+/// durably recorded is empty by construction: cgroup v2 cannot remove a
+/// populated cgroup. Every other inspection error fails closed.
+pub fn cleanup_recorded_cgroup(
+    id: Uuid,
+    locator: &Path,
+    signal: i32,
+    grace: Duration,
+) -> Result<()> {
+    let Some(path) = validate_recorded_cgroup(id, locator)? else {
+        return Ok(());
+    };
+
+    if signal == libc::SIGKILL {
+        kill_cgroup_path(&path)?;
+    } else {
+        signal_cgroup_path(&path, signal)?;
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| anyhow!("cgroup cleanup grace deadline overflow"))?;
+        while cgroup_path_populated(&path)? && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if cgroup_path_populated(&path)? {
+            kill_cgroup_path(&path)?;
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cgroup_path_populated(&path)? {
+        if Instant::now() >= deadline {
+            bail!("timed out proving recorded cgroup {} empty", path.display());
+        }
+        // Older cgroup-v2 mounts may not expose cgroup.kill. Repeat the
+        // pidfd-less cgroup.procs fallback so a member that forked between
+        // the first read and signal cannot make cleanup appear complete.
+        kill_cgroup_path(&path)?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+fn validate_recorded_cgroup(id: Uuid, locator: &Path) -> Result<Option<PathBuf>> {
+    let root = Path::new("/sys/fs/cgroup");
+    let expected = format!("aplexer-workload-{id}.scope");
+    if !locator.is_absolute()
+        || !locator.starts_with(root)
+        || locator.file_name() != Some(OsStr::new(&expected))
+        || locator
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "untrusted recorded cgroup locator for session {id}: {}",
+            locator.display()
+        );
+    }
+    let canonical = match fs::canonicalize(locator) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("resolve recorded cgroup {}", locator.display()))
+        }
+    };
+    let canonical_root = fs::canonicalize(root).context("resolve cgroup v2 root")?;
+    if !canonical.starts_with(&canonical_root)
+        || canonical.file_name() != Some(OsStr::new(&expected))
+    {
+        bail!(
+            "recorded cgroup for session {id} escaped the cgroup root: {}",
+            canonical.display()
+        );
+    }
+    if !fs::metadata(&canonical)?.is_dir() {
+        bail!(
+            "recorded cgroup is not a directory: {}",
+            canonical.display()
+        );
+    }
+    Ok(Some(canonical))
+}
+
+fn cgroup_path_populated(path: &Path) -> Result<bool> {
+    match read_counter(&path.join("cgroup.events"), "populated") {
+        Ok(value) => Ok(value != 0),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn signal_cgroup_path(path: &Path, signal: i32) -> Result<()> {
+    let procs = path.join("cgroup.procs");
+    let pids = match fs::read_to_string(&procs) {
+        Ok(pids) => pids,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", procs.display())),
+    };
+    for text in pids.lines() {
+        let pid = text
+            .parse::<i32>()
+            .with_context(|| format!("parse pid in {}/cgroup.procs", path.display()))?;
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| format!("signal cgroup member {pid}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kill_cgroup_path(path: &Path) -> Result<()> {
+    let kill = path.join("cgroup.kill");
+    if kill.exists() {
+        match fs::write(&kill, "1") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("write {}", kill.display())),
+        }
+    } else {
+        signal_cgroup_path(path, libc::SIGKILL)
     }
 }
 fn wait_for_scope_cgroup(unit: &str, timeout: Duration) -> Result<PathBuf> {
@@ -2348,6 +2496,8 @@ mod tests {
             phase: Phase::Running,
             worker_pid: Some(pid),
             workload_pid: None,
+            containment_cgroup: None,
+            containment_empty: false,
             socket_path: state_dir.join("control.sock"),
             history_path: state_dir.join("history.bin"),
             exit: None,

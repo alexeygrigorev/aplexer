@@ -54,6 +54,8 @@ impl Harness {
             phase: Phase::Starting,
             worker_pid: None,
             workload_pid: None,
+            containment_cgroup: None,
+            containment_empty: false,
             socket_path: self.paths.socket(id),
             history_path: self.paths.history(id),
             exit: None,

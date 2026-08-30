@@ -563,6 +563,8 @@ mod tests {
             phase,
             worker_pid: None,
             workload_pid: None,
+            containment_cgroup: None,
+            containment_empty: false,
             socket_path: "/tmp/s".into(),
             history_path: "/tmp/h".into(),
             exit: None,
