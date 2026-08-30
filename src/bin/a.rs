@@ -1731,6 +1731,46 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let cgv2 = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
     checks.push(json!({"name":"cgroup_v2","ok":cgv2,"detail":if cgv2{"mounted"}else{"not mounted; unlimited sessions still work"}}));
     match Config::load(paths){Ok(config)=>checks.push(json!({"name":"config","ok":true,"detail":format!("{} engines, {} profiles",config.engines.len(),config.profiles.len())})),Err(e)=>checks.push(json!({"name":"config","ok":false,"detail":format!("{e:#}")}))}
+    match list_records(paths) {
+        Ok(records) => {
+            let record_count = records.len();
+            let broken: Vec<Value> = records
+                .into_iter()
+                .filter(|record| record.worker_phase_active() && !record.worker_alive())
+                .map(|record| {
+                    json!({
+                        "id": record.id,
+                        "selector": record.selector(),
+                        "phase": phase_name(&record.phase),
+                        "recovery": {
+                            "kill": format!("a kill {}", record.id),
+                            "forget": format!("a forget {} --force", record.id),
+                        },
+                    })
+                })
+                .collect();
+            let detail = if broken.is_empty() {
+                format!("{record_count} session record(s), none broken")
+            } else {
+                format!(
+                    "{} broken/stale session(s); run `a kill SESSION`, or if safe recovery is refused, `a forget SESSION --force`",
+                    broken.len()
+                )
+            };
+            checks.push(json!({
+                "name": "sessions",
+                "ok": broken.is_empty(),
+                "detail": detail,
+                "broken_sessions": broken,
+            }));
+        }
+        Err(error) => checks.push(json!({
+            "name": "sessions",
+            "ok": false,
+            "detail": format!("cannot inspect session records: {error:#}"),
+            "broken_sessions": [],
+        })),
+    }
     let ok = checks.iter().all(|v| v["ok"].as_bool().unwrap_or(false));
     if json_output {
         println!(
