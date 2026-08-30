@@ -4440,12 +4440,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         *shared_record.lock().unwrap_or_else(PoisonError::into_inner) = outcome.record;
         reader = outcome.reader; // old stream dropped (closed) here
 
-        // Light-variant reset: clear screen + home + show cursor, but keep
-        // the DECSTBM scroll region and raw mode -- they are terminal
-        // state, not session state. ?25h because A's TUI may have hidden
-        // the cursor and B never knows to show it; same rationale as
-        // reset_terminal's.
-        let mut seq: Vec<u8> = b"\x1b[2J\x1b[H\x1b[?25h".to_vec();
+        // A and B have independent terminal state. Neutralize every buffer
+        // and input mode A's snapshot/live stream may have enabled before
+        // replaying B's snapshot: a default-mode B deliberately emits no
+        // mouse-off or primary-screen transition of its own. B's snapshot
+        // follows immediately and re-enables exactly the modes it owns.
+        // Raw termios belongs to this client rather than either session, so
+        // it remains in force across the switch.
+        let mut seq: Vec<u8> = TERMINAL_RESET_SEQUENCE.to_vec();
         seq.extend_from_slice(&outcome.history);
         // The new session's margins are its own: drop whatever the previous
         // one had, then learn the new one's from its snapshot payload.

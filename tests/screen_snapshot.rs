@@ -1546,6 +1546,80 @@ fn switching_sessions_drops_the_previous_sessions_scroll_region() {
     harness.run_ok(&["kill", &id_b, "--signal", "KILL"], Duration::from_secs(5));
 }
 
+#[test]
+fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("switch-modes");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id_a = start_session(&harness, &workspace, "modes");
+    let id_b = start_session(&harness, &workspace, "plain");
+    harness.run_ok(
+        &[
+            "send",
+            &id_a,
+            r#"printf '\033[?1049h\033[?1000h\033[?1006hA-MODE-%s' MARK"#,
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id_a, "A-MODE-MARK");
+    harness.run_ok(
+        &["send", &id_b, r#"printf 'B-PLAIN-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id_b, "B-PLAIN-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id_a, 24, 80);
+    client.wait_for(b"A-MODE-MARK", 0, "session A's mode marker");
+    let switch_at = client.mark();
+    let before = client.output();
+    let host_before = host_terminal(&before, 24, 80);
+    assert!(host_before.screen().alternate_screen());
+    assert_eq!(
+        host_before.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::PressRelease
+    );
+    assert_eq!(
+        host_before.screen().mouse_protocol_encoding(),
+        vt100::MouseProtocolEncoding::Sgr
+    );
+
+    client.send(&[0x02, b'n']);
+    let target_at =
+        client.wait_for_offset(b"B-PLAIN-MARK", switch_at, "session B's plain snapshot");
+    let out = client.output();
+    let transition = &out[switch_at..target_at];
+    for reset in [
+        b"\x1b[?1049l".as_slice(),
+        b"\x1b[?1000l".as_slice(),
+        b"\x1b[?1006l".as_slice(),
+    ] {
+        assert!(
+            find_bytes(transition, reset).is_some(),
+            "switch did not emit mode reset {:?} before B's snapshot marker; captured:\n{}",
+            String::from_utf8_lossy(reset),
+            escape(transition)
+        );
+    }
+
+    let host_after = host_terminal(&out, 24, 80);
+    assert!(!host_after.screen().alternate_screen());
+    assert_eq!(
+        host_after.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert_eq!(
+        host_after.screen().mouse_protocol_encoding(),
+        vt100::MouseProtocolEncoding::Default
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id_a, "--signal", "KILL"], Duration::from_secs(5));
+    harness.run_ok(&["kill", &id_b, "--signal", "KILL"], Duration::from_secs(5));
+}
+
 /// End-to-end regression test for `MarginTracker::set_rows`' bottom-anchored
 /// growth rule, in the real client + worker path rather than against the
 /// tracker in isolation.
