@@ -44,6 +44,7 @@ pub const MAX_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024;
 /// `inbox` (see `maybe_gc`) so a large mailbox is not rescanned on every
 /// call; `a message gc` itself always runs unconditionally.
 const OPPORTUNISTIC_GC_INTERVAL_SECS: u64 = 300;
+const MAX_MAILBOX_STATE_BYTES: usize = 64 * 1024;
 /// Cursor state belongs to one session UUID and has no value once that
 /// session is gone. Keep inactive cursor state for a full month before GC so
 /// short-lived cleanup/recovery gaps cannot make an acknowledgement reappear.
@@ -119,8 +120,9 @@ struct WorkspaceMetadata {
 /// without its reverse mapping.
 fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -> Result<()> {
     let metadata_path = workspace_dir.join("workspace.json");
-    let bytes = fs::read(&metadata_path)
-        .with_context(|| format!("read mailbox metadata {}", metadata_path.display()))?;
+    let bytes =
+        read_bounded_regular_file(&metadata_path, "mailbox metadata", MAX_MAILBOX_STATE_BYTES)?
+            .ok_or_else(|| anyhow!("mailbox metadata is missing: {}", metadata_path.display()))?;
     let metadata: WorkspaceMetadata = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse mailbox metadata {}", metadata_path.display()))?;
     if metadata.workspace != canonical_workspace {
@@ -132,6 +134,45 @@ fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -
         );
     }
     Ok(())
+}
+
+/// Read small mailbox state without following symlinks or blocking on an
+/// accidental FIFO/device. Returning `None` for absence lets cursor callers
+/// retain their documented empty-state behavior while every other file type
+/// and oversize value fails closed.
+fn read_bounded_regular_file(path: &Path, label: &str, cap: usize) -> Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {label} {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{label} is not a regular file: {}", path.display());
+    }
+    if metadata.len() > cap as u64 {
+        bail!(
+            "{label} {} exceeds the {cap}-byte cap (got {} bytes)",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {label} {}", path.display()))?;
+    if bytes.len() > cap {
+        bail!("{label} {} exceeds the {cap}-byte cap", path.display());
+    }
+    Ok(Some(bytes))
 }
 
 fn initialize_workspace_dir(mp: &MessagePaths, canonical_workspace: &Path) -> Result<()> {
@@ -784,12 +825,12 @@ fn cursor_lock_path(cursors_dir: &Path, consumer_id: Uuid) -> PathBuf {
 }
 
 fn read_cursor_file(path: &Path) -> Result<Cursor> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse mailbox cursor {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursor::default()),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
+    let Some(bytes) = read_bounded_regular_file(path, "mailbox cursor", MAX_MAILBOX_STATE_BYTES)?
+    else {
+        return Ok(Cursor::default());
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse mailbox cursor {}", path.display()))
 }
 
 fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
@@ -1591,6 +1632,58 @@ mod tests {
             "unexpected error: {ack_error:#}"
         );
         assert_eq!(fs::read(&cursor_path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn workspace_and_cursor_state_reject_special_and_oversized_files() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-mailbox-state-types-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+
+        fs::remove_file(&mp.workspace_file).unwrap();
+        let fifo = std::ffi::CString::new(mp.workspace_file.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let metadata_error = verify_workspace_metadata(&mp.workspace_dir, workspace)
+            .expect_err("workspace metadata FIFO must fail without blocking");
+        assert!(
+            format!("{metadata_error:#}").contains("not a regular file"),
+            "unexpected error: {metadata_error:#}"
+        );
+        fs::remove_file(&mp.workspace_file).unwrap();
+        atomic_write_json(
+            &mp.workspace_file,
+            &serde_json::json!({"workspace": workspace}),
+        )
+        .unwrap();
+
+        let cursor_path = mp.cursors_dir.join(format!("{}.json", Uuid::from_u128(7)));
+        let outside = root.path().join("outside-cursor.json");
+        fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, &cursor_path).unwrap();
+        let symlink_error =
+            read_cursor_file(&cursor_path).expect_err("cursor symlink must not be followed");
+        assert!(
+            format!("{symlink_error:#}").contains("open mailbox cursor"),
+            "unexpected error: {symlink_error:#}"
+        );
+        fs::remove_file(&cursor_path).unwrap();
+
+        let oversized = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cursor_path)
+            .unwrap();
+        oversized
+            .set_len(MAX_MAILBOX_STATE_BYTES as u64 + 1)
+            .unwrap();
+        drop(oversized);
+        let size_error = read_cursor_file(&cursor_path)
+            .expect_err("oversized cursor must be rejected before reading");
+        assert!(
+            format!("{size_error:#}").contains("exceeds the"),
+            "unexpected error: {size_error:#}"
+        );
     }
 
     #[test]
