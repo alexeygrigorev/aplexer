@@ -505,12 +505,34 @@ Example lines:
    skip-permissions argv variant are shipped. The remaining risk is integration behavior:
    preserve PocketShell's tmux metadata, compare native and delegated launch specs, define the
    fallback when aplexer is absent/older, and roll out behind a kill switch.
-2. **Agent-state ingestion:** PocketShell's working mechanism is agent hooks pushing state
-   (`tmux set-option @ps_agent_state`). Spec §20 only lists derivation (process/output/logs).
-   Aplexer likely needs a push endpoint (e.g. `a state-report waiting`, callable from
-   Claude/Codex/OpenCode hooks, resolving its target via the same `APLEXER_SESSION_ID`
-   mechanism `a whoami` now uses) to reach parity; whether hook installation itself (today
-   `hooks.py`) moves into aplexer's workspace preparation is undecided.
+2. **Agent-state ingestion:** **the aplexer-side primitive is resolved; hook installation is
+   still open.** `a state-report <idle|waiting|working>` now exists (`Operation::ReportState` in
+   `src/lib.rs`/`src/worker.rs`), resolving its target exactly like `a whoami` does — via
+   `APLEXER_SESSION_ID`, never a selector, so a hook script has no addressing to get wrong.
+   `SessionRecord` gains `reported_state`/`reported_state_at_ms`; `a watch --jsonl`'s
+   `agent.state` event treats a push fresher than `REPORTED_STATE_STALE_MS` (8s, `src/watch.rs`)
+   as authoritative over the PTY-recency heuristic, tagging the event `metadata.state_source =
+   "reported"` vs `"heuristic"` so a consumer can tell which it got. The vocabulary is `idle`/
+   `waiting`/`working`, matching PocketShell's own `SessionAgentState` granularity
+   (Idle/WaitingForInput/Working) one for one rather than inventing a fourth naming scheme;
+   `idle` is a genuinely new wire value the heuristic alone could never produce (it only ever
+   distinguished "PTY active" from "PTY silent", collapsing idle and waiting-for-input into one
+   bucket). See `src/watch.rs`'s `fresh_reported_state`/`derive_agent_state_with_source` doc
+   comments for the exact merge rule and why it is a pure elapsed-time window rather than
+   PocketShell's activity-based staleness fix (issue #1570) — a deliberate simplification,
+   documented there, that still self-heals because control simply passes back to the heuristic,
+   which reads real PTY activity on its own.
+
+   Left **explicitly undesigned**, per this section's own "hook installation... undecided" call:
+   nothing in this repo calls `a state-report` from inside a live Claude/Codex/OpenCode session.
+   Whether that wiring becomes an aplexer-side hook-installation step (alongside `a start`/
+   `a launch-exec`) or stays a PocketShell-side concern (pointing `hooks.py`'s existing Claude
+   Stop/Notification handlers, Codex `notify`, and the OpenCode plugin at this command instead
+   of/in addition to `tmux set-option @ps_agent_state`) is still an open product decision — this
+   repo only ships the primitive that decision builds on either way. A future hook that also
+   fires at resume/tool-start boundaries (which PocketShell's current tmux mechanism does not)
+   could push `working` explicitly too, rather than relying on the heuristic to infer it once a
+   `waiting`/`idle` push goes stale.
 3. **Desktop panes/splits vs aplexer's no-panes model** — *resolved by the repo correction*:
    this was the biggest product conflict when the desktop was the archived VS Code fork, but
    pocketshell-electron has no split/pane UI (one full-screen terminal per session tab), so
