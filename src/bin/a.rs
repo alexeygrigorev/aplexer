@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use aplexer::messaging::*;
 use aplexer::*;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -85,6 +85,9 @@ enum Commands {
     Doctor,
     /// Print the current session's identity (workspace/tag/engine/profile).
     Whoami,
+    /// Push the current session's semantic agent state, for a hook script
+    /// to call from inside it (see `a state-report --help`).
+    StateReport(StateReportArgs),
     /// Send or read messages between sibling agent sessions.
     Message(MessageArgs),
     /// Stream session lifecycle events.
@@ -315,6 +318,34 @@ struct RenameArgs {
     tag: Option<String>,
 }
 
+#[derive(Args)]
+struct StateReportArgs {
+    /// idle: the agent finished its turn and is resting, nothing
+    /// outstanding. waiting: blocked on a prompt/question and needs the
+    /// user. working: actively producing/thinking. Matches PocketShell's
+    /// SessionAgentState vocabulary (Idle/WaitingForInput/Working) one for
+    /// one -- see SessionAgentState.kt in the pocketshell repo.
+    state: ReportedState,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum ReportedState {
+    Idle,
+    Waiting,
+    Working,
+}
+
+impl ReportedState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReportedState::Idle => "idle",
+            ReportedState::Waiting => "waiting",
+            ReportedState::Working => "working",
+        }
+    }
+}
+
 // -- Inter-agent messaging (docs/inter-agent-messaging-design.md, section 7) --
 
 #[derive(Args)]
@@ -505,6 +536,7 @@ fn run() -> Result<()> {
         Commands::LaunchSpec(args) => cmd_launch_spec(&paths, args, cli.json),
         Commands::LaunchExec(args) => cmd_launch_exec(&paths, args),
         Commands::Whoami => cmd_whoami(&paths, cli.json),
+        Commands::StateReport(args) => cmd_state_report(&paths, args.state),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::Watch(args) => cmd_watch(&paths, args),
@@ -1782,6 +1814,56 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         }
         println!("state: {}", phase_name(&record.phase));
     }
+    Ok(())
+}
+
+/// `a state-report <idle|waiting|working>`
+/// (docs/pocketshell-integration-plan.md Open question #2, "Agent-state
+/// ingestion"): lets a hook running INSIDE a session push its own semantic
+/// state -- the missing half of `a watch --jsonl`'s `agent.state` event,
+/// which otherwise only has a coarse PTY-recency heuristic to go on (see
+/// watch.rs's `fresh_reported_state`/`derive_agent_state_with_source` for
+/// exactly how a push is merged with that heuristic and for how long it
+/// stays authoritative).
+///
+/// Resolves its target exactly like `a whoami` -- via the injected
+/// `APLEXER_SESSION_ID`, never a selector -- because a hook script has no
+/// notion of "which session" other than the one it is running inside; see
+/// `cmd_whoami`'s doc comment for the shared mechanism (`discover_session_id`,
+/// the same env var `worker.rs::spawn_workload` injects into every
+/// session). Same exit-code contract as `a whoami`: a plain `exit(1)` with
+/// one stderr line when `APLEXER_SESSION_ID` is unset (so a hook wired as
+/// `a state-report waiting || true` degrades silently outside aplexer);
+/// any other failure (record missing, worker dead/unreachable, invalid
+/// state rejected by the worker) propagates through `?` to `main`'s
+/// generic `a: {error}` / exit(1) handler, same as every other subcommand.
+///
+/// What this repo does NOT do (deliberately out of scope -- see
+/// docs/pocketshell-integration-plan.md's Open question #2 and section
+/// "0.2"/A3): install a Claude Stop/Notification hook, a Codex `notify`
+/// program, or an OpenCode plugin that actually CALLS this command at the
+/// right moments. Whether hook installation moves into aplexer's own
+/// workspace preparation (alongside `a start`/`a launch-exec`) or stays a
+/// PocketShell-side concern (pocketshell's own `hooks.py`, pointed at this
+/// command instead of/in addition to `tmux set-option @ps_agent_state`) is
+/// an open product decision the integration plan explicitly flags as
+/// undesigned; this command is the aplexer-side primitive that decision
+/// can build on either way.
+fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
+    let Some(id) = discover_session_id() else {
+        eprintln!("a state-report: not inside an aplexer session (APLEXER_SESSION_ID not set)");
+        std::process::exit(1);
+    };
+    let record = read_record(&paths.record(id)).with_context(|| {
+        format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
+    })?;
+    rpc_simple(
+        &record,
+        Operation::ReportState {
+            state: state.as_str().to_string(),
+        },
+        None,
+    )?;
     Ok(())
 }
 
@@ -4792,6 +4874,8 @@ mod switching_tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase,
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
