@@ -53,6 +53,8 @@ impl Harness {
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase: Phase::Starting,
             worker_pid: None,
             workload_pid: None,

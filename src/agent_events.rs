@@ -1258,6 +1258,8 @@ fn dummy_record(engine: &str) -> SessionRecord {
         created_at_ms: 0,
         updated_at_ms: 0,
         last_activity_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
         phase: crate::Phase::Running,
         worker_pid: None,
         workload_pid: None,

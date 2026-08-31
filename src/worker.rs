@@ -794,6 +794,8 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase: Phase::Running,
             worker_pid: None,
             workload_pid: None,
@@ -1211,6 +1213,20 @@ impl WorkerRuntime {
         self.update_record(|r| {
             r.workspace = workspace;
             r.tag = tag;
+        })
+    }
+    /// `a state-report <state>` (docs/pocketshell-integration-plan.md Open
+    /// question #2): a hook running inside this session pushes its own
+    /// semantic state. Validated here (not just at the CLI's `ValueEnum`
+    /// layer) so a direct/malformed RPC from any caller can't write an
+    /// unrecognised value into the record that `watch.rs`'s merge logic
+    /// would then have to guess at -- the same defensive posture `rename`
+    /// takes with `validate_tag` above.
+    fn report_state(&self, state: String) -> Result<SessionRecord> {
+        validate_reported_state(&state)?;
+        self.update_record(move |r| {
+            r.reported_state = Some(state);
+            r.reported_state_at_ms = Some(now_ms());
         })
     }
 }
@@ -2657,6 +2673,13 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
             Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
         },
         Operation::Rename { workspace, tag } => match runtime.rename(workspace, tag) {
+            Ok(record) => write_json(
+                &mut stream,
+                &Response::ok(id, serde_json::to_value(record)?),
+            )?,
+            Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
+        },
+        Operation::ReportState { state } => match runtime.report_state(state) {
             Ok(record) => write_json(
                 &mut stream,
                 &Response::ok(id, serde_json::to_value(record)?),

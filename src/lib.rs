@@ -388,6 +388,23 @@ pub fn validate_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// `a state-report <state>` vocabulary (docs/pocketshell-integration-plan.md
+/// Open question #2, "Agent-state ingestion"). A Claude/Codex/OpenCode hook
+/// running inside a session pushes one of these; `watch.rs`'s
+/// `agent.state` merge logic treats a fresh push as authoritative over its
+/// own PTY-recency heuristic (see `watch::fresh_reported_state`). Chosen to
+/// match PocketShell's own `SessionAgentState` granularity
+/// (Idle/WaitingForInput/Working) one-for-one rather than inventing a
+/// fourth aplexer-only vocabulary for the same concept.
+pub const REPORTED_AGENT_STATES: [&str; 3] = ["idle", "waiting", "working"];
+
+pub fn validate_reported_state(state: &str) -> Result<()> {
+    if !REPORTED_AGENT_STATES.contains(&state) {
+        bail!("invalid reported state {state:?}; expected one of {REPORTED_AGENT_STATES:?}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -503,6 +520,19 @@ pub struct SessionRecord {
     /// activity, not true agent-semantic state (spec.md section 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<u64>,
+    /// Semantic state a hook running inside the session pushed via
+    /// `a state-report` (docs/pocketshell-integration-plan.md Open question
+    /// #2), one of `REPORTED_AGENT_STATES`. `None` means no hook has ever
+    /// reported for this session -- `a watch`'s heuristic runs unmodified.
+    /// See `watch::fresh_reported_state` for how this is merged with
+    /// `last_activity_ms`-derived state and for how long it stays
+    /// authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_state: Option<String>,
+    /// When `reported_state` was written (`WorkerRuntime::report_state`),
+    /// ms since epoch. Always `Some` when `reported_state` is `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_state_at_ms: Option<u64>,
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_pid: Option<u32>,
@@ -1917,6 +1947,17 @@ pub enum Operation {
     /// -- "richer PocketShell previews" from spec.md section 17.
     CaptureScreen {
         plain: bool,
+    },
+    /// `a state-report <state>` (docs/pocketshell-integration-plan.md Open
+    /// question #2, "Agent-state ingestion"): a hook running inside the
+    /// session pushes its own semantic state, the missing half of `a watch
+    /// --jsonl`'s `agent.state` PTY-recency heuristic. `state` must be one
+    /// of `REPORTED_AGENT_STATES`; the worker validates and rejects
+    /// anything else (`WorkerRuntime::report_state`) rather than writing an
+    /// unrecognised value the watch merge logic would then have to guess
+    /// at.
+    ReportState {
+        state: String,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4098,6 +4139,8 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase: Phase::Exited,
             worker_pid: None,
             workload_pid: None,
@@ -4355,6 +4398,8 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase: Phase::Running,
             worker_pid: Some(pid),
             workload_pid: None,

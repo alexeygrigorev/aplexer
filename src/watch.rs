@@ -45,6 +45,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 /// recently", not as "the agent is idle".
 const ACTIVITY_THRESHOLD_MS: u64 = 3_000;
 
+/// How long a value pushed by `a state-report` (docs/pocketshell-
+/// integration-plan.md Open question #2) stays authoritative over the
+/// PTY-recency heuristic below, counted from
+/// `SessionRecord::reported_state_at_ms`.
+///
+/// Merge rule (see `fresh_reported_state`): while a push is within this
+/// window, it wins outright -- the PTY-recency heuristic does not run at
+/// all for that poll. Once the window elapses with no fresh push to
+/// refresh the timestamp, `derive_agent_state_with_source` falls straight
+/// back to the heuristic, honest per-poll, with no separate "was it ever
+/// pushed" memory. Terminal phases (`Phase::Exited`/`Phase::Failed`)
+/// already bypass this branch entirely, which is what gives "or process
+/// exit" from the design brief for free -- a dead workload's exit event
+/// always wins over a stale push.
+///
+/// In ordinary operation this window rarely matters: a hook fires at every
+/// stop/waiting boundary (and, if a future hook installation also fires on
+/// resume/tool-start, at every "back to work" boundary too -- see the CLI
+/// doc comment on `a state-report` for what is and is not wired up in this
+/// repo), so `reported_state_at_ms` keeps refreshing well inside the
+/// window. The window exists as a safety net for the case that motivates
+/// "or process exit" in the first place: a hook process that reported once
+/// and then the engine was killed, crashed, or the session was torn down
+/// without a final hook firing to say so. Deliberately NOT tied to
+/// `last_activity_ms` (PocketShell's own `resolveSessionAgentState`
+/// invalidates a resting push the moment newer PTY activity appears,
+/// issue #1570) -- that rule solves a real bug there, but a pure
+/// elapsed-time window is sufficient here and simpler: once a push goes
+/// stale, control passes back to the PTY-recency heuristic, which itself
+/// reads `last_activity_ms` and will correctly report `running` if the
+/// agent is in fact still producing output. Chosen at roughly 10x `a
+/// watch`'s own `POLL_INTERVAL` so ordinary poll jitter cannot flap a
+/// fresh push back to the heuristic mid-window.
+const REPORTED_STATE_STALE_MS: u64 = 8_000;
+
 /// heru's `UnifiedEvent` envelope (docs/pocketshell-integration-plan.md
 /// Part 2, section 2.1 -- found in heru's real `heru/types.py`, not
 /// inferred). Serialized with null/empty fields omitted, matching heru's own
@@ -124,32 +159,87 @@ fn session_kind(record: &SessionRecord) -> &'static str {
     }
 }
 
+/// Reads a fresh `a state-report` push off `record` and maps it onto `a
+/// watch`'s wire vocabulary, or `None` when there is nothing to trust (no
+/// push ever recorded, or it is older than `REPORTED_STATE_STALE_MS`).
+///
+/// `idle` and `waiting` map onto themselves -- `idle` is a genuinely new
+/// wire value this feature introduces (the PTY-recency heuristic cannot
+/// tell "resting, nothing to do" apart from "blocked on a question", so it
+/// never emitted `idle` before; see the doc comment this replaces).
+/// `working` folds onto the heuristic's existing `running` value rather
+/// than adding a second word for the same idea -- any consumer that
+/// already understands the heuristic's `running` handles a *reported*
+/// `working` push for free, and the two genuinely mean the same thing
+/// (actively producing/thinking).
+fn fresh_reported_state(record: &SessionRecord, now: u64) -> Option<&'static str> {
+    let state = record.reported_state.as_deref()?;
+    let at = record.reported_state_at_ms?;
+    if now.saturating_sub(at) > REPORTED_STATE_STALE_MS {
+        return None;
+    }
+    match state {
+        "idle" => Some("idle"),
+        "waiting" => Some("waiting"),
+        "working" => Some("running"),
+        // Defensive only: the worker validates every write
+        // (WorkerRuntime::report_state), so this arm only fires against a
+        // foreign/hand-edited session.json. Fall back to the heuristic
+        // rather than propagate an unrecognised value into the stream.
+        _ => None,
+    }
+}
+
 /// `starting/running/waiting/idle/exited/oom/error/unknown` is spec.md
-/// section 20's full vocabulary; this heuristic only ever produces
-/// `starting` (Phase::Starting), `running`/`waiting` (the PTY-recency
-/// heuristic, see ACTIVITY_THRESHOLD_MS), `exited`, and `oom`/`error` for
-/// the terminal phases -- `idle`/`unknown` are not used by this v1 proxy.
-fn derive_agent_state(record: &SessionRecord, now: u64) -> &'static str {
+/// section 20's full vocabulary. `starting`, the PTY-recency
+/// `running`/`waiting` (see ACTIVITY_THRESHOLD_MS), and the terminal
+/// `exited`/`oom`/`error` are the original v1 proxy's output, unchanged.
+/// `idle` -- and an authoritative rather than guessed `running`/`waiting`
+/// -- now also come from a fresh `a state-report` push
+/// (`fresh_reported_state`), which is checked first and, while fresh,
+/// replaces the heuristic outright rather than merely tie-breaking it.
+/// `unknown` is still not emitted (no source ever produces it).
+///
+/// Returns `(state, source)`; `source` is `"reported"` when a fresh push
+/// won, `"heuristic"` otherwise, surfaced on the `agent.state` event as
+/// `metadata.state_source` so a consumer can tell which is authoritative
+/// without hard-coding the staleness window itself.
+fn derive_agent_state_with_source(
+    record: &SessionRecord,
+    now: u64,
+) -> (&'static str, &'static str) {
     match record.phase {
-        Phase::Starting => "starting",
-        Phase::Running | Phase::Exiting => match record.last_activity_ms {
-            Some(ts) if now.saturating_sub(ts) < ACTIVITY_THRESHOLD_MS => "running",
-            Some(_) => "waiting",
-            // No PTY output observed yet (e.g. worker just flipped to
-            // Running but the periodic activity-persist tick hasn't fired):
-            // assume running rather than waiting, since the session just
-            // started and there is no evidence yet of it going quiet.
-            None => "running",
-        },
+        Phase::Starting => ("starting", "heuristic"),
+        Phase::Running | Phase::Exiting => {
+            if let Some(state) = fresh_reported_state(record, now) {
+                return (state, "reported");
+            }
+            let state = match record.last_activity_ms {
+                Some(ts) if now.saturating_sub(ts) < ACTIVITY_THRESHOLD_MS => "running",
+                Some(_) => "waiting",
+                // No PTY output observed yet (e.g. worker just flipped to
+                // Running but the periodic activity-persist tick hasn't
+                // fired): assume running rather than waiting, since the
+                // session just started and there is no evidence yet of it
+                // going quiet.
+                None => "running",
+            };
+            (state, "heuristic")
+        }
         Phase::Exited => {
-            if record.exit.as_ref().map(|e| e.oom_killed).unwrap_or(false) {
+            let state = if record.exit.as_ref().map(|e| e.oom_killed).unwrap_or(false) {
                 "oom"
             } else {
                 "exited"
-            }
+            };
+            (state, "heuristic")
         }
-        Phase::Failed => "error",
+        Phase::Failed => ("error", "heuristic"),
     }
+}
+
+fn derive_agent_state(record: &SessionRecord, now: u64) -> &'static str {
+    derive_agent_state_with_source(record, now).0
 }
 
 fn exit_reason(exit: Option<&ExitInfo>) -> &'static str {
@@ -277,12 +367,18 @@ fn make_deleted_event(record: &SessionRecord, generation: u64, sequence: &mut u6
 fn make_agent_state_event(
     record: &SessionRecord,
     state: &'static str,
+    source: &'static str,
     generation: u64,
     sequence: &mut u64,
 ) -> UnifiedEvent {
     let mut metadata = common_metadata(record, generation);
     metadata.insert("event".into(), json!("agent.state"));
     metadata.insert("state".into(), json!(state));
+    // "reported" (a fresh `a state-report` push, see fresh_reported_state)
+    // or "heuristic" (the PTY-recency proxy) -- lets a consumer trust a
+    // `waiting`/`idle` chip more when it knows a hook actually said so,
+    // without hard-coding REPORTED_STATE_STALE_MS itself.
+    metadata.insert("state_source".into(), json!(source));
     UnifiedEvent {
         kind: "status",
         engine: record.engine.clone(),
@@ -319,10 +415,10 @@ fn transition_events(
         events.push(make_exited_event(current, generation, sequence));
         ks.exit_emitted = true;
     }
-    let new_state = derive_agent_state(current, now);
+    let (new_state, source) = derive_agent_state_with_source(current, now);
     if !is_new && new_state != ks.derived_state {
         events.push(make_agent_state_event(
-            current, new_state, generation, sequence,
+            current, new_state, source, generation, sequence,
         ));
     }
     ks.derived_state = new_state;
@@ -484,8 +580,127 @@ mod tests {
 
     #[test]
     fn agent_state_vocabulary() {
-        assert!(["starting", "running", "waiting", "exited", "oom", "error"]
-            .contains(&derive_agent_state(&sample_record(Phase::Starting), 0)));
+        assert!(
+            ["starting", "running", "waiting", "idle", "exited", "oom", "error"]
+                .contains(&derive_agent_state(&sample_record(Phase::Starting), 0))
+        );
+    }
+
+    // -- a state-report merge/priority logic (fresh_reported_state /
+    // derive_agent_state_with_source) --
+
+    #[test]
+    fn fresh_reported_state_covers_every_worker_validated_value() {
+        // Ties REPORTED_AGENT_STATES (validated worker-side on write) to
+        // fresh_reported_state's match (read watch-side) so the two cannot
+        // silently drift -- a new value added to one without the other
+        // would either be rejected at write time or silently ignored at
+        // read time, and this test fails on either.
+        for state in REPORTED_AGENT_STATES {
+            let mut record = sample_record(Phase::Running);
+            record.reported_state = Some(state.to_string());
+            record.reported_state_at_ms = Some(1_000);
+            assert!(
+                fresh_reported_state(&record, 1_000).is_some(),
+                "fresh_reported_state does not handle {state:?}, but the worker accepts it"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_working_state_wins_over_a_heuristic_that_would_say_waiting() {
+        let mut record = sample_record(Phase::Running);
+        // PTY has been silent well past ACTIVITY_THRESHOLD_MS -- the
+        // heuristic alone would say "waiting".
+        record.last_activity_ms = Some(0);
+        record.reported_state = Some("working".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        let now = 1_000 + ACTIVITY_THRESHOLD_MS + 1;
+        assert_eq!(
+            derive_agent_state_with_source(&record, now),
+            ("running", "reported")
+        );
+    }
+
+    #[test]
+    fn reported_idle_state_is_a_new_value_the_heuristic_alone_never_produces() {
+        let mut record = sample_record(Phase::Running);
+        record.last_activity_ms = Some(0);
+        record.reported_state = Some("idle".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000),
+            ("idle", "reported")
+        );
+    }
+
+    #[test]
+    fn reported_waiting_state_wins_even_over_fresh_pty_activity() {
+        let mut record = sample_record(Phase::Running);
+        // The heuristic alone would say "running": output just now.
+        record.last_activity_ms = Some(1_000);
+        record.reported_state = Some("waiting".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000),
+            ("waiting", "reported")
+        );
+    }
+
+    #[test]
+    fn reported_state_falls_back_to_heuristic_once_the_stale_window_elapses() {
+        let mut record = sample_record(Phase::Running);
+        record.last_activity_ms = Some(0); // heuristic: "waiting"
+        record.reported_state = Some("working".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        let still_fresh = 1_000 + REPORTED_STATE_STALE_MS;
+        assert_eq!(
+            derive_agent_state_with_source(&record, still_fresh),
+            ("running", "reported"),
+            "must still be authoritative at exactly the window boundary"
+        );
+        let now_stale = 1_000 + REPORTED_STATE_STALE_MS + 1;
+        assert_eq!(
+            derive_agent_state_with_source(&record, now_stale),
+            ("waiting", "heuristic"),
+            "must fall back to the PTY-recency heuristic once stale"
+        );
+    }
+
+    #[test]
+    fn reported_state_never_overrides_a_terminal_phase() {
+        let mut record = sample_record(Phase::Exited);
+        record.reported_state = Some("working".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        // Fresh by every measure, but the session already exited.
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000),
+            ("exited", "heuristic")
+        );
+    }
+
+    #[test]
+    fn unrecognised_reported_state_falls_back_to_heuristic() {
+        // Simulates a foreign/hand-edited session.json -- the worker
+        // itself never writes anything outside REPORTED_AGENT_STATES.
+        let mut record = sample_record(Phase::Running);
+        record.last_activity_ms = Some(1_000);
+        record.reported_state = Some("bogus".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000),
+            ("running", "heuristic")
+        );
+    }
+
+    #[test]
+    fn no_reported_state_runs_the_heuristic_unmodified() {
+        let mut record = sample_record(Phase::Running);
+        record.last_activity_ms = Some(0);
+        assert_eq!(
+            derive_agent_state_with_source(&record, ACTIVITY_THRESHOLD_MS + 1),
+            ("waiting", "heuristic")
+        );
     }
 
     /// A real cgroup-level OOM kill on the workload's own PTY-owning process
@@ -560,6 +775,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
             phase,
             worker_pid: None,
             workload_pid: None,
