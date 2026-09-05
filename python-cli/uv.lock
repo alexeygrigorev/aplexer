@@ -3,12 +3,12 @@ revision = 3
 requires-python = ">=3.11"
 
 [options]
-exclude-newer = "2026-08-23T11:10:00.025398923Z"
+exclude-newer = "2026-08-29T20:36:23.872793541Z"
 exclude-newer-span = "P7D"
 
 [[package]]
 name = "aplexer"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "aplexer-client" },
@@ -19,5 +19,5 @@ requires-dist = [{ name = "aplexer-client", directory = "../python" }]
 
 [[package]]
 name = "aplexer-client"
-version = "0.1.1"
+version = "0.1.2"
 source = { directory = "../python" }

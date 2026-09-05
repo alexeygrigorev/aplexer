@@ -66,6 +66,18 @@ jobs:
                   errors.append(
                       f"{label} version is {version!r}, tag requires {expected_version!r}"
                   )
+          init_path = root / "python-cli" / "aplexer_cli" / "__init__.py"
+          init_version = None
+          for line in init_path.read_text(encoding="utf-8").splitlines():
+              if line.startswith("__version__"):
+                  init_version = line.split('"')[1]
+                  break
+          print(f"python-cli/aplexer_cli/__init__.py: __version__={init_version}")
+          if init_version != expected_version:
+              errors.append(
+                  "python-cli/aplexer_cli/__init__.py __version__ is "
+                  f"{init_version!r}, tag requires {expected_version!r}"
+              )
           cli_project = tomllib.loads(
               (root / "python-cli" / "pyproject.toml").read_text(encoding="utf-8")
           )["project"]
