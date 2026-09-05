@@ -931,6 +931,7 @@ fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) -> Result<(
 #[cfg(test)]
 mod startup_cleanup_tests {
     use super::*;
+    use crate::ExitInfo;
 
     #[test]
     fn pidfd_preflight_can_pin_and_probe_current_process() {
@@ -965,6 +966,172 @@ mod startup_cleanup_tests {
         assert_eq!(
             startup_descendant_capacity(u64::MAX, 0).expect("large descriptor budget"),
             STARTUP_MAX_DESCENDANTS
+        );
+    }
+
+    fn startup_record(
+        phase: Phase,
+        exit: Option<ExitInfo>,
+        containment_empty: Option<bool>,
+    ) -> SessionRecord {
+        SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::nil(),
+            workspace: PathBuf::from("/ws"),
+            tag: "main".into(),
+            engine: "shell".into(),
+            profile: None,
+            command: vec!["/bin/true".into()],
+            cwd: PathBuf::from("/ws"),
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: 1024,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
+            phase,
+            worker_pid: Some(1),
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty,
+            socket_path: PathBuf::from("/ws/control.sock"),
+            history_path: PathBuf::from("/ws/history.bin"),
+            exit,
+            error: None,
+        }
+    }
+
+    /// `(description, phase, exit, containment_empty, expected_accept)`.
+    type AcceptanceCase = (&'static str, Phase, Option<ExitInfo>, Option<bool>, bool);
+
+    fn clean_exit() -> Option<ExitInfo> {
+        Some(ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 2,
+        })
+    }
+
+    /// Exhaustive matrix for the accept condition applied to an exited
+    /// worker's durable record. Every clause of
+    /// `exited_worker_completed_startup` is exercised in both directions:
+    /// deleting any one of the three conjuncts turns at least one `false` row
+    /// green, which is what makes this table load-bearing rather than
+    /// decorative.
+    #[test]
+    fn exited_worker_startup_acceptance_matrix() {
+        let cases: &[AcceptanceCase] = &[
+            // The fast-workload shape the readiness Ping can never observe:
+            // ran to completion, recorded its exit, proved containment empty.
+            (
+                "exited with exit info and proven-empty containment",
+                Phase::Exited,
+                clean_exit(),
+                Some(true),
+                true,
+            ),
+            // Terminal phase, but nothing proves the workload ever ran.
+            (
+                "exited without exit info",
+                Phase::Exited,
+                None,
+                Some(true),
+                false,
+            ),
+            // The only shape the `exit.is_some()` conjunct guards on its own.
+            (
+                "exiting without exit info",
+                Phase::Exiting,
+                None,
+                Some(true),
+                false,
+            ),
+            // Pinned decision: symmetric with the readiness arm's
+            // `Running | Exiting | Exited`, currently unreachable in practice.
+            (
+                "exiting with exit info and proven-empty containment",
+                Phase::Exiting,
+                clean_exit(),
+                Some(true),
+                true,
+            ),
+            // A worker that vanished mid-run never became ready, whatever
+            // exit info happens to be on the record.
+            (
+                "running with exit info",
+                Phase::Running,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The exact initial record `start_session` writes before the
+            // worker registers itself.
+            (
+                "starting, as start_session first writes it",
+                Phase::Starting,
+                None,
+                Some(false),
+                false,
+            ),
+            // Same phase, but with every other clause satisfied, so this row
+            // isolates the phase guard rather than riding on `exit`.
+            (
+                "starting with exit info and proven-empty containment",
+                Phase::Starting,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The worker's own recorded failure is never laundered into a
+            // completed session here.
+            (
+                "failed with exit info and proven-empty containment",
+                Phase::Failed,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The safety clause: a terminal record whose containment domain
+            // is NOT proven empty may have an escaped descendant, so
+            // reporting startup success would be exactly the laundering this
+            // predicate exists to prevent.
+            (
+                "exited with exit info but containment not proven empty",
+                Phase::Exited,
+                clean_exit(),
+                Some(false),
+                false,
+            ),
+            // Legacy/absent proof is not proof. Unreachable for a record
+            // written by the worker this call spawned, but the predicate
+            // must not silently widen if that ever stops holding.
+            (
+                "exited with exit info but no containment field",
+                Phase::Exited,
+                clean_exit(),
+                None,
+                false,
+            ),
+        ];
+        // Collect every mismatch instead of stopping at the first, so
+        // deleting a conjunct names the whole set of rows it breaks.
+        let mut mismatches = Vec::new();
+        for (name, phase, exit, containment_empty, expected) in cases {
+            let record = startup_record(phase.clone(), exit.clone(), *containment_empty);
+            let actual = exited_worker_completed_startup(&record);
+            if actual != *expected {
+                mismatches.push(format!("{name}: expected {expected}, got {actual}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "exited-worker acceptance matrix regressed:\n  {}",
+            mismatches.join("\n  ")
         );
     }
 }
@@ -1527,6 +1694,98 @@ fn cleanup_superseded_archive(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Forces the fast-workload startup interleaving that `start_session`'s
+/// readiness poll can otherwise only lose by chance: block until the worker
+/// has finished its job, unlinked its control socket and exited, so the poll
+/// loop below can never observe a live socket to Ping.
+///
+/// Timing alone does not reproduce this on an idle machine -- 25+ repetitions
+/// of the fast-workload test pass locally -- which is exactly how the
+/// readiness-Ping gate reached a release with this ordering unhandled. The
+/// non-default `startup-test-hooks` feature is the authorization boundary for
+/// pinning it; default and release builds do not contain this path.
+#[cfg(feature = "startup-test-hooks")]
+fn await_worker_exit_before_readiness_poll(
+    startup: &mut StartupGuard<'_>,
+    paths: &Paths,
+    id: Uuid,
+) -> Result<()> {
+    if std::env::var_os("APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL").is_none() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // `Child::try_wait` caches the reaped status, so the poll loop's own
+        // `try_wait` still observes this exit rather than an "already reaped"
+        // error.
+        let exited = startup.child_mut().try_wait()?.is_some();
+        if exited && !paths.socket(id).exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("test hook timed out waiting for worker {id} to exit before readiness poll");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Whether a worker that has already exited left durable proof that its
+/// session started and ran, rather than failing during startup.
+///
+/// `start_session` commits readiness by Pinging the worker's live control
+/// socket. A fast workload (a one-shot shell command, an agent binary that
+/// rejects its config immediately) can run to completion, persist its exit,
+/// unlink that socket and exit inside a single 25ms poll interval, so the
+/// readiness arm never gets a socket to Ping. The durable terminal record is
+/// the evidence the vanished socket can no longer provide, and it is strictly
+/// stronger: it is the same record a successful Ping would have returned.
+///
+/// Deliberately narrow -- every other shape still fails startup:
+///
+/// * a non-terminal phase (`Starting`/`Running`): a worker that vanished
+///   without recording that it ever ran;
+/// * `Phase::Failed`: the worker's own recorded failure, reported with its
+///   reason by the poll loop's `Failed` arm rather than laundered into a
+///   completed session here;
+/// * a terminal phase with no `exit`: nothing proves the workload ran;
+/// * `containment_empty` not explicitly `Some(true)`: no durable proof that
+///   the containment domain is empty.
+///
+/// The caller additionally requires the worker's own exit status to be zero,
+/// because a crashed worker is a startup failure whatever its record claims.
+///
+/// `Phase::Exiting` is accepted for symmetry with the readiness arm above,
+/// which treats `Running | Exiting | Exited` alike. That combination is
+/// currently unreachable -- `run_lifecycle` writes `Exiting` in exactly one
+/// place, with `exit` still `None` -- but it is pinned by the table test
+/// below so a future writer cannot change the answer silently.
+///
+/// The containment conjunct is the local enforcement of this function's
+/// safety property. Today it is implied: `run_lifecycle` writes the one and
+/// only production record carrying `exit` in a single update that also sets
+/// `containment_empty`, and it selects `Phase::Exited` exactly when that
+/// lifecycle recorded no error -- which it can only do after observing the
+/// domain empty. Asserting it here turns that cross-file induction into an
+/// invariant checked on a record already in hand, so a future lifecycle
+/// change that wrote `Exited` with an unproven domain would fail startup
+/// instead of silently reporting success for a session with an escaped
+/// descendant.
+///
+/// `containment_empty` is `Option<bool>` only for on-disk records written
+/// before the field existed (see `SessionRecord::containment_proven_empty`).
+/// It cannot be `None` here: `start_session` writes the initial record with
+/// an explicit `Some(false)`, and every later writer -- the worker's
+/// lifecycle and startup-failure paths, and this process's own
+/// `persist_independent_cleanup_proof` -- writes an explicit `Some`. The
+/// record read here was written by the worker this same call just spawned,
+/// so the legacy shape is unreachable and the strict `Some(true)` comparison
+/// cannot reject a genuinely completed session.
+fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
+    matches!(record.phase, Phase::Exiting | Phase::Exited)
+        && record.exit.is_some()
+        && record.containment_empty == Some(true)
+}
+
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     ensure_sigchld_compatible_for_child_management()?;
     validate_tag(&req.tag)?;
@@ -1662,6 +1921,8 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             });
         }
         startup.track_child(command.spawn().context("spawn worker")?);
+        #[cfg(feature = "startup-test-hooks")]
+        await_worker_exit_before_readiness_poll(&mut startup, paths, id)?;
         let started = Instant::now();
         let timeout = Duration::from_millis(req.startup_timeout_ms);
         loop {
@@ -1692,6 +1953,18 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 _ => {}
             }
             if let Some(status) = startup.child_mut().try_wait()? {
+                // A worker that exited cleanly after durably recording a
+                // completed session did not fail to start (see
+                // `exited_worker_completed_startup`). An unreadable record
+                // falls through to the failure below rather than replacing
+                // the startup diagnosis with a read error.
+                if status.success() {
+                    if let Ok(final_record) = read_session_record(paths, id) {
+                        if exited_worker_completed_startup(&final_record) {
+                            return Ok(final_record);
+                        }
+                    }
+                }
                 bail!("worker exited during startup: {status}");
             }
             thread::sleep(Duration::from_millis(25));

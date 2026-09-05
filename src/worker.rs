@@ -180,6 +180,21 @@ fn startup_checkpoint(point: &str) -> Result<()> {
         bail!("worker startup cancelled by termination signal");
     }
     #[cfg(feature = "startup-test-hooks")]
+    if let Ok(spec) = env::var("APLEXER_TEST_EXIT_WORKER_AT") {
+        // "<checkpoint>:<exit status>". Unlike the failure hook below this
+        // leaves through `process::exit`, so the worker's own StartupGuard
+        // never runs and the durable record keeps whatever non-terminal
+        // phase it had. That is the only way to build the two shapes the
+        // API's "worker exited during startup" handling must still reject:
+        // a worker gone with no terminal record at all, and one gone
+        // cleanly (status 0) that never recorded an exit.
+        if let Some((target, status)) = spec.split_once(':') {
+            if target == point {
+                std::process::exit(status.parse().unwrap_or(1));
+            }
+        }
+    }
+    #[cfg(feature = "startup-test-hooks")]
     if env::var("APLEXER_TEST_FAIL_WORKER_STARTUP_AT").as_deref() == Ok(point) {
         bail!("injected worker startup failure at {point}");
     }

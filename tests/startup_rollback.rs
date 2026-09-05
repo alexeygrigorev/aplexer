@@ -776,3 +776,191 @@ fn externally_reaped_worker_preserves_ambiguous_containment_evidence() {
     assert_process_exited(workload_pid as u32);
     workload_cleanup.disarm();
 }
+
+/// A workload that finishes instantly lets its worker record a terminal
+/// phase, unlink the control socket and exit before `start_session`'s
+/// readiness poll ever sees a live socket to Ping. That session started and
+/// ran to completion; reporting it as "worker exited during startup: exit
+/// status: 0" is wrong. `APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL`
+/// pins that interleaving so the assertion is deterministic instead of a
+/// timing lottery the CI runner happened to lose once.
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn fast_workload_that_exits_before_readiness_probe_starts_successfully() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let output = harness.run_with_env(
+        &[
+            "--json",
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "fast-exit",
+            "--startup-timeout-ms",
+            "10000",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'fast-exit\\n'",
+        ],
+        &[("APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL", "1")],
+    );
+    assert!(
+        output.status.success(),
+        "fast workload reported a startup failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout).expect("start JSON record");
+    assert_eq!(record["phase"], "exited", "unexpected phase: {record}");
+    assert_eq!(record["exit"]["code"], 0, "unexpected exit info: {record}");
+    assert!(
+        record["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "terminal record omitted the session id: {record}"
+    );
+    // `exited_worker_completed_startup` requires durable proof that the
+    // containment domain is empty before it will call a vanished worker a
+    // completed session. Pin that a real worker's terminal record actually
+    // carries that proof, so the safety conjunct is grounded end to end and
+    // cannot be satisfied only in unit-test fixtures.
+    assert_eq!(
+        record["containment_empty"], true,
+        "completed session lacks durable containment proof: {record}"
+    );
+
+    // The session that ran must stay listable rather than being rolled back
+    // as a failed startup.
+    let listed = harness.run(&["--json", "list"]);
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    assert!(
+        listed
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["id"] == record["id"])),
+        "completed session was rolled back out of the registry: {listed}"
+    );
+}
+
+/// The clean-exit acceptance above is scoped to a durable terminal record.
+/// A worker that exits with status 0 before it ever registered itself, having
+/// recorded no exit at all, never became ready -- so it must still fail closed
+/// and roll its state back.
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn clean_worker_exit_without_terminal_record_still_fails_startup() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let output = harness.run_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "silent-clean-exit",
+            "--startup-timeout-ms",
+            "10000",
+            "--",
+            "/bin/sleep",
+            "30",
+        ],
+        &[
+            ("APLEXER_TEST_EXIT_WORKER_AT", "after_worker_lock:0"),
+            ("APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL", "1"),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "recordless clean worker exit was accepted as a started session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("worker exited during startup"),
+        "unexpected stderr: {stderr}"
+    );
+    harness.assert_no_session_artifacts();
+}
+
+/// A worker that dies with a non-zero status is a startup failure whatever
+/// its durable record says; the clean-exit acceptance must not widen into
+/// "any worker exit is fine".
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn nonzero_worker_exit_still_fails_startup() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let output = harness.run_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "nonzero-exit",
+            "--startup-timeout-ms",
+            "10000",
+            "--",
+            "/bin/sleep",
+            "30",
+        ],
+        &[
+            ("APLEXER_TEST_EXIT_WORKER_AT", "after_worker_lock:9"),
+            ("APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL", "1"),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "non-zero worker exit was accepted as a started session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("worker exited during startup") && stderr.contains("exit status: 9"),
+        "unexpected stderr: {stderr}"
+    );
+    harness.assert_no_session_artifacts();
+}
+
+/// A worker that recorded `Phase::Failed` and then exited must still be
+/// reported as a startup failure with its own recorded reason, not laundered
+/// into a completed session by the exited-worker path.
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn failed_record_from_exited_worker_still_fails_startup() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let output = harness.run_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "failed-record",
+            "--startup-timeout-ms",
+            "10000",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'failed-record\\n'",
+        ],
+        &[
+            (
+                "APLEXER_TEST_FAIL_WORKER_STARTUP_AT",
+                "after_running_record",
+            ),
+            ("APLEXER_TEST_AWAIT_WORKER_EXIT_BEFORE_READINESS_POLL", "1"),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "worker startup failure was accepted as a started session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("worker startup failed")
+            && stderr.contains("injected worker startup failure at after_running_record"),
+        "unexpected stderr: {stderr}"
+    );
+    harness.assert_no_session_artifacts();
+}
