@@ -110,6 +110,44 @@ fn wait_for_path(path: &Path) {
     assert!(path.exists(), "{} did not appear", path.display());
 }
 
+/// Descriptors a process launched from here holds immediately after `exec`:
+/// its three standard streams, plus every descriptor this test process itself
+/// inherited without `FD_CLOEXEC`. CI runners routinely leak a couple of those
+/// in, and the launcher's containment budget is computed against whatever it
+/// finds open, so a descriptor budget that ignores them is really a budget for
+/// one particular machine.
+///
+/// Descriptors this process opens for its own work (temp dirs, records, the
+/// `/proc/self/fd` handle below) are all `FD_CLOEXEC`, so they are excluded:
+/// they never reach the child, and excluding them also makes the count immune
+/// to whatever sibling tests are doing on other threads.
+#[cfg(feature = "startup-test-hooks")]
+fn inherited_descriptor_count() -> libc::rlim_t {
+    let mut inherited = std::collections::BTreeSet::from([0, 1, 2]);
+    for entry in fs::read_dir("/proc/self/fd").expect("read open descriptors") {
+        let entry = entry.expect("enumerate open descriptors");
+        let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            inherited.insert(fd);
+        }
+    }
+    inherited.len() as libc::rlim_t
+}
+
+/// The descendant budget the launcher reported refusing to exceed, parsed back
+/// out of its own error text so the test can prove which budget it exercised.
+#[cfg(feature = "startup-test-hooks")]
+fn reported_descendant_limit(stderr: &str) -> Option<usize> {
+    let tail = stderr.split_once("safe descendant limit of ")?.1;
+    let digits = tail
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?;
+    digits.parse().ok()
+}
+
 #[cfg(feature = "startup-test-hooks")]
 fn limit_open_files(command: &mut Command, soft_limit: libc::rlim_t) {
     unsafe {
@@ -610,11 +648,28 @@ fn timeout_after_workload_spawn_does_not_orphan_workload() {
 #[test]
 #[cfg(feature = "startup-test-hooks")]
 fn pidfd_budget_failure_resumes_tree_and_preserves_evidence() {
+    // The hostile workload shell plus the children it spawns. Containment has
+    // to walk past this many descendants to pin the tree.
+    const HOSTILE_WORKLOAD_CHILDREN: usize = 32;
+    const HOSTILE_TREE_DESCENDANTS: usize = HOSTILE_WORKLOAD_CHILDREN + 1;
+    // Mirrors `STARTUP_FD_RESERVE` plus the single descriptor the launcher
+    // keeps for the worker pidfd, i.e. everything its budget subtracts before
+    // any descendant can be pinned.
+    const LAUNCHER_FD_OVERHEAD: libc::rlim_t = 16 + 1;
+    // The descendant budget this test wants the launcher to end up with. Any
+    // value in `1..HOSTILE_TREE_DESCENDANTS` exercises the intended path;
+    // sitting near the middle leaves room in both directions for the handful
+    // of descriptors the launcher opens for its own work before preflighting.
+    const TARGET_DESCENDANT_BUDGET: libc::rlim_t = 16;
+
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
     let marker = harness.runtime_dir.path().join("budget-workload-pid");
     let marker_text = marker.to_str().expect("UTF-8 marker path");
+    let workload = format!(
+        "i=0; while [ \"$i\" -lt {HOSTILE_WORKLOAD_CHILDREN} ]; do sleep 30 & i=$((i + 1)); done; wait"
+    );
     let mut command = harness.command_with_env(
         &[
             "start",
@@ -627,7 +682,7 @@ fn pidfd_budget_failure_resumes_tree_and_preserves_evidence() {
             "--",
             "/bin/sh",
             "-c",
-            "i=0; while [ \"$i\" -lt 32 ]; do sleep 30 & i=$((i + 1)); done; wait",
+            &workload,
         ],
         &[
             (
@@ -637,16 +692,38 @@ fn pidfd_budget_failure_resumes_tree_and_preserves_evidence() {
             ("APLEXER_TEST_WORKER_STARTUP_MARKER", marker_text),
         ],
     );
-    // This leaves room for normal startup and the worker pidfd, but not for
-    // pinning the hostile tree. The cleanup path must fail closed and resume
+    // The launcher derives its containment budget as
+    //   soft RLIMIT_NOFILE - open descriptors - STARTUP_FD_RESERVE - 1,
+    // so a hardcoded soft limit silently spends part of the budget on however
+    // many descriptors the environment leaked in, and decides which failure
+    // path runs from ambient machine state rather than from the behaviour under
+    // test. Paying for the inherited descriptors explicitly cancels that term
+    // out: the launcher is left with `TARGET_DESCENDANT_BUDGET` minus its own
+    // few working descriptors, whatever the environment looks like. That is
+    // room for normal startup and the worker pidfd, but nowhere near enough to
+    // pin the hostile tree, so the cleanup path must fail closed and resume
     // everything it stopped instead of exhausting RLIMIT_NOFILE.
-    limit_open_files(&mut command, 24);
+    limit_open_files(
+        &mut command,
+        inherited_descriptor_count() + LAUNCHER_FD_OVERHEAD + TARGET_DESCENDANT_BUDGET,
+    );
     let output = command.output().expect("run descriptor-limited start");
     assert!(!output.status.success(), "limited startup succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("safe descendant limit") && stderr.contains("resumed"),
         "unexpected stderr: {stderr}"
+    );
+    // Guard the budget arithmetic itself. Reaching the descendant limit proves
+    // the budget landed inside `1..HOSTILE_TREE_DESCENDANTS`; re-checking it
+    // here turns a future drift towards either edge into a diagnosable failure
+    // instead of a silent slide onto the neighbouring preflight path.
+    let budget = reported_descendant_limit(&stderr)
+        .unwrap_or_else(|| panic!("descendant limit missing from cleanup failure: {stderr}"));
+    assert!(
+        (1..HOSTILE_TREE_DESCENDANTS).contains(&budget),
+        "descendant budget {budget} left no room for startup, or enough to pin all \
+         {HOSTILE_TREE_DESCENDANTS} hostile descendants: {stderr}"
     );
 
     let record_path = fs::read_dir(harness.state_dir.path().join("sessions"))
