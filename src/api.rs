@@ -976,6 +976,7 @@ mod startup_cleanup_tests {
         containment_empty: Option<bool>,
     ) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::nil(),
             workspace: PathBuf::from("/ws"),
@@ -1860,6 +1861,17 @@ fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
         && record.containment_empty == Some(true)
 }
 
+/// The `SessionRecord::parent_session` value for a session being started
+/// here: the calling process's ambient `APLEXER_SESSION_ID` stamp (see
+/// `discover_session_id`, which also walks ancestor environments), kept only
+/// when it names a record that still exists. Deliberately infallible -- a
+/// stale stamp (parent already killed/forgotten, a leftover export, an
+/// unparsable value) means "no recorded lineage", never a failed start.
+fn resolve_parent_session(paths: &Paths) -> Option<Uuid> {
+    let parent = crate::discover_session_id()?;
+    read_session_record(paths, parent).map(|_| parent).ok()
+}
+
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     ensure_sigchld_compatible_for_child_management()?;
     validate_tag(&req.tag)?;
@@ -1948,7 +1960,9 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         atomic_write_json(&launch_environment_path, &launch.env)?;
         let _launch_environment_guard = LaunchEnvironmentGuard(launch_environment_path);
         let now = crate::now_ms();
+        let parent_session = resolve_parent_session(paths);
         let record = SessionRecord {
+            parent_session,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: workspace.clone(),
@@ -2177,6 +2191,7 @@ mod reclaim_tests {
     /// nothing left running.
     fn zombie_record() -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::new_v4(),
             workspace: PathBuf::from("/ws/zombie"),

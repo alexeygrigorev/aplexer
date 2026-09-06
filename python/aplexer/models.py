@@ -48,6 +48,7 @@ class Session:
     tag: str
     engine: str
     profile: str | None
+    parent_session: str | None
     command: tuple[str, ...]
     cwd: Path
     phase: str
@@ -71,6 +72,7 @@ class Session:
         return cls(
             id=str(value["id"]), workspace=Path(value["workspace"]), tag=str(value["tag"]),
             engine=str(value["engine"]), profile=value.get("profile"),
+            parent_session=value.get("parent_session"),
             command=tuple(str(v) for v in value.get("command", [])), cwd=Path(value["cwd"]),
             phase=str(value["phase"]), socket_path=Path(value["socket_path"]),
             history_path=Path(value["history_path"]), worker_pid=value.get("worker_pid"),

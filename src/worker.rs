@@ -794,6 +794,7 @@ mod tests {
         // candidate was serialized, exercising the publish boundary.
         fs::create_dir(&record_path).unwrap();
         let record = SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: dir.path().to_path_buf(),

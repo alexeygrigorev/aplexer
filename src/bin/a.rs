@@ -827,6 +827,26 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Lineage labels: a session started from inside another session (`a
+    // start` ran with its parent's APLEXER_SESSION_ID still in the
+    // environment) shows where it came from -- the parent's tag while its
+    // record exists, a short id once it doesn't, since the recorded lineage
+    // deliberately survives a killed or forgotten parent.
+    let lineage_labels: BTreeMap<Uuid, String> = {
+        let by_id: BTreeMap<Uuid, &SessionRecord> =
+            records.iter().map(|record| (record.id, record)).collect();
+        records
+            .iter()
+            .filter_map(|record| {
+                let parent = record.parent_session?;
+                let label = match by_id.get(&parent) {
+                    Some(parent_record) => parent_record.tag.clone(),
+                    None => parent.to_string()[..8].to_string(),
+                };
+                Some((record.id, format!(" ↳ {label}")))
+            })
+            .collect()
+    };
     let groups = group_by_workspace(records);
     let home = env::var_os("HOME").map(PathBuf::from);
     let current_workspace = resolve_message_workspace(None).ok();
@@ -922,15 +942,20 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             } else {
                 String::new()
             };
+            let lineage = match lineage_labels.get(&record.id) {
+                Some(label) => paint(color, ANSI_DIM, label),
+                None => String::new(),
+            };
             println!(
-                "{} {:>2}  {}  {}  {}{} {}",
+                "{} {:>2}  {}  {}  {}{} {}{}",
                 paint(color, ANSI_GRAY, connector),
                 index + 1,
                 tag,
                 engine,
                 state_text,
                 attention_mark,
-                age
+                age,
+                lineage
             );
         }
     }
@@ -1779,6 +1804,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if io::stdout().is_terminal() {
         cmd_status_tty(
+            paths,
             &current,
             &raw,
             worker_reachable,
@@ -1859,6 +1885,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
 /// containment evidence rather than a generic "try these commands" list.
 /// The redirected rendering above stays byte-identical to the pre-UX format.
 fn cmd_status_tty(
+    paths: &Paths,
     current: &SessionRecord,
     raw: &Value,
     worker_reachable: bool,
@@ -1905,6 +1932,17 @@ fn cmd_status_tty(
     println!("  workspace   {workspace}");
     println!("  engine      {engine}");
     println!("  session     {}", current.id);
+    if let Some(parent) = current.parent_session {
+        // Same rendering rule as `a list`: the parent's tag while its
+        // record exists, a short id once it doesn't.
+        let label = read_record(&paths.record(parent))
+            .map(|record| record.tag)
+            .unwrap_or_else(|_| parent.to_string()[..8].to_string());
+        println!(
+            "  {}",
+            paint(color, ANSI_DIM, &format!("parent      {label}"))
+        );
+    }
     if let Some(foreground) = foreground_override(current, raw) {
         println!("  foreground  {foreground}");
     }
@@ -6138,6 +6176,7 @@ mod switching_tests {
     fn mk_record(workspace: &str, tag: &str, phase: Phase) -> SessionRecord {
         let id = Uuid::new_v4();
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: PathBuf::from(workspace),

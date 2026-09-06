@@ -1248,6 +1248,7 @@ pub fn read_transcript_events(engine: &str, path: &Path) -> Result<Vec<UnifiedEv
 
 fn dummy_record(engine: &str) -> SessionRecord {
     SessionRecord {
+        parent_session: None,
         schema_version: crate::SCHEMA_VERSION,
         id: uuid::Uuid::nil(),
         workspace: PathBuf::from("/"),

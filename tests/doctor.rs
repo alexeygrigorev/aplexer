@@ -19,6 +19,7 @@ fn test_paths(temp: &TempDir) -> Paths {
 fn stale_running_record(paths: &Paths) -> SessionRecord {
     let id = Uuid::new_v4();
     SessionRecord {
+        parent_session: None,
         schema_version: SCHEMA_VERSION,
         id,
         workspace: PathBuf::from("/tmp/doctor-workspace"),

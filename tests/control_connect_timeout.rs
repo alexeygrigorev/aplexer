@@ -28,6 +28,7 @@ fn status_cli_bounds_connect_to_a_saturated_control_backlog() {
     let _queued = UnixStream::connect(&socket_path).unwrap();
 
     let record = SessionRecord {
+        parent_session: None,
         schema_version: 1,
         id,
         workspace: workspace.path().to_path_buf(),

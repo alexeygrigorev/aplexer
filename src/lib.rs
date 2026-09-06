@@ -528,6 +528,14 @@ pub struct SessionRecord {
     pub engine: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Session this one was started from: the `a start` client's ambient
+    /// `APLEXER_SESSION_ID` (`discover_session_id`), recorded only when it
+    /// named a session record that still existed at start time. Best-effort
+    /// provenance, not an enforced hierarchy -- the parent may be killed or
+    /// forgotten later, leaving this pointing at a removed record on
+    /// purpose, so the lineage fact survives the parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<Uuid>,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     #[serde(default)]
@@ -4411,6 +4419,7 @@ mod tests {
 
     fn registry_record(paths: &Paths, id: Uuid) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: paths.state_root.clone(),
@@ -4754,6 +4763,7 @@ mod tests {
     fn liveness_record(state_dir: &Path) -> SessionRecord {
         let pid = std::process::id();
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::new_v4(),
             workspace: state_dir.to_path_buf(),
