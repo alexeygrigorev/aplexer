@@ -114,6 +114,9 @@ command = ["$SHELL", "-l"]   # resolved from $SHELL at load time, "/bin/sh" as a
 [engines.codex]
 command = ["codex", "-c", "check_for_update_on_startup=false"]
 
+[engines.zcodex]
+command = ["zcodex", "-c", "check_for_update_on_startup=false"]
+
 [engines.claude]
 command = ["claude"]
 
@@ -124,7 +127,7 @@ command = ["gemini"]
 command = ["grok"]
 ```
 
-Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703).
+Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703). `zcodex` is a codex variant — a codex-rs fork with the same CLI surface and the same rollout log (`CODEX_HOME`, defaulting to `~/.codex`) — so its builtin mirrors codex's and its conversation-log handling (`a transcript`, below) rides the codex machinery (`engine_family` in `src/lib.rs`), with sessions and emitted events keeping the `zcodex` engine id.
 
 Agent engine ids (every id except the literal `shell` engine) always add the
 built-in provider/cloud credential list to `env_unset`, preserving the
@@ -253,7 +256,7 @@ a watch --jsonl --all   # also include shell (non-agent) sessions
 
 ## Conversation events (`a transcript`)
 
-PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`).
+PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`). Variant engines identified with a built-in family — currently `zcodex`, a codex variant — locate and parse through their family's machinery while keeping their own engine id on the emitted events.
 
 How the log is captured and kept: aplexer does **not** copy conversation bytes into its own state. The engine's append-only JSONL is the source of truth (PTY `history.bin` is a separate, raw terminal capture). The first successful locate writes a bind sidecar `<state>/sessions/<id>/transcript.json` so later pages and `--follow` hit the same file even if another session shares the cwd. If the bound file disappears, the next call re-runs the heuristic.
 
