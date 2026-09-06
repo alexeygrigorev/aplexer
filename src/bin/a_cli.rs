@@ -134,8 +134,10 @@ mod legacy {
 
     fn ux_state(record: &SessionRecord, raw: Option<&Value>, now: u64) -> UxState {
         let worker_alive = record.worker_alive();
-        if matches!(record.phase, Phase::Starting | Phase::Running | Phase::Exiting)
-            && !worker_alive
+        if matches!(
+            record.phase,
+            Phase::Starting | Phase::Running | Phase::Exiting
+        ) && !worker_alive
         {
             return UxState {
                 label: "broken",
@@ -234,11 +236,7 @@ mod legacy {
         }
     }
 
-    fn heuristic_agent_state(
-        record: &SessionRecord,
-        raw: Option<&Value>,
-        now: u64,
-    ) -> UxState {
+    fn heuristic_agent_state(record: &SessionRecord, raw: Option<&Value>, now: u64) -> UxState {
         let last_activity = raw
             .and_then(|value| value.get("last_activity_ms"))
             .and_then(Value::as_u64)
@@ -383,7 +381,10 @@ mod legacy {
             } else {
                 String::new()
             };
-            println!("{badge} {name}{marker}  {}", paint(color, ANSI_DIM, &summary));
+            println!(
+                "{badge} {name}{marker}  {}",
+                paint(color, ANSI_DIM, &summary)
+            );
 
             let tag_width = sessions
                 .iter()
@@ -419,7 +420,11 @@ mod legacy {
                     .filter(|at| now.saturating_sub(*at) <= REPORTED_STATE_STALE_MS_UX)
                     .or(record.last_activity_ms)
                     .or(Some(record.updated_at_ms));
-                let age = paint(color, ANSI_DIM, &format!("{:>4}", human_age(now, timestamp)));
+                let age = paint(
+                    color,
+                    ANSI_DIM,
+                    &format!("{:>4}", human_age(now, timestamp)),
+                );
                 println!(
                     "{} {:>2}  {}  {}  {} {}",
                     paint(color, ANSI_GRAY, connector),
@@ -510,7 +515,11 @@ mod legacy {
                 .worker_pid
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "—".to_string()),
-            if reachable { "reachable" } else { "unreachable" },
+            if reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            },
             current
                 .workload_pid
                 .map(|pid| pid.to_string())
@@ -535,7 +544,10 @@ mod legacy {
         if state.active && reachable {
             println!("Attach: a open {}", &current.id.to_string()[..8]);
         } else {
-            println!("Inspect output: a capture {} --screen --plain", &current.id.to_string()[..8]);
+            println!(
+                "Inspect output: a capture {} --screen --plain",
+                &current.id.to_string()[..8]
+            );
             println!("Remove record:  a kill {}", &current.id.to_string()[..8]);
         }
         Ok(())
@@ -555,11 +567,7 @@ mod legacy {
         Ok(())
     }
 
-    fn cmd_start_attaching_ux(
-        paths: &Paths,
-        args: StartArgs,
-        json_output: bool,
-    ) -> Result<()> {
+    fn cmd_start_attaching_ux(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         if json_output {
             bail!(
                 "--json cannot be combined with `start --attach`: JSON session metadata and terminal bytes cannot share stdout; run `a --json start ...` and `a attach SESSION` separately"
@@ -858,7 +866,11 @@ mod legacy {
         }
     }
 
-    fn attach_ux(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
+    fn attach_ux(
+        paths: &Paths,
+        record: &SessionRecord,
+        history_bytes: Option<usize>,
+    ) -> Result<()> {
         if !io::stdout().is_terminal() {
             return attach(paths, record, history_bytes);
         }
@@ -876,7 +888,11 @@ mod legacy {
         };
         let worker_geometry = initial_geometry.map(|(rows, cols)| {
             (
-                if display_tty { reserved_rows(rows) } else { rows },
+                if display_tty {
+                    reserved_rows(rows)
+                } else {
+                    rows
+                },
                 cols,
             )
         });
@@ -1102,8 +1118,7 @@ mod legacy {
                             .map(|error| {
                                 matches!(
                                     error.kind(),
-                                    io::ErrorKind::ConnectionReset
-                                        | io::ErrorKind::UnexpectedEof
+                                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
                                 )
                             })
                             .unwrap_or(false) =>
@@ -1146,9 +1161,7 @@ mod legacy {
             let Some(outcome) = take_pending_switch(&pending_switch, &switch_in_progress) else {
                 break;
             };
-            *shared_record
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = outcome.record;
+            *shared_record.lock().unwrap_or_else(PoisonError::into_inner) = outcome.record;
             reader = outcome.reader;
             let mut sequence = TERMINAL_RESET_SEQUENCE.to_vec();
             sequence.extend_from_slice(&outcome.history);
