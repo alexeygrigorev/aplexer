@@ -7,8 +7,31 @@ use aplexer::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+/// How long a poll for something that must eventually become true is allowed
+/// to run before the test gives up. A workload that genuinely leaked stays
+/// alive indefinitely, so waiting cannot turn a leak into a pass; the budget
+/// only bounds how long a broken run takes to say so.
+const LIVENESS_BACKSTOP: Duration = Duration::from_secs(30);
+
+/// `process_alive` is `kill(pid, 0)`, which reports a process that has exited
+/// but not yet been reaped as alive. The worker reaps its workload before
+/// exiting, so the ordering is sound -- but this test inspects the pid from a
+/// third process, after the worker is gone, and a workload the worker did not
+/// reap is a zombie reparented to init for as long as init takes to collect it.
+/// The original point assertion had no retry at all and would have read that
+/// window as a leak. Polling removes the window without weakening the check.
+fn assert_workload_exited(pid: u32, point: &str) {
+    let deadline = Instant::now() + LIVENESS_BACKSTOP;
+    while process_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process_alive(pid), "workload {pid} leaked at {point}");
+}
 
 struct Harness {
     runtime: TempDir,
@@ -138,7 +161,7 @@ fn post_spawn_and_partial_thread_failures_kill_workload_and_clean_runtime() {
         let pid = failed
             .workload_pid
             .expect("post-spawn failure records workload pid");
-        assert!(!process_alive(pid), "workload {pid} leaked at {point}");
+        assert_workload_exited(pid, point);
         assert!(
             !fs::read_to_string(harness.paths.record(failed.id))
                 .expect("read record text")

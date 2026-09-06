@@ -12,8 +12,15 @@ printf '==> Rust formatting, type checking, and tests\n'
 command -v cargo >/dev/null 2>&1 || { echo 'cargo is required' >&2; exit 127; }
 cargo fmt --all -- --check
 cargo check --all-targets
-cargo test --all-targets
-cargo test --features startup-test-hooks \
+# Run both suites through the executed-count guard. `cargo test` exits 0 for a
+# run that executed nothing -- see scripts/check-test-execution.sh -- so the
+# exit status alone cannot tell "everything passed" from "nothing ran". The
+# floors are collapse detectors, not ratchets: they sit well under the real
+# counts (about 290 and 15 at the time of writing) so adding or removing a test
+# never trips them, while a suite that silently stops running does.
+scripts/check-test-execution.sh --self-test
+scripts/check-test-execution.sh --min 250 -- cargo test --all-targets
+scripts/check-test-execution.sh --min 12 -- cargo test --features startup-test-hooks \
   --test startup_rollback --test worker_startup_transaction --test lifecycle_failure
 
 if [ -d python ]; then

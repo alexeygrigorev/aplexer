@@ -922,13 +922,48 @@ pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
                 entry_path.display()
             )
         })?;
-        out.push(
-            read_session_record(paths, id)
-                .with_context(|| format!("load session registry entry {}", entry_path.display()))?,
-        );
+        match read_session_record(paths, id) {
+            Ok(record) => out.push(record),
+            // A session directory with no record in it yet is a session being
+            // created, not a corrupt registry: `start_session` creates the
+            // directory a moment before it writes the session's first record.
+            // Both happen under the registry lock, so no other `a start` can
+            // observe the gap -- but every reader that does NOT take that lock
+            // can, and `a watch` polls the registry forever, so it hits the gap
+            // eventually and used to exit on it. Measured on an idle box, an
+            // `a watch` starting alongside an `a start` died this way on 2 runs
+            // out of 20:
+            //
+            //     a: load session registry entry <dir>: read <dir>/session.json:
+            //     No such file or directory (os error 2)
+            //
+            // Skipping the entry reports the session on the next scan instead,
+            // which is what the watcher's own new-session handling already
+            // does. Every other defect -- unparseable record, unsupported
+            // schema, mismatched identity or paths, a stray non-directory entry
+            // -- still fails closed exactly as before.
+            Err(error) if record_is_not_written_yet(&error) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("load session registry entry {}", entry_path.display())
+                })
+            }
+        }
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
     Ok(out)
+}
+
+/// Whether `error` reports a session record that is absent, as opposed to one
+/// that exists and is wrong. `read_record`'s `fs::read` is the only filesystem
+/// access in the chain, so a `NotFound` anywhere in it can only mean the record
+/// file itself is missing.
+fn record_is_not_written_yet(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::NotFound)
+    })
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -4171,6 +4206,66 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains(&id.to_string()), "{message}");
         assert!(message.contains("parse"), "{message}");
+    }
+
+    /// The window `start_session` opens between creating a session directory
+    /// and writing that session's first record. Any reader that does not hold
+    /// the registry lock can land in it, and treating it as corruption killed
+    /// `a watch` outright (see `list_records`). The same fixture must still be
+    /// reported once the record appears, so the entry is skipped, not
+    /// blacklisted.
+    #[test]
+    fn registry_enumeration_skips_a_session_whose_record_is_not_written_yet() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let pending = Uuid::new_v4();
+        fs::create_dir(paths.state_session(pending)).unwrap();
+        let written = Uuid::new_v4();
+        fs::create_dir(paths.state_session(written)).unwrap();
+        atomic_write_json(&paths.record(written), &registry_record(&paths, written)).unwrap();
+
+        let records = list_records(&paths).unwrap();
+        assert_eq!(
+            records.iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![written],
+            "a session mid-creation must be skipped, not reported and not fatal"
+        );
+
+        // ... and picked up as soon as its record lands.
+        atomic_write_json(&paths.record(pending), &registry_record(&paths, pending)).unwrap();
+        let mut ids = list_records(&paths)
+            .unwrap()
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        let mut expected = vec![pending, written];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    /// The complement of the test above: skipping a missing record must not
+    /// weaken the fail-closed contract for a record that is present and wrong.
+    #[test]
+    fn registry_enumeration_still_fails_closed_on_an_empty_record_file() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::new_v4();
+        fs::create_dir(paths.state_session(id)).unwrap();
+        fs::write(paths.record(id), b"").unwrap();
+
+        let error = list_records(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("parse"), "{error:#}");
     }
 
     #[test]

@@ -31,6 +31,23 @@ use tempfile::TempDir;
 /// updating one is expected to grep for the other.
 const REPORTED_STATE_STALE_MS: u64 = 8_000;
 
+/// How long a poll for something that must eventually become true is allowed
+/// to run before the test gives up.
+///
+/// Every `wait_for` below is armed only after `await_watch_ready` has proved
+/// the watcher is live, so the event it waits for is guaranteed to be emitted:
+/// the budget decides how long a genuinely broken run takes to report itself,
+/// not whether a healthy one passes. It is therefore sized for a saturated CI
+/// runner rather than for an idle laptop -- raising it cannot mask a defect,
+/// because none of these loops can ever pass by timing out.
+const LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// How long one readiness probe waits for its own `session.created` before the
+/// handshake assumes that probe was itself swallowed by `a watch`'s startup
+/// snapshot and tries another. Several poll intervals, so a healthy watcher
+/// never needs a second probe.
+const READINESS_PROBE_WINDOW: Duration = Duration::from_secs(5);
+
 struct Harness {
     runtime: TempDir,
     state: TempDir,
@@ -127,13 +144,43 @@ impl Harness {
 
     fn spawn_watch_all(&self) -> Follow {
         let mut command = self.command();
+        command.args(["watch", "--jsonl", "--all"]);
+        Self::follow(command)
+    }
+
+    /// `a watch --jsonl --all`, but held at the starting line until `gate`
+    /// exists. Lets a test place a session's creation provably before the
+    /// watcher's startup snapshot instead of hoping a sleep is long enough --
+    /// the deterministic form of the scheduling delay that made this suite
+    /// miss `session.created` on a loaded box.
+    fn spawn_watch_all_gated(&self, gate: &Path) -> Follow {
+        let mut command = Command::new("/bin/sh");
         command
-            .args(["watch", "--jsonl", "--all"])
+            .env("APLEXER_RUNTIME_DIR", self.runtime.path())
+            .env("APLEXER_STATE_DIR", self.state.path())
+            .env("APLEXER_CONFIG", &self.config)
+            .env_remove("APLEXER_SESSION_ID")
+            .arg("-c")
+            .arg(
+                "gate=\"$1\"; shift; \
+                 while [ ! -e \"$gate\" ]; do sleep 0.02; done; \
+                 exec \"$@\"",
+            )
+            .arg("sh")
+            .arg(gate)
+            .arg(env!("CARGO_BIN_EXE_a"))
+            .args(["watch", "--jsonl", "--all"]);
+        Self::follow(command)
+    }
+
+    fn follow(mut command: Command) -> Follow {
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn a watch --all");
         let stdout = child.stdout.take().expect("watch stdout");
+        let stderr = child.stderr.take().expect("watch stderr");
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         thread::spawn(move || {
@@ -145,7 +192,70 @@ impl Harness {
                 }
             }
         });
-        Follow { child, events }
+        // Drained into the failure message rather than discarded: a watcher
+        // that dies on startup otherwise looks exactly like a watcher that saw
+        // nothing, which is the difference between a broken fixture and a
+        // broken product.
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let diagnostics_sink = diagnostics.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                diagnostics_sink.lock().unwrap().push(line);
+            }
+        });
+        Follow {
+            child,
+            events,
+            diagnostics,
+        }
+    }
+
+    /// Block until `a watch` has provably finished its startup snapshot and is
+    /// polling for changes.
+    ///
+    /// `watch::run` records every session that already exists before entering
+    /// its loop and never replays history, so a session created before that
+    /// snapshot is invisible to the watcher for the rest of its life. Spawning
+    /// the watcher and immediately starting a session is therefore a race, and
+    /// losing it does not merely delay `session.created`, it removes the event
+    /// entirely -- which is why the failure looked like "timed out waiting for
+    /// session.created; saw 0 events: []" (issue #2) and why raising the
+    /// deadline could never have fixed it.
+    ///
+    /// The watcher publishes no readiness signal, so probe for one: start a
+    /// throwaway session and wait a few poll intervals for its own
+    /// `session.created`. A probe that was itself caught by the snapshot
+    /// produces nothing, so try another; the snapshot is taken exactly once, so
+    /// a later probe is guaranteed to land after it. Once any probe is seen,
+    /// every session created afterwards is guaranteed to be reported, which is
+    /// what turns the deadlines further down into pure liveness backstops.
+    fn await_watch_ready(&mut self, watch: &Follow, workspace: &Path) {
+        let deadline = Instant::now() + LIVENESS_BACKSTOP;
+        let mut probes = 0;
+        loop {
+            probes += 1;
+            let record = self.start(workspace, &format!("watch-readiness-probe-{probes}"));
+            let id = record["id"].as_str().expect("probe session id").to_string();
+            let probe_deadline = Instant::now() + READINESS_PROBE_WINDOW;
+            loop {
+                if watch.snapshot().iter().any(|event| is_created(event, &id)) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "`a watch` never reported a session as created after {probes} probes; \
+                     saw {:#?}; watcher stderr: {}",
+                    watch.snapshot(),
+                    watch.stderr()
+                );
+                if Instant::now() >= probe_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -163,11 +273,16 @@ impl Drop for Harness {
 struct Follow {
     child: Child,
     events: Arc<Mutex<Vec<Value>>>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
 }
 
 impl Follow {
     fn snapshot(&self) -> Vec<Value> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn stderr(&self) -> String {
+        self.diagnostics.lock().unwrap().join("\n")
     }
 }
 
@@ -218,12 +333,18 @@ fn wait_for(
         }
         if Instant::now() >= deadline {
             panic!(
-                "timed out waiting for {what}; saw {} events: {events:#?}",
-                events.len()
+                "timed out waiting for {what}; saw {} events: {events:#?}; \
+                 watcher stderr: {}",
+                events.len(),
+                follow.stderr()
             );
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn is_created(event: &Value, session_id: &str) -> bool {
+    event["metadata"]["event"] == "session.created" && event["metadata"]["session_id"] == session_id
 }
 
 fn agent_state_events<'a>(events: &'a [Value], session_id: &str) -> Vec<&'a Value> {
@@ -241,16 +362,23 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
     let workspace = TempDir::new().expect("workspace tempdir");
 
     // Start watching BEFORE the session exists so `a watch` (which does not
-    // replay history) is guaranteed to observe the session's own
-    // `session.created` and every subsequent transition live.
+    // replay history) can observe the session's own `session.created` and
+    // every subsequent transition live -- and then WAIT until the watcher has
+    // provably reached that point. Spawning it is not the same as it watching:
+    // until its startup snapshot is done, a session created in the gap is
+    // invisible to it forever, and no deadline recovers from that.
     let watch = h.spawn_watch_all();
+    h.await_watch_ready(&watch, workspace.path());
 
     let record = h.start(workspace.path(), "state-report-it");
     let id = record["id"].as_str().expect("session id").to_string();
 
-    let created_deadline = Instant::now() + Duration::from_secs(10);
+    // Armed only now, after the handshake, so it measures how long the
+    // watcher takes to report a session it is guaranteed to see rather than
+    // how responsive the machine was while it was still starting up.
+    let created_deadline = Instant::now() + LIVENESS_BACKSTOP;
     wait_for(&watch, created_deadline, "session.created", |e| {
-        e["metadata"]["event"] == "session.created" && e["metadata"]["session_id"] == id
+        is_created(e, &id)
     });
 
     // Push a value the PTY-recency heuristic could never produce by itself
@@ -259,7 +387,7 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
     // push reached `a watch`, not a heuristic coincidence.
     h.state_report(&id, "idle");
 
-    let reported_deadline = Instant::now() + Duration::from_secs(6);
+    let reported_deadline = Instant::now() + LIVENESS_BACKSTOP;
     let reported_event = wait_for(
         &watch,
         reported_deadline,
@@ -281,7 +409,7 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
     // the push and nothing feeds the heuristic's activity signal either.
     thread::sleep(Duration::from_millis(REPORTED_STATE_STALE_MS + 1_500));
 
-    let fallback_deadline = Instant::now() + Duration::from_secs(6);
+    let fallback_deadline = Instant::now() + LIVENESS_BACKSTOP;
     let fallback_event = wait_for(
         &watch,
         fallback_deadline,
@@ -309,6 +437,89 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
     assert!(
         states.len() >= 2,
         "expected at least the reported and fallback events: {states:#?}"
+    );
+}
+
+/// Control for the handshake in the test above: it proves the failure mode the
+/// handshake exists to remove is real, and that the handshake itself is what
+/// detects readiness rather than luck.
+///
+/// A watcher held at the starting line until after a session exists snapshots
+/// that session as pre-existing and never emits `session.created` for it --
+/// permanently, not late. On the pre-handshake test that presented as
+/// "timed out waiting for session.created; saw 0 events: []" after a 10s
+/// wall-clock budget, indistinguishable from a slow machine. Here the miss is
+/// asserted directly, and the probe session created after the same watcher is
+/// released proves the watcher was alive and reporting the whole time, so the
+/// missing event cannot be blamed on a dead or slow watcher.
+#[test]
+fn a_session_created_before_the_watch_snapshot_is_never_reported_as_created() {
+    let mut h = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let gate = h.runtime.path().join("release-the-watcher");
+
+    let watch = h.spawn_watch_all_gated(&gate);
+    let missed = h.start(workspace.path(), "created-before-the-snapshot");
+    let missed_id = missed["id"].as_str().expect("session id").to_string();
+
+    std::fs::write(&gate, b"go").expect("release the watcher");
+    h.await_watch_ready(&watch, workspace.path());
+
+    let events = watch.snapshot();
+    assert!(
+        !events.iter().any(|event| is_created(event, &missed_id)),
+        "a watcher that started after {missed_id} existed reported it as newly \
+         created: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["metadata"]["event"] == "session.created"),
+        "the readiness probe should have produced a session.created: {events:#?}"
+    );
+}
+
+/// End-to-end regression for the other half of "saw 0 events: []": `a watch`
+/// used to EXIT when the registry contained a session directory whose record
+/// had not been written yet, which is the state `a start` leaves on disk for a
+/// moment while it creates a session.
+///
+/// A watcher racing a concurrent `a start` therefore died about 1 run in 10 on
+/// an idle box, printing
+///
+/// ```text
+/// a: load session registry entry <dir>: read <dir>/session.json:
+/// No such file or directory (os error 2)
+/// ```
+///
+/// to a stderr nobody was reading, and every later `wait_for` then timed out
+/// against a corpse. This test pins that exact on-disk state deterministically
+/// instead of racing for it, and requires the watcher to keep running and keep
+/// reporting.
+#[test]
+fn watch_keeps_running_when_a_session_record_is_not_written_yet() {
+    // A syntactically valid session id with no record behind it: byte for byte
+    // what `a start` has on disk between `ensure_private_dir` and its first
+    // `atomic_write_json`.
+    const PENDING_SESSION: &str = "0f1e2d3c-4b5a-4968-8776-655443332211";
+
+    let mut h = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    std::fs::create_dir_all(h.state.path().join("sessions").join(PENDING_SESSION))
+        .expect("create a session directory with no record in it");
+
+    let watch = h.spawn_watch_all();
+    // Fails outright if the watcher exited on the pending directory: the probe
+    // handshake is exactly "prove this watcher is alive and reporting".
+    h.await_watch_ready(&watch, workspace.path());
+
+    assert!(
+        !watch
+            .snapshot()
+            .iter()
+            .any(|event| event["metadata"]["session_id"] == PENDING_SESSION),
+        "a session with no record was reported as a session: {:#?}",
+        watch.snapshot()
     );
 }
 

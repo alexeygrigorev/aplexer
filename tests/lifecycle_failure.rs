@@ -65,8 +65,21 @@ impl Drop for PidGuard {
     }
 }
 
+/// How long a poll for something that must eventually become true is allowed
+/// to run before the test gives up.
+///
+/// Neither loop below asserts anything about *when* its condition holds, only
+/// that it does: both exit the instant it is true, so a generous budget cannot
+/// turn a real failure into a pass -- a pid file the workload never writes
+/// never appears, and a worker that never finalizes never reaches
+/// `Failed`+`containment_empty`+exited. The budget only decides how long a
+/// genuinely broken run takes to report itself, so it is sized for a saturated
+/// CI runner rather than an idle laptop. The 6s and 10s budgets it replaces
+/// were a lottery on a loaded box for no gain in strictness.
+const LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+
 fn wait_for_pid_file(path: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + LIVENESS_BACKSTOP;
     loop {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(pid) = text.trim().parse() {
@@ -80,6 +93,21 @@ fn wait_for_pid_file(path: &Path) -> u32 {
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// `process_alive` is `kill(pid, 0)`, which still reports a process that has
+/// exited but not yet been reaped by its new parent. The worker empties its
+/// domain before exiting, so the descendant is dead by the time the record says
+/// so -- but "dead" and "gone from the process table" are two different
+/// instants, and only the second one `kill(pid, 0)` can see. Poll rather than
+/// assert at a point: a descendant that genuinely survived stays alive forever,
+/// so this cannot pass by waiting.
+fn assert_process_gone(pid: u32, what: &str) {
+    let deadline = Instant::now() + LIVENESS_BACKSTOP;
+    while process_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!process_alive(pid), "{what}");
 }
 
 #[test]
@@ -128,7 +156,7 @@ fn waiter_failure_kills_detached_descendant_before_worker_exits() {
         .join("sessions")
         .join(id)
         .join("session.json");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + LIVENESS_BACKSTOP;
     let failed = loop {
         let record = read_record(&record_path).expect("read session record");
         if record.phase == Phase::Failed
@@ -152,8 +180,8 @@ fn waiter_failure_kills_detached_descendant_before_worker_exits() {
         "unexpected lifecycle error: {:?}",
         failed.error
     );
-    assert!(
-        !process_alive(descendant_pid),
-        "detached descendant survived waiter failure cleanup"
+    assert_process_gone(
+        descendant_pid,
+        "detached descendant survived waiter failure cleanup",
     );
 }
