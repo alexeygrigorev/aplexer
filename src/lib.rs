@@ -1819,6 +1819,22 @@ impl Config {
                 skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
             },
         );
+        // `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
+        // with the same CLI surface and the same rollout log, so its launch
+        // spec mirrors codex's exactly, with the fork's own binary name.
+        config.engines.insert(
+            "zcodex".into(),
+            EngineConfig {
+                command: vec![
+                    "zcodex".into(),
+                    "-c".into(),
+                    "check_for_update_on_startup=false".into(),
+                ],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            },
+        );
         config.engines.insert(
             "gemini".into(),
             EngineConfig {
@@ -4423,6 +4439,30 @@ mod tests {
             exit: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn zcodex_is_a_built_in_codex_variant() {
+        let config = load_config_text("").unwrap();
+        let zcodex = config
+            .engines
+            .get("zcodex")
+            .expect("built-in zcodex engine");
+        assert_eq!(
+            zcodex.command,
+            vec![
+                "zcodex".to_string(),
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+            ]
+        );
+        assert_eq!(
+            zcodex.skip_permissions_argv,
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+        assert_eq!(engine_family("zcodex"), "codex");
+        assert_eq!(engine_family("codex"), "codex");
+        assert_eq!(engine_family("claude"), "claude");
     }
 
     #[test]
