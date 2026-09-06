@@ -3,7 +3,6 @@ name = "aplexer"
 version = "0.1.3"
 edition = "2021"
 rust-version = "1.85"
-autobins = false
 description = "Daemonless, durable PTY session workers for Linux"
 license = "Apache-2.0"
 repository = "https://github.com/alexeygrigorev/aplexer"
@@ -15,7 +14,7 @@ crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "a"
-path = "src/bin/a_cli.rs"
+path = "src/bin/a.rs"
 
 [[bin]]
 name = "aplexer"

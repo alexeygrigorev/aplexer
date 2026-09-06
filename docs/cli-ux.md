@@ -161,14 +161,15 @@ PR #4 implements the highest-frequency, lowest-contract-risk improvements.
 - the footer teaches attach, create-or-attach here, and help;
 - `a status` on a TTY becomes a task-first summary with a suggested next action;
 - top-level help adds a quick-workflow section;
-- aliases reduce recall:
+- the human vocabulary is real Clap commands and visible aliases (so
+  completions and `a help` know every name):
   - `a here` -> current-directory create-or-attach;
   - `a new` -> `start --attach`;
   - `a open` -> `attach`;
   - `a ps` -> `list`;
   - `a current` -> `whoami`;
   - `a keys` -> `hotkeys`;
-  - `a check` -> `doctor`.
+  - `a check` -> `doctor`;
 
 ### Inside a session
 

@@ -28,8 +28,8 @@ use uuid::Uuid;
 #[command(
     name = "a",
     version,
-    about = "Daemonless durable PTY sessions",
-    disable_help_subcommand = true
+    about = "Run, inspect, and switch between durable agent sessions",
+    after_help = "Common workflows:\n  a                         sessions at a glance\n  a here                    create or reattach the main session here\n  a here codex review       create or reattach Codex, tagged review\n  a open review             attach by tag in the current workspace\n  a new --engine shell      start and attach using full start options\n  a current                 show the session containing this shell\n  a keys                    show keys available while attached"
 )]
 struct Cli {
     #[arg(
@@ -46,18 +46,28 @@ struct Cli {
 enum Commands {
     /// Start a new session (workspace + tag + engine/profile) and its worker.
     Start(StartArgs),
+    /// Start a new session and immediately attach to it (`--attach` implied;
+    /// every other flag is `start`'s).
+    New(StartArgs),
+    /// Create-or-attach in the current workspace -- the typed-out form of
+    /// `a -`: `a here [engine [tag]]`, or `a here <command...>` to run a
+    /// literal command. Takes the same words `a -` takes, not flags; use
+    /// `a new` for start's full flag surface.
+    Here(QuickLaunchArgs),
     /// List sessions grouped by workspace.
-    #[command(alias = "ls")]
+    #[command(visible_aliases = ["ls", "ps"])]
     List(ListArgs),
     /// Same as `list`, but always machine-readable (see also `list --json`).
     Snapshot(ListArgs),
     /// Attach to a session's live PTY (Ctrl-b d to detach).
+    #[command(visible_alias = "open")]
     Attach(AttachArgs),
     /// Send input to a session without attaching.
     Send(SendArgs),
     /// Print a session's captured output/scrollback.
     Capture(CaptureArgs),
     /// Show a session's phase, exit info, and liveness.
+    #[command(visible_alias = "show")]
     Status(TargetArgs),
     /// Signal a session's workload and clean up its records.
     Kill(KillArgs),
@@ -82,11 +92,14 @@ enum Commands {
     #[command(hide = true)]
     LaunchExec(LaunchArgs),
     /// Check aplexer's environment/config for problems.
+    #[command(visible_alias = "check")]
     Doctor,
     /// Print the current session's identity (workspace/tag/engine/profile).
+    #[command(visible_alias = "current")]
     Whoami,
     /// Push the current session's semantic agent state, for a hook script
     /// to call from inside it (see `a state-report --help`).
+    #[command(visible_alias = "state")]
     StateReport(StateReportArgs),
     /// Send or read messages between sibling agent sessions.
     Message(MessageArgs),
@@ -97,6 +110,7 @@ enum Commands {
     /// Print a shell completion script for `a` to stdout.
     Completions(CompletionsArgs),
     /// Print the attach-mode keyboard shortcuts (Ctrl-b prefix, detach).
+    #[command(visible_alias = "keys")]
     Hotkeys,
     /// `a <workspace-index> [session-index-or-tag]`, rewritten into this by
     /// main() before argument parsing -- not a name a user types directly.
@@ -132,7 +146,10 @@ struct CompletionsArgs {
 struct StartArgs {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    #[arg(long, default_value = "default")]
+    // The terminal-first default tag is `main`, matching `a here` and `a -`.
+    // Resolution of a bare target still falls back to `default` (see
+    // `resolve`), so sessions created by older builds stay attachable.
+    #[arg(long, default_value = DEFAULT_HUMAN_TAG)]
     tag: String,
     #[arg(long)]
     engine: Option<String>,
@@ -185,7 +202,7 @@ struct LaunchArgs {
 struct TargetArgs {
     #[arg(
         value_name = "SESSION",
-        help = "Full UUID or an unambiguous UUID prefix"
+        help = "UUID/prefix, workspace:tag selector, or tag in the current workspace"
     )]
     selector: Option<String>,
     #[arg(long, value_name = "PATH")]
@@ -518,6 +535,19 @@ fn run() -> Result<()> {
         .unwrap_or(Commands::List(ListArgs { running: false }));
     match command {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
+        Commands::New(mut args) => {
+            args.attach = true;
+            cmd_start(&paths, args, cli.json)
+        }
+        Commands::Here(args) => {
+            if cli.json {
+                bail!(
+                    "`a here` is an interactive create-or-attach command; use \
+                     `a --json start --workspace ... --tag ...` for automation"
+                );
+            }
+            cmd_quick_launch(&paths, args)
+        }
         Commands::List(args) => cmd_list(&paths, args, cli.json),
         Commands::Snapshot(args) => cmd_list(&paths, args, true),
         Commands::Attach(args) => {
@@ -580,6 +610,33 @@ fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
     rewritten
 }
 
+/// The tag the terminal-first vocabulary creates and resolves by default:
+/// `a here`, `a -`, and `a start` all mean tag `main` in the current
+/// workspace, so "work on the main thing here" is one word in every form.
+const DEFAULT_HUMAN_TAG: &str = "main";
+/// Sessions created before the terminal-first default stay attachable with
+/// no flags: after `main`, a bare `a attach`/`a status` falls back to this
+/// pre-UX tag before giving up.
+const LEGACY_DEFAULT_TAG: &str = "default";
+
+/// Whether a selector could plausibly be a UUID or UUID prefix: only hex
+/// digits and dashes, with 8..=32 digits (a full UUID is 32, the shortest
+/// useful prefix `resolve_record` honors is 8). Anything containing a
+/// non-hex character is a word -- i.e. a candidate tag -- never a UUID.
+fn looks_like_uuid_selector(raw: &str) -> bool {
+    let mut hex_digits = 0usize;
+    for byte in raw.bytes() {
+        if byte == b'-' {
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+        hex_digits += 1;
+    }
+    (8..=32).contains(&hex_digits)
+}
+
 fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
     // `a attach 1`, `a status 1`, `a kill 1`, etc. should mean the same
     // thing as the bare `a 1` shortcut, not just work for `attach`. Only
@@ -595,6 +652,72 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
             if is_quick_index {
                 let index: usize = selector.parse().unwrap_or(0);
                 return resolve_quick_index(paths, index, None);
+            }
+        }
+    }
+    // Terminal-first default target: no selector and no --tag means "the
+    // main session here" -- the same session `a here` creates. Prefers
+    // `main`, then falls back to the pre-UX `default` tag so existing
+    // sessions remain one-command attachable after upgrading. An explicit
+    // --workspace pins the lookup; with no flag the workspace is
+    // $APLEXER_WORKSPACE (set inside every session) or the cwd, matching
+    // `resolve_message_workspace` so all "here" resolution agrees.
+    if target.selector.is_none() && target.tag.is_none() {
+        let workspace = match &target.workspace {
+            Some(ws) => Some(canonical_workspace(ws)?),
+            None => resolve_message_workspace(None).ok(),
+        };
+        if let Some(workspace) = workspace {
+            let records = list_records(paths)?;
+            if let Some(record) = records
+                .iter()
+                .find(|r| r.workspace == workspace && r.tag == DEFAULT_HUMAN_TAG)
+                .or_else(|| {
+                    records
+                        .iter()
+                        .find(|r| r.workspace == workspace && r.tag == LEGACY_DEFAULT_TAG)
+                })
+            {
+                return Ok(record.clone());
+            }
+            if target.workspace.is_none() {
+                bail!(
+                    "no {DEFAULT_HUMAN_TAG} session in {}; run `a here` to create one, or `a` to list every session",
+                    display_workspace(&workspace, env::var_os("HOME").as_deref().map(Path::new))
+                );
+            }
+            // Explicit --workspace with no main/default session: fall
+            // through to resolve_record's legacy `default`-tag resolution
+            // and its own error message.
+        }
+    }
+    // `a open review`, `a show review`: a plain word that is not a candidate
+    // UUID resolves as a tag in the current workspace, after UUID and
+    // full `workspace:tag` selectors have had their chance -- so existing
+    // machine-facing selector semantics can never be shadowed by a tag.
+    if let Some(selector) = &target.selector {
+        if target.workspace.is_none() && target.tag.is_none() && !looks_like_uuid_selector(selector)
+        {
+            if let Ok(record) = resolve_record(paths, Some(selector), None, None) {
+                return Ok(record);
+            }
+            if let Ok(workspace) = resolve_message_workspace(None) {
+                let matches: Vec<SessionRecord> = list_records(paths)?
+                    .into_iter()
+                    .filter(|r| r.workspace == workspace && r.tag == selector.as_str())
+                    .collect();
+                match matches.len() {
+                    1 => return Ok(matches.into_iter().next().expect("one match")),
+                    0 => bail!(
+                        "no session tagged '{selector}' in {}; run `a` to list sessions, \
+                         or use a full workspace:tag selector",
+                        display_workspace(
+                            &workspace,
+                            env::var_os("HOME").as_deref().map(Path::new)
+                        )
+                    ),
+                    _ => bail!("tag '{selector}' is ambiguous in this workspace"),
+                }
             }
         }
     }
@@ -672,6 +795,161 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
         );
         return Ok(());
     }
+    // Human output is terminal-first: on a real TTY the richer tree below
+    // adds semantic state and current-workspace orientation; redirected
+    // output keeps the pre-UX plain rendering byte-for-byte, so scripts
+    // piping `a list` never see presentation changes.
+    if io::stdout().is_terminal() {
+        return cmd_list_tty(paths, args);
+    }
+    cmd_list_plain(paths, args)
+}
+
+/// The terminal rendering of `a list` -- see cmd_list's redirect contract.
+fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
+    let mut records = list_records(paths)?;
+    if args.running {
+        records.retain(|record| record.worker_phase_active() && record.worker_alive());
+    }
+    if records.is_empty() {
+        if args.running {
+            println!("No running sessions.");
+        } else {
+            println!("No aplexer sessions yet.");
+            println!();
+            println!("Start and attach in this directory:");
+            println!("  a here                 default engine, tag main");
+            println!("  a here codex review    codex, tag review");
+            println!("  a new --engine shell   full start options, attached");
+            println!();
+            println!("Discover: a engines · a profiles · a help");
+        }
+        return Ok(());
+    }
+
+    let groups = group_by_workspace(records);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let current_workspace = resolve_message_workspace(None).ok();
+    let color = color_enabled();
+    let now = now_ms();
+
+    for (workspace_index, (workspace, sessions)) in groups.iter().enumerate() {
+        if workspace_index > 0 {
+            println!();
+        }
+        let states: Vec<(&'static str, bool, bool)> = sessions
+            .iter()
+            .map(|record| {
+                let (state, _) = session_ui_state(record, now);
+                (
+                    state,
+                    ui_state_is_active(state),
+                    ui_state_needs_attention(state),
+                )
+            })
+            .collect();
+        let active = states.iter().filter(|(_, active, _)| *active).count();
+        let attention = states.iter().filter(|(_, _, attention)| *attention).count();
+        let stopped = sessions.len().saturating_sub(active);
+        let mut summary = format!("{active} active");
+        if attention > 0 {
+            summary.push_str(&format!(" · {attention} needs you"));
+        }
+        if stopped > 0 {
+            summary.push_str(&format!(" · {stopped} stopped"));
+        }
+        let here = current_workspace.as_deref() == Some(workspace.as_path());
+        let badge = paint(
+            color,
+            &format!("{ANSI_BOLD}{ANSI_CYAN}"),
+            &format!("[{}]", workspace_index + 1),
+        );
+        let name = paint(
+            color,
+            ANSI_BOLD,
+            &display_workspace(workspace, home.as_deref()),
+        );
+        let marker = if here {
+            paint(color, ANSI_CYAN, "  ← here")
+        } else {
+            String::new()
+        };
+        println!(
+            "{badge} {name}{marker}  {}",
+            paint(color, ANSI_DIM, &summary)
+        );
+
+        // Column widths adapt to the widest tag/engine actually present, so
+        // a registry of long agent tags doesn't force every row to wrap.
+        let tag_width = sessions
+            .iter()
+            .map(|record| terminal_display_width(&record.tag))
+            .max()
+            .unwrap_or(3)
+            .clamp(6, 20);
+        let engine_width = sessions
+            .iter()
+            .map(|record| {
+                terminal_display_width(&match &record.profile {
+                    Some(profile) => format!("{}/{}", record.engine, profile),
+                    None => record.engine.clone(),
+                })
+            })
+            .max()
+            .unwrap_or(6)
+            .clamp(6, 22);
+        let last = sessions.len().saturating_sub(1);
+        for (index, record) in sessions.iter().enumerate() {
+            let (state, _, attention) = states[index];
+            let connector = if index == last { "└─" } else { "├─" };
+            let engine = match &record.profile {
+                Some(profile) => format!("{}/{}", record.engine, profile),
+                None => record.engine.clone(),
+            };
+            let tag = paint(color, ANSI_BOLD, &fit_column(&record.tag, tag_width));
+            let engine = paint(color, ANSI_DIM, &fit_column(&engine, engine_width));
+            let (sdot, scolor) = state_glyph(state);
+            let state_text = fit_column(&format!("{sdot} {state}"), 11);
+            let state_text = paint(color, scolor, &state_text);
+            let timestamp = state_timestamp(record, state, now);
+            let age = paint(
+                color,
+                ANSI_DIM,
+                &format!("{:>4}", compact_elapsed(now.saturating_sub(timestamp))),
+            );
+            let attention_mark = if attention {
+                paint(color, ANSI_YELLOW, " !")
+            } else {
+                String::new()
+            };
+            println!(
+                "{} {:>2}  {}  {}  {}{} {}",
+                paint(color, ANSI_GRAY, connector),
+                index + 1,
+                tag,
+                engine,
+                state_text,
+                attention_mark,
+                age
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "{}",
+        paint(
+            color,
+            ANSI_DIM,
+            "Attach: a <workspace#> [session#|tag] · Start here: a here [engine] [tag] · Help: a help"
+        )
+    );
+    Ok(())
+}
+
+/// The redirected rendering of `a list` -- the pre-UX format, unchanged so
+/// piped/parsed output is stable across the UX work.
+fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     let mut records = list_records(paths)?;
     if args.running {
         records.retain(|r| r.worker_phase_active() && r.worker_alive());
@@ -777,11 +1055,165 @@ fn paint(enabled: bool, code: &str, text: &str) -> String {
 
 fn state_glyph(state: &str) -> (&'static str, &'static str) {
     match state {
-        "running" => ("\u{25CF}", ANSI_GREEN),
-        "starting" | "exiting" => ("\u{25D0}", ANSI_YELLOW),
-        "failed" | "broken" => ("\u{2717}", ANSI_RED),
-        _ => ("\u{25CB}", ANSI_GRAY), // "exited"
+        "running" | "working" | "active" => ("\u{25CF}", ANSI_GREEN),
+        "waiting" => ("!", ANSI_YELLOW),
+        "starting" | "exiting" | "stopping" => ("\u{25D0}", ANSI_YELLOW),
+        "failed" | "broken" | "oom" => ("\u{2717}", ANSI_RED),
+        _ => ("\u{25CB}", ANSI_GRAY), // "exited", "idle", "quiet"
     }
+}
+
+/// The single human-facing state derivation: lifecycle facts first (a dead
+/// worker behind a non-terminal phase is `broken` regardless of anything the
+/// record claims), then the authoritative agent-state derivation shared with
+/// `a watch` (`aplexer::watch::derive_agent_state_with_source` -- one set of
+/// freshness thresholds, never a copy), mapped onto the honest human
+/// vocabulary from docs/cli-ux.md section 4:
+///
+/// - a fresh `a state-report` push is semantic fact: `working`/`waiting`/`idle`
+/// - PTY-recency inference never claims semantics: recent output is
+///   `active`, silence is `quiet` -- deliberately NOT `waiting`, because
+///   "the terminal went quiet" cannot tell a blocked agent from a long
+///   compute step
+/// - a plain shell is just `running` no matter how quiet its PTY is
+///
+/// Returns `(state, source)` where source is `reported`, `activity`, or
+/// `lifecycle`, so callers can qualify inferred states instead of faking
+/// certainty.
+fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static str) {
+    if matches!(
+        record.phase,
+        Phase::Starting | Phase::Running | Phase::Exiting
+    ) && !record.worker_alive()
+    {
+        return ("broken", "lifecycle");
+    }
+    match record.phase {
+        Phase::Starting => ("starting", "lifecycle"),
+        Phase::Exiting => ("stopping", "lifecycle"),
+        Phase::Exited => {
+            let oom = record
+                .exit
+                .as_ref()
+                .map(|exit| exit.oom_killed)
+                .unwrap_or(false);
+            (if oom { "oom" } else { "exited" }, "lifecycle")
+        }
+        Phase::Failed => ("failed", "lifecycle"),
+        Phase::Running => {
+            if record.engine == "shell" {
+                return ("running", "lifecycle");
+            }
+            let (state, source) = aplexer::watch::derive_agent_state_with_source(record, now);
+            match (state, source) {
+                // A fresh state-report push is what the agent says it is.
+                ("running", "reported") => ("working", "reported"),
+                ("waiting", "reported") => ("waiting", "reported"),
+                ("idle", "reported") => ("idle", "reported"),
+                // The heuristic's "running/waiting" words imply agent
+                // semantics the PTY cannot actually know; translate to
+                // activity words that don't.
+                ("running", _) => ("active", "activity"),
+                ("waiting", _) => ("quiet", "activity"),
+                (state, source) => (state, source),
+            }
+        }
+    }
+}
+
+/// Whether a state word counts as "alive/working" in workspace summaries --
+/// everything a live worker can be in, including the merely-quiet.
+fn ui_state_is_active(state: &str) -> bool {
+    matches!(
+        state,
+        "working" | "waiting" | "idle" | "active" | "quiet" | "running" | "starting" | "stopping"
+    )
+}
+
+/// Whether a state word means "the human should look at this": reported
+/// waits and every failure/health condition. Inferred quiet is deliberately
+/// not attention -- it is usually just a long-running command.
+fn ui_state_needs_attention(state: &str) -> bool {
+    matches!(state, "waiting" | "broken" | "failed" | "oom")
+}
+
+/// How long a state word's evidence is stale-able, for the list's age
+/// column: the state-report push for semantic states, last PTY output for
+/// activity states, the exit for terminal ones. Falls back to the record's
+/// own update time so the column always has something honest to show.
+fn state_timestamp(record: &SessionRecord, state: &str, now: u64) -> u64 {
+    let candidate = match state {
+        "working" | "waiting" | "idle" => record.reported_state_at_ms,
+        "active" | "quiet" => record.last_activity_ms,
+        "exited" | "oom" => record.exit.as_ref().map(|exit| exit.exited_at_ms),
+        _ => None,
+    };
+    candidate
+        .filter(|at| *at <= now)
+        .unwrap_or(record.updated_at_ms)
+}
+
+/// Compact age for dense lists: `now`, `30s`, `2m`, `3h`, `5d`.
+fn compact_elapsed(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 5 {
+        "now".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// The phrase form for prose contexts (`a status`): "just now", "4m ago".
+fn human_age_phrase(ms: u64) -> String {
+    match compact_elapsed(ms).as_str() {
+        "now" => "just now".to_string(),
+        age => format!("{age} ago"),
+    }
+}
+
+/// Qualifier appended to a semantic state so a human can tell what kind of
+/// fact they are looking at; empty for authoritative sources.
+fn state_source_suffix(source: &str) -> &'static str {
+    match source {
+        "activity" => " (inferred from output activity)",
+        _ => "",
+    }
+}
+
+/// Pads or truncates to exactly `width` display cells, marking a truncation
+/// with `…` (counted against the width), Unicode-width safe: CJK-width
+/// glyphs and combining sequences never split mid-cluster or misalign the
+/// columns built from `fit_column` calls.
+fn fit_column(text: &str, width: usize) -> String {
+    let display_width = terminal_display_width(text);
+    if display_width <= width {
+        return format!("{text}{}", " ".repeat(width - display_width));
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut result = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = terminal_display_width(grapheme);
+        if used + grapheme_width > width - 1 {
+            break;
+        }
+        result.push_str(grapheme);
+        used += grapheme_width;
+    }
+    result.push('…');
+    result.push_str(&" ".repeat(width.saturating_sub(used + 1)));
+    result
 }
 
 fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str) {
@@ -1345,6 +1777,15 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
             value["rpc_error"] = json!(error);
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if io::stdout().is_terminal() {
+        cmd_status_tty(
+            &current,
+            &raw,
+            worker_reachable,
+            rpc_error.as_deref(),
+            history_persistence_error.as_deref(),
+            record_persistence_error.as_deref(),
+        )?;
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
@@ -1408,6 +1849,150 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         if let Some(error) = record_persistence_error {
             println!("record_persistence_error: {error}");
         }
+    }
+    Ok(())
+}
+
+/// The terminal rendering of `a status` -- task-first (tag and state lead;
+/// pids and sockets are evidence at the bottom), state qualified by its
+/// source, and exactly one next action chosen from lifecycle/reachability/
+/// containment evidence rather than a generic "try these commands" list.
+/// The redirected rendering above stays byte-identical to the pre-UX format.
+fn cmd_status_tty(
+    current: &SessionRecord,
+    raw: &Value,
+    worker_reachable: bool,
+    rpc_error: Option<&str>,
+    history_persistence_error: Option<&str>,
+    record_persistence_error: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    let (mut state, mut source) = session_ui_state(current, now);
+    // A live worker that will not answer is its own condition -- more
+    // specific than any state the record could claim.
+    if current.worker_alive() && !worker_reachable {
+        state = "unreachable";
+        source = "lifecycle";
+    }
+    let color = color_enabled();
+    let short_id = current.id.to_string()[..8].to_string();
+    let workspace = display_workspace(
+        &current.workspace,
+        env::var_os("HOME").as_deref().map(Path::new),
+    );
+    let engine = match &current.profile {
+        Some(profile) => format!("{}/{}", current.engine, profile),
+        None => current.engine.clone(),
+    };
+
+    let (glyph, glyph_color) = state_glyph(state);
+    println!(
+        "{}  {}",
+        paint(color, ANSI_BOLD, &current.tag),
+        paint(color, glyph_color, &format!("{glyph} {state}"))
+    );
+    let suffix = state_source_suffix(source);
+    if !suffix.is_empty() {
+        println!("  {}", paint(color, ANSI_DIM, suffix.trim()));
+    }
+    let lifecycle = observed_state(&current.phase, current.worker_alive());
+    if lifecycle != state {
+        println!(
+            "  {}",
+            paint(color, ANSI_DIM, &format!("lifecycle: {lifecycle}"))
+        );
+    }
+    println!("  workspace   {workspace}");
+    println!("  engine      {engine}");
+    println!("  session     {}", current.id);
+    if let Some(foreground) = foreground_override(current, raw) {
+        println!("  foreground  {foreground}");
+    }
+    let activity = raw
+        .get("last_activity_ms")
+        .and_then(Value::as_u64)
+        .or(current.last_activity_ms);
+    let activity_text = match activity {
+        Some(at) if at <= now => human_age_phrase(now - at),
+        _ => "unknown".to_string(),
+    };
+    println!("  activity    {activity_text}");
+    println!(
+        "  command     {}",
+        current
+            .command
+            .iter()
+            .map(|value| shell_quote(value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "  processes   worker {} ({}) · workload {}",
+        current
+            .worker_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "—".to_string()),
+        if worker_reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        },
+        current
+            .workload_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "—".to_string())
+    );
+    if let Some(exit) = &current.exit {
+        println!(
+            "  exit        code={:?} signal={:?} oom={}",
+            exit.code, exit.signal, exit.oom_killed
+        );
+    }
+    if let Some(error) = current.error.as_deref() {
+        println!("  error       {error}");
+    }
+    if let Some(error) = rpc_error {
+        println!("  rpc         {error}");
+    }
+    if let Some(error) = history_persistence_error {
+        println!("  history     {error}");
+    }
+    if let Some(error) = record_persistence_error {
+        println!("  record      {error}");
+    }
+    if let Some(cgroup) = raw.get("cgroup") {
+        if !cgroup.is_null() {
+            println!("  resources   {cgroup}");
+        }
+    }
+    println!();
+
+    // One next action, chosen from the same evidence model `a doctor` uses:
+    // attach what is live, capture what is over, and get dead records out of
+    // the way by the cheapest safe route (`a prune` when the record is one
+    // it can reap, else `a kill` -- whose own refusal message is the right
+    // teacher for the rare uncontainable case). A live-but-unreachable
+    // worker gets a diagnosis pointer, not a destructive command.
+    let attachable = matches!(
+        current.phase,
+        Phase::Starting | Phase::Running | Phase::Exiting
+    ) && current.worker_alive()
+        && worker_reachable;
+    if attachable {
+        println!("Attach: a open {short_id}");
+        return Ok(());
+    }
+    if matches!(current.phase, Phase::Exited | Phase::Failed) || state == "broken" {
+        println!("Inspect output: a capture {short_id} --screen --plain");
+    }
+    if !current.worker_alive() {
+        if reap_verdict(current).is_some() {
+            println!("Remove record:  a prune");
+        } else {
+            println!("Remove record:  a kill {short_id}");
+        }
+    } else if !worker_reachable {
+        println!("Diagnose:       a check");
     }
     Ok(())
 }
@@ -1940,7 +2525,19 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         if let Some(profile) = &record.profile {
             println!("profile: {profile}");
         }
-        println!("state: {}", record.phase.name());
+        // On a terminal, lead with the honest semantic state and show the
+        // underlying lifecycle when it differs; redirected output keeps the
+        // raw phase word the pre-UX build printed.
+        if io::stdout().is_terminal() {
+            let (state, source) = session_ui_state(&record, now_ms());
+            println!("state: {state}{}", state_source_suffix(source));
+            let lifecycle = observed_state(&record.phase, record.worker_alive());
+            if lifecycle != state {
+                println!("lifecycle: {lifecycle}");
+            }
+        } else {
+            println!("state: {}", record.phase.name());
+        }
     }
     Ok(())
 }
@@ -2280,19 +2877,20 @@ fn cmd_completions(args: CompletionsArgs) -> Result<()> {
 }
 
 /// `a hotkeys` -- a lookup command for the attach-mode Ctrl-b chords, kept in
-/// sync by hand with the startup banner (`"[aplexer attached; ...]"`, printed
-/// where `attach()` enters raw mode) and the `SwitchTarget` match arms in the
-/// attach loop's byte scanner -- there is one authoritative keymap, this just
+/// sync by hand with the attach status bar's `?` flash (`ATTACH_KEY_HELP`,
+/// drawn where `attach()` enters raw mode) and the `SwitchTarget` match arms
+/// in the attach loop's byte scanner -- there is one authoritative keymap,
+/// this just
 /// prints it somewhere you can look it up without already being attached.
 fn cmd_hotkeys() -> Result<()> {
-    println!("Attach-mode hotkeys (press Ctrl-b, then one of these):");
+    println!("Attach-mode keys (press Ctrl-b, then one of these):");
     println!();
+    println!("  ?        show this reference in the status bar");
+    println!("  d        detach (the workload keeps running)");
     println!("  n / p    next / previous session in this workspace");
-    println!("  N / P    next / previous session, across all workspaces");
-    println!("  Ctrl-b 1..9 jumps to that number from the status bar");
-    println!("  1-9      jump to that number after Ctrl-b");
-    println!("  l        toggle back to the last session you were on");
-    println!("  d        detach");
+    println!("  N / P    next / previous session across all workspaces");
+    println!("  1-9      jump to the numbered session in the status bar");
+    println!("  l        return to the previously attached session");
     println!();
     println!("Any other key after Ctrl-b is forwarded through untouched.");
     Ok(())
@@ -3386,12 +3984,16 @@ fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let state = observed_state(&r.phase, r.worker_alive());
+            let (state, _) = session_ui_state(r, now_ms());
             let mut part = format!("{}:{}", i + 1, r.tag);
             if r.id == record.id {
                 part.push('*');
             }
-            if state != "running" {
+            // Running-ish states are the expected background; anything else
+            // (a reported wait, a death, a broken worker) is worth seeing
+            // while attached. The same rule `workspace_summary_regions`
+            // mirrors for the click map.
+            if !matches!(state, "running" | "working" | "active" | "quiet") {
                 part.push_str(&format!("({state})"));
             }
             part
@@ -3471,16 +4073,37 @@ struct StatusBarCtx {
 
 type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
 
-/// How long a switch-failure message stays on the status bar before the
-/// normal text resumes (docs/fast-session-switching-design.md section 6.1).
-const FLASH_DURATION: Duration = Duration::from_secs(2);
+/// How long a transient status-bar message (switch failure, attach hint,
+/// `Ctrl-b ?` help) stays visible before the normal text resumes
+/// (docs/fast-session-switching-design.md section 6.1). Three seconds
+/// rather than two: help text has to be readable, not merely noticed.
+const FLASH_DURATION: Duration = Duration::from_secs(3);
 
-/// Compact, agent-first status-bar line: workspace, tag, engine/profile,
-/// live memory (if the session has a cgroup), and the current workspace's
-/// numbered session list -- the aplexer analogue of tmux's window list,
-/// adapted for a per-session/per-tag model rather than tmux's single-server
-/// window set. Renders a flashed error instead of the normal text while one
-/// is active (section 6.1).
+/// The one-line key reference `Ctrl-b ?` flashes onto the status bar --
+/// the same chords `a keys`/`a hotkeys` print, compressed to what fits a
+/// terminal line. Consumed locally: no byte reaches the workload.
+const ATTACH_KEY_HELP: &str =
+    "Ctrl-b: d detach · n/p switch · N/P global · 1-9 jump · l last · ? help";
+
+/// Shows a transient message on the status bar and redraws immediately --
+/// the single channel for attach hints, help, and switch failures, so
+/// nothing is ever printed into the workload's output stream (the original
+/// attach banner's corruption failure mode, docs/terminal-state-design.md
+/// section 6.3 step 6).
+fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
+    if let Ok(mut flash) = ctx.flash.lock() {
+        *flash = Some((message.into(), Instant::now()));
+    }
+    draw_status_bar(ctx, true);
+}
+
+/// Status-bar text, adaptive by width. All layouts lead with identity and
+/// state -- the two things a returning human needs -- and drop detail from
+/// the right as the terminal narrows: full (workspace:tag, state,
+/// engine/foreground, memory, sibling list, help affordance), medium
+/// (tag-first), compact (tag + state + help), and a minimum that keeps
+/// state and `^b ?` alive on even a few columns. Renders a flashed message
+/// instead of all of these while one is active (section 6.1).
 fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     {
         let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3509,16 +4132,38 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     {
         ep.push_str(&format!(" -> {fg}"));
     }
-    let mut text = format!("{ws}:{} [{ep}]", record.tag);
-    if let Some(mem) = raw.as_ref().and_then(|raw| memory_indicator(&record, raw)) {
-        text.push_str(&format!("  mem {mem}"));
-    }
+    let mem = raw.as_ref().and_then(|raw| memory_indicator(&record, raw));
     let siblings = workspace_summary(ctx, &record);
-    if !siblings.is_empty() {
-        text.push_str("  |  ");
-        text.push_str(&siblings);
+    let (state_word, _) = session_ui_state(&record, now_ms());
+    let (glyph, _) = state_glyph(state_word);
+    let state = format!("{glyph} {}", state_word.to_uppercase());
+
+    let mut full = format!("{ws}:{}  {state}  {ep}", record.tag);
+    if let Some(mem) = &mem {
+        full.push_str(&format!("  mem {mem}"));
     }
-    pad_or_truncate(&sanitize_terminal_text(&text), cols)
+    if !siblings.is_empty() {
+        full.push_str("  |  ");
+        full.push_str(&siblings);
+    }
+    full.push_str("  |  ^b ?");
+
+    let mut medium = format!("{}  {state}  {ep}", record.tag);
+    if !siblings.is_empty() {
+        medium.push_str("  |  ");
+        medium.push_str(&siblings);
+    }
+    medium.push_str("  |  ^b ?");
+
+    let compact = format!("{}  {state}  ^b ?", record.tag);
+    let minimum = format!("{state}  ^b ?");
+
+    let rendered = [full, medium, compact]
+        .into_iter()
+        .map(|candidate| sanitize_terminal_text(&candidate))
+        .find(|candidate| terminal_display_width(candidate) <= cols)
+        .unwrap_or_else(|| sanitize_terminal_text(&minimum));
+    pad_or_truncate(&rendered, cols)
 }
 
 /// Redraws the reserved bottom row in place: save cursor, jump to the last
@@ -4028,12 +4673,12 @@ fn workspace_summary_regions(
             text.push(' ');
         }
         let start = terminal_display_width(&text);
-        let state = observed_state(&r.phase, r.worker_alive());
+        let (state, _) = session_ui_state(r, now_ms());
         text.push_str(&format!("{}:{}", i + 1, sanitize_terminal_text(&r.tag)));
         if r.id == current_id {
             text.push('*');
         }
-        if state != "running" {
+        if !matches!(state, "running" | "working" | "active" | "quiet") {
             text.push_str(&format!("({state})"));
         }
         let end = terminal_display_width(&text);
@@ -4055,6 +4700,10 @@ enum InputAction {
     Detach,
     /// `Ctrl-b n/p/N/P/l/1-9`.
     Switch(SwitchTarget),
+    /// `Ctrl-b ?`: a purely local help flash on the status bar. Consumed
+    /// like every other chord -- no byte reaches the workload, so asking
+    /// for help can never type `?` into a prompt.
+    Help,
 }
 
 /// Byte-scanning state for the `Ctrl-b` prefix state machine, split out of
@@ -4071,11 +4720,11 @@ struct InputScanner {
 
 impl InputScanner {
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
-    /// `Ctrl-b d` detaches; `n p N P l 1-9`
-    /// are consumed after a pending `Ctrl-b`. Anything else pending is "not a
-    /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
-    /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
-    /// still pass through to the workload untouched.
+    /// `Ctrl-b d` detaches; `?` flashes the key reference; `n p N P l 1-9`
+    /// switch. Anything else pending is "not a real prefix" -- the withheld
+    /// `Ctrl-b` byte is forwarded and the current byte is reprocessed
+    /// normally, so unbound `Ctrl-b` sequences still pass through to the
+    /// workload untouched.
     fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
         let mut actions = Vec::new();
         let mut out: Vec<u8> = Vec::new();
@@ -4084,7 +4733,7 @@ impl InputScanner {
             let byte = buffer[i];
             if self.pending_ctrl_b {
                 self.pending_ctrl_b = false;
-                let switch = match byte {
+                let action = match byte {
                     b'd' => {
                         if !out.is_empty() {
                             actions.push(InputAction::Forward(std::mem::take(&mut out)));
@@ -4092,19 +4741,22 @@ impl InputScanner {
                         actions.push(InputAction::Detach);
                         return actions;
                     }
-                    b'n' => Some(SwitchTarget::Next),
-                    b'p' => Some(SwitchTarget::Prev),
-                    b'N' => Some(SwitchTarget::NextGlobal),
-                    b'P' => Some(SwitchTarget::PrevGlobal),
-                    b'l' => Some(SwitchTarget::Last),
-                    b'1'..=b'9' => Some(SwitchTarget::Index((byte - b'0') as usize)),
+                    b'?' => Some(InputAction::Help),
+                    b'n' => Some(InputAction::Switch(SwitchTarget::Next)),
+                    b'p' => Some(InputAction::Switch(SwitchTarget::Prev)),
+                    b'N' => Some(InputAction::Switch(SwitchTarget::NextGlobal)),
+                    b'P' => Some(InputAction::Switch(SwitchTarget::PrevGlobal)),
+                    b'l' => Some(InputAction::Switch(SwitchTarget::Last)),
+                    b'1'..=b'9' => Some(InputAction::Switch(SwitchTarget::Index(
+                        (byte - b'0') as usize,
+                    ))),
                     _ => None,
                 };
-                if let Some(target) = switch {
+                if let Some(action) = action {
                     if !out.is_empty() {
                         actions.push(InputAction::Forward(std::mem::take(&mut out)));
                     }
-                    actions.push(InputAction::Switch(target));
+                    actions.push(action);
                     i += 1;
                     continue;
                 }
@@ -4341,16 +4993,6 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             apply_terminal_layout(&stdout, &term, rows, cols);
         }
     }
-    if display_tty {
-        // No banner into the output stream (section 6.3 step 6 / section
-        // 10.1 item c): printed here, before the snapshot write below, so
-        // the snapshot's own ED2 clear repaints over it -- this ordering
-        // (banner then snapshot, both after raw mode/layout are already in
-        // effect) is exactly the fix for the original corruption, where the
-        // banner landed inside a live TUI's input box. A real status-bar
-        // flash slot for this is future work (section 6.3 step 6).
-        eprintln!("[aplexer attached; Ctrl-b d detaches; Ctrl-b n/p/1-9/l switches]");
-    }
     // Scanned before the bar is drawn: the snapshot re-emits the workload's
     // DECSTBM sub-range as its last bytes (design doc section 6.2 step 3), so
     // scanning it here is what lets the immediately-following `draw_status_bar`
@@ -4358,7 +5000,19 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     scan_workload_margins(&workload_margins, &handshake.initial);
     write_locked(&stdout, &handshake.initial)?;
     if display_tty {
-        draw_status_bar(&status_ctx, true); // the snapshot's ED2 blanked the bar row
+        // The attach hint goes through the status-bar flash channel, not an
+        // eprintln'd banner: a banner written before/around the snapshot is
+        // what once corrupted a live TUI's input box (docs/terminal-state-
+        // design.md section 6.3 step 6 / section 10.1 item c). The flash is
+        // drawn after the snapshot (whose ED2 blanked the bar row) and
+        // disappears on its own after FLASH_DURATION.
+        flash_status(
+            &status_ctx,
+            format!(
+                "attached to {} · Ctrl-b ? help · Ctrl-b d detach",
+                record.tag
+            ),
+        );
     }
     // The explicit post-connect Resize control send is unnecessary when the
     // Attach already carried geometry and a new-enough worker honored it
@@ -4373,6 +5027,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
 
     let input_writer = writer.clone();
     let input_active = active.clone();
+    // Set when THIS client ends its attach on purpose (Ctrl-b d, or its
+    // stdin hit EOF) as opposed to the session ending under it -- the
+    // difference between the "Detached from ..." and "Session ended ..."
+    // goodbye lines below.
+    let detached_by_client = Arc::new(AtomicBool::new(false));
+    let input_detached = detached_by_client.clone();
     let input_paths = paths.clone();
     let input_term = term.clone();
     let input_shared_record = shared_record.clone();
@@ -4385,9 +5045,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
         // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
-        // Ctrl-b n/p/N/P/l/1-9 switch sessions,
-        // anything else pending is not a real prefix (both bytes forward to
-        // the workload). See
+        // Ctrl-b ? flashes the key reference, Ctrl-b n/p/N/P/l/1-9 switch
+        // sessions, anything else pending is not a real prefix (both bytes
+        // forward to the workload). See
         // `InputScanner` for the byte-level rules and why this needs to
         // survive across separate read() calls, not just within one
         // buffer.
@@ -4397,7 +5057,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
         // has no such command-prefix system and isn't growing one just for
         // this, so the simplest reasonable behavior is used instead: a
-        // *bound* Ctrl-b sequence (d/n/p/N/P/l/1-9) is consumed; anything
+        // *bound* Ctrl-b sequence (d/?/n/p/N/P/l/1-9) is consumed; anything
         // else is not a prefix at all -- both bytes are forwarded through as
         // ordinary input, so a program that wants a literal Ctrl-b (some
         // editors and REPLs use it) isn't broken by this feature.
@@ -4405,12 +5065,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
                 Ok(0) => {
+                    input_detached.store(true, Ordering::Relaxed);
                     detach_attached_client(&input_writer, &input_active);
                     break;
                 }
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
+                    input_detached.store(true, Ordering::Relaxed);
                     detach_attached_client(&input_writer, &input_active);
                     break;
                 }
@@ -4436,8 +5098,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         }
                     }
                     InputAction::Detach => {
+                        input_detached.store(true, Ordering::Relaxed);
                         detach_attached_client(&input_writer, &input_active);
                         break 'outer;
+                    }
+                    InputAction::Help => {
+                        flash_status(&input_status_ctx, ATTACH_KEY_HELP);
                     }
                     InputAction::Switch(target) => {
                         let result = perform_switch(
@@ -4458,10 +5124,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // the bar. The consumed chord bytes are never
                         // forwarded either way.
                         if let Err(e) = result {
-                            if let Ok(mut flash) = input_status_ctx.flash.lock() {
-                                *flash = Some((format!("{e:#}"), Instant::now()));
-                            }
-                            draw_status_bar(&input_status_ctx, true);
+                            flash_status(&input_status_ctx, format!("{e:#}"));
                         }
                     }
                 }
@@ -4577,6 +5240,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         });
     }
 
+    // Whether the session ended while we were attached to it (worker sent
+    // End/Exit) as opposed to the client leaving first -- drives the
+    // honest goodbye line after terminal restoration.
+    let mut session_ended = false;
     'session: loop {
         loop {
             let frame = match read_frame(&mut reader) {
@@ -4604,11 +5271,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         *t = Instant::now();
                     }
                 }
-                FrameKind::End => break,
+                FrameKind::End => {
+                    session_ended = !detached_by_client.load(Ordering::Relaxed);
+                    break;
+                }
                 FrameKind::Json => {
                     let event: ServerEvent = serde_json::from_slice(&frame.payload)?;
                     match event {
-                        ServerEvent::Exit { .. } => break,
+                        ServerEvent::Exit { .. } => {
+                            session_ended = true;
+                            break;
+                        }
                         ServerEvent::Error { message } => {
                             eprintln!("[aplexer: {message}]");
                             break;
@@ -4695,6 +5368,26 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             libc::raise(signal);
         }
     }
+    if display_tty {
+        // After restoration, so the message lands on a clean cooked
+        // terminal: what happened to the session, not just that the client
+        // came back -- "Detached" means it is still running, "Session
+        // ended" means the workload is gone and the record is worth
+        // inspecting.
+        let current_record = shared_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if session_ended {
+            eprintln!(
+                "Session ended: {}. Inspect output with `a capture {} --screen --plain`.",
+                current_record.selector(),
+                &current_record.id.to_string()[..8]
+            );
+        } else {
+            eprintln!("Detached from {}.", current_record.selector());
+        }
+    }
     Ok(())
 }
 
@@ -4763,6 +5456,21 @@ mod switching_tests {
         assert!(parse_hex("aéa".as_bytes()).is_err());
     }
 
+    #[test]
+    fn ctrl_b_question_mark_flashes_help_without_forwarding() {
+        let mut scanner = InputScanner::default();
+        let actions = scanner.scan(&[0x02, b'?']);
+        assert!(matches!(actions.as_slice(), [InputAction::Help]));
+        assert!(bytes(&actions).is_empty());
+        // Help is consumed wherever it appears in the stream, and the
+        // withheld Ctrl-b of an unbound chord still forwards.
+        let mut scanner = InputScanner::default();
+        let actions = scanner.scan(&[b'x', 0x02, b'?', b'y']);
+        assert_eq!(bytes(&actions), b"xy");
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[1], InputAction::Help));
+    }
+
     fn bytes(actions: &[InputAction]) -> Vec<u8> {
         let mut out = Vec::new();
         for a in actions {
@@ -4771,6 +5479,174 @@ mod switching_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn human_commands_parse_as_real_clap_commands() {
+        // The terminal-first vocabulary must be real Clap commands and
+        // visible aliases -- not argv rewriting -- so generated completions
+        // and `a help` know every name.
+        let args = args_of(&["here", "codex", "review"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Here(quick)) => {
+                assert_eq!(quick.rest, vec!["codex".to_string(), "review".to_string()])
+            }
+            _ => panic!("expected `here` command"),
+        }
+
+        let args = args_of(&["open", "review"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Attach(attach)) => {
+                assert_eq!(attach.target.selector.as_deref(), Some("review"))
+            }
+            _ => panic!("expected `open` alias of attach"),
+        }
+
+        let args = args_of(&["new", "--engine", "shell"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::New(start)) => assert_eq!(start.engine.as_deref(), Some("shell")),
+            _ => panic!("expected `new` command"),
+        }
+
+        for (argv, expected) in [
+            (vec!["ps"], "list"),
+            (vec!["show", "x"], "status"),
+            (vec!["current"], "whoami"),
+            (vec!["keys"], "hotkeys"),
+            (vec!["check"], "doctor"),
+        ] {
+            let parsed = Cli::try_parse_from(args_of(&argv)).unwrap();
+            let name = parsed
+                .command
+                .map(|command| command_name(&command).to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            assert_eq!(name, expected, "argv {argv:?}");
+        }
+
+        // `start`'s terminal-first default tag, shared with `a here`/`a -`.
+        let args = args_of(&["start"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Start(start)) => assert_eq!(start.tag, DEFAULT_HUMAN_TAG),
+            _ => panic!("expected start command"),
+        }
+    }
+
+    fn args_of(argv: &[&str]) -> Vec<String> {
+        std::iter::once("a")
+            .chain(argv.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn command_name(command: &Commands) -> &'static str {
+        match command {
+            Commands::Start(_) => "start",
+            Commands::New(_) => "new",
+            Commands::Here(_) => "here",
+            Commands::List(_) => "list",
+            Commands::Snapshot(_) => "snapshot",
+            Commands::Attach(_) => "attach",
+            Commands::Send(_) => "send",
+            Commands::Capture(_) => "capture",
+            Commands::Status(_) => "status",
+            Commands::Kill(_) => "kill",
+            Commands::Forget(_) => "forget",
+            Commands::Prune => "prune",
+            Commands::Rename(_) => "rename",
+            Commands::Engines => "engines",
+            Commands::Profiles => "profiles",
+            Commands::LaunchSpec(_) => "launch-spec",
+            Commands::LaunchExec(_) => "launch-exec",
+            Commands::Doctor => "doctor",
+            Commands::Whoami => "whoami",
+            Commands::StateReport(_) => "state-report",
+            Commands::Message(_) => "message",
+            Commands::Watch(_) => "watch",
+            Commands::Transcript(_) => "transcript",
+            Commands::Completions(_) => "completions",
+            Commands::Hotkeys => "hotkeys",
+            Commands::QuickAttach(_) => "quick-attach",
+            Commands::QuickLaunch(_) => "quick-launch",
+        }
+    }
+
+    #[test]
+    fn uuid_like_selector_detection_does_not_consume_normal_tags() {
+        assert!(looks_like_uuid_selector("01234567"));
+        assert!(looks_like_uuid_selector(
+            "01234567-89ab-cdef-0123-456789abcdef"
+        ));
+        assert!(!looks_like_uuid_selector("review"));
+        assert!(!looks_like_uuid_selector("deadbee"));
+        // Dashes alone carry no digits; a 7-digit quick index is not a UUID
+        // prefix and stays with the quick-attach resolver.
+        assert!(!looks_like_uuid_selector("-------"));
+        assert!(!looks_like_uuid_selector("1234567"));
+    }
+
+    #[test]
+    fn compact_elapsed_and_fit_column_render_for_dense_terminals() {
+        assert_eq!(compact_elapsed(0), "now");
+        assert_eq!(compact_elapsed(4_000), "now");
+        assert_eq!(compact_elapsed(59_000), "59s");
+        assert_eq!(compact_elapsed(120_000), "2m");
+        assert_eq!(compact_elapsed(7_200_000), "2h");
+        assert_eq!(compact_elapsed(172_800_000), "2d");
+
+        assert_eq!(fit_column("abcdefgh", 5), "abcd…");
+        // Wide glyphs count display cells, not chars: two CJK glyphs fit a
+        // 5-cell column exactly with padding, three must truncate.
+        assert_eq!(terminal_display_width(&fit_column("界界界", 5)), 5);
+        assert_eq!(fit_column("界界", 5), "界界 ");
+    }
+
+    #[test]
+    fn ui_state_is_semantic_when_reported_and_honest_when_inferred() {
+        let now: u64 = 20_000;
+        let mut record = mk_record("/ws/state", "agent", Phase::Running);
+        record.engine = "codex".to_string();
+
+        // A fresh state-report push is semantic fact.
+        record.reported_state = Some("waiting".to_string());
+        record.reported_state_at_ms = Some(now - 500);
+        assert_eq!(session_ui_state(&record, now), ("waiting", "reported"));
+        assert!(ui_state_needs_attention("waiting"));
+        assert!(ui_state_is_active("waiting"));
+
+        record.reported_state = Some("working".to_string());
+        assert_eq!(session_ui_state(&record, now), ("working", "reported"));
+        record.reported_state = Some("idle".to_string());
+        assert_eq!(session_ui_state(&record, now), ("idle", "reported"));
+        assert!(!ui_state_needs_attention("idle"));
+
+        // Stale push: only PTY-recency evidence, so only activity words.
+        record.reported_state = Some("waiting".to_string());
+        record.reported_state_at_ms = Some(now.saturating_sub(60_000));
+        record.last_activity_ms = Some(now - 500);
+        assert_eq!(session_ui_state(&record, now), ("active", "activity"));
+        record.last_activity_ms = Some(now - 5_000);
+        assert_eq!(session_ui_state(&record, now), ("quiet", "activity"));
+        // Quiet is deliberately not attention: silence is not a reported wait.
+        assert!(!ui_state_needs_attention("quiet"));
+    }
+
+    #[test]
+    fn ui_state_does_not_guess_agent_semantics_for_shells_or_corpses() {
+        let now: u64 = 20_000;
+        // A plain shell stays `running` however quiet its PTY is.
+        let mut record = mk_record("/ws/state", "shell", Phase::Running);
+        record.last_activity_ms = Some(now.saturating_sub(60_000));
+        assert_eq!(session_ui_state(&record, now), ("running", "lifecycle"));
+
+        // Non-terminal phase + dead worker = broken, regardless of what the
+        // record still claims or what was last reported.
+        let mut corpse = mk_record("/ws/state", "agent", Phase::Running);
+        corpse.engine = "codex".to_string();
+        corpse.worker_pid = None;
+        corpse.reported_state = Some("working".to_string());
+        corpse.reported_state_at_ms = Some(now);
+        assert_eq!(session_ui_state(&corpse, now), ("broken", "lifecycle"));
+        assert!(ui_state_needs_attention("broken"));
     }
 
     #[test]
