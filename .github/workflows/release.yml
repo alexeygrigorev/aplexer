@@ -106,11 +106,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # A `cargo test` run that executes NOTHING exits 0 and reads as a pass
+      # (see scripts/check-test-execution.sh). The release gate is the last
+      # place that should accept one, so assert on the executed count. Floors
+      # are deliberately well under the current 292/15 so adding or
+      # quarantining a test never trips them, while losing a suite does.
+      - name: Self-test the executed-count guard
+        run: scripts/check-test-execution.sh --self-test
+
       - name: Run Rust tests
-        run: cargo test --locked --release --verbose
+        run: >-
+          scripts/check-test-execution.sh --min 250 --
+          cargo test --locked --release --verbose
 
       - name: Run startup containment fault-injection tests
         run: >-
+          scripts/check-test-execution.sh --min 12 --
           cargo test --locked --release --features startup-test-hooks
           --test startup_rollback --test worker_startup_transaction
           --test lifecycle_failure --verbose
