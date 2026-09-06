@@ -1458,6 +1458,20 @@ fn default_config_version() -> u32 {
     1
 }
 
+/// Transcript-family normalization: a variant engine -- a fork of a built-in
+/// engine CLI with the same wire format and the same native conversation-log
+/// location -- is identified with that engine's family for parsing, while
+/// sessions and emitted events keep the variant's own id. `zcodex` is a
+/// codex-rs fork (same `-c` overrides, same rollout JSONL under
+/// `CODEX_HOME`/`~/.codex`), so it rides the codex machinery; everything
+/// else is its own family.
+pub fn engine_family(engine: &str) -> &str {
+    match engine {
+        "zcodex" => "codex",
+        other => other,
+    }
+}
+
 /// A single engine's profile-discovery rule (spec.md 9.2 / 23: "Aplexer
 /// should absorb PocketShell's existing profile discovery concepts"), ported
 /// from PocketShell's `tools/pocketshell/src/pocketshell/profiles.py`.
