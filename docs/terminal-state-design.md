@@ -520,6 +520,40 @@ frame (or drops it for non-`want_screen` subscribers).
 
 ## 7. The status bar: what this fixes, what it doesn't
 
+> **Amended by issue #5 (status-bar injection corrupts heavy TUI redraws).**
+> Sections 7 and 7.1 below were written while the *client* was still a blind
+> relay -- only the worker had a screen model. It now has one too
+> (`aplexer::screen::ClientScreen`, fed every byte `a attach` writes), which
+> changes three of the conclusions recorded here:
+>
+> - **The status bar no longer writes at an arbitrary point in the stream.**
+>   The corruption reported in #5 was not the margin problem this section
+>   describes; it was that a PTY read boundary is not an escape-sequence
+>   boundary. Measured on a real `a attach` against a continuously-streaming
+>   full-screen TUI, 5 of 10 redraws were spliced into the middle of an
+>   unterminated CSI sequence (`...\x1b[38;5;` + the redraw + `91m...`); the
+>   host terminal abandons the workload's partial sequence and prints its
+>   remaining parameter bytes as literal text into the frame. The client now
+>   asks `ClientScreen::at_escape_boundary()` before writing anything of its
+>   own, and defers to the next PTY chunk when the answer is no. It also
+>   tracks `CSI ? 2026 h/l` and prefers to stay out of a workload's declared
+>   frame, bounded by `STATUS_BAR_SYNC_DEFER_LIMIT` so an unclosed block
+>   cannot starve the bar.
+> - **No `\x1b7`/`\x1b8` bracket anywhere in the client.** A terminal has one
+>   save-cursor register; writing to it from a relayed stream destroys the
+>   workload's own saved position (Claude Code opens with `\x1b7\x1b[r\x1b8`;
+>   opencode uses the same register via `CSI s`/`CSI u`). The cursor -- and
+>   the SGR pen, which DECRC only restores on terminals whose DECSC saves
+>   attributes, and `vt100` is not one -- is restored absolutely from the
+>   client's model instead (`ClientScreen::cursor_restore`).
+> - **7.1's reserved-row walk is fixed, not merely pinned.** See the note
+>   inside 7.1.
+>
+> What is unchanged: which scroll region the bar re-asserts, and why
+> (below); the Layout-event triggers; and the ED2 residue, which the
+> absolute cursor/pen restore makes self-healing but does not eliminate.
+
+
 Today the bar's DECSTBM reservation is blind: the client cannot see the
 workload reset the host's margins (`\x1b[r`, RIS) or flip screens, so the
 bar's survival depends on timers (`STATUS_BAR_IDLE_GAP`, whose own doc
@@ -573,7 +607,24 @@ residue meanwhile.
 
 ### 7.1 Known limitation: a sub-range does not protect the reserved row
 
-Open, deliberately not fixed in v1. DECSTBM constrains scrolling *inside*
+> **Closed by issue #5.** The analysis below is still exactly right about the
+> mechanism, and about the fact that no choice of DECSTBM can express both
+> demands. What changed is the last paragraph's premise: closing the gap
+> "means the client emulating the workload's stream well enough to clamp
+> cursor motion", and the client now does emulate it. `ClientScreen::relay`
+> splits a chunk at line-feed controls, and whenever one executes while the
+> model's cursor is on the model's last row -- outside the sub-range, so the
+> model clamps while the host would move down -- it splices an absolute
+> reposition in directly after it. Pinned by
+> `relay_keeps_a_line_feed_off_the_reserved_row_under_a_sub_range`
+> (src/screen.rs) and
+> `workload_line_feed_no_longer_reaches_the_reserved_row_under_a_sub_range`
+> (src/bin/a.rs), which replaced the characterization test named below. The
+> residual case is a *wrap* off the last column of that same row, which is
+> not rewritten but now self-heals, because every status redraw restores the
+> cursor absolutely from the model.
+
+Originally recorded as open, deliberately not fixed in v1. DECSTBM constrains scrolling *inside*
 the region, not cursor motion outside it, so while the client is
 re-asserting a workload's sub-range the reserved bottom row is exposed in a
 way it is not under the client's own `1;{rows-1}`:

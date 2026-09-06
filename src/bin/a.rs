@@ -3683,27 +3683,47 @@ fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
 /// cursor-position/clear escapes and renders close enough.
 const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 
-/// aplexer has no real terminal emulation (spec.md's v1 non-goal), so the
-/// status-bar thread has no way to know what the workload's screen actually
-/// looks like right now or whether interjecting a redraw would visually
-/// collide with something the workload just drew -- unlike tmux, which can
-/// place its status line safely because it tracks real per-pane terminal
-/// state server-side. The save-cursor/jump/draw/restore-cursor sequence in
-/// `draw_status_bar` is byte-safe (serialized under the shared stdout
-/// mutex, so writes never tear or interleave), but a fast-redrawing
-/// full-screen TUI (htop's ~1-2s full-screen cycle) can still visibly
-/// reflect our redraw firing mid-cycle, or have its own cursor-position
-/// bookkeeping thrown off by our jump-away-and-back. Building real terminal
-/// state tracking to eliminate this completely is a much bigger project
-/// than this fix -- so instead of a fixed independent timer, the status
-/// thread redraws when the PTY has been quiet for `STATUS_BAR_IDLE_GAP`
-/// (tending to land in the gaps between a TUI's own redraws rather than
-/// racing them on an unrelated clock), falling back to a forced redraw
-/// every `STATUS_BAR_MAX_INTERVAL` for workloads that stream continuously
-/// (agent CLIs during generation, a chatty build) and so never go quiet.
+/// **These timers no longer decide whether a redraw is *safe*, only when one
+/// is *wanted*.** The previous version of this comment said aplexer had "no
+/// real terminal emulation (spec.md's v1 non-goal)" and that building it was
+/// "a much bigger project than this fix", so the timers were the whole
+/// mitigation: redraw in an idle gap and hope. That was already stale when it
+/// was written -- docs/terminal-state-design.md shipped a live `vt100` model
+/// in the worker -- and the hope did not survive contact with the workload
+/// aplexer exists for. An agent CLI mid-generation never goes quiet, so
+/// `STATUS_BAR_IDLE_GAP` never opened and `STATUS_BAR_MAX_INTERVAL` fired into
+/// an arbitrary byte offset of the relayed stream, forever. Measured on a real
+/// `a attach` against a continuously-streaming full-screen TUI (issue #5), 5 of
+/// 10 redraws were spliced into the middle of an unterminated CSI sequence:
+/// the host terminal abandoned the workload's half-read sequence and printed
+/// its remaining parameter bytes as literal text into the workload's own
+/// frame.
+///
+/// The client now keeps its own `ClientScreen` (`aplexer::screen`) over the
+/// bytes it relays, so "is this a safe place to write?" is answered from the
+/// stream's actual parser state rather than guessed from a clock:
+/// `draw_status_bar` refuses to write unless the stream is between complete
+/// escape sequences and characters, and defers to `ctx.pending` otherwise --
+/// which the frame loop flushes at the first safe boundary. What is left for
+/// these constants is scheduling: `STATUS_BAR_IDLE_GAP` still debounces an
+/// idle session's redraws, and `STATUS_BAR_MAX_INTERVAL` still bounds how
+/// stale a continuously-streaming session's bar may get.
 const STATUS_BAR_IDLE_GAP: Duration = Duration::from_millis(450);
 const STATUS_BAR_MAX_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// How long a redraw may be held back purely because the workload has an
+/// unclosed synchronized-output block (`CSI ? 2026 h`).
+///
+/// Staying out of a declared frame is a genuine improvement -- opencode and
+/// codex bracket every frame in `?2026`, so the block boundaries are exact
+/// frame boundaries handed to us for free -- but it is a *preference*, not a
+/// correctness requirement: an injection at an escape boundary inside a
+/// synchronized block is transparent anyway, since the cursor and pen are
+/// restored absolutely. Bounding it means a workload that opens a block and
+/// never closes it (or a terminal-side sync timeout that already released it)
+/// cannot freeze the bar indefinitely.
+const STATUS_BAR_SYNC_DEFER_LIMIT: Duration = Duration::from_millis(500);
 
 /// Physical terminal geometry as last observed by the resize-poll thread,
 /// shared with the status-bar thread so its redraws always target the
@@ -3734,6 +3754,21 @@ fn reserved_rows(rows: u16) -> u16 {
 /// Serializes a write behind the shared stdout lock so the main frame loop
 /// (writing PTY data) and the status-bar/layout threads (writing redraws)
 /// can never tear/interleave each other's output.
+///
+/// **The stdout lock is also the client's terminal-state lock.** Anything that
+/// consults `ClientScreen` in order to decide *what* to write -- where the
+/// workload's cursor is, whether the stream is between escape sequences --
+/// must hold this lock across both the decision and the write, or the answer
+/// can go stale in the gap. It did: the first version of the issue #5 fix
+/// checked the escape boundary in the status thread and wrote afterwards, and
+/// a real capture caught 4 of 39 redraws still landing mid-CSI because the
+/// frame loop had written another chunk in between.
+///
+/// Lock order everywhere is **`stdout` -> `term` -> `screen`**, with
+/// `last_drawn`/`flash`/`record` as leaves. Nothing acquires `stdout` while
+/// holding `term` or `screen`: `apply_terminal_layout` writes and only then
+/// records the new geometry, and the switch path reads the geometry before
+/// taking `stdout`.
 fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()> {
     let mut out = stdout
         .lock()
@@ -3742,29 +3777,50 @@ fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()>
     out.flush()
 }
 
-/// Sets (or, for a too-small terminal, clears) the DECSTBM scrolling region
-/// and records the resulting geometry for the status-bar thread. Wrapped in
-/// DEC save/restore cursor (`\x1b7`/`\x1b8`) because DECSTBM itself moves the
-/// cursor to the region's home position as a side effect on real terminals;
-/// saving immediately before and restoring immediately after -- with nothing
-/// else written in between -- keeps that jump invisible and leaves the
-/// shell's own cursor position undisturbed.
-fn apply_terminal_layout(
-    stdout: &Arc<Mutex<io::Stdout>>,
-    term: &Arc<Mutex<TermGeom>>,
-    rows: u16,
-    cols: u16,
-) {
-    let reserved = rows > 2;
+/// The DECSTBM reservation (or its removal, on a terminal too small to spare
+/// a row) followed by an absolute cursor restore from the client's model.
+///
+/// No `\x1b7`/`\x1b8` bracket: see `status_bar_sequence` for why the client
+/// must never write to the shared save-cursor register.
+fn terminal_layout_sequence(rows: u16, restore: &[u8]) -> Vec<u8> {
     let mut seq = Vec::new();
-    seq.extend_from_slice(b"\x1b7");
-    if reserved {
+    if rows > 2 {
         seq.extend_from_slice(format!("\x1b[1;{}r", rows - 1).as_bytes());
     } else {
         seq.extend_from_slice(b"\x1b[r");
     }
-    seq.extend_from_slice(b"\x1b8");
-    let _ = write_locked(stdout, &seq);
+    seq.extend_from_slice(restore);
+    seq
+}
+
+/// Sets (or, for a too-small terminal, clears) the DECSTBM scrolling region
+/// and records the resulting geometry for the status-bar thread.
+///
+/// DECSTBM moves the cursor to the region's home position as a side effect on
+/// real terminals, so something has to put it back. That used to be a
+/// `\x1b7`/`\x1b8` (DECSC/DECRC) bracket, which is exactly the bug issue #5
+/// exists for: a terminal has one save-cursor register, and writing to it from
+/// a stream we are only relaying destroys whatever the workload had saved
+/// there. The cursor is restored from `ClientScreen` instead -- absolutely,
+/// and including the workload's pen -- so the register stays the workload's
+/// private property.
+fn apply_terminal_layout(
+    stdout: &Arc<Mutex<io::Stdout>>,
+    term: &Arc<Mutex<TermGeom>>,
+    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+    rows: u16,
+    cols: u16,
+) {
+    let reserved = rows > 2;
+    {
+        let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
+        let restore = screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursor_restore();
+        let _ = out.write_all(&terminal_layout_sequence(rows, &restore));
+        let _ = out.flush();
+    }
     if let Ok(mut g) = term.lock() {
         *g = TermGeom {
             rows,
@@ -3774,42 +3830,56 @@ fn apply_terminal_layout(
     }
 }
 
-/// Feeds PTY bytes on their way to the terminal through the client's copy of
-/// the worker's `MarginTracker`, so `draw_status_bar` knows which scroll
-/// region the workload currently holds -- see `StatusBarCtx::workload_margins`
-/// for why the bar must not blindly re-assert its own.
+/// Writes a live PTY chunk to the terminal, after feeding it through the
+/// client's own model of the workload's screen (`ClientScreen`).
 ///
-/// A byte-level state machine with no allocation on the common path, run on
-/// the same bytes that are about to be `write`n anyway; the worker already
-/// pays the identical cost per chunk (docs/terminal-state-design.md section
-/// 9's steady-state parse budget), and this is strictly cheaper than that
-/// since it recognizes two sequences rather than emulating a terminal.
-fn scan_workload_margins(margins: &Arc<Mutex<aplexer::screen::MarginTracker>>, data: &[u8]) {
-    if let Ok(mut m) = margins.lock() {
-        m.scan(data);
-    }
+/// The model is what makes the status bar safe to inject at all: it knows
+/// where the workload's cursor and pen actually are, whether the relayed
+/// stream is currently between complete escape sequences, and whether the
+/// workload is part-way through a synchronized-output frame. It can also
+/// rewrite the chunk -- the one case being the reserved-row walk, see
+/// `ClientScreen::relay`.
+///
+/// The worker already pays the identical parse cost per chunk
+/// (docs/terminal-state-design.md section 9's steady-state parse budget);
+/// paying it a second time in the client is the price of the client no longer
+/// writing blind into someone else's byte stream.
+fn relay_to_terminal(
+    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+    stdout: &Arc<Mutex<io::Stdout>>,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let rewritten = {
+        let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
+        s.relay(data)
+    };
+    out.write_all(rewritten.as_deref().unwrap_or(data))?;
+    out.flush()
 }
 
-/// Forgets the tracked workload scroll region on an in-process session
-/// switch: the new session's margins are its own, and carrying the previous
-/// session's over would apply that region to it (observed directly --
-/// switching away from a session holding `\x1b[5;15r` left the bar
-/// re-asserting `5;15` on the session switched *to*).
-///
-/// Note this must be `reset()`, not `set_rows()`: `set_rows` clamps the
-/// region to a row count rather than clearing it, so on a switch that did
-/// not also change the terminal size it is a no-op.
-fn reset_workload_margins(
-    margins: &Arc<Mutex<aplexer::screen::MarginTracker>>,
-    term: &Arc<Mutex<TermGeom>>,
-) {
-    let rows = term.lock().map(|g| g.rows).unwrap_or(0);
-    if let Ok(mut m) = margins.lock() {
-        m.reset();
-        if rows > 0 {
-            m.set_rows(reserved_rows(rows));
+/// Writes bytes the client is emitting verbatim -- the attach snapshot, a
+/// switch's replayed screen -- and feeds them to the model under the *same*
+/// stdout lock, so a concurrent status redraw can never see a model that is
+/// ahead of what the terminal has actually been sent.
+fn feed_and_write(
+    stdout: &Arc<Mutex<io::Stdout>>,
+    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+    prefix: &[u8],
+    payload: &[u8],
+    reset_to: Option<(u16, u16)>,
+) -> io::Result<()> {
+    let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    {
+        let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((rows, cols)) = reset_to {
+            s.reset(rows, cols);
         }
+        s.feed(payload);
     }
+    out.write_all(prefix)?;
+    out.write_all(payload)?;
+    out.flush()
 }
 
 /// Undoes `apply_terminal_layout` and clears the screen, exactly like tmux
@@ -4055,20 +4125,36 @@ struct StatusBarCtx {
     /// `draw_status_bar`'s doc comment and
     /// docs/low-bandwidth-remote-access-design.md section 2.1.
     last_drawn: Arc<Mutex<LastDrawnStatus>>,
-    /// The *workload's* current DECSTBM scroll region, recovered by running
-    /// the same `MarginTracker` the worker uses over every PTY byte this
-    /// client writes to the terminal (including the attach snapshot, which
-    /// re-emits the region per docs/terminal-state-design.md section 6.2
-    /// step 3). `None` means the workload is on full-screen margins, the
-    /// common case.
+    /// The client's own live model of the *workload's* screen, fed every PTY
+    /// byte this client writes to the terminal (including the attach
+    /// snapshot, which is a full repaint of that screen per
+    /// docs/terminal-state-design.md section 6.2). It answers the three
+    /// questions a status-bar redraw has to answer before it may write
+    /// anything at all:
     ///
-    /// This exists so `draw_status_bar`'s defensive margin re-assert can
-    /// re-assert *the right region*. Without it the bar unconditionally
-    /// rewrote `\x1b[1;{rows-1}r`, which silently destroyed a workload's own
-    /// sub-range within one redraw cycle -- including the one the attach
-    /// snapshot had just restored, defeating section 6.3 step 3's "the
-    /// workload's sub-range lands after and wins".
-    workload_margins: Arc<Mutex<aplexer::screen::MarginTracker>>,
+    /// - *May I write here?* -- `at_escape_boundary()`. The relayed stream
+    ///   must be between complete escape sequences and complete characters.
+    ///   A PTY read boundary is not one of those by construction, which is
+    ///   how the redraw used to land inside a workload's half-emitted
+    ///   `\x1b[38;5;` and turn its remaining parameter bytes into literal
+    ///   text (issue #5).
+    /// - *Where do I put the cursor back?* -- `cursor_restore()`. Absolutely,
+    ///   from the model, instead of through the single shared DECSC register
+    ///   the workload also owns.
+    /// - *Which scroll region should be in force?* -- `margins()`, the same
+    ///   distinction the previous `MarginTracker`-only field existed for:
+    ///   re-asserting `\x1b[1;{rows-1}r` unconditionally destroys a
+    ///   workload's own sub-range, including the one the attach snapshot just
+    ///   restored.
+    screen: Arc<Mutex<aplexer::screen::ClientScreen>>,
+    /// Set when a redraw was wanted but the stream was not at a safe boundary
+    /// (or was inside a synchronized-output frame). The main frame loop
+    /// flushes it at the first boundary that is safe, so deferring never
+    /// means dropping.
+    pending: Arc<AtomicBool>,
+    /// When the current synchronized-output deferral started, so
+    /// `STATUS_BAR_SYNC_DEFER_LIMIT` can bound it.
+    sync_deferred_since: Arc<Mutex<Option<Instant>>>,
 }
 
 type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
@@ -4166,14 +4252,25 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     pad_or_truncate(&rendered, cols)
 }
 
-/// Redraws the reserved bottom row in place: save cursor, jump to the last
-/// row, clear it, draw the (reverse-video, full-width) status line, restore
-/// cursor -- so a redraw racing a keystroke never disturbs the shell's own
-/// cursor position. No-ops when the current terminal is too small to have a
-/// reserved row.
+/// Redraws the reserved bottom row in place: jump to the last row, clear it,
+/// draw the (reverse-video, full-width) status line, and put the workload's
+/// cursor and pen back absolutely from the client's own screen model. No-ops
+/// when the current terminal is too small to have a reserved row.
 ///
-/// Two deliberate additions beyond the original version:
+/// Four properties, each load-bearing:
 ///
+/// - **Only writes at a safe boundary.** The relayed stream must be between
+///   complete escape sequences and complete characters
+///   (`ClientScreen::at_escape_boundary`), and preferably not inside a
+///   workload's synchronized-output frame (`sync_defer`). A PTY read boundary
+///   is neither of those by construction: measured on a real `a attach`
+///   against a continuously-streaming full-screen TUI, 5 of 10 redraws landed
+///   inside an unterminated CSI sequence, whose remaining parameter bytes the
+///   host then printed as literal text into the workload's frame. When the
+///   stream is not safe the redraw is *deferred*, not dropped -- `ctx.pending`
+///   is flushed by the main frame loop at the next boundary.
+/// - **Never touches the shared save-cursor register.** See
+///   `status_bar_sequence`.
 /// - **Dirty-checked**: skips the write entirely when the rendered text and
 ///   geometry are byte-identical to the last actual write (`ctx.last_drawn`).
 ///   An idle session's bar is naturally quantized (memory rounds to whole
@@ -4187,24 +4284,11 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 ///   thread only reapplies it when the physical terminal *size* changes, so
 ///   a clobbered margin would otherwise stay clobbered for the rest of the
 ///   attach. Reasserting it here means the reservation self-heals within one
-///   redraw cycle instead of being lost permanently. Cheap (a handful of
-///   extra bytes) and wrapped in the same save/restore-cursor pair so it
-///   can't disturb the workload's own cursor position.
-///
-///   What gets reasserted is `ctx.workload_margins`-aware, and that
-///   distinction is load-bearing rather than cosmetic. Reasserting
-///   `apply_terminal_layout`'s own `\x1b[1;{rows-1}r` *unconditionally*
-///   clobbers a workload that set its own DECSTBM sub-range: the host
-///   terminal then stops scrolling the workload's region, so the workload's
-///   line feeds at the bottom of its region walk the cursor past it and
-///   overwrite whatever the workload placed below instead. Reproduced
-///   directly -- a workload holding `\x1b[5;15r` and scrolling inside it
-///   rendered `SCROLLER-70M-ROW-16` on the host, a mangled overlay of its
-///   scrolling text on the fixed row 16 the worker's own screen model
-///   correctly still showed as `FIXED-BOTTOM-ROW-16`. It also silently
-///   undid the sub-range the attach snapshot had just restored
-///   (docs/terminal-state-design.md section 6.2 step 3), on the very first
-///   bar redraw after attaching.
+///   redraw cycle instead of being lost permanently. Which region gets
+///   reasserted is `ClientScreen::margins`-aware -- see `status_bar_sequence`
+///   for why reasserting `1;{rows-1}` unconditionally is a bug, reproduced
+///   directly as a workload holding `\x1b[5;15r` rendering
+///   `SCROLLER-70M-ROW-16` over its own fixed row 16.
 ///
 /// `force`: bypass the dirty-check and write unconditionally. The
 /// dirty-check alone would let a *clobbered margin* go unrepaired
@@ -4213,67 +4297,198 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 /// guarantee to actually bound in time -- the status thread's own
 /// `STATUS_BAR_MAX_INTERVAL` forced tick, and every switch/flash redraw,
 /// which are already low-frequency, user-triggered events where bandwidth
-/// isn't the concern -- pass `true`.
+/// isn't the concern -- pass `true`. `force` does **not** bypass the boundary
+/// gate: nothing does, because writing at an unsafe point is the bug.
 ///
 /// Returns whether a real write to the terminal happened (`false` when the
-/// reserved row doesn't exist, or the dirty-check skipped an unchanged
-/// redraw). Callers that drive `STATUS_BAR_MAX_INTERVAL`'s overdue timer
-/// must only reset it on `true` -- resetting on a dirty-check no-op would
-/// let a workload with frequent-but-unchanging redraws (a spinner, streamed
-/// tokens with pauses) keep the timer perpetually "recently fired" without
-/// ever actually rewriting a margin a full-screen erase clobbered, breaking
-/// the self-heal guarantee this constant exists for.
+/// reserved row doesn't exist, the redraw was deferred, or the dirty-check
+/// skipped an unchanged redraw). Callers that drive
+/// `STATUS_BAR_MAX_INTERVAL`'s overdue timer must only reset it on `true` --
+/// resetting on a dirty-check no-op would let a workload with
+/// frequent-but-unchanging redraws (a spinner, streamed tokens with pauses)
+/// keep the timer perpetually "recently fired" without ever actually
+/// rewriting a margin a full-screen erase clobbered, breaking the self-heal
+/// guarantee this constant exists for.
 fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
+    // The stdout lock is taken *before* `status_bar_redraw` consults the
+    // client's terminal model, and held across the write. Checking the escape
+    // boundary and then writing without the lock is a race the frame loop
+    // wins about 10% of the time (measured: 4 of 39 redraws in a real capture
+    // still landed mid-CSI) -- it writes another chunk in between, and the
+    // "safe" answer the status thread got is stale by the time its bytes go
+    // out. See `write_locked` for the lock order this relies on.
+    // Cheap pre-gate, before anything is rendered. The main frame loop calls
+    // this after *every* PTY chunk while a redraw is pending, and rendering
+    // the bar text reads session records off disk -- doing that per chunk
+    // under a streaming workload is a throughput cliff. The authoritative
+    // check is the one inside `status_bar_redraw_locked`, which runs under
+    // the stdout lock; this one only avoids the work when the answer is
+    // already known to be "not here".
+    {
+        let (at_boundary, in_sync) = {
+            let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+            (screen.at_escape_boundary(), screen.in_synchronized_update())
+        };
+        if !at_boundary || sync_defer(ctx, in_sync) {
+            ctx.pending.store(true, Ordering::Relaxed);
+            return false;
+        }
+    }
+    let Some((geom, text)) = status_bar_render(ctx) else {
+        return false;
+    };
+    let mut out = ctx
+        .stdout
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match status_bar_redraw_locked(ctx, geom, &text, force) {
+        Some(seq) => {
+            let _ = out.write_all(&seq);
+            let _ = out.flush();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Geometry plus the rendered bar text, or `None` when the terminal has no
+/// reserved row. Deliberately computed *before* the stdout lock is taken:
+/// `status_bar_text` reads session records off disk, and the PTY relay must
+/// not block behind that.
+fn status_bar_render(ctx: &StatusBarCtx) -> Option<(TermGeom, String)> {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     if !geom.reserved {
-        return false;
+        return None;
     }
-    let workload_margins = ctx
-        .workload_margins
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .margins();
     let text = status_bar_text(ctx, geom.cols as usize);
+    Some((geom, text))
+}
+
+/// `status_bar_render` + `status_bar_redraw_locked`, for tests and for
+/// callers with no concurrent writer.
+#[cfg(test)]
+fn status_bar_redraw(ctx: &StatusBarCtx, force: bool) -> Option<Vec<u8>> {
+    let (geom, text) = status_bar_render(ctx)?;
+    status_bar_redraw_locked(ctx, geom, &text, force)
+}
+
+/// `draw_status_bar` minus the write: every gate (reserved row, escape
+/// boundary, synchronized-output deferral, dirty check) and the exact bytes
+/// that would go to the terminal, or `None` when nothing should be written.
+///
+/// Split out so tests can drive the real decision path and feed the real
+/// bytes through a real `vt100` host terminal, without redirecting the
+/// process's fd 1 out from under a concurrently-running test harness.
+fn status_bar_redraw_locked(
+    ctx: &StatusBarCtx,
+    geom: TermGeom,
+    text: &str,
+    force: bool,
+) -> Option<Vec<u8>> {
+    // -- Boundary gate, before anything is rendered or written --------------
+    //
+    // The client is a raw byte relay, so a PTY read boundary lands at an
+    // arbitrary offset in the workload's output: "between two chunks" is not
+    // "between two escape sequences". Writing anywhere else splices our
+    // `\x1b...` into the middle of the workload's half-emitted sequence (or
+    // its half-emitted UTF-8 character); the host terminal abandons the
+    // partial sequence and prints its remaining parameter bytes as literal
+    // text into the workload's own frame. That is the reported corruption,
+    // and it is not fixable by re-timing -- only by asking the stream.
+    //
+    // Deferring is never dropping: `ctx.pending` is flushed by the main frame
+    // loop at the first safe boundary, which is at most one PTY chunk away.
+    let (at_boundary, in_sync, restore, workload_margins) = {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            screen.at_escape_boundary(),
+            screen.in_synchronized_update(),
+            screen.cursor_restore(),
+            screen.margins(),
+        )
+    };
+    if !at_boundary || sync_defer(ctx, in_sync) {
+        ctx.pending.store(true, Ordering::Relaxed);
+        return None;
+    }
     {
         let mut last = ctx
             .last_drawn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let key = (text.clone(), geom.rows, geom.cols, workload_margins);
+        let key = (text.to_string(), geom.rows, geom.cols, workload_margins);
         if !force && last.as_ref() == Some(&key) {
-            return false;
+            ctx.pending.store(false, Ordering::Relaxed);
+            return None;
         }
         *last = Some(key);
     }
+    ctx.pending.store(false, Ordering::Relaxed);
+    Some(status_bar_sequence(geom, text, workload_margins, &restore))
+}
+
+/// Whether a redraw should be held back because the workload is part-way
+/// through a synchronized-output frame, bounded by
+/// `STATUS_BAR_SYNC_DEFER_LIMIT` so an unclosed block cannot freeze the bar.
+fn sync_defer(ctx: &StatusBarCtx, in_sync: bool) -> bool {
+    let mut since = ctx
+        .sync_deferred_since
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if !in_sync {
+        *since = None;
+        return false;
+    }
+    match *since {
+        Some(started) => started.elapsed() < STATUS_BAR_SYNC_DEFER_LIMIT,
+        None => {
+            *since = Some(Instant::now());
+            true
+        }
+    }
+}
+
+/// The exact bytes a status-bar redraw writes. Split out from
+/// `draw_status_bar` so a test can drive the real sequence through a real
+/// `vt100` host terminal rather than assert on substrings of it.
+///
+/// There is deliberately **no `\x1b7`/`\x1b8` (DECSC/DECRC) bracket** here any
+/// more, and none anywhere else in the client. A terminal has exactly one
+/// save-cursor register. Saving into it from a stream we are only relaying
+/// silently destroys whatever the workload put there, and the workload's own
+/// later `\x1b8` then restores to *our* saved position -- text landing on the
+/// wrong row, which is the superimposed-frames half of issue #5. Claude Code
+/// opens with exactly that idiom (`\x1b7\x1b[r\x1b8`), opencode uses the same
+/// register through `CSI s`/`CSI u`, and every `tput sc`-style progress line
+/// run inside a session does too. The register is the workload's; the client
+/// restores absolutely from its own model instead (`restore`, from
+/// `ClientScreen::cursor_restore`), which also restores the workload's SGR pen
+/// -- something DECRC only gives back on terminals whose DECSC saves
+/// attributes, and `vt100` (the model aplexer itself runs) is not one.
+///
+/// `\x1b[?25l` first so the cursor does not visibly hop to the bar row and
+/// back; `restore` ends with the workload's own cursor visibility, so the
+/// hide is undone exactly as the workload wants it.
+///
+/// The scroll region re-asserted is the workload's own sub-range when it has
+/// one, otherwise the bar's `1;{rows-1}` reservation. Re-asserting
+/// `1;{rows-1}` unconditionally destroys a margin-using TUI's region --
+/// including the one the attach snapshot just restored
+/// (docs/terminal-state-design.md section 6.2 step 3) -- and makes the host
+/// scroll the wrong rows. DECSTBM homes the cursor as a side effect on real
+/// terminals, which is precisely why the absolute restore has to come after
+/// it rather than being skipped when the region is unchanged.
+fn status_bar_sequence(
+    geom: TermGeom,
+    text: &str,
+    workload_margins: Option<(u16, u16)>,
+    restore: &[u8],
+) -> Vec<u8> {
     let mut seq = Vec::new();
-    seq.extend_from_slice(b"\x1b7");
-    // Re-assert whichever scroll region should currently be in force: the
-    // workload's own sub-range when it has one, otherwise the bar's
-    // `1;rows-1` reservation.
-    //
-    // Known limitation, deliberately accepted (see
-    // `workload_line_feed_can_still_reach_the_reserved_row_under_a_sub_range`
-    // and docs/terminal-state-design.md section 7): while a workload
-    // sub-range is in force, the reserved row is *not* protected the way
-    // `1;rows-1` protects it. DECSTBM constrains scrolling inside the region,
-    // not cursor motion outside it, so a workload whose cursor sits on its
-    // own last row (`rows-1` -- outside its sub-range, since its PTY is one
-    // row shorter than the terminal) and emits a line feed walks onto the
-    // reserved row and writes there, because for the host terminal that row
-    // is just the screen bottom rather than a margin boundary. The bar text
-    // is repainted on the next redraw, but the workload's cursor is left one
-    // row lower than its own screen model believes.
-    //
-    // Not re-asserting the sub-range is not the alternative: that was the
-    // bug this replaced, and it corrupts every frame a margin-using TUI
-    // draws rather than one row on an uncommon cursor walk. Closing the gap
-    // properly means the client emulating the workload's stream well enough
-    // to clamp its cursor motion -- a different design (the client passes
-    // PTY bytes straight through today), tracked as a follow-up rather than
-    // papered over here.
+    seq.extend_from_slice(b"\x1b[?25l");
     seq.extend_from_slice(
         match workload_margins {
             Some((top, bottom)) => format!("\x1b[{top};{bottom}r"),
@@ -4284,9 +4499,9 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
     seq.extend_from_slice(b"\x1b[2K\x1b[7m");
     seq.extend_from_slice(text.as_bytes());
-    seq.extend_from_slice(b"\x1b[0m\x1b8");
-    let _ = write_locked(&ctx.stdout, &seq);
-    true
+    seq.extend_from_slice(b"\x1b[0m");
+    seq.extend_from_slice(restore);
+    seq
 }
 
 /// Which session a `Ctrl-b` switch chord asks for
@@ -4967,12 +5182,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     let switch_in_progress = Arc::new(AtomicBool::new(false));
     let last_session: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
     let switch_replay_bytes = Some(history_bytes.unwrap_or(SWITCH_REPLAY_BYTES));
-    // Sized to the *workload's* row count (the terminal minus the reserved
-    // bar row), which is what a DECSTBM the workload emits is validated
-    // against -- see `StatusBarCtx::workload_margins`.
-    let workload_margins = Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(
-        worker_geometry.map(|(rows, _)| rows).unwrap_or(24),
-    )));
+    // Sized to the *workload's* geometry (the terminal minus the reserved bar
+    // row), so the model's coordinates are the host's coordinates for every
+    // row the workload can reach -- see `StatusBarCtx::screen`.
+    let (screen_rows, screen_cols) = worker_geometry.unwrap_or((
+        aplexer::screen::DEFAULT_TERMINAL_ROWS,
+        aplexer::screen::DEFAULT_TERMINAL_COLS,
+    ));
+    let workload_screen = Arc::new(Mutex::new(aplexer::screen::ClientScreen::try_new(
+        screen_rows,
+        screen_cols,
+    )?));
     let status_ctx = StatusBarCtx {
         stdout: stdout.clone(),
         term: term.clone(),
@@ -4980,7 +5200,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         record: shared_record.clone(),
         flash: Arc::new(Mutex::new(None)),
         last_drawn: Arc::new(Mutex::new(None)),
-        workload_margins: workload_margins.clone(),
+        screen: workload_screen.clone(),
+        pending: Arc::new(AtomicBool::new(false)),
+        sync_deferred_since: Arc::new(Mutex::new(None)),
     };
 
     // Reservation asserted *first* (docs/terminal-state-design.md section
@@ -4990,15 +5212,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // default-margin workload leaves this reservation standing.
     if display_tty {
         if let Some((rows, cols)) = initial_geometry {
-            apply_terminal_layout(&stdout, &term, rows, cols);
+            apply_terminal_layout(&stdout, &term, &workload_screen, rows, cols);
         }
     }
     // Scanned before the bar is drawn: the snapshot re-emits the workload's
     // DECSTBM sub-range as its last bytes (design doc section 6.2 step 3), so
     // scanning it here is what lets the immediately-following `draw_status_bar`
     // re-assert that region instead of overwriting it with the bar's own.
-    scan_workload_margins(&workload_margins, &handshake.initial);
-    write_locked(&stdout, &handshake.initial)?;
+    feed_and_write(&stdout, &workload_screen, b"", &handshake.initial, None)?;
     if display_tty {
         // The attach hint goes through the status-bar flash channel, not an
         // eprintln'd banner: a banner written before/around the snapshot is
@@ -5136,7 +5357,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let resize_active = active.clone();
         let resize_stdout = stdout.clone();
         let resize_term = term.clone();
-        let resize_margins = workload_margins.clone();
+        let resize_screen = workload_screen.clone();
         let resize_initial = initial_geometry;
         thread::spawn(move || {
             // Seeded with the geometry `attach()` already applied and already
@@ -5157,10 +5378,16 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // re-clamp the region to the new row count rather
                         // than dropping it (see `MarginTracker::set_rows`
                         // and design doc section 5.3's correction).
-                        if let Ok(mut m) = resize_margins.lock() {
-                            m.set_rows(reserved_rows(rows));
+                        if let Ok(mut m) = resize_screen.lock() {
+                            m.set_size(reserved_rows(rows), cols);
                         }
-                        apply_terminal_layout(&resize_stdout, &resize_term, rows, cols);
+                        apply_terminal_layout(
+                            &resize_stdout,
+                            &resize_term,
+                            &resize_screen,
+                            rows,
+                            cols,
+                        );
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
                         // perform_switch); if a real terminal resize races
@@ -5222,8 +5449,16 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
                     // `overdue` forces the write even if the text is
                     // unchanged -- see draw_status_bar's doc comment on why
-                    // the margin-defense guarantee needs that. Only reset
-                    // `last_draw` when a real write happened (`wrote`):
+                    // the margin-defense guarantee needs that. It does *not*
+                    // force the write to happen here: if the relayed stream is
+                    // mid-escape-sequence (which, for a continuously-streaming
+                    // agent CLI, it is about half the time), `draw_status_bar`
+                    // marks `ctx.pending` and the main frame loop performs the
+                    // write at the next safe boundary instead. `wrote` is
+                    // false in that case, so this timer correctly keeps
+                    // considering the bar overdue until a real write lands.
+                    //
+                    // Only reset `last_draw` when a real write happened:
                     // resetting it on every tick regardless -- even ticks
                     // the dirty-check turned into a no-op -- would let the
                     // idle-gap branch's frequent no-op "redraws" keep
@@ -5265,10 +5500,19 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             };
             match frame.kind {
                 FrameKind::Data => {
-                    scan_workload_margins(&workload_margins, &frame.payload);
-                    write_locked(&stdout, &frame.payload)?;
+                    relay_to_terminal(&workload_screen, &stdout, &frame.payload)?;
                     if let Ok(mut t) = last_activity.lock() {
                         *t = Instant::now();
+                    }
+                    // A redraw the status thread wanted while the stream was
+                    // mid-sequence (or mid-frame) waits here rather than being
+                    // written at an unsafe offset. This is the only place a
+                    // continuously-streaming workload's bar gets refreshed at
+                    // all, and it is by construction a chunk boundary that the
+                    // model has just confirmed is also an escape boundary --
+                    // see `draw_status_bar`'s boundary gate.
+                    if status_ctx.pending.load(Ordering::Relaxed) {
+                        draw_status_bar(&status_ctx, true);
                     }
                 }
                 FrameKind::End => {
@@ -5322,13 +5566,34 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // follows immediately and re-enables exactly the modes it owns.
         // Raw termios belongs to this client rather than either session, so
         // it remains in force across the switch.
-        let mut seq: Vec<u8> = TERMINAL_RESET_SEQUENCE.to_vec();
-        seq.extend_from_slice(&outcome.history);
-        // The new session's margins are its own: drop whatever the previous
-        // one had, then learn the new one's from its snapshot payload.
-        reset_workload_margins(&workload_margins, &term);
-        scan_workload_margins(&workload_margins, &outcome.history);
-        let _ = write_locked(&stdout, &seq);
+        //
+        // Geometry is read before `stdout` is taken, keeping the
+        // `stdout` -> `term` -> `screen` order `write_locked` documents.
+        let geom = term.lock().map(|g| *g).unwrap_or(TermGeom {
+            rows: 0,
+            cols: 0,
+            reserved: false,
+        });
+        // The new session's screen is its own: drop the previous one's model
+        // (its margins, its half-parsed sequences, its cursor) and learn the
+        // new one's from its snapshot payload, under the same lock as the
+        // write so the status thread can never redraw against a model that
+        // disagrees with what the terminal has been sent.
+        let (screen_rows, screen_cols) = if geom.rows > 0 {
+            (reserved_rows(geom.rows), geom.cols)
+        } else {
+            (
+                aplexer::screen::DEFAULT_TERMINAL_ROWS,
+                aplexer::screen::DEFAULT_TERMINAL_COLS,
+            )
+        };
+        let _ = feed_and_write(
+            &stdout,
+            &workload_screen,
+            TERMINAL_RESET_SEQUENCE,
+            &outcome.history,
+            Some((screen_rows, screen_cols)),
+        );
         if let Ok(mut t) = last_activity.lock() {
             *t = Instant::now();
         }
@@ -5337,11 +5602,6 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // 24x80 default). The resize thread won't resend an unchanged
         // terminal size (its `last` cache), so push the current geometry
         // explicitly.
-        let geom = term.lock().map(|g| *g).unwrap_or(TermGeom {
-            rows: 0,
-            cols: 0,
-            reserved: false,
-        });
         if geom.rows > 0 {
             let _ = send_control(
                 &writer,
@@ -6619,6 +6879,15 @@ mod switching_tests {
         }
     }
 
+    /// Feeds bytes into a test context's model the way the client's relay
+    /// path does, without a terminal to write them to.
+    fn feed_test_screen(screen: &Arc<Mutex<aplexer::screen::ClientScreen>>, data: &[u8]) {
+        screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .feed(data);
+    }
+
     fn status_ctx_for_test(reserved: bool) -> StatusBarCtx {
         StatusBarCtx {
             stdout: Arc::new(Mutex::new(io::stdout())),
@@ -6639,7 +6908,11 @@ mod switching_tests {
             ))),
             flash: Arc::new(Mutex::new(None)),
             last_drawn: Arc::new(Mutex::new(None)),
-            workload_margins: Arc::new(Mutex::new(aplexer::screen::MarginTracker::new(23))),
+            screen: Arc::new(Mutex::new(
+                aplexer::screen::ClientScreen::try_new(23, 80).unwrap(),
+            )),
+            pending: Arc::new(AtomicBool::new(false)),
+            sync_deferred_since: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -6706,7 +6979,7 @@ mod switching_tests {
     }
 
     /// Regression test for the DECSTBM clobber described on
-    /// `StatusBarCtx::workload_margins`: the bar's defensive scroll-region
+    /// `StatusBarCtx::screen`: the bar's defensive scroll-region
     /// re-assert used to write `\x1b[1;{rows-1}r` unconditionally, which
     /// destroyed a workload's own sub-range -- including the one the attach
     /// snapshot had just restored (docs/terminal-state-design.md section 6.2
@@ -6727,7 +7000,7 @@ mod switching_tests {
 
         // Workload sets a DECSTBM sub-range (as an attach snapshot's trailing
         // bytes do, and as a margin-using TUI does live).
-        scan_workload_margins(&ctx.workload_margins, b"\x1b[5;15r");
+        feed_test_screen(&ctx.screen, b"\x1b[5;15r");
         let pipe = StdoutToPipe::new();
         draw_status_bar(&ctx, true);
         let sub_range = String::from_utf8_lossy(&pipe.take()).into_owned();
@@ -6742,7 +7015,7 @@ mod switching_tests {
 
         // Workload releases its region (`\x1b[r`): the bar's own reservation
         // must come straight back, or the reserved row stops being protected.
-        scan_workload_margins(&ctx.workload_margins, b"\x1b[r");
+        feed_test_screen(&ctx.screen, b"\x1b[r");
         let pipe = StdoutToPipe::new();
         draw_status_bar(&ctx, true);
         let released = String::from_utf8_lossy(&pipe.take()).into_owned();
@@ -6768,74 +7041,578 @@ mod switching_tests {
             !draw_status_bar(&ctx, false),
             "unchanged state must be a skip"
         );
-        scan_workload_margins(&ctx.workload_margins, b"\x1b[5;15r");
+        feed_test_screen(&ctx.screen, b"\x1b[5;15r");
         assert!(
             draw_status_bar(&ctx, false),
             "a workload margin change must defeat the dirty-check even when the text is unchanged"
         );
     }
 
-    /// Characterization test for the documented limitation on
-    /// `draw_status_bar`'s scroll-region re-assert: re-asserting a workload's
-    /// own DECSTBM sub-range does **not** protect the client's reserved
-    /// bottom row, because DECSTBM constrains scrolling *inside* the region,
-    /// not cursor motion outside it.
+    // ---------------------------------------------------------------------
+    // Issue #5: the status bar must not be able to corrupt a workload frame.
+    //
+    // Everything below asserts on the *rendered screen* of a real
+    // `vt100::Parser` standing in for the user's terminal, compared against a
+    // second parser standing in for what the workload believes it drew. A
+    // byte-level assertion would pass while the screen was still wrong, which
+    // is exactly the trap this class of bug sets.
+    // ---------------------------------------------------------------------
+
+    /// The user's real terminal (`host`, full physical geometry) beside the
+    /// workload's own screen (`workload`, one row shorter -- its PTY is
+    /// resized to leave the status row free). The client is a byte relay
+    /// between them, so for every row the workload can reach the two must
+    /// render identically, character for character, and agree on the cursor.
+    struct Harness {
+        ctx: StatusBarCtx,
+        host: vt100::Parser,
+        workload: vt100::Parser,
+        rows: u16,
+        cols: u16,
+        /// Every status redraw that actually reached the terminal, with the
+        /// stream state it was written at.
+        redraws: Vec<Redraw>,
+    }
+
+    struct Redraw {
+        at_escape_boundary: bool,
+        in_synchronized_update: bool,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (rows, cols) = (24u16, 80u16);
+            let ctx = status_ctx_for_test(true);
+            let mut host = vt100::Parser::new(rows, cols, 0);
+            // What `apply_terminal_layout` puts on the wire at attach time.
+            host.process(format!("\x1b[1;{}r", rows - 1).as_bytes());
+            Self {
+                ctx,
+                host,
+                workload: vt100::Parser::new(rows - 1, cols, 0),
+                rows,
+                cols,
+                redraws: Vec::new(),
+            }
+        }
+
+        /// One PTY chunk: the workload's own screen sees it, and so does the
+        /// client's model on its way to the host terminal.
+        fn workload_emits(&mut self, data: &[u8]) {
+            self.workload.process(data);
+            let rewritten = {
+                let mut screen = self
+                    .ctx
+                    .screen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                screen.relay(data)
+            };
+            self.host.process(rewritten.as_deref().unwrap_or(data));
+            // What the main frame loop does after every Data frame.
+            if self.ctx.pending.load(Ordering::Relaxed) {
+                self.status_redraw();
+            }
+        }
+
+        /// What the status thread's timer does. Returns whether the redraw
+        /// actually reached the terminal (false = deferred to `ctx.pending`).
+        fn status_redraw(&mut self) -> bool {
+            let (at_escape_boundary, in_synchronized_update) = {
+                let screen = self
+                    .ctx
+                    .screen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                (screen.at_escape_boundary(), screen.in_synchronized_update())
+            };
+            match status_bar_redraw(&self.ctx, true) {
+                Some(bytes) => {
+                    assert!(!bytes.is_empty(), "a reported write must emit bytes");
+                    self.host.process(&bytes);
+                    self.redraws.push(Redraw {
+                        at_escape_boundary,
+                        in_synchronized_update,
+                    });
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// Simulates `STATUS_BAR_SYNC_DEFER_LIMIT` having elapsed, so the
+        /// synchronized-output deferral stops holding the redraw back and the
+        /// escape-boundary gate is the only thing standing between the
+        /// injection and the workload's half-emitted sequence. That is the
+        /// production worst case (a frame longer than the limit, or a block
+        /// the workload never closes) and the case issue #5 was reported
+        /// from, so the tests drive it directly rather than hiding behind the
+        /// softer gate.
+        fn expire_sync_deferral(&self) {
+            let mut since = self
+                .ctx
+                .sync_deferred_since
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *since = Instant::now().checked_sub(STATUS_BAR_SYNC_DEFER_LIMIT * 2);
+        }
+
+        fn row(parser: &vt100::Parser, row: u16, cols: u16) -> String {
+            parser.screen().contents_between(row, 0, row, cols)
+        }
+
+        /// The load-bearing assertion: every row the workload can reach must
+        /// render on the host exactly as the workload drew it, and the cursor
+        /// must agree.
+        fn assert_screens_agree(&self, label: &str) {
+            for row in 0..self.rows - 1 {
+                assert_eq!(
+                    Self::row(&self.host, row, self.cols),
+                    Self::row(&self.workload, row, self.cols),
+                    "{label}: host row {} diverged from the workload's screen",
+                    row + 1
+                );
+            }
+            assert_eq!(
+                self.host.screen().cursor_position(),
+                self.workload.screen().cursor_position(),
+                "{label}: host and workload disagree on the cursor position"
+            );
+        }
+
+        fn assert_bar_drawn(&self, label: &str) {
+            let bar = Self::row(&self.host, self.rows - 1, self.cols);
+            assert!(
+                bar.contains("status-bar-test"),
+                "{label}: the reserved row must still carry the status bar, got {bar:?}"
+            );
+        }
+    }
+
+    /// One opencode/opentui-shaped frame: a synchronized-output block wrapping
+    /// a per-cell diff repaint, every run absolutely positioned with its own
+    /// SGR. Captured verbatim from a real `opencode` session for issue #5:
+    /// `\x1b[?2026h\x1b[?25l\x1b[15;64H\x1b[38;5;237m\x1b[48;5;234m\xc2\xb7...`
+    fn opencode_shaped_frame(generation: usize) -> Vec<u8> {
+        let words = [
+            "Replace",
+            "with",
+            "ValueError",
+            "capture-warnings.html",
+            "docs.pytest.org",
+            "session",
+            "passed",
+        ];
+        let mut frame = b"\x1b[?2026h\x1b[?25l".to_vec();
+        for row in 1..=23usize {
+            let mut col = 1usize;
+            let mut k = 0usize;
+            while col < 66 {
+                let word = words[(generation + row + k) % words.len()];
+                frame.extend_from_slice(
+                    format!(
+                        "\x1b[{row};{col}H\x1b[38;5;{}m\x1b[48;5;234m{word}\x1b[0m",
+                        16 + ((generation + row + k) % 200)
+                    )
+                    .as_bytes(),
+                );
+                col += word.len() + 1;
+                k += 1;
+            }
+        }
+        frame.extend_from_slice(b"\x1b[13;17H\x1b[?25h\x1b[?2026l");
+        frame
+    }
+
+    /// **The issue #5 reproduction.** A status redraw requested while the
+    /// relayed stream sits inside a half-emitted CSI sequence -- which is
+    /// where a PTY read boundary lands about half the time under a
+    /// continuously-streaming TUI (measured: 5 of 10 redraws on a real
+    /// `a attach`) -- used to be written there anyway. The host terminal
+    /// abandons the workload's partial sequence when our `ESC` arrives and
+    /// prints its remaining parameter bytes as literal text into the frame:
+    /// `\x1b[38;5;` + our redraw + `91m...` renders a stray `91m` welded into
+    /// the row and shifts everything after it along, which is exactly the
+    /// reported `Rep69ce with Val` / `Doos` / `hetps` corruption.
     ///
-    /// Both halves are measured against a real `vt100::Parser` standing in
-    /// for the host terminal, at the client's own geometry (24 physical rows,
-    /// row 24 reserved, the workload told it has 23):
-    ///
-    /// - under the bar's own `1;23`, a line feed on row 23 scrolls rows 1-23
-    ///   and the cursor stays on row 23 -- row 24 is untouched;
-    /// - under a workload sub-range (`5;15`), the same line feed walks the
-    ///   cursor onto row 24 and writes there, because for the host terminal
-    ///   that row is the screen bottom rather than a margin boundary.
-    ///
-    /// This is pinned rather than fixed (see the comment in
-    /// `draw_status_bar`): the alternative -- not re-asserting the workload's
-    /// region -- is the strictly worse bug this replaced. If the client ever
-    /// grows enough emulation to clamp the workload's cursor, this test is
-    /// where that shows up, and the comments it points at have to change with
-    /// it.
+    /// The split point here is not hand-picked to be convenient: the test
+    /// walks *every* byte offset inside the frame, so it covers splits inside
+    /// CSI parameters, inside intermediate bytes, between an `ESC` and its
+    /// `[`, and inside the multi-byte characters the frame draws with.
     #[test]
-    fn workload_line_feed_can_still_reach_the_reserved_row_under_a_sub_range() {
-        // The workload parks on its own last row -- host row 23, which is
-        // *outside* a 5;15 sub-range -- and line-feeds, as anything printing
-        // a trailing newline at the bottom of its own screen does.
-        let walk = b"\x1b[23;1HWORKLOAD-LAST-ROW\nWALKED";
-
-        let mut protected = vt100::Parser::new(24, 80, 0);
-        protected.process(b"\x1b[24;1HBAR-TEXT\x1b[1;23r");
-        protected.process(walk);
-        assert_eq!(
-            protected.screen().cursor_position().0 + 1,
-            23,
-            "under the bar's own reservation the cursor must stay on row 23"
-        );
-        assert_eq!(
-            protected.screen().contents().lines().nth(23),
-            Some("BAR-TEXT"),
-            "under the bar's own reservation row 24 must be untouched"
-        );
-
-        let mut exposed = vt100::Parser::new(24, 80, 0);
-        exposed.process(b"\x1b[24;1HBAR-TEXT\x1b[5;15r");
-        exposed.process(walk);
-        assert_eq!(
-            exposed.screen().cursor_position().0 + 1,
-            24,
-            "known limitation: a workload sub-range lets a line feed on row 23 reach row 24"
+    fn status_redraw_never_splices_into_a_workload_frame() {
+        let frame = opencode_shaped_frame(0);
+        // Every offset would be ~3500 harnesses; step through it densely
+        // enough to hit every sequence position class many times over while
+        // keeping the test fast.
+        let mut deferred = 0usize;
+        let mut written = 0usize;
+        for split in (1..frame.len()).step_by(7) {
+            let mut h = Harness::new();
+            h.workload_emits(&frame[..split]);
+            // The whole frame is inside a `?2026` block, so without this the
+            // softer synchronized-output gate would defer every redraw and the
+            // escape-boundary gate -- the one that actually prevents the
+            // corruption -- would never be exercised.
+            h.expire_sync_deferral();
+            if h.status_redraw() {
+                written += 1;
+            } else {
+                deferred += 1;
+            }
+            h.workload_emits(&frame[split..]);
+            h.assert_screens_agree(&format!("split at byte {split}"));
+            h.assert_bar_drawn(&format!("split at byte {split}"));
+            for r in &h.redraws {
+                assert!(
+                    r.at_escape_boundary,
+                    "split at byte {split}: a redraw was written mid-escape-sequence"
+                );
+            }
+        }
+        assert!(
+            deferred > 0,
+            "the frame must contain unsafe split points for this test to mean anything"
         );
         assert!(
-            exposed
-                .screen()
-                .contents()
-                .lines()
-                .nth(23)
-                .is_some_and(|row| row.contains("WALKED")),
-            "known limitation: the reserved row is written over, not protected; row 24 was {:?}",
-            exposed.screen().contents().lines().nth(23)
+            written > 0,
+            "and safe ones, so the bar is not simply never drawn"
         );
+    }
+
+    /// One Claude-Code-shaped frame: **no `?2026` anywhere**. Ink-based TUIs
+    /// (Claude Code, and codex before it adopted synchronized output) repaint
+    /// with a full-screen erase followed by absolutely-positioned SGR runs,
+    /// and Claude Code opens with the DEC save/restore-cursor idiom
+    /// (`\x1b7\x1b[r\x1b8`) that the status bar used to clobber. Measured from
+    /// a real 24x100 capture: 1 `ESC 7`, 1 `ESC 8`, 0 `CSI ?2026h`.
+    fn claude_code_shaped_frame(generation: usize) -> Vec<u8> {
+        let words = [
+            "Removed",
+            "InDjango70Warning",
+            "category",
+            "capture-warnings.html",
+            "docs.pytest.org",
+            "8 passed, 3 warnings",
+        ];
+        // The exact opening idiom, plus a save the workload restores later.
+        let mut frame = b"\x1b7\x1b[r\x1b8\x1b[2J\x1b[H".to_vec();
+        for row in 1..=23usize {
+            frame.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            let mut k = 0usize;
+            let mut col = 1usize;
+            while col < 70 {
+                let word = words[(generation + row + k) % words.len()];
+                frame.extend_from_slice(
+                    format!(
+                        "\x1b[38;5;{}m\x1b[1m{word}\x1b[0m ",
+                        16 + ((generation + row + k) % 200)
+                    )
+                    .as_bytes(),
+                );
+                col += word.len() + 1;
+                k += 1;
+            }
+        }
+        frame.extend_from_slice(b"\x1b[9;5H\x1b7\x1b[23;1H\x1b[2Kfooter\x1b8ANCHORED");
+        frame
+    }
+
+    /// `flash_status` is a *new* forced-redraw caller (the terminal-first CLI
+    /// merge routed the attach hint, `Ctrl-b ?` help and switch failures
+    /// through it, replacing an `eprintln!` banner and two direct
+    /// `draw_status_bar` calls). It must not be a hole in the boundary gate.
+    ///
+    /// It is not, by construction rather than by discipline: the gate lives
+    /// inside `draw_status_bar`, which is the single funnel every bar write
+    /// goes through, so a caller cannot opt out of it -- `flash_status` passes
+    /// `force: true` and `force` deliberately does not bypass the boundary
+    /// check. This pins that: a flash raised while the workload is
+    /// mid-escape-sequence must be deferred rather than spliced, and must
+    /// still reach the terminal at the next boundary with its message intact.
+    ///
+    /// This matters more since the maintainer's "let's not hide status"
+    /// decision (aplexer#12 closed won't-do): there is no suppression flag, so
+    /// the injected path has to be correct on its own for every caller.
+    #[test]
+    fn flash_status_cannot_bypass_the_boundary_gate() {
+        let frame = opencode_shaped_frame(3);
+        // A split inside a CSI parameter list -- the shape a real capture put
+        // 11 of 54 status writes into.
+        let needle = b"\x1b[38;5;";
+        let split = frame
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap()
+            + needle.len();
+        let mut h = Harness::new();
+        h.workload_emits(&frame[..split]);
+        h.expire_sync_deferral();
+        assert!(
+            !h.ctx
+                .screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .at_escape_boundary(),
+            "the harness must actually be mid-sequence for this test to mean anything"
+        );
+
+        flash_status(&h.ctx, "FLASHED-MESSAGE");
+        assert!(
+            h.ctx.pending.load(Ordering::Relaxed),
+            "a flash raised mid-sequence must be deferred, not written"
+        );
+        assert!(
+            !Harness::row(&h.host, h.rows - 1, h.cols).contains("FLASHED-MESSAGE"),
+            "nothing may reach the terminal while the stream is mid-sequence"
+        );
+
+        // The rest of the frame arrives; the frame loop flushes the deferral.
+        h.workload_emits(&frame[split..]);
+        h.assert_screens_agree("flash deferred across a mid-sequence split");
+        assert!(
+            Harness::row(&h.host, h.rows - 1, h.cols).contains("FLASHED-MESSAGE"),
+            "the deferred flash must still be delivered, got {:?}",
+            Harness::row(&h.host, h.rows - 1, h.cols)
+        );
+        for r in &h.redraws {
+            assert!(
+                r.at_escape_boundary,
+                "a flash was written mid-escape-sequence"
+            );
+        }
+    }
+
+    /// **The fix must not depend on synchronized-output mode.** opencode and
+    /// codex bracket every frame in `CSI ?2026 h/l`, but Claude Code -- the
+    /// most-used agent here -- emits none at all, so if the boundary detection
+    /// leaned on `?2026` it would be a strictly weaker code path for exactly
+    /// the workload that matters most.
+    ///
+    /// It does not. `?2026` is a *soft* preference layered on top: it keeps a
+    /// redraw out of a frame the workload declared, and is bounded by
+    /// `STATUS_BAR_SYNC_DEFER_LIMIT` precisely so nothing can depend on it.
+    /// The protection is `ClientScreen::at_escape_boundary()`, which is
+    /// derived from the stream's own parser state and knows nothing about
+    /// `?2026`.
+    ///
+    /// This test is the same all-offsets split walk as
+    /// `status_redraw_never_splices_into_a_workload_frame`, over a frame that
+    /// provably contains no synchronized-output markers, with the additional
+    /// assertion that the synchronized-update gate never once fired -- so a
+    /// green result here can only come from the escape-boundary gate.
+    #[test]
+    fn escape_boundary_gate_protects_a_workload_that_never_uses_synchronized_output() {
+        let frame = claude_code_shaped_frame(0);
+        assert!(
+            !frame
+                .windows(8)
+                .any(|w| w == b"\x1b[?2026h" || w == b"\x1b[?2026l"),
+            "this test is only meaningful on a frame with no ?2026 markers"
+        );
+        let mut deferred = 0usize;
+        let mut written = 0usize;
+        let mut redraws = 0usize;
+        for split in (1..frame.len()).step_by(7) {
+            let mut h = Harness::new();
+            h.workload_emits(&frame[..split]);
+            if h.status_redraw() {
+                written += 1;
+            } else {
+                deferred += 1;
+            }
+            h.workload_emits(&frame[split..]);
+            h.assert_screens_agree(&format!("no-sync split at byte {split}"));
+            h.assert_bar_drawn(&format!("no-sync split at byte {split}"));
+            // The workload's own `\x1b7`/`\x1b8` pair must have survived every
+            // redraw: `ANCHORED` belongs at row 9 col 5, not wherever the bar
+            // last left the cursor.
+            assert!(
+                Harness::row(&h.host, 8, h.cols).contains("ANCHORED"),
+                "no-sync split at byte {split}: the workload's DECRC must land where it saved, row 9 was {:?}",
+                Harness::row(&h.host, 8, h.cols)
+            );
+            for r in &h.redraws {
+                assert!(
+                    r.at_escape_boundary,
+                    "no-sync split at byte {split}: a redraw was written mid-escape-sequence"
+                );
+                assert!(
+                    !r.in_synchronized_update,
+                    "no-sync split at byte {split}: this workload has no synchronized-output \
+                     blocks, so the sync gate must never be what protected it"
+                );
+                redraws += 1;
+            }
+        }
+        assert!(
+            deferred > 0,
+            "the frame must contain unsafe split points for this test to mean anything"
+        );
+        assert!(
+            written > 0 && redraws > 0,
+            "and the bar must still be drawn"
+        );
+    }
+
+    /// A workload that uses the DEC save/restore-cursor register itself --
+    /// Claude Code opens with exactly `\x1b7\x1b[r\x1b8`, opencode uses the
+    /// same register via `CSI s`/`CSI u`, and every `tput sc`-style progress
+    /// line inside a session does too. A terminal has one such register, so
+    /// the status bar's old `\x1b7 ... \x1b8` bracket overwrote the workload's
+    /// saved position and its own later restore jumped to *ours*.
+    #[test]
+    fn workload_saved_cursor_survives_a_status_redraw() {
+        let mut h = Harness::new();
+        h.workload_emits(b"\x1b[2J\x1b[5;1HHEADER");
+        h.workload_emits(b"\x1b7"); // workload saves its cursor at row 5
+        h.workload_emits(b"\x1b[20;1Hfooter drawn elsewhere");
+        assert!(h.status_redraw(), "a ground-state redraw must be written");
+        h.workload_emits(b"\x1b8TAIL"); // workload restores -- must be row 5
+        h.assert_screens_agree("workload DECSC/DECRC");
+        assert!(
+            Harness::row(&h.host, 4, h.cols).contains("HEADERTAIL"),
+            "the workload's own restore must land where it saved, got {:?}",
+            Harness::row(&h.host, 4, h.cols)
+        );
+        h.assert_bar_drawn("workload DECSC/DECRC");
+    }
+
+    /// A workload that never goes idle -- an agent CLI mid-generation, the
+    /// workload aplexer exists for -- never opens `STATUS_BAR_IDLE_GAP`, so
+    /// every redraw it ever gets is the `STATUS_BAR_MAX_INTERVAL` forced one.
+    /// This drives that worst case directly: a redraw requested after *every*
+    /// chunk of a continuous multi-frame stream chopped at pseudo-random
+    /// offsets. The bar must stay fresh, and no redraw may be written at an
+    /// unsafe point or inside a declared frame.
+    #[test]
+    fn continuously_streaming_workload_redraws_only_at_frame_boundaries() {
+        let mut stream = Vec::new();
+        for generation in 0..6 {
+            stream.extend_from_slice(&opencode_shaped_frame(generation));
+        }
+        // Phase A: the synchronized-output deferral in force. Every redraw
+        // that reaches the terminal must be both at an escape boundary and
+        // outside a declared frame.
+        let mut h = Harness::new();
+        // A deterministic LCG stands in for PTY read boundaries, which fall at
+        // arbitrary byte offsets rather than on sequence boundaries.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut at = 0usize;
+        while at < stream.len() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (((seed >> 33) % 900) + 100) as usize;
+            let end = (at + len).min(stream.len());
+            h.workload_emits(&stream[at..end]);
+            h.status_redraw();
+            at = end;
+        }
+        h.assert_screens_agree("continuous stream, sync respected");
+        h.assert_bar_drawn("continuous stream, sync respected");
+        assert!(
+            !h.redraws.is_empty(),
+            "a never-idle workload must still get its bar refreshed"
+        );
+        for (i, r) in h.redraws.iter().enumerate() {
+            assert!(
+                r.at_escape_boundary,
+                "redraw {i} was written mid-escape-sequence"
+            );
+            assert!(
+                !r.in_synchronized_update,
+                "redraw {i} was written inside a synchronized-output frame"
+            );
+        }
+
+        // Phase B: the deferral bounded out (a frame longer than
+        // `STATUS_BAR_SYNC_DEFER_LIMIT`, or a block the workload never
+        // closes). Redraws are now allowed inside a frame, so the
+        // escape-boundary gate is the only protection left -- and it has to be
+        // enough, which is the whole claim of this fix.
+        let mut h = Harness::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut at = 0usize;
+        while at < stream.len() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (((seed >> 33) % 900) + 100) as usize;
+            let end = (at + len).min(stream.len());
+            h.workload_emits(&stream[at..end]);
+            h.expire_sync_deferral();
+            h.status_redraw();
+            at = end;
+        }
+        h.assert_screens_agree("continuous stream, deferral bounded out");
+        h.assert_bar_drawn("continuous stream, deferral bounded out");
+        assert!(
+            h.redraws.len() >= 10,
+            "with the deferral bounded out the bar must refresh often; got {} redraws",
+            h.redraws.len()
+        );
+        assert!(
+            h.redraws.iter().any(|r| r.in_synchronized_update),
+            "this phase must actually exercise redraws inside a frame"
+        );
+        for (i, r) in h.redraws.iter().enumerate() {
+            assert!(
+                r.at_escape_boundary,
+                "redraw {i} was written mid-escape-sequence"
+            );
+        }
+    }
+
+    /// docs/terminal-state-design.md section 7.1's reserved-row walk, which
+    /// this replaces the old characterization test for. While the client
+    /// re-asserts a workload's own DECSTBM sub-range, the host's bottom row is
+    /// the screen bottom rather than a margin boundary, so a line feed on the
+    /// workload's last row walked the host cursor onto the reserved row and
+    /// left it there -- the workload's screen model and the host permanently
+    /// one row apart. The client's model now detects that at the byte that
+    /// causes it and splices in an absolute reposition.
+    #[test]
+    fn workload_line_feed_no_longer_reaches_the_reserved_row_under_a_sub_range() {
+        let mut h = Harness::new();
+        h.workload_emits(b"\x1b[5;15r");
+        assert!(
+            h.status_redraw(),
+            "the bar re-asserts the workload sub-range"
+        );
+        h.workload_emits(b"\x1b[23;1HWORKLOAD-LAST-ROW\nWALKED");
+        h.assert_screens_agree("sub-range line feed");
+        assert_eq!(
+            h.host.screen().cursor_position().0 + 1,
+            23,
+            "the cursor must stay on the workload's last row"
+        );
+        h.assert_bar_drawn("sub-range line feed");
+    }
+
+    /// The client must never write DECSC/DECRC into a stream it is only
+    /// relaying -- not from the status bar and not from the layout code. This
+    /// is a hard cut, not a preference: there is one save-cursor register and
+    /// it belongs to the workload.
+    #[test]
+    fn client_never_writes_the_shared_save_cursor_register() {
+        let ctx = status_ctx_for_test(true);
+        let restore = ctx
+            .screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursor_restore();
+        let mut bytes = status_bar_redraw(&ctx, true).expect("a ground-state redraw writes");
+        bytes.extend_from_slice(&terminal_layout_sequence(24, &restore));
+        bytes.extend_from_slice(TERMINAL_RESET_SEQUENCE);
+        assert!(!bytes.is_empty());
+        for pair in [&b"\x1b7"[..], b"\x1b8"] {
+            assert!(
+                !bytes.windows(2).any(|w| w == pair),
+                "client emitted {pair:?}: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
     }
 
     #[test]

@@ -484,7 +484,7 @@ Two changes to make the digits discoverable and give errors a home:
 | A's worker dies mid-switch | `take_pending_switch`'s 500ms grace completes the switch anyway (the user was leaving A regardless). |
 | B's worker dies immediately after handoff | Frame loop hits EOF with no pending switch: falls through to the normal detach path -- `TerminalUiGuard`/`RawMode` restore the terminal and `attach()` returns, exactly like a session exiting under you today. A hard post-switch failure degrades to a clean detach, never a wedged terminal. |
 | Switch to self (`Ctrl-b 1` while on #1, `l` with last == current is impossible by construction) | Silent no-op. |
-| Flash while a full-screen TUI is redrawing | Same byte-safety as every status redraw: serialized under the `stdout` mutex, save/restore-cursor wrapped (`draw_status_bar`'s existing sequence). |
+| Flash while a full-screen TUI is redrawing | Same safety as every status redraw: serialized under the `stdout` mutex, gated on the relayed stream being at an escape boundary, and cursor/pen restored absolutely from the client's own screen model rather than through the shared DECSC register (see `draw_status_bar`/`status_bar_sequence` and terminal-state-design.md section 7). |
 
 Errors are flashed rather than detaching on: a failed switch means the user
 still has a perfectly good live session on screen; throwing them out to a

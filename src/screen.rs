@@ -551,6 +551,411 @@ impl ScreenTracker {
         }
         out
     }
+
+    /// The current DECSTBM sub-range, or `None` for full-screen margins --
+    /// the same emission-facing view `MarginTracker::margins` documents.
+    pub fn margins(&self) -> Option<(u16, u16)> {
+        self.margins.margins()
+    }
+
+    /// Where the *workload* believes its cursor is, 0-based `(row, col)`.
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.parser.screen().cursor_position()
+    }
+
+    /// The screen's row count, i.e. the workload's own last row index + 1.
+    pub fn rows(&self) -> u16 {
+        self.parser.screen().size().0
+    }
+
+    /// Escape sequences that put a host terminal's cursor and drawing
+    /// attributes back exactly where this model says the workload left them,
+    /// **without touching the shared DECSC/DECRC save-cursor register**.
+    ///
+    /// This is the replacement for the `\x1b7 ... \x1b8` bracket the status
+    /// bar used to wrap its redraw in. A terminal has exactly one save-cursor
+    /// register; saving into it from a stream we are only relaying silently
+    /// destroys whatever the workload put there, and the workload's own later
+    /// `\x1b8` then jumps to *our* saved position (Claude Code's startup
+    /// `\x1b7\x1b[r\x1b8` and any `tput sc`/`tput rc` progress line are
+    /// exactly this shape). Restoring absolutely from the model instead makes
+    /// the register the workload's private property again.
+    ///
+    /// Composition, in `vt100`'s own prescribed order:
+    ///
+    /// 1. `cursor_state_formatted()` -- cursor visibility plus an absolute
+    ///    reposition that also reproduces the *pending-wrap* state (it
+    ///    re-draws the cell at the end of the row when the cursor sits past
+    ///    the last column), which a bare `CSI row;col H` cannot express.
+    /// 2. `attributes_formatted()` -- the workload's current SGR pen. Step 1
+    ///    may itself alter the attributes (that re-drawn cell carries its
+    ///    own), and the bar's own `\x1b[0m` has already cleared them, so this
+    ///    has to come second. Real terminals restore SGR from DECSC; `vt100`
+    ///    (and any emulator that saves only the position) does not, so the
+    ///    old bracket left the workload's pen reset to default on exactly the
+    ///    terminals aplexer models itself on.
+    pub fn cursor_restore(&self) -> Vec<u8> {
+        let screen = self.parser.screen();
+        let mut out = screen.cursor_state_formatted();
+        out.extend_from_slice(&screen.attributes_formatted());
+        out
+    }
+}
+
+/// Where in an escape sequence (or a multi-byte UTF-8 character) a relayed
+/// byte stream currently sits, plus how deeply nested it is inside a
+/// synchronized-output block.
+///
+/// This exists for one reason: `a attach` is a raw byte relay, and the
+/// status bar interjects its own bytes into that relay. A PTY read boundary
+/// lands at an arbitrary byte offset, so "between two chunks" is emphatically
+/// **not** "between two escape sequences" -- measured against a real
+/// continuously-streaming TUI workload, 5 of 10 status-bar redraws were
+/// spliced into the middle of an unterminated `CSI` sequence
+/// (`...\x1b[38;5;` + our redraw + `91m...`). The host terminal's parser
+/// abandons the partial sequence when our `ESC` arrives, and the workload's
+/// remaining parameter bytes are then printed as literal text into its own
+/// frame -- which is exactly the reported corruption (stray digit/letter
+/// runs welded into rows, everything after them shifted along the row).
+/// Splitting a multi-byte UTF-8 character is the same failure with a
+/// replacement glyph instead of digits.
+///
+/// So the client asks this type "is the stream at a boundary where an
+/// injection is invisible?" before writing anything of its own. Deliberately
+/// a boundary recognizer, not a parser: it never interprets a sequence's
+/// meaning, only where one begins and ends.
+#[derive(Debug, Clone)]
+pub struct StreamBoundary {
+    state: BoundaryState,
+    /// UTF-8 continuation bytes still expected for the character in flight.
+    utf8_remaining: u8,
+    /// Nesting depth of `CSI ? 2026 h` / `CSI ? 2026 l` (DEC synchronized
+    /// output). A workload that brackets each frame in these -- opencode,
+    /// codex and every other Bubble Tea/opentui-style renderer measured for
+    /// issue #5 -- is telling us precisely where its frame boundaries are,
+    /// for free.
+    sync_depth: u16,
+    /// Private marker + parameter bytes of the CSI in flight, capped; only
+    /// used to recognize `?2026h`/`?2026l`.
+    csi_params: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundaryState {
+    Ground,
+    /// `ESC` seen (or `ESC` plus intermediate bytes).
+    Esc,
+    /// `ESC [` seen; consuming parameter/intermediate bytes.
+    Csi,
+    /// Inside an `OSC`/`DCS`/`SOS`/`PM`/`APC` string.
+    Str {
+        osc: bool,
+    },
+    /// `ESC` seen inside such a string (candidate `ST`).
+    StrEsc {
+        osc: bool,
+    },
+}
+
+/// Cap on the CSI parameter bytes retained for `?2026` recognition. `?2026`
+/// is 5 bytes; anything longer cannot be it.
+const BOUNDARY_PARAM_CAP: usize = 8;
+
+impl Default for StreamBoundary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamBoundary {
+    pub fn new() -> Self {
+        Self {
+            state: BoundaryState::Ground,
+            utf8_remaining: 0,
+            sync_depth: 0,
+            csi_params: Vec::new(),
+        }
+    }
+
+    /// Forget everything, for an in-process session switch: the next
+    /// session's bytes are a different stream and cannot continue this one's
+    /// half-parsed sequence or synchronized-output block.
+    pub fn reset(&mut self) {
+        self.state = BoundaryState::Ground;
+        self.utf8_remaining = 0;
+        self.sync_depth = 0;
+        self.csi_params.clear();
+    }
+
+    /// True when the stream is between complete sequences and characters --
+    /// the only place the client may write bytes of its own.
+    pub fn at_escape_boundary(&self) -> bool {
+        self.state == BoundaryState::Ground && self.utf8_remaining == 0
+    }
+
+    /// True while the workload has an unclosed `CSI ? 2026 h` block, i.e.
+    /// while it is part-way through emitting a frame it asked the terminal
+    /// to display atomically.
+    pub fn in_synchronized_update(&self) -> bool {
+        self.sync_depth > 0
+    }
+
+    pub fn feed(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.step(byte);
+        }
+    }
+
+    fn step(&mut self, byte: u8) {
+        // CAN/SUB abort whatever is in flight, in every state.
+        if byte == 0x18 || byte == 0x1a {
+            self.state = BoundaryState::Ground;
+            self.utf8_remaining = 0;
+            self.csi_params.clear();
+            return;
+        }
+        match self.state {
+            BoundaryState::Ground => {
+                if self.utf8_remaining > 0 {
+                    if (0x80..0xc0).contains(&byte) {
+                        self.utf8_remaining -= 1;
+                    } else {
+                        // Malformed continuation: the host terminal gives up
+                        // on the character too, so this byte starts fresh.
+                        self.utf8_remaining = 0;
+                        self.start_ground(byte);
+                    }
+                } else {
+                    self.start_ground(byte);
+                }
+            }
+            BoundaryState::Esc => match byte {
+                0x1b => {}
+                b'[' => {
+                    self.state = BoundaryState::Csi;
+                    self.csi_params.clear();
+                }
+                b']' => self.state = BoundaryState::Str { osc: true },
+                b'P' | b'X' | b'^' | b'_' => self.state = BoundaryState::Str { osc: false },
+                // Intermediate bytes keep the escape sequence open.
+                0x20..=0x2f => {}
+                _ => self.state = BoundaryState::Ground,
+            },
+            BoundaryState::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    self.finish_csi(byte);
+                    self.state = BoundaryState::Ground;
+                } else if byte == 0x1b {
+                    self.state = BoundaryState::Esc;
+                    self.csi_params.clear();
+                } else {
+                    if self.csi_params.len() < BOUNDARY_PARAM_CAP {
+                        self.csi_params.push(byte);
+                    } else {
+                        // Too long to be `?2026`; keep consuming, stop
+                        // recording (and make sure a truncated prefix can
+                        // never be mistaken for one).
+                        self.csi_params.push(b'x');
+                        self.csi_params.remove(0);
+                    }
+                }
+            }
+            BoundaryState::Str { osc } => {
+                if osc && byte == 0x07 {
+                    self.state = BoundaryState::Ground;
+                } else if byte == 0x1b {
+                    self.state = BoundaryState::StrEsc { osc };
+                }
+            }
+            BoundaryState::StrEsc { osc } => {
+                if byte == b'\\' {
+                    self.state = BoundaryState::Ground;
+                } else {
+                    self.state = BoundaryState::Str { osc };
+                }
+            }
+        }
+    }
+
+    fn start_ground(&mut self, byte: u8) {
+        match byte {
+            0x1b => self.state = BoundaryState::Esc,
+            0xc2..=0xdf => self.utf8_remaining = 1,
+            0xe0..=0xef => self.utf8_remaining = 2,
+            0xf0..=0xf4 => self.utf8_remaining = 3,
+            _ => {}
+        }
+    }
+
+    fn finish_csi(&mut self, final_byte: u8) {
+        if self.csi_params == b"?2026" {
+            match final_byte {
+                b'h' => self.sync_depth = self.sync_depth.saturating_add(1),
+                b'l' => self.sync_depth = self.sync_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        self.csi_params.clear();
+    }
+}
+
+/// The attached client's own copy of the workload's terminal, kept by feeding
+/// it the very bytes the client is relaying to the user's terminal.
+///
+/// The worker has had a live `vt100` model since docs/terminal-state-design.md
+/// shipped, but only the *worker* had one: the client stayed a blind relay
+/// that hand-injected `\x1b7 ... \x1b8` brackets into someone else's byte
+/// stream and hoped. This gives the client the same model, which is what the
+/// status bar needs to be able to
+///
+/// - inject only at a boundary where an injection is invisible
+///   (`at_safe_boundary`),
+/// - put the cursor and pen back absolutely rather than through the shared
+///   DECSC register (`ScreenTracker::cursor_restore`), and
+/// - keep the host's cursor from walking onto the reserved row while a
+///   workload scroll-region sub-range is in force (`relay`).
+///
+/// Sized to the workload's geometry -- the physical terminal minus the
+/// reserved status row -- so its coordinates are the host's coordinates for
+/// every row the workload can reach.
+pub struct ClientScreen {
+    screen: ScreenTracker,
+    boundary: StreamBoundary,
+}
+
+impl ClientScreen {
+    pub fn try_new(rows: u16, cols: u16) -> Result<Self> {
+        Ok(Self {
+            screen: ScreenTracker::try_new(rows, cols)?,
+            boundary: StreamBoundary::new(),
+        })
+    }
+
+    /// Feed bytes that are being written to the host terminal *verbatim* --
+    /// the attach snapshot and a session switch's replayed screen. These
+    /// describe the workload's screen, so the model must see them, but they
+    /// are never rewritten (there is no live workload cursor to protect
+    /// during a snapshot; the snapshot is itself an absolute repaint).
+    pub fn feed(&mut self, data: &[u8]) {
+        self.screen.process(data);
+        self.boundary.feed(data);
+    }
+
+    /// Feed a live PTY chunk and return the bytes the client should actually
+    /// write, or `None` when the chunk goes out unchanged (the common case,
+    /// and the only one when the workload has no scroll-region sub-range).
+    ///
+    /// The rewrite exists solely for docs/terminal-state-design.md section
+    /// 7.1's reserved-row walk. While the client is re-asserting a workload's
+    /// own DECSTBM sub-range, the host terminal's bottom row is the *screen*
+    /// bottom rather than a margin boundary, so a line feed on the workload's
+    /// own last row moves the host cursor down onto the reserved row while
+    /// the workload's screen -- one row shorter -- clamps and stays put.
+    /// Everything the workload writes afterwards then lands a row below where
+    /// it believes it is, and stays there: the old code could only repaint
+    /// the bar text over the damage, never re-align the cursor.
+    ///
+    /// With a model of the workload's screen the divergence is detectable at
+    /// the byte that causes it. The chunk is split at line-feed controls
+    /// (`LF`/`VT`/`FF`); whenever one of them executes while the model's
+    /// cursor is on the model's last row -- and that row is outside the
+    /// sub-range, so the model clamps instead of scrolling -- an absolute
+    /// reposition to the model's own cursor is spliced in directly after it.
+    /// A line feed never leaves a pending-wrap state, so a plain `CUP` is an
+    /// exact restore here.
+    ///
+    /// Engages only while a sub-range whose bottom is above the workload's
+    /// last row is in force; every other stream takes one `Option` check and
+    /// the untouched bulk path. The residual case -- a *wrap* off the last
+    /// column of that same last row -- is not rewritten (detecting it needs
+    /// per-byte column tracking through the whole chunk, for a workload that
+    /// is simultaneously using a scroll-region sub-range and printing to the
+    /// far column of a row outside it); unlike the line-feed walk it now
+    /// self-heals, because every status-bar redraw restores the cursor
+    /// absolutely from this model.
+    pub fn relay(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        self.boundary.feed(data);
+        if !data.iter().any(|b| matches!(b, b'\n' | 0x0b | 0x0c)) {
+            // No line-feed control in this chunk, so no walk is possible --
+            // whatever else it does to the margins takes effect for the next
+            // one. The overwhelmingly common path: one bulk parse, no scan.
+            self.screen.process(data);
+            return None;
+        }
+        let mut out: Option<Vec<u8>> = None;
+        let mut segment_start = 0usize;
+        for i in 0..data.len() {
+            if !matches!(data[i], b'\n' | 0x0b | 0x0c) {
+                continue;
+            }
+            // Everything up to (not including) the control, then the control
+            // on its own, so both the margins and the cursor row immediately
+            // before it are known -- the chunk may well be the one that set
+            // the sub-range in the first place.
+            self.screen.process(&data[segment_start..i]);
+            let last_row = self.screen.rows().saturating_sub(1);
+            let exposed = matches!(self.screen.margins(), Some((_, bottom)) if bottom <= last_row);
+            let before_row = self.screen.cursor_position().0;
+            self.screen.process(&data[i..=i]);
+            if !exposed || before_row != last_row {
+                continue;
+            }
+            let (row, col) = self.screen.cursor_position();
+            let buf = out.get_or_insert_with(Vec::new);
+            buf.extend_from_slice(&data[segment_start..=i]);
+            buf.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+            segment_start = i + 1;
+        }
+        self.screen.process(&data[segment_start..]);
+        if let Some(buf) = out.as_mut() {
+            buf.extend_from_slice(&data[segment_start..]);
+        }
+        out
+    }
+
+    /// Re-fit both the model and the tracked margins to a new workload
+    /// geometry (the physical terminal minus the reserved row).
+    pub fn set_size(&mut self, rows: u16, cols: u16) {
+        let _ = self.screen.try_set_size(rows, cols);
+    }
+
+    /// Start over for a different session (`Ctrl-b n`): a new workload has
+    /// its own screen, its own margins and its own half-parsed sequences.
+    pub fn reset(&mut self, rows: u16, cols: u16) {
+        if let Ok(fresh) = ScreenTracker::try_new(rows, cols) {
+            self.screen = fresh;
+        }
+        self.boundary.reset();
+    }
+
+    pub fn margins(&self) -> Option<(u16, u16)> {
+        self.screen.margins()
+    }
+
+    /// True when the client may write bytes of its own: the relayed stream is
+    /// between complete escape sequences and characters. This is a hard
+    /// requirement -- injecting anywhere else corrupts the workload's frame.
+    pub fn at_escape_boundary(&self) -> bool {
+        self.boundary.at_escape_boundary()
+    }
+
+    /// True while the workload is part-way through a synchronized-output
+    /// frame. A soft preference rather than a hard requirement: waiting for
+    /// the frame to close keeps the redraw out of the middle of a repaint,
+    /// but a workload that never closes one must not be able to starve the
+    /// bar forever (see `STATUS_BAR_SYNC_DEFER_LIMIT` in `src/bin/a.rs`).
+    pub fn in_synchronized_update(&self) -> bool {
+        self.boundary.in_synchronized_update()
+    }
+
+    pub fn cursor_restore(&self) -> Vec<u8> {
+        self.screen.cursor_restore()
+    }
+
+    #[cfg(test)]
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.screen.cursor_position()
+    }
 }
 
 #[cfg(test)]
@@ -1470,5 +1875,206 @@ mod tests {
             !shredded,
             "screen contents look shredded to one character per row:\n{contents}"
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    fn boundary_after(chunks: &[&[u8]]) -> StreamBoundary {
+        let mut b = StreamBoundary::new();
+        for c in chunks {
+            b.feed(c);
+        }
+        b
+    }
+
+    /// The exact shape measured on a real `a attach` against a
+    /// continuously-streaming TUI (issue #5): the PTY read boundary fell
+    /// inside `\x1b[38;5;`, and the status bar wrote there. Every one of these
+    /// mid-sequence positions has to report "not a boundary", or the client
+    /// will splice into a half-emitted sequence again.
+    #[test]
+    fn mid_sequence_positions_are_not_boundaries() {
+        for prefix in [
+            &b"\x1b"[..],
+            b"\x1b[",
+            b"\x1b[38",
+            b"\x1b[38;5;",
+            b"\x1b[38;5;91",
+            b"\x1b[?2026",
+            b"\x1b#",
+            b"\x1b]0;title",
+            b"\x1b]0;title\x1b",
+            b"\x1bPtmux;",
+            b"\x1b_payload",
+        ] {
+            assert!(
+                !boundary_after(&[prefix]).at_escape_boundary(),
+                "{prefix:?} leaves an unterminated sequence in flight"
+            );
+        }
+        for complete in [
+            &b"\x1b[38;5;91m"[..],
+            b"\x1b[?2026h\x1b[?2026l",
+            b"\x1b[H",
+            b"\x1b7",
+            b"\x1b]0;title\x07",
+            b"\x1b]0;title\x1b\\",
+            b"\x1bPtmux;x\x1b\\",
+            b"plain text",
+            b"",
+        ] {
+            assert!(
+                boundary_after(&[complete]).at_escape_boundary(),
+                "{complete:?} ends between sequences"
+            );
+        }
+    }
+
+    /// A sequence split across two PTY reads is still one sequence: the state
+    /// has to survive the chunk boundary, which is the whole point (the
+    /// injection happens *at* chunk boundaries).
+    #[test]
+    fn state_survives_a_chunk_split() {
+        assert!(!boundary_after(&[b"\x1b[38;5;", b"9"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\x1b[38;5;", b"91m"]).at_escape_boundary());
+        assert!(!boundary_after(&[b"\x1b", b"["]).at_escape_boundary());
+    }
+
+    /// Splitting a multi-byte character is the same corruption with a
+    /// replacement glyph instead of stray digits, so a partial UTF-8
+    /// character is not a boundary either. `\xc2\xb7` (MIDDLE DOT) is exactly
+    /// what opencode draws its separators with.
+    #[test]
+    fn partial_utf8_is_not_a_boundary() {
+        assert!(!boundary_after(&[b"\xc2"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\xc2\xb7"]).at_escape_boundary());
+        assert!(!boundary_after(&[b"\xe2\x94"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\xe2\x94\x80"]).at_escape_boundary());
+        assert!(!boundary_after(&[b"\xf0\x9f\x92"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\xf0\x9f\x92\xa9"]).at_escape_boundary());
+    }
+
+    /// `CSI ? 2026 h` / `l` bracket a frame. opencode and codex emit one pair
+    /// per redraw (measured: 44 pairs in a 30 s capture), so tracking the
+    /// depth hands the client exact frame boundaries for free.
+    #[test]
+    fn synchronized_update_depth_tracks_frames() {
+        let mut b = StreamBoundary::new();
+        assert!(!b.in_synchronized_update());
+        b.feed(b"\x1b[?2026h");
+        assert!(b.in_synchronized_update());
+        b.feed(b"\x1b[1;1Hpainting");
+        assert!(b.in_synchronized_update());
+        b.feed(b"\x1b[?2026l");
+        assert!(!b.in_synchronized_update());
+        // Split across chunks, and not confused by a same-shaped neighbour.
+        b.feed(b"\x1b[?202");
+        b.feed(b"6h");
+        assert!(b.in_synchronized_update());
+        b.feed(b"\x1b[?2004l\x1b[?1049l");
+        assert!(b.in_synchronized_update());
+        b.feed(b"\x1b[?2026l");
+        assert!(!b.in_synchronized_update());
+    }
+
+    /// A switch hands the client a different session's stream; a half-parsed
+    /// sequence or an open frame from the previous one must not carry over.
+    #[test]
+    fn reset_clears_in_flight_state() {
+        let mut b = StreamBoundary::new();
+        b.feed(b"\x1b[?2026h\x1b[38;5;");
+        assert!(!b.at_escape_boundary());
+        assert!(b.in_synchronized_update());
+        b.reset();
+        assert!(b.at_escape_boundary());
+        assert!(!b.in_synchronized_update());
+    }
+
+    /// The reserved-row walk (docs/terminal-state-design.md section 7.1),
+    /// measured both ways against real `vt100` parsers: the workload's own
+    /// 23-row screen versus the 24-row host running the workload's `5;15`
+    /// sub-range. Without the rewrite the host cursor lands on row 24 and the
+    /// two disagree forever; with it, the spliced reposition puts the host
+    /// back on row 23 where the workload believes it is.
+    #[test]
+    fn relay_keeps_a_line_feed_off_the_reserved_row_under_a_sub_range() {
+        let mut client = ClientScreen::try_new(23, 80).unwrap();
+        let mut host = vt100::Parser::new(24, 80, 0);
+        host.process(b"\x1b[24;1HBAR-TEXT\x1b[1;23r");
+        let mut workload = vt100::Parser::new(23, 80, 0);
+
+        let walk = b"\x1b[5;15r\x1b[23;1HWORKLOAD-LAST-ROW\nWALKED";
+        workload.process(walk);
+        // The client re-asserts the workload's sub-range on the host, which is
+        // what exposes row 24 (see `draw_status_bar`).
+        host.process(b"\x1b[5;15r");
+        let rewritten = client.relay(walk);
+        assert!(
+            rewritten.is_some(),
+            "a line feed on the last row under a sub-range must be repaired"
+        );
+        host.process(rewritten.as_deref().unwrap());
+
+        assert_eq!(
+            host.screen().cursor_position(),
+            workload.screen().cursor_position(),
+            "host and workload must agree on the cursor after the walk"
+        );
+        assert_eq!(
+            host.screen().cursor_position().0 + 1,
+            23,
+            "the cursor must stay on the workload's last row, not walk onto row 24"
+        );
+        assert_eq!(
+            host.screen()
+                .contents_between(23, 0, 23, 80)
+                .trim_end()
+                .to_string(),
+            "BAR-TEXT",
+            "the reserved row must not be written over"
+        );
+    }
+
+    /// The rewrite must engage only where it is needed: no sub-range, or a
+    /// sub-range that already covers the workload's last row, means the host
+    /// and the workload scroll identically and the chunk goes out untouched.
+    #[test]
+    fn relay_leaves_ordinary_streams_untouched() {
+        let mut client = ClientScreen::try_new(23, 80).unwrap();
+        assert!(client.relay(b"\x1b[23;1Hline\nmore\n").is_none());
+        // A bottom-anchored sub-range: row 23 is inside it, so a line feed
+        // scrolls on both sides and needs no repair.
+        assert!(client.relay(b"\x1b[5;23r").is_none());
+        assert!(client.relay(b"\x1b[23;1Hline\n").is_none());
+        // A sub-range that excludes the last row, but no line feed in the
+        // chunk: still nothing to repair.
+        assert!(client
+            .relay(b"\x1b[5;15r\x1b[10;1Hno newline here")
+            .is_none());
+    }
+
+    /// `cursor_restore` is the replacement for the `\x1b7`/`\x1b8` bracket, so
+    /// it must actually restore -- position, pending wrap, and the pen -- and
+    /// it must never emit DECSC/DECRC itself.
+    #[test]
+    fn cursor_restore_reproduces_position_and_pen_without_decsc() {
+        let mut client = ClientScreen::try_new(23, 80).unwrap();
+        client.feed(b"\x1b[7;13H\x1b[1m\x1b[38;5;42m");
+        let restore = client.cursor_restore();
+        assert!(
+            !restore.windows(2).any(|w| w == b"\x1b7" || w == b"\x1b8"),
+            "restore must not touch the shared save-cursor register: {restore:?}"
+        );
+        let mut host = vt100::Parser::new(23, 80, 0);
+        host.process(b"\x1b[1;1H\x1b[0m");
+        host.process(&restore);
+        assert_eq!(host.screen().cursor_position(), (6, 12));
+        host.process(b"X");
+        let cell = host.screen().cell(6, 12).unwrap();
+        assert!(cell.bold(), "the workload's pen must be restored");
+        assert_eq!(cell.fgcolor(), vt100::Color::Idx(42));
     }
 }
