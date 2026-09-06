@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 python/aplexer/_native.abi3.so
 /.claude/worktrees/
+/.worktrees/
