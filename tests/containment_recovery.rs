@@ -63,6 +63,23 @@ fn process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Scope note -- this test asserts `a kill`'s and `a forget`'s contract
+/// only: kill refuses a cleanup it cannot prove and preserves both evidence
+/// directories, and only `--force` removes them. It is NOT a claim about
+/// `a prune`, which deliberately supersedes that preservation for exactly
+/// this state.
+///
+/// Measured, not assumed: killing the worker closes the PTY, so the leader
+/// `sh` takes the resulting SIGHUP and dies with it -- only the `setsid`
+/// descendant, which traps HUP, survives. Running `a prune` at the point
+/// where this test checks the preserved directories therefore REAPS the
+/// record (verified: `{"removed":["<id>"],
+/// "removed_without_containment_proof":["<id>"],"retained_count":0}`),
+/// leaving the descendant alive and unsignalled. That trade-off is the
+/// subject of `aplexer::containment_reap_verdict`'s "Supersedes" note and is
+/// pinned end to end by
+/// `tests/prune_dead_records.rs::prune_reaps_a_record_whose_setsid_descendant_escaped`;
+/// this test stays on kill/forget so the two contracts remain separable.
 #[test]
 fn kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant() {
     assert!(Path::new("/usr/bin/setsid").is_file(), "setsid is required");

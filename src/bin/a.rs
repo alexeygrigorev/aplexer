@@ -723,7 +723,7 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
                 None => r.engine.clone(),
             };
             let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
-            let state = display_state(&r.phase, r.worker_alive());
+            let state = observed_state(&r.phase, r.worker_alive());
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));
             println!("{connector} {idx}  {tag} {ep} {state}");
@@ -794,21 +794,6 @@ fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str)
     }
 }
 
-/// A persisted `phase` of Starting/Running/Exiting only means the worker
-/// *said* it was in that phase the last time it wrote its record -- if the
-/// worker process has since died (e.g. SIGKILL, which gives it no chance to
-/// update the record), that phase is stale. `phase` and worker liveness are
-/// different facts (spec.md 20: "session worker alive" vs "workload alive"
-/// vs "agent semantic state" are different facts) so this only affects
-/// display, not the persisted phase itself.
-fn display_state(phase: &Phase, worker_alive: bool) -> &'static str {
-    if matches!(phase, Phase::Starting | Phase::Running | Phase::Exiting) && !worker_alive {
-        "broken"
-    } else {
-        phase_name(phase)
-    }
-}
-
 /// Shortens a workspace path under $HOME to `~/...`, matching spec.md's own
 /// display examples (e.g. section 2's `~/git/pocketshell` tree).
 fn display_workspace(path: &Path, home: Option<&Path>) -> String {
@@ -827,7 +812,7 @@ fn display_workspace(path: &Path, home: Option<&Path>) -> String {
 fn running_count(group: &[SessionRecord]) -> (usize, usize) {
     let running = group
         .iter()
-        .filter(|r| display_state(&r.phase, r.worker_alive()) == "running")
+        .filter(|r| observed_state(&r.phase, r.worker_alive()) == "running")
         .count();
     (running, group.len())
 }
@@ -999,35 +984,179 @@ fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     attach(paths, &record, None)
 }
 
-fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
-    let records = list_records(paths)?;
-    let mut removed = Vec::new();
-    let mut retained_count = 0usize;
-    for record in records {
-        let workload_alive = record.workload_pid.map(process_alive).unwrap_or(false);
-        if workload_alive || !record.worker_finished() || !record.containment_proven_empty() {
-            retained_count += 1;
+/// Total wall-clock budget one `a prune` run may spend waiting for workers
+/// that its own record says are on their way out. Shared across every
+/// record in the run so a registry full of dying sessions cannot make prune
+/// hang: `a kill` only returns once the workload's containment domain is
+/// empty, so the worker it leaves behind is milliseconds from exiting, not
+/// seconds -- this budget is sized for a saturated box, and burning all of
+/// it can only produce the pre-existing "retained" answer, never a wrong
+/// removal.
+const PRUNE_TERMINATION_BUDGET: Duration = Duration::from_secs(5);
+const PRUNE_TERMINATION_POLL: Duration = Duration::from_millis(25);
+
+struct PruneOutcome {
+    removed: Vec<Uuid>,
+    removed_without_containment_proof: Vec<Uuid>,
+    retained_count: usize,
+}
+
+enum ReapResult {
+    Removed {
+        containment_proven: bool,
+    },
+    Retained,
+    /// The record disappeared between the registry scan and the lock --
+    /// another `a prune`/`a kill`/`a forget` got there first. Neither
+    /// removed by us nor still present to retain.
+    Vanished,
+}
+
+/// A record is prune-able when nothing that could still be running depends
+/// on it. Three independent facts, all required:
+///
+///  1. no live worker -- `worker_alive()` stays the authority, including its
+///     deliberate fallback to the bare pid check when the identity sidecar
+///     is missing or unreadable, so uncertainty retains rather than reaps;
+///  2. no live workload leader -- the safety property `a forget --force`
+///     exists to override, unchanged;
+///  3. containment holds no remaining handle (see `containment_reap_verdict`).
+///
+/// Note what is deliberately NOT required any more: `worker_finished()`, a
+/// terminal *phase*. A worker killed with SIGKILL never gets to write one,
+/// which is why records at `phase: running, worker_alive: false` could never
+/// be reaped by any number of `a prune` runs.
+fn reap_verdict(record: &SessionRecord) -> Option<ContainmentReap> {
+    if record.worker_alive() || record.workload_leader_alive() {
+        return None;
+    }
+    match containment_reap_verdict(record) {
+        ContainmentReap::Retain => None,
+        verdict => Some(verdict),
+    }
+}
+
+/// Wait, within the run's shared budget, for a worker whose own record says
+/// it is terminating. Returns the record as it stands afterwards: the worker
+/// finishes its lifecycle while we wait (writing its exit, its terminal
+/// phase and its containment proof), so the stale in-memory copy must not be
+/// the one the reap decision is made from.
+fn settle_terminating_record(
+    paths: &Paths,
+    record: SessionRecord,
+    deadline: Instant,
+) -> SessionRecord {
+    if !record.worker_alive() || !record.worker_is_terminating() {
+        return record;
+    }
+    let mut current = record;
+    while Instant::now() < deadline {
+        thread::sleep(PRUNE_TERMINATION_POLL);
+        match read_session_record(paths, current.id) {
+            Ok(fresh) => current = fresh,
+            // Vanished or unreadable mid-flight: hand back what we have and
+            // let the locked re-read below decide.
+            Err(_) => return current,
+        }
+        if !current.worker_alive() {
+            break;
+        }
+    }
+    current
+}
+
+/// Remove one record's durable state, re-deciding under the registry lock.
+///
+/// The scan-time verdict is advisory: `start_session` holds this same lock
+/// across the whole spawn, so a record that looked like a dead `Starting`
+/// stub during the scan can be a fully live session by the time the lock is
+/// ours. Re-read and re-check before destroying anything, and fence a
+/// pre-PID worker the same way `a forget` does, so a worker spawned but not
+/// yet registered cannot come up on top of a removed record.
+fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> {
+    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    let current = match read_session_record(paths, id) {
+        Ok(record) => record,
+        Err(_) if !paths.record(id).exists() => return Ok(ReapResult::Vanished),
+        Err(error) => return Err(error).with_context(|| format!("re-read session {id}")),
+    };
+    let Some(verdict) = reap_verdict(&current) else {
+        return Ok(ReapResult::Retained);
+    };
+    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
+        let lock_path = paths.worker_lock(current.id);
+        match FileLock::exclusive(&lock_path, true) {
+            Ok(lock) => Some(lock),
+            // Held: a worker exists for this record even though it has not
+            // registered a pid yet. Not ours to remove.
+            Err(_) => return Ok(ReapResult::Retained),
+        }
+    } else {
+        None
+    };
+    fs::remove_dir_all(paths.state_session(id))
+        .with_context(|| format!("remove stale session {id} durable state"))?;
+    let _ = fs::remove_dir_all(paths.runtime_session(id));
+    Ok(ReapResult::Removed {
+        containment_proven: verdict == ContainmentReap::Proven,
+    })
+}
+
+fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
+    let deadline = Instant::now() + PRUNE_TERMINATION_BUDGET;
+    let mut outcome = PruneOutcome {
+        removed: Vec::new(),
+        removed_without_containment_proof: Vec::new(),
+        retained_count: 0,
+    };
+    for record in list_records(paths)? {
+        let record = settle_terminating_record(paths, record, deadline);
+        if reap_verdict(&record).is_none() {
+            outcome.retained_count += 1;
             continue;
         }
-        remove_session_state(paths, record.id)
-            .with_context(|| format!("remove stale session {}", record.id))?;
-        removed.push(record.id);
+        match reap_session_state(paths, record.id)? {
+            ReapResult::Removed { containment_proven } => {
+                outcome.removed.push(record.id);
+                if !containment_proven {
+                    outcome.removed_without_containment_proof.push(record.id);
+                }
+            }
+            ReapResult::Retained => outcome.retained_count += 1,
+            ReapResult::Vanished => {}
+        }
+    }
+    Ok(outcome)
+}
+
+fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
+    let outcome = prune_dead_sessions(paths)?;
+    // Say plainly which reaps rested on "nothing left to hold on to" rather
+    // than on a worker's own proof that its containment domain was empty --
+    // the same distinction `a forget --force` reports, minus its scarier
+    // wording, which was never accurate for a record whose leader is also
+    // provably gone.
+    for id in &outcome.removed_without_containment_proof {
+        eprintln!(
+            "a: removed broken session {id} without a containment proof; its worker died without recording one and nothing addressable remained"
+        );
     }
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "removed": removed,
-                "retained_count": retained_count,
+                "removed": outcome.removed,
+                "removed_without_containment_proof": outcome.removed_without_containment_proof,
+                "retained_count": outcome.retained_count,
             }))?
         );
-    } else if removed.is_empty() {
+    } else if outcome.removed.is_empty() {
         println!("no dead sessions to prune");
     } else {
-        for id in &removed {
+        for id in &outcome.removed {
             println!("removed {id}");
         }
-        println!("removed {} session(s)", removed.len());
+        println!("removed {} session(s)", outcome.removed.len());
     }
     Ok(())
 }
@@ -1226,7 +1355,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
-        println!("state: {}", display_state(&current.phase, worker_alive));
+        println!("state: {}", observed_state(&current.phase, worker_alive));
         let ep = match &current.profile {
             Some(p) => format!("{}/{p}", current.engine),
             None => current.engine.clone(),
@@ -1517,11 +1646,7 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
             }
             remove_session_state(paths, record.id)
                 .with_context(|| format!("remove finished session {}", record.id))?;
-            eprintln!(
-                "a: removed {} session {}",
-                phase_name(&record.phase),
-                record.id
-            );
+            eprintln!("a: removed {} session {}", record.phase.name(), record.id);
         }
     }
     if json_output {
@@ -1569,6 +1694,16 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
 /// sessions retain an authoritative cgroup locator; every other broken
 /// session is preserved for manual investigation rather than reporting a
 /// false cleanup success.
+///
+/// That preservation is `a kill`'s rule and is unchanged. It is NOT a
+/// promise that the record survives forever: once the workload leader is
+/// also gone, `a prune` reaps such a record on the grounds that no
+/// programmatic handle to a survivor remains (see
+/// `aplexer::containment_reap_verdict`, and
+/// `tests/prune_dead_records.rs::prune_reaps_a_record_whose_setsid_descendant_escaped`,
+/// which pins the case where an escaped `setsid` descendant outlives the
+/// reap). `a kill` never does that: it still refuses, and still preserves
+/// both directories, because unlike prune it would be claiming a cleanup.
 fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
     let grace = kill_grace_duration(grace_ms)?;
     if record.containment_proven_empty() {
@@ -1812,7 +1947,7 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         if let Some(profile) = &record.profile {
             println!("profile: {profile}");
         }
-        println!("state: {}", phase_name(&record.phase));
+        println!("state: {}", record.phase.name());
     }
     Ok(())
 }
@@ -2031,6 +2166,7 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     match list_records(paths) {
         Ok(records) => {
             let record_count = records.len();
+            let mut reapable_count = 0usize;
             let broken: Vec<Value> = records
                 .into_iter()
                 .filter_map(|record| {
@@ -2045,25 +2181,49 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
                     if worker_alive && worker_reachable {
                         return None;
                     }
+                    // Recovery advice has to follow the same predicate prune
+                    // actually uses, or doctor sends the user at a command
+                    // that hard-fails. `a kill` on a broken unlimited record
+                    // exits 1 with "no authoritative containment locator",
+                    // and `a forget --force`'s "workload processes may
+                    // survive" warning is not what this needs -- for a
+                    // record prune can reap, `a prune` is the whole answer.
+                    let recovery = if reap_verdict(&record).is_some() {
+                        reapable_count += 1;
+                        json!({ "prune": "a prune" })
+                    } else {
+                        json!({
+                            "kill": format!("a kill {}", record.id),
+                            "forget": format!("a forget {} --force", record.id),
+                        })
+                    };
                     Some(json!({
                         "id": record.id,
                         "selector": record.selector(),
-                        "phase": phase_name(&record.phase),
+                        "phase": record.phase.name(),
+                        "state": record.observed_state(),
                         "worker_alive": worker_alive,
                         "worker_reachable": worker_reachable,
                         "rpc_error": rpc_error,
-                        "recovery": {
-                            "kill": format!("a kill {}", record.id),
-                            "forget": format!("a forget {} --force", record.id),
-                        },
+                        "recovery": recovery,
                     }))
                 })
                 .collect();
             let detail = if broken.is_empty() {
                 format!("{record_count} session record(s), none broken")
-            } else {
+            } else if reapable_count == broken.len() {
+                format!(
+                    "{} broken/stale session(s), all reapable; run `a prune`",
+                    broken.len()
+                )
+            } else if reapable_count == 0 {
                 format!(
                     "{} broken/stale session(s); run `a kill SESSION`, or if safe recovery is refused, `a forget SESSION --force`",
+                    broken.len()
+                )
+            } else {
+                format!(
+                    "{} broken/stale session(s); `a prune` removes {reapable_count} of them, for the rest run `a kill SESSION`, or if safe recovery is refused, `a forget SESSION --force`",
                     broken.len()
                 )
             };
@@ -2214,16 +2374,6 @@ fn path_check(name: &str, path: &Path) -> Value {
         Err(e) => json!({"name":name,"ok":false,"detail":format!("{}: {e}",path.display())}),
     }
 }
-fn phase_name(phase: &Phase) -> &'static str {
-    match phase {
-        Phase::Starting => "starting",
-        Phase::Running => "running",
-        Phase::Exiting => "exiting",
-        Phase::Exited => "exited",
-        Phase::Failed => "failed",
-    }
-}
-
 /// Attach/send/capture have no sensible action against a session with no
 /// live worker other than saying so plainly -- left to `connect()`, a
 /// terminal-phase session (worker gone, socket removed on its way out) or a
@@ -2260,7 +2410,7 @@ fn check_attachable(record: &SessionRecord) -> Result<()> {
         bail!(
             "session {}'s worker is not running (state: {}); run `a status` for details, `a kill` to reclaim it",
             record.id,
-            display_state(&record.phase, worker_alive)
+            observed_state(&record.phase, worker_alive)
         );
     }
     if !record.socket_path.exists() {
@@ -3243,7 +3393,7 @@ fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let state = display_state(&r.phase, r.worker_alive());
+            let state = observed_state(&r.phase, r.worker_alive());
             let mut part = format!("{}:{}", i + 1, r.tag);
             if r.id == record.id {
                 part.push('*');
@@ -3885,7 +4035,7 @@ fn workspace_summary_regions(
             text.push(' ');
         }
         let start = terminal_display_width(&text);
-        let state = display_state(&r.phase, r.worker_alive());
+        let state = observed_state(&r.phase, r.worker_alive());
         text.push_str(&format!("{}:{}", i + 1, sanitize_terminal_text(&r.tag)));
         if r.id == current_id {
             text.push('*');
@@ -5247,6 +5397,116 @@ mod switching_tests {
         dead_worker.socket_path = PathBuf::from("/does/not/matter");
         let err = check_attachable(&dead_worker).unwrap_err().to_string();
         assert!(err.contains("worker is not running"), "{err}");
+    }
+
+    /// A registry containing exactly one record, with its paths wired to
+    /// the throwaway state/runtime roots so `read_session_record`'s identity
+    /// checks accept it.
+    fn seeded_registry(
+        record: &mut SessionRecord,
+    ) -> (Paths, tempfile::TempDir, tempfile::TempDir) {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        record.socket_path = paths.socket(record.id);
+        record.history_path = paths.history(record.id);
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), record).unwrap();
+        (paths, state_dir, runtime_dir)
+    }
+
+    /// `worker_alive()` deliberately falls back to the bare pid check when
+    /// the worker identity sidecar cannot be read, so an unreadable sidecar
+    /// can never let prune delete a live worker's session. Prune must
+    /// inherit that conservatism instead of re-deriving liveness: while the
+    /// recorded pid exists and the sidecar is garbage, the record stays --
+    /// even though every other reap condition (non-terminal phase, dead
+    /// workload, no containment proof) is satisfied.
+    #[test]
+    fn prune_retains_a_record_whose_worker_identity_is_unreadable() {
+        let mut record = mk_record("/ws/uncertain", "main", Phase::Running);
+        // A real throwaway process standing in for the recorded worker,
+        // never this test process's own pid.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        record.worker_pid = Some(child.id());
+        record.workload_pid = None;
+        record.containment_empty = Some(false);
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut record);
+        // Unparseable, so read_worker_identity errors rather than returning
+        // None: the "we cannot tell" case, not the "legacy record" case.
+        fs::write(
+            paths.state_session(record.id).join("worker.identity.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let outcome = prune_dead_sessions(&paths).unwrap();
+        assert!(
+            outcome.removed.is_empty(),
+            "prune reaped a session whose worker liveness was unknown"
+        );
+        assert_eq!(outcome.retained_count, 1);
+        assert!(
+            paths.state_session(record.id).exists(),
+            "durable state was removed under an unreadable identity"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "prune must never signal anything"
+        );
+
+        // Same unreadable sidecar, worker genuinely gone: now it is reapable.
+        // Proves the retention above came from the liveness fallback and not
+        // from some blanket refusal to touch this record.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(record.worker_pid.unwrap()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let outcome = prune_dead_sessions(&paths).unwrap();
+        assert_eq!(outcome.removed, vec![record.id]);
+        assert_eq!(outcome.removed_without_containment_proof, vec![record.id]);
+        assert!(!paths.state_session(record.id).exists());
+    }
+
+    /// Prune no longer requires a terminal phase, so it can now see a
+    /// `Starting` record with no worker pid -- which is exactly what
+    /// `start_session` writes before its worker registers itself. That
+    /// worker holds the session's worker lock, so prune must fence on it
+    /// the same way `a forget` does rather than deleting a session that is
+    /// coming up.
+    #[test]
+    fn prune_fences_a_pre_pid_starting_record_against_its_worker_lock() {
+        let mut record = mk_record("/ws/starting", "main", Phase::Starting);
+        record.worker_pid = None;
+        record.workload_pid = None;
+        record.containment_empty = Some(false);
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut record);
+
+        let held = FileLock::exclusive(&paths.worker_lock(record.id), true).unwrap();
+        let outcome = prune_dead_sessions(&paths).unwrap();
+        assert!(
+            outcome.removed.is_empty(),
+            "prune removed a session whose worker still holds its lock"
+        );
+        assert_eq!(outcome.retained_count, 1);
+        assert!(paths.state_session(record.id).exists());
+
+        drop(held);
+        let outcome = prune_dead_sessions(&paths).unwrap();
+        assert_eq!(
+            outcome.removed,
+            vec![record.id],
+            "an unfenced pre-PID stub must still be reapable"
+        );
+        assert!(!paths.state_session(record.id).exists());
     }
 
     /// `a kill` against a record whose worker_pid is alive but whose control

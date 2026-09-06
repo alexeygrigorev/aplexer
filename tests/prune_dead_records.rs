@@ -1,0 +1,439 @@
+//! Product-path regressions for `a prune`.
+//!
+//! Reproduces the state reported on 2026-09-06: three ~10-day-old records
+//! whose workers had been killed without recording an exit sat at
+//! `phase: running, worker_alive: false` forever. `a status` already called
+//! them `broken`, but `a prune` retained all three (`{"removed": [],
+//! "retained_count": 3}`) because `worker_finished()` requires a terminal
+//! phase a crashed worker never gets to write. Only `a forget --force`
+//! could remove them, printing a "workload processes may survive" warning
+//! that was not true for any of them.
+//!
+//! The safety property those retained records were supposed to protect is
+//! tested here too: a record whose workload leader is still alive must
+//! survive prune, because prune deletes the last durable handle to it.
+//!
+//! Harness style follows tests/containment_recovery.rs (direct CLI, real
+//! sessions, real signals).
+
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+struct Harness {
+    runtime: TempDir,
+    state: TempDir,
+    config: PathBuf,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let runtime = TempDir::new().expect("runtime tempdir");
+        let state = TempDir::new().expect("state tempdir");
+        let config = state.path().join("config.toml");
+        Self {
+            runtime,
+            state,
+            config,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_a"))
+            .env("APLEXER_RUNTIME_DIR", self.runtime.path())
+            .env("APLEXER_STATE_DIR", self.state.path())
+            .env("APLEXER_CONFIG", &self.config)
+            .args(args)
+            .output()
+            .expect("run aplexer CLI")
+    }
+
+    fn run_ok(&self, args: &[&str]) -> Output {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "`a {}` failed (status {:?}): stdout={} stderr={}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn json(&self, args: &[&str]) -> Value {
+        let output = self.run_ok(args);
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "`a {}` did not print JSON ({error}): {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    }
+
+    /// A session whose workload is a plain long sleep -- long enough that
+    /// nothing in these tests can pass merely because it exited on its own.
+    /// Killing this session's worker takes the workload with it (the PTY
+    /// master closes and the leader takes the resulting SIGHUP), which is
+    /// exactly how the reported zombie records were produced.
+    fn start_sleeper(&self, workspace: &TempDir, tag: &str) -> Session {
+        self.start(workspace, tag, &["/bin/sleep", "300"])
+    }
+
+    /// A workload leader that deliberately survives its worker: it ignores
+    /// the SIGHUP the closing PTY delivers, so killing the worker leaves a
+    /// real orphaned process the record is the last handle to.
+    fn start_hup_proof_sleeper(&self, workspace: &TempDir, tag: &str) -> Session {
+        self.start(
+            workspace,
+            tag,
+            &["/bin/sh", "-c", "trap \"\" HUP TERM; sleep 300"],
+        )
+    }
+
+    /// A workload whose leader forks a `setsid` descendant -- a process
+    /// that escapes both the leader's process group and, once the worker
+    /// dies, the subreaper tree that was the session's only containment
+    /// boundary. The descendant writes its pid to `marker` so the test can
+    /// watch it directly.
+    fn start_setsid_escapee(&self, workspace: &TempDir, tag: &str, marker: &Path) -> Session {
+        self.start(
+            workspace,
+            tag,
+            &[
+                "/bin/sh",
+                "-c",
+                "/usr/bin/setsid /bin/sh -c 'trap \"\" HUP TERM; echo $$ > \"$1\"; sleep 900' \
+                 aplexer-descendant \"$1\" & wait",
+                "aplexer-leader",
+                marker.to_str().expect("UTF-8 marker path"),
+            ],
+        )
+    }
+
+    fn start(&self, workspace: &TempDir, tag: &str, command: &[&str]) -> Session {
+        let mut args = vec![
+            "--json",
+            "start",
+            "--workspace",
+            workspace.path().to_str().expect("UTF-8 workspace"),
+            "--tag",
+            tag,
+            "--",
+        ];
+        args.extend_from_slice(command);
+        let record = self.json(&args);
+        Session {
+            id: record["id"].as_str().expect("session id").to_string(),
+            worker_pid: record["worker_pid"].as_i64().expect("worker pid") as i32,
+            workload_pid: record["workload_pid"].as_i64().expect("workload pid") as i32,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Value> {
+        self.json(&["--json", "list"])
+            .as_array()
+            .expect("snapshot array")
+            .clone()
+    }
+
+    fn state_dir_exists(&self, id: &str) -> bool {
+        self.state.path().join("sessions").join(id).exists()
+    }
+}
+
+struct Session {
+    id: String,
+    worker_pid: i32,
+    workload_pid: i32,
+}
+
+/// Kills anything the test may have orphaned, so a failing assertion cannot
+/// leave a `sleep 300` behind on the box.
+struct ProcessCleanup(Vec<i32>);
+
+impl Drop for ProcessCleanup {
+    fn drop(&mut self) {
+        for pid in self.0.drain(..) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// SIGKILL a pid and wait for it to leave /proc. Tolerates a pid that is
+/// already gone: killing a worker often takes its workload with it, and the
+/// point of the call is the post-condition, not the signal.
+fn kill_and_wait(pid: i32) {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process_alive(pid), "pid {pid} did not die");
+}
+
+fn row<'a>(snapshot: &'a [Value], id: &str) -> Option<&'a Value> {
+    snapshot.iter().find(|row| row["id"] == id)
+}
+
+/// Reproduce the reported state: a worker SIGKILLed without recording an
+/// exit, and no workload left behind. `phase` stays at whatever the worker
+/// last wrote (`running`) forever, because a killed worker never gets to
+/// write a terminal one.
+fn make_zombie(harness: &Harness, workspace: &TempDir, tag: &str) -> Session {
+    let session = harness.start_sleeper(workspace, tag);
+    // Worker first, so it never gets to record an exit. Killing it closes
+    // the PTY, which usually takes the plain `sleep` leader with it; kill
+    // it explicitly anyway so both pids are provably absent from /proc.
+    kill_and_wait(session.worker_pid);
+    kill_and_wait(session.workload_pid);
+    let snapshot = harness.snapshot();
+    let listed = row(&snapshot, &session.id).expect("record still listed");
+    assert_eq!(
+        listed["phase"], "running",
+        "fixture no longer reproduces the reported stale phase: {listed}"
+    );
+    assert_eq!(
+        listed["worker_alive"], false,
+        "fixture no longer reproduces the reported dead worker: {listed}"
+    );
+    session
+}
+
+/// The reported bug: a record stuck at `phase: running` with both pids gone
+/// was structurally unreapable -- `a prune` returned `{"removed": [],
+/// "retained_count": N}` no matter how often it ran. Nothing about that
+/// state is recoverable and nothing survives it, so prune must reap it.
+#[test]
+fn prune_reaps_broken_record_whose_worker_and_workload_are_gone() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let session = make_zombie(&harness, &workspace, "zombie");
+
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([session.id]),
+        "broken record was not reaped: {pruned}"
+    );
+    assert_eq!(pruned["retained_count"], 0, "{pruned}");
+    // No worker ever proved its containment empty, so prune must say so
+    // rather than silently claiming a clean reap.
+    assert_eq!(
+        pruned["removed_without_containment_proof"],
+        serde_json::json!([session.id]),
+        "{pruned}"
+    );
+    assert!(
+        !harness.state_dir_exists(&session.id),
+        "durable state survived the reap"
+    );
+    assert!(harness.snapshot().is_empty(), "record still listed");
+}
+
+/// `a status` has always called this record `broken`; `a list --json` kept
+/// reporting `"phase": "running"` with no derived field at all, so a machine
+/// consumer (pocketshell's session tree) could not tell a zombie from a live
+/// session and rendered it as an attachable row.
+#[test]
+fn list_json_reports_the_same_state_as_status_for_a_broken_record() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let session = make_zombie(&harness, &workspace, "zombie");
+
+    let status = String::from_utf8_lossy(&harness.run_ok(&["status", &session.id]).stdout)
+        .lines()
+        .find(|line| line.starts_with("state: "))
+        .map(str::to_string)
+        .expect("status prints a state line");
+    assert_eq!(status, "state: broken", "status stopped saying broken");
+
+    let snapshot = harness.snapshot();
+    let listed = row(&snapshot, &session.id).expect("record still listed");
+    assert_eq!(
+        listed["state"], "broken",
+        "`a list --json` must not disagree with `a status` about liveness: {listed}"
+    );
+    // The persisted facts stay exactly as they were: `state` is derived on
+    // top of them, it does not rewrite them.
+    assert_eq!(listed["phase"], "running", "{listed}");
+    assert_eq!(listed["worker_alive"], false, "{listed}");
+}
+
+/// The safety property the old guard was protecting, and the reason
+/// `forget --force` exists: an orphaned workload leader is still running,
+/// and the record is the last durable handle to it. Prune must not touch it.
+#[test]
+fn prune_retains_broken_record_whose_workload_is_still_alive() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let session = harness.start_hup_proof_sleeper(&workspace, "orphan");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid]);
+
+    kill_and_wait(session.worker_pid);
+    assert!(
+        process_alive(session.workload_pid),
+        "fixture needs a surviving workload leader"
+    );
+
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([]),
+        "prune deleted the last handle to a live workload: {pruned}"
+    );
+    assert_eq!(pruned["retained_count"], 1, "{pruned}");
+    assert!(
+        harness.state_dir_exists(&session.id),
+        "durable evidence for a live workload was removed"
+    );
+    assert!(
+        process_alive(session.workload_pid),
+        "prune must never signal anything"
+    );
+}
+
+/// A healthy, live session is not prune's business at all.
+#[test]
+fn prune_retains_a_live_session() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let session = harness.start_sleeper(&workspace, "live");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid]);
+
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(pruned["removed"], serde_json::json!([]), "{pruned}");
+    assert_eq!(pruned["retained_count"], 1, "{pruned}");
+    assert!(harness.state_dir_exists(&session.id));
+    assert!(
+        process_alive(session.worker_pid) && process_alive(session.workload_pid),
+        "prune must never signal a live session"
+    );
+    let snapshot = harness.snapshot();
+    let listed = row(&snapshot, &session.id).expect("live record still listed");
+    assert_eq!(listed["state"], "running", "{listed}");
+    assert_eq!(listed["worker_alive"], true, "{listed}");
+}
+
+/// Second reported defect: `a kill` leaves the record behind at
+/// `phase: exited, worker_alive: true` while the worker winds down, so a
+/// caller that kills and then prunes (pocketshell's Stop) used to get
+/// `{"removed": [], "retained_count": N}` and a row that never went away.
+#[test]
+fn prune_immediately_after_kill_removes_the_record() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let session = harness.start_sleeper(&workspace, "stopped");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid]);
+
+    harness.run_ok(&["kill", &session.id]);
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([session.id]),
+        "kill-then-prune was a no-op: {pruned}"
+    );
+    assert_eq!(pruned["retained_count"], 0, "{pruned}");
+    // The worker got to finish its own lifecycle, so this reap is proven
+    // clean -- it must not be reported as an unproven one.
+    assert_eq!(
+        pruned["removed_without_containment_proof"],
+        serde_json::json!([]),
+        "{pruned}"
+    );
+    assert!(
+        !harness.state_dir_exists(&session.id),
+        "durable state survived the reap"
+    );
+    assert!(harness.snapshot().is_empty(), "stopped record still listed");
+}
+
+/// The invariant this change deliberately supersedes, pinned so it stays a
+/// decision rather than a surprise.
+///
+/// `a kill`/`a forget` preserve a broken unlimited session's evidence
+/// "for manual investigation rather than reporting a false cleanup success"
+/// (`recover_broken_containment`; asserted by
+/// `tests/containment_recovery.rs::kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant`).
+/// That rule is untouched for `a kill`, and it still holds under `a prune`
+/// while the workload leader is alive -- the state that sibling test builds,
+/// which the retention test above covers. Once the leader is gone too,
+/// `a prune` reaps: the escaped descendant outlives it, unsignalled, with no
+/// record left naming the session it came from. That is the accepted cost of
+/// making a permanently unreapable record reapable; the alternative was a row
+/// that only `a forget --force` could ever remove.
+#[test]
+fn prune_reaps_a_record_whose_setsid_descendant_escaped() {
+    assert!(Path::new("/usr/bin/setsid").is_file(), "setsid is required");
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let marker = harness.runtime.path().join("setsid-descendant-pid");
+    let session = harness.start_setsid_escapee(&workspace, "escapee", &marker);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let descendant: i32 = fs::read_to_string(&marker)
+        .expect("descendant marker")
+        .trim()
+        .parse()
+        .expect("descendant pid");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid, descendant]);
+
+    // Worker first (no exit recorded), then the leader. The `setsid`
+    // descendant survives both: it is in its own session and ignores HUP.
+    kill_and_wait(session.worker_pid);
+    kill_and_wait(session.workload_pid);
+    assert!(
+        process_alive(descendant),
+        "fixture needs an escaped descendant that outlived worker and leader"
+    );
+
+    // `a kill` still refuses this record -- it cannot prove any cleanup.
+    let killed = harness.run(&["kill", &session.id]);
+    assert!(
+        !killed.status.success(),
+        "a kill claimed a cleanup it cannot do"
+    );
+    assert!(
+        String::from_utf8_lossy(&killed.stderr).contains("no authoritative containment locator"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(
+        harness.state_dir_exists(&session.id),
+        "a kill must still preserve the evidence it refused to act on"
+    );
+
+    // `a prune` supersedes that preservation once nothing addressable is
+    // left, and reports the reap as unproven rather than claiming it clean.
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([session.id]),
+        "{pruned}"
+    );
+    assert_eq!(
+        pruned["removed_without_containment_proof"],
+        serde_json::json!([session.id]),
+        "an escaped descendant must never be reported as a proven-clean reap: {pruned}"
+    );
+    assert!(!harness.state_dir_exists(&session.id));
+    assert!(
+        process_alive(descendant),
+        "prune must never signal anything, including a descendant it is abandoning"
+    );
+}

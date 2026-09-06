@@ -459,6 +459,40 @@ pub enum Phase {
     Failed,
 }
 
+impl Phase {
+    /// The wire/display name, identical to this enum's serde representation.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Phase::Starting => "starting",
+            Phase::Running => "running",
+            Phase::Exiting => "exiting",
+            Phase::Exited => "exited",
+            Phase::Failed => "failed",
+        }
+    }
+}
+
+/// A persisted `phase` of Starting/Running/Exiting only means the worker
+/// *said* it was in that phase the last time it wrote its record -- if the
+/// worker process has since died (e.g. SIGKILL, which gives it no chance to
+/// update the record), that phase is stale. `phase` and worker liveness are
+/// different facts (spec.md 20: "session worker alive" vs "workload alive"
+/// vs "agent semantic state" are different facts), so this derives a third
+/// one from both instead of rewriting either: the persisted `phase` stays
+/// exactly what the worker wrote, and `worker_alive` stays the live probe.
+///
+/// Both `a status`'s `state:` line and every `a list --json`/`a snapshot`
+/// row's `state` field come from here, so the two commands cannot disagree
+/// about whether a session is broken -- the disagreement that let a machine
+/// consumer read a zombie record as an ordinary running session.
+pub fn observed_state(phase: &Phase, worker_alive: bool) -> &'static str {
+    if matches!(phase, Phase::Starting | Phase::Running | Phase::Exiting) && !worker_alive {
+        "broken"
+    } else {
+        phase.name()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitInfo {
     pub code: Option<i32>,
@@ -645,6 +679,156 @@ impl SessionRecord {
     pub fn worker_finished(&self) -> bool {
         matches!(self.phase, Phase::Exited | Phase::Failed) && !self.worker_alive()
     }
+
+    /// Whether the recorded workload leader is still in `/proc`. A record
+    /// with no leader pid never had one recorded; that is not a liveness
+    /// claim either way, only the absence of this particular handle.
+    pub fn workload_leader_alive(&self) -> bool {
+        self.workload_pid.map(process_alive).unwrap_or(false)
+    }
+
+    /// Whether the record itself says the session is on its way out, so a
+    /// caller waiting for the worker to disappear is waiting for something
+    /// that is actually going to happen. Either the worker wrote a
+    /// terminal/exiting phase, or the workload leader it was supervising is
+    /// already gone (the worker exits shortly after its workload does, and
+    /// it may not have updated the phase yet -- the exact window that made
+    /// `a kill` followed by `a prune` a no-op).
+    pub fn worker_is_terminating(&self) -> bool {
+        matches!(self.phase, Phase::Exiting | Phase::Exited | Phase::Failed)
+            || (self.workload_pid.is_some() && !self.workload_leader_alive())
+    }
+
+    /// The derived liveness state, identical to `a status`'s `state:` line.
+    pub fn observed_state(&self) -> &'static str {
+        observed_state(&self.phase, self.worker_alive())
+    }
+}
+
+/// What removing a record's durable state would cost, containment-wise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainmentReap {
+    /// Nothing survives this session: either the worker durably proved its
+    /// containment domain empty, or the domain was observed empty just now.
+    Proven,
+    /// No proof either way, but the record holds no handle to whatever might
+    /// have survived, so keeping it protects nothing.
+    NoRemainingHandle,
+    /// Something may still be inside the containment domain AND this record
+    /// is how it can still be reached. Keep it.
+    Retain,
+}
+
+/// Decide whether prune may drop this record's durable state.
+///
+/// `containment_proven_empty()` alone is the wrong predicate for a broken
+/// record: a worker that was SIGKILLed never wrote `containment_empty`, and
+/// the legacy `exit.is_some()` fallback is false for exactly the same
+/// reason, so a crashed session can never satisfy it no matter how long it
+/// sits there. The question that actually matters is not "did somebody once
+/// prove this empty" but "would removing this record lose the last handle to
+/// a process that might still be running":
+///
+/// * durable proof -- trust it, unchanged;
+/// * a recorded cgroup -- ask the kernel *now*. That is strictly stronger
+///   evidence than the persisted bit, and it is also the handle at risk: a
+///   populated (or unreadable, or unvalidatable) domain must keep its
+///   locator, so anything short of an observed-empty answer retains;
+/// * no recorded cgroup -- an unlimited session's only containment boundary
+///   was its worker's subreaper tree, which died with the worker. A `setsid`
+///   descendant may have escaped, and the record retains no *programmatic*
+///   handle to it: `a kill` refuses such a record ("no authoritative
+///   containment locator"), and the leader pid, if any, is already gone.
+///   What the record does still hold is a manual-investigation trail --
+///   `command`, `cwd`, `workspace`, the persisted transcript -- and reaping
+///   it drops that trail. That is a deliberate trade, not an oversight: the
+///   alternative is a record no command can ever remove except
+///   `a forget --force`, whose "workload processes may survive" warning is
+///   itself misleading here, sitting in `a list` forever (issue: three such
+///   records, 234-254h old, on the maintainer's box). So it is reapable, and
+///   the caller reports it as an unproven reap rather than pretending the
+///   domain was clean.
+///
+/// ## Supersedes: `recover_broken_containment`'s preservation rule
+///
+/// `a kill`/`a forget` deliberately preserve a broken unlimited session's
+/// durable and runtime evidence "for manual investigation rather than
+/// reporting a false cleanup success"
+/// (`a.rs::recover_broken_containment`, and
+/// `tests/containment_recovery.rs::kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant`,
+/// which asserts exactly that). That rule is unchanged for `a kill` -- it
+/// still refuses, and still preserves both directories, because it would be
+/// claiming a cleanup it cannot perform.
+///
+/// `a prune` now supersedes it. The state that sibling test builds is, once
+/// its worker is killed, precisely the class reaped here: closing the PTY
+/// kills the leader `sh` with SIGHUP, leaving only the `setsid` descendant
+/// that traps it. Running prune there removes both directories and the
+/// descendant outlives the reap, unsignalled, with no record left naming the
+/// session it came from -- measured, not inferred, and pinned end to end by
+/// `tests/prune_dead_records.rs::prune_reaps_a_record_whose_setsid_descendant_escaped`.
+/// The trade is deliberate: the alternative is a record that no routine
+/// command can ever remove, which is the bug this exists to fix.
+///
+/// Caller-side guards, deliberately NOT folded in here: a live worker and a
+/// live workload leader are checked separately and always retain.
+pub fn containment_reap_verdict(record: &SessionRecord) -> ContainmentReap {
+    containment_reap_verdict_with(record, recorded_cgroup_observed_empty)
+}
+
+/// The decision table, with the kernel probe injected so every arm --
+/// including `Ok(false) => Retain`, the one arm standing between prune and a
+/// live containment domain -- is pinned by an ordinary unit test on any
+/// machine, not only one with cgroup-v2 delegation. The real probe is
+/// covered separately against a real cgroup (see
+/// `recorded_cgroup_observed_empty_tracks_a_real_delegated_cgroup`).
+fn containment_reap_verdict_with(
+    record: &SessionRecord,
+    probe: impl FnOnce(Uuid, &Path, Option<&CgroupIdentity>) -> Result<bool>,
+) -> ContainmentReap {
+    if record.containment_proven_empty() {
+        return ContainmentReap::Proven;
+    }
+    let Some(locator) = record.containment_cgroup.as_deref() else {
+        return ContainmentReap::NoRemainingHandle;
+    };
+    match probe(
+        record.id,
+        locator,
+        record.containment_cgroup_identity.as_ref(),
+    ) {
+        Ok(true) => ContainmentReap::Proven,
+        // Populated, or any inspection/validation error: fail closed and keep
+        // the locator, exactly like `recover_broken_containment`'s preflight.
+        Ok(false) | Err(_) => ContainmentReap::Retain,
+    }
+}
+
+/// Read-only membership check for a durably recorded cgroup. Signals
+/// nothing and removes nothing.
+fn recorded_cgroup_observed_empty(
+    id: Uuid,
+    locator: &Path,
+    identity: Option<&CgroupIdentity>,
+) -> Result<bool> {
+    // A cgroup recorded under a different boot cannot hold a live process:
+    // the hierarchy is rebuilt empty at boot, so both the domain and every
+    // task that was in it are gone. Checked before validate_recorded_cgroup,
+    // which (correctly, for destructive recovery) refuses to act at all on a
+    // foreign-boot identity and would otherwise make a rebooted-away record
+    // permanently unreapable.
+    if let Some(identity) = identity {
+        if identity.boot_id != linux_boot_id()? {
+            return Ok(true);
+        }
+    }
+    let Some(path) = validate_recorded_cgroup(id, locator, identity)? else {
+        // The directory is gone. cgroup v2 cannot remove a populated cgroup,
+        // so a locator that was durably recorded and has since disappeared
+        // is empty by construction.
+        return Ok(true);
+    };
+    Ok(!cgroup_path_populated(&path)?)
 }
 
 pub fn read_record(path: &Path) -> Result<SessionRecord> {
@@ -4505,6 +4689,319 @@ mod tests {
             history_path: state_dir.join("history.bin"),
             exit: None,
             error: None,
+        }
+    }
+
+    /// The two proof shapes that short-circuit before the kernel is ever
+    /// consulted, and the no-locator shape that is the reported zombie.
+    #[test]
+    fn containment_reap_verdict_reads_durable_proof_without_probing() {
+        let state = tempfile::tempdir().unwrap();
+        let base = liveness_record(state.path());
+        let refuse = |_: Uuid, _: &Path, _: Option<&CgroupIdentity>| -> Result<bool> {
+            panic!("probe must not run when the record already answers the question")
+        };
+
+        let mut proven = base.clone();
+        proven.containment_empty = Some(true);
+        assert_eq!(
+            containment_reap_verdict_with(&proven, refuse),
+            ContainmentReap::Proven,
+            "a worker's own durable proof must still be trusted"
+        );
+
+        let mut legacy_exit = base.clone();
+        legacy_exit.containment_empty = None;
+        legacy_exit.exit = Some(ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 2,
+        });
+        assert_eq!(
+            containment_reap_verdict_with(&legacy_exit, refuse),
+            ContainmentReap::Proven,
+            "the legacy pre-field ExitInfo proof must still be trusted"
+        );
+
+        // The reported zombie shape: unlimited session, worker SIGKILLed
+        // before it could prove anything. No locator, so nothing to probe.
+        let unlimited = base.clone();
+        assert_eq!(unlimited.containment_cgroup, None);
+        assert_eq!(unlimited.containment_empty, Some(false));
+        assert_eq!(
+            containment_reap_verdict_with(&unlimited, refuse),
+            ContainmentReap::NoRemainingHandle
+        );
+    }
+
+    /// Every outcome the kernel probe can return, including the one arm that
+    /// stands between `a prune` and deleting the last handle to a live
+    /// containment domain: a locator that validates and is still POPULATED
+    /// must retain. Injected rather than staged on a real cgroup so this
+    /// runs everywhere, on every `cargo test`, with no delegation needed;
+    /// `recorded_cgroup_observed_empty_tracks_a_real_delegated_cgroup`
+    /// covers the probe itself against a real one.
+    #[test]
+    fn containment_reap_verdict_maps_every_cgroup_probe_outcome() {
+        let state = tempfile::tempdir().unwrap();
+        let mut record = liveness_record(state.path());
+        record.containment_empty = Some(false);
+        record.containment_cgroup = Some(PathBuf::from(format!(
+            "{CGROUP_V2_ROOT}/aplexer-workload-{}.scope",
+            record.id
+        )));
+
+        assert_eq!(
+            containment_reap_verdict_with(&record, |_, _, _| Ok(true)),
+            ContainmentReap::Proven,
+            "an observed-empty domain is proof at least as strong as the persisted bit"
+        );
+        assert_eq!(
+            containment_reap_verdict_with(&record, |_, _, _| Ok(false)),
+            ContainmentReap::Retain,
+            "a populated containment domain must keep its locator"
+        );
+        assert_eq!(
+            containment_reap_verdict_with(&record, |_, _, _| bail!("cgroup inspection failed")),
+            ContainmentReap::Retain,
+            "an unreadable containment domain must fail closed"
+        );
+
+        // The probe is handed the record's own identity triple -- a mixed-up
+        // locator would validate against the wrong domain.
+        let mut seen = None;
+        containment_reap_verdict_with(&record, |id, locator, identity| {
+            seen = Some((id, locator.to_path_buf(), identity.cloned()));
+            Ok(false)
+        });
+        let (id, locator, identity) = seen.expect("probe ran");
+        assert_eq!(id, record.id);
+        assert_eq!(Some(locator), record.containment_cgroup);
+        assert!(identity.is_none());
+    }
+
+    /// A recorded cgroup with no identity cannot be validated, so it cannot
+    /// be declared empty either -- keep the locator.
+    #[test]
+    fn containment_reap_verdict_retains_an_unvalidatable_locator() {
+        let state = tempfile::tempdir().unwrap();
+        let mut record = liveness_record(state.path());
+        record.containment_cgroup = Some(PathBuf::from(format!(
+            "{CGROUP_V2_ROOT}/aplexer-workload-{}.scope",
+            record.id
+        )));
+        assert!(record.containment_cgroup_identity.is_none());
+        assert_eq!(
+            containment_reap_verdict(&record),
+            ContainmentReap::Retain,
+            "an unvalidatable containment locator must fail closed"
+        );
+    }
+
+    /// A cgroup recorded under a different boot cannot hold a live process:
+    /// the hierarchy and every task in it ceased to exist at reboot. Without
+    /// this, `validate_recorded_cgroup`'s (correct, for destructive
+    /// recovery) refusal to touch a foreign-boot identity would make a
+    /// rebooted-away record permanently unreapable.
+    #[test]
+    fn containment_reap_verdict_treats_a_previous_boot_as_empty() {
+        let state = tempfile::tempdir().unwrap();
+        let mut record = liveness_record(state.path());
+        record.containment_cgroup = Some(PathBuf::from(format!(
+            "{CGROUP_V2_ROOT}/aplexer-workload-{}.scope",
+            record.id
+        )));
+        let mut identity = current_cgroup_identity().unwrap_or(CgroupIdentity {
+            boot_id: String::new(),
+            cgroup_namespace_device: 0,
+            cgroup_namespace_inode: 0,
+            mount_namespace_device: 0,
+            mount_namespace_inode: 0,
+            cgroup_mount_id: 0,
+            cgroup_root_device: 0,
+            cgroup_root_inode: 0,
+        });
+        identity.boot_id = "00000000-0000-0000-0000-000000000000".into();
+        assert_ne!(identity.boot_id, linux_boot_id().unwrap());
+        record.containment_cgroup_identity = Some(identity);
+        assert_eq!(
+            containment_reap_verdict(&record),
+            ContainmentReap::Proven,
+            "a cgroup from a previous boot cannot hold a live process"
+        );
+    }
+
+    /// The membership half of the real probe, without needing a real
+    /// cgroup: `cgroup.events` says `populated 1` while tasks remain, and a
+    /// collected cgroup loses the file entirely (ENOENT means empty).
+    #[test]
+    fn cgroup_path_populated_reads_the_kernel_counter_and_treats_enoent_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !cgroup_path_populated(dir.path()).unwrap(),
+            "a collected cgroup (no cgroup.events) is empty, not an error"
+        );
+        fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(cgroup_path_populated(dir.path()).unwrap());
+        fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!cgroup_path_populated(dir.path()).unwrap());
+        fs::write(dir.path().join("cgroup.events"), "frozen 0\n").unwrap();
+        assert!(
+            cgroup_path_populated(dir.path()).is_err(),
+            "a cgroup.events with no populated key must fail closed, not read as empty"
+        );
+    }
+
+    /// A cgroup created inside the caller's own delegated subtree, named
+    /// exactly the way a real session's containment scope is named, so
+    /// `validate_recorded_cgroup`'s full chain (locator shape, cgroup-v2
+    /// filesystem, mount device, identity triple) runs for real. Returns
+    /// None when the environment has no writable cgroup-v2 parent.
+    struct DelegatedCgroup {
+        path: PathBuf,
+        members: Vec<std::process::Child>,
+    }
+
+    impl DelegatedCgroup {
+        fn create(id: Uuid) -> Option<Self> {
+            let own = fs::read_to_string("/proc/self/cgroup").ok()?;
+            let relative = own
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))?
+                .trim()
+                .trim_start_matches('/')
+                .to_string();
+            let mut candidate = Path::new(CGROUP_V2_ROOT).join(&relative);
+            let leaf = format!("aplexer-workload-{id}.scope");
+            // Walk up until a parent accepts a new child cgroup: the leaf a
+            // test process sits in is usually not delegated, its user@.service
+            // ancestor is.
+            loop {
+                let path = candidate.join(&leaf);
+                if fs::create_dir(&path).is_ok() {
+                    return Some(Self {
+                        path,
+                        members: Vec::new(),
+                    });
+                }
+                candidate = candidate.parent()?.to_path_buf();
+                if !candidate.starts_with(CGROUP_V2_ROOT) || candidate == Path::new(CGROUP_V2_ROOT)
+                {
+                    return None;
+                }
+            }
+        }
+
+        fn populate(&mut self) -> u32 {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn cgroup member");
+            let pid = child.id();
+            self.members.push(child);
+            fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
+                .expect("move member into the delegated cgroup");
+            pid
+        }
+
+        /// Stop every member and reap it, so the cgroup can be collected and
+        /// no `sleep` outlives the test.
+        fn drain_members(&mut self) {
+            for mut member in self.members.drain(..) {
+                let _ = member.kill();
+                let _ = member.wait();
+            }
+        }
+    }
+
+    impl Drop for DelegatedCgroup {
+        fn drop(&mut self) {
+            self.drain_members();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.path.exists() && Instant::now() < deadline {
+                if fs::remove_dir(&self.path).is_ok() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// The real kernel probe, end to end, against a genuinely delegated
+    /// cgroup: empty, then POPULATED (the arm that must retain), then empty
+    /// again, then collected. `#[ignore]`d for the same reason
+    /// `tests/oom_isolation.rs`'s destructive tests are -- it needs a
+    /// cgroup-v2 tree with delegation to the running user, which a CI
+    /// container generally lacks. Run it explicitly:
+    ///
+    ///   cargo test --lib recorded_cgroup_observed_empty -- --ignored --nocapture
+    ///
+    /// The decision arms it feeds are pinned unconditionally by
+    /// `containment_reap_verdict_maps_every_cgroup_probe_outcome`, and the
+    /// membership read by
+    /// `cgroup_path_populated_reads_the_kernel_counter_and_treats_enoent_as_empty`;
+    /// this test is what proves those two meet reality.
+    #[test]
+    #[ignore = "needs cgroup-v2 delegation to the running user; run explicitly"]
+    fn recorded_cgroup_observed_empty_tracks_a_real_delegated_cgroup() {
+        let state = tempfile::tempdir().unwrap();
+        let mut record = liveness_record(state.path());
+        record.containment_empty = Some(false);
+        let mut cgroup = DelegatedCgroup::create(record.id)
+            .expect("this environment has no writable cgroup-v2 parent");
+        record.containment_cgroup = Some(cgroup.path.clone());
+        record.containment_cgroup_identity = Some(current_cgroup_identity().unwrap());
+        let probe = || {
+            recorded_cgroup_observed_empty(
+                record.id,
+                record.containment_cgroup.as_deref().unwrap(),
+                record.containment_cgroup_identity.as_ref(),
+            )
+            .unwrap()
+        };
+
+        assert!(probe(), "a freshly created cgroup is empty");
+        assert_eq!(containment_reap_verdict(&record), ContainmentReap::Proven);
+
+        let pid = cgroup.populate();
+        assert!(
+            !probe(),
+            "a cgroup holding a live process must not read as empty"
+        );
+        assert_eq!(
+            containment_reap_verdict(&record),
+            ContainmentReap::Retain,
+            "prune must keep the locator of a populated containment domain"
+        );
+        assert!(process_alive(pid), "probing must not signal anything");
+
+        cgroup.drain_members();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !probe() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(probe(), "an emptied cgroup must read as empty again");
+        assert_eq!(containment_reap_verdict(&record), ContainmentReap::Proven);
+
+        // Collected: cgroup v2 cannot remove a populated cgroup, so a
+        // durably recorded locator that has since disappeared is empty by
+        // construction.
+        fs::remove_dir(&cgroup.path).expect("remove the now-empty cgroup");
+        assert!(probe(), "a collected cgroup is empty by construction");
+        assert_eq!(containment_reap_verdict(&record), ContainmentReap::Proven);
+    }
+
+    /// `state` is derived from both facts and rewrites neither.
+    #[test]
+    fn observed_state_reports_broken_only_for_a_contradicted_phase() {
+        for phase in [Phase::Starting, Phase::Running, Phase::Exiting] {
+            assert_eq!(observed_state(&phase, false), "broken");
+            assert_eq!(observed_state(&phase, true), phase.name());
+        }
+        for phase in [Phase::Exited, Phase::Failed] {
+            assert_eq!(observed_state(&phase, false), phase.name());
+            assert_eq!(observed_state(&phase, true), phase.name());
         }
     }
 

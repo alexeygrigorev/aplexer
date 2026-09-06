@@ -49,8 +49,13 @@ fn stale_running_record(paths: &Paths) -> SessionRecord {
     }
 }
 
+/// A stale record with no live worker and no live workload is exactly what
+/// `a prune` now reaps, so that is the command doctor must name. It used to
+/// print `a kill SESSION` (which exits 1 on this record: "no authoritative
+/// containment locator") with `a forget --force` as the fallback, whose
+/// "workload processes may survive" warning is not true here either.
 #[test]
-fn doctor_reports_stale_active_records_with_recovery_commands() {
+fn doctor_points_a_reapable_stale_record_at_prune() {
     let temp = TempDir::new().unwrap();
     let paths = test_paths(&temp);
     let record = stale_running_record(&paths);
@@ -83,13 +88,88 @@ fn doctor_reports_stale_active_records_with_recovery_commands() {
     assert!(sessions["broken_sessions"][0]["rpc_error"]
         .as_str()
         .is_some_and(|error| error.contains("connect")));
+    assert_eq!(sessions["broken_sessions"][0]["state"], "broken");
     assert_eq!(
-        sessions["broken_sessions"][0]["recovery"]["kill"],
-        format!("a kill {}", record.id)
+        sessions["broken_sessions"][0]["recovery"]["prune"],
+        "a prune"
     );
+    assert!(
+        sessions["broken_sessions"][0]["recovery"]["kill"].is_null(),
+        "doctor still suggests `a kill`, which hard-fails on this record"
+    );
+    assert!(
+        sessions["broken_sessions"][0]["recovery"]["forget"].is_null(),
+        "doctor still suggests the --force escape hatch this record does not need"
+    );
+    assert!(
+        sessions["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("a prune")),
+        "human advice must name prune too: {}",
+        sessions["detail"]
+    );
+
+    // And the advice is honest: running it removes the record.
+    let pruned = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "prune"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+    assert!(pruned.status.success(), "{pruned:?}");
+    let pruned: Value = serde_json::from_slice(&pruned.stdout).unwrap();
     assert_eq!(
-        sessions["broken_sessions"][0]["recovery"]["forget"],
+        pruned["removed"],
+        serde_json::json!([record.id.to_string()]),
+        "doctor advised a command that does nothing: {pruned}"
+    );
+}
+
+/// The counterpart: a broken record whose workload leader is still running
+/// is NOT reapable, so the kill/forget advice stays exactly as it was.
+#[test]
+fn doctor_keeps_kill_and_forget_advice_for_a_record_prune_retains() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut record = stale_running_record(&paths);
+    // This test process stands in for a workload leader that outlived its
+    // worker: prune must retain the record, so doctor must not say `prune`.
+    record.workload_pid = Some(std::process::id());
+    std::fs::create_dir_all(paths.state_session(record.id)).unwrap();
+    atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .unwrap();
+    let broken = &sessions["broken_sessions"][0];
+    assert_eq!(broken["id"], record.id.to_string());
+    assert_eq!(broken["recovery"]["kill"], format!("a kill {}", record.id));
+    assert_eq!(
+        broken["recovery"]["forget"],
         format!("a forget {} --force", record.id)
+    );
+    assert!(
+        broken["recovery"]["prune"].is_null(),
+        "doctor advised prune for a record prune will not touch"
+    );
+    assert!(
+        sessions["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.contains("a prune")),
+        "human advice must not name prune here: {}",
+        sessions["detail"]
     );
 }
 

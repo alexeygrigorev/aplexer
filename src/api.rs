@@ -1223,7 +1223,14 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
     let mut enriched = Vec::with_capacity(records.len());
     for record in &records {
         let mut value = serde_json::to_value(public_session_record(record))?;
-        value["worker_alive"] = json!(record.worker_alive());
+        let worker_alive = record.worker_alive();
+        value["worker_alive"] = json!(worker_alive);
+        // The derived liveness fact, identical to `a status`'s `state:`
+        // line (see `observed_state`). Machine consumers were previously
+        // handed only the persisted `phase`, which a killed worker leaves
+        // at "running" forever, so a zombie record was indistinguishable
+        // from a live session on the wire.
+        value["state"] = json!(crate::observed_state(&record.phase, worker_alive));
         enriched.push(value);
     }
     Ok(Value::Array(enriched))

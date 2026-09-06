@@ -1065,10 +1065,18 @@ Representative element (additional persisted fields may also be present):
     "workload_pid": 12352,
     "socket_path": "/run/user/1000/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/control.sock",
     "history_path": "/home/alexey/.local/state/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/history.bin",
-    "worker_alive": true
+    "worker_alive": true,
+    "state": "running"
   }
 ]
 ```
+
+`phase` is the persisted fact -- whatever the worker last wrote. `state` is
+the derived one, and is the same value `a status` prints: `broken` whenever a
+non-terminal `phase` is contradicted by a dead worker, and the `phase` itself
+otherwise. A machine consumer deciding whether a session is attachable must
+read `state` (or `phase` together with `worker_alive`), because a worker
+killed without recording an exit leaves `phase` at `running` forever.
 
 The schema must support deterministic reverse lookups by:
 
@@ -1699,6 +1707,41 @@ broken worker
 ```
 
 Never treat an enumeration failure as “all sessions are gone”.
+
+### 32.1 Removing a dead record: kill, prune, forget
+
+Three commands remove session records, and they differ by what they are
+willing to claim:
+
+- `a kill SESSION` acts. It signals the workload, and removes the record only
+  when it can prove the containment domain is empty. For a broken unlimited
+  session it refuses ("no authoritative containment locator") and preserves
+  both the durable and runtime directories rather than report a cleanup it
+  did not perform.
+- `a prune` claims nothing and signals nothing. It removes a record only when
+  the worker is gone, the workload leader is gone, and containment holds no
+  remaining handle: either proven empty (by the worker, or by reading the
+  recorded cgroup now), or there is no recorded cgroup at all, so nothing the
+  record names could still be acted on. A terminal `phase` is deliberately
+  NOT required -- a worker killed with SIGKILL never writes one, and
+  requiring it made such records unreapable forever.
+- `a forget SESSION --force` is the explicit override for everything else:
+  the workload may still be running and the operator says remove it anyway.
+
+Because prune does not require a terminal phase, it supersedes `a kill`'s
+preservation rule for one class: an unlimited session whose worker and
+workload leader are both gone but whose `setsid` descendant escaped. Prune
+removes that record; the descendant keeps running, unsignalled, and the
+manual-investigation trail (`command`, `cwd`, `workspace`, transcript) goes
+with the record. That is a deliberate trade against a record no routine
+command could ever remove. Prune reports it: such ids are listed under
+`removed_without_containment_proof` in `a prune --json`, separately from the
+proven-clean reaps, and each gets a line on stderr.
+
+`a prune` may block for up to five seconds in total while it waits for
+workers whose own record says they are already terminating -- `a kill`
+returns before its worker has finished exiting, and without that wait a
+kill-then-prune sequence removes nothing.
 
 ---
 
