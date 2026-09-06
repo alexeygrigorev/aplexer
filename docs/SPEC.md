@@ -1072,7 +1072,9 @@ Representative element (additional persisted fields may also be present):
 ```
 
 `phase` is the persisted fact -- whatever the worker last wrote. `state` is
-the derived one, and is the same value `a status` prints: `broken` whenever a
+the derived one, and is the same value `a status` prints -- in its human
+output and in `a status --json`, which carries `state` alongside
+`worker_alive` for exactly this reason: `broken` whenever a
 non-terminal `phase` is contradicted by a dead worker, and the `phase` itself
 otherwise. A machine consumer deciding whether a session is attachable must
 read `state` (or `phase` together with `worker_alive`), because a worker

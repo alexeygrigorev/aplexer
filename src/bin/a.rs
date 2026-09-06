@@ -1347,6 +1347,14 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
             value["record_persistence_error"] = json!(error);
         }
         value["worker_alive"] = json!(worker_alive);
+        // The same derived fact the human branch prints as `state:` and
+        // every `a list --json`/`a snapshot` row carries, from the same
+        // helper so the three can never disagree: a SIGKILLed worker
+        // leaves `phase` at "running" forever, so a machine consumer of
+        // `status` reading `phase` alone could not tell a zombie record
+        // from a live session -- while the same command was telling a
+        // human "broken".
+        value["state"] = json!(observed_state(&current.phase, worker_alive));
         value["worker_reachable"] = json!(worker_reachable);
         if let Some(error) = &rpc_error {
             value["rpc_error"] = json!(error);
