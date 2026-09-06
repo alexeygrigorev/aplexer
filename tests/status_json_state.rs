@@ -289,12 +289,16 @@ fn status_json_agrees_with_list_json_and_human_output_for_a_live_record() {
 }
 
 /// Additive-only wire check: every key the released CLI put on the wire for
-/// this fixture is still there, and `state` is the only thing added. The
-/// baseline is the released binary's real output (see
+/// this fixture is still there, and the only things added are the two
+/// query-time derived fields -- `state` (liveness, see `observed_state`) and
+/// `agent` (which agent is live in the workload's process tree,
+/// pocketshell issue #2580). The baseline is the released binary's real output (see
 /// `BASELINE_STATUS_JSON_KEYS`), so this fails on a removed or renamed key
-/// even though nothing in the source says "these keys are load-bearing".
+/// even though nothing in the source says "these keys are load-bearing", and
+/// it fails again the moment a THIRD field appears without a deliberate
+/// decision to widen the wire.
 #[test]
-fn status_json_adds_state_and_removes_nothing() {
+fn status_json_adds_only_the_derived_state_and_agent_fields() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");
     let session = broken_session(&harness, &workspace, "zombie");
@@ -319,7 +323,7 @@ fn status_json_adds_state_and_removes_nothing() {
     let added: Vec<&String> = observed.difference(&baseline).collect();
     assert_eq!(
         added,
-        vec!["state"],
-        "`a status --json` changed its wire shape by more than the additive `state` field"
+        vec!["agent", "state"],
+        "`a status --json` changed its wire shape by more than the additive `agent`/`state` fields"
     );
 }

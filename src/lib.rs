@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod agent_events;
+pub mod agent_kind;
 pub mod api;
 pub mod messaging;
 pub mod screen;

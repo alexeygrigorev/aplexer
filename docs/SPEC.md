@@ -1066,7 +1066,8 @@ Representative element (additional persisted fields may also be present):
     "socket_path": "/run/user/1000/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/control.sock",
     "history_path": "/home/alexey/.local/state/aplexer/sessions/7f3e8a82-4438-4fd5-bbb8-e3b0c66e7716/history.bin",
     "worker_alive": true,
-    "state": "running"
+    "state": "running",
+    "agent": "claude"
   }
 ]
 ```
@@ -1079,6 +1080,31 @@ non-terminal `phase` is contradicted by a dead worker, and the `phase` itself
 otherwise. A machine consumer deciding whether a session is attachable must
 read `state` (or `phase` together with `worker_alive`), because a worker
 killed without recording an exit leaves `phase` at `running` forever.
+
+`agent` names the coding agent aplexer can see running inside the session
+right now: `claude`, `codex`, `opencode`, `grok`, or `null`. Like `state` it
+is derived rather than persisted, and it is present on every `a list --json`
+/ `a snapshot` row and in `a status --json`, so the commands cannot disagree.
+At query time aplexer walks the workload's descendant process tree
+(`workload_pid` plus `/proc/<pid>/task/*/children` -- the same walk
+containment uses) breadth-first and classifies each process's `comm` and
+`cmdline` by whole-word command token, so a bare `codex` and a node-wrapped
+`node /…/bin/codex` both name codex while `codex-helper` inside an unrelated
+path does not.
+
+This field exists because `engine` cannot answer the question. The normal
+PocketShell session is `engine: "shell"` with an agent started by hand
+inside it, so the only authority on "which agent is in here" is the live
+process tree. Three consequences are deliberate:
+
+- The key is always present, so a consumer reads it unconditionally. `null`
+  means no recognisable agent is running -- including a shell session whose
+  agent has just exited.
+- Nothing is written to disk. A session record has no `agent` field, so the
+  value can never go stale, and the worker's hot path never pays for it.
+- A record with a terminal `phase` is never probed. Its `workload_pid` names
+  a process that is gone, and a recycled numeric pid must not resurrect an
+  agent for a dead session.
 
 The schema must support deterministic reverse lookups by:
 

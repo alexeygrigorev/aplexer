@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::agent_kind::{detect_agent, AgentKind, DEFAULT_PROC_ROOT};
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json,
@@ -1216,6 +1217,25 @@ pub fn launch_spec_json(
     }))
 }
 
+/// Which agent is running inside `record`'s workload process tree right now
+/// (see `crate::agent_kind`), or `None` when nothing recognisable is there.
+///
+/// Detection is query-time only and never persisted: the record on disk has
+/// no `agent` field, so it can never be stale. Two guards keep the answer
+/// honest rather than merely present:
+///
+/// * A record whose phase is already terminal (`exited`/`failed`) is not
+///   probed at all. Its `workload_pid` names a process that is gone, and a
+///   recycled numeric pid could otherwise make an unrelated `claude` on the
+///   box look like this dead session's agent.
+/// * A record with no recorded `workload_pid` has no handle to walk.
+pub fn record_agent(record: &SessionRecord) -> Option<AgentKind> {
+    if !record.worker_phase_active() {
+        return None;
+    }
+    detect_agent(Path::new(DEFAULT_PROC_ROOT), record.workload_pid?)
+}
+
 pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
     let mut records = list_records(paths)?;
     if running {
@@ -1232,6 +1252,13 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         // at "running" forever, so a zombie record was indistinguishable
         // from a live session on the wire.
         value["state"] = json!(crate::observed_state(&record.phase, worker_alive));
+        // Which agent is live inside the session right now, detected from the
+        // workload's process tree at query time (`record_agent`). Always
+        // present, `null` when no agent is detectable -- every pocketshell
+        // session is `engine: "shell"` with the agent started by hand inside
+        // it, so `engine` cannot answer this and a consumer needs one key it
+        // can read unconditionally.
+        value["agent"] = json!(record_agent(record));
         enriched.push(value);
     }
     Ok(Value::Array(enriched))
@@ -1312,6 +1339,10 @@ pub fn status_json(paths: &Paths, selector: &str) -> Result<Value> {
         };
     value["worker_alive"] = json!(current.worker_alive());
     value["worker_reachable"] = json!(worker_reachable);
+    // Same query-time agent detection every `a list --json`/`a snapshot` row
+    // carries, so the two commands cannot disagree about which agent is in a
+    // session.
+    value["agent"] = json!(record_agent(&current));
     if let Some(error) = rpc_error {
         value["rpc_error"] = json!(error);
     }

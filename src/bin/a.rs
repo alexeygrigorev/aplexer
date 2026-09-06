@@ -1772,6 +1772,11 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         // from a live session -- while the same command was telling a
         // human "broken".
         value["state"] = json!(observed_state(&current.phase, worker_alive));
+        // Which agent is running inside the session's workload tree right
+        // now, from the same query-time detection every `a list --json` row
+        // carries (`api::record_agent`). Always present; `null` when no
+        // agent is detectable.
+        value["agent"] = json!(aplexer::api::record_agent(&current));
         value["worker_reachable"] = json!(worker_reachable);
         if let Some(error) = &rpc_error {
             value["rpc_error"] = json!(error);
