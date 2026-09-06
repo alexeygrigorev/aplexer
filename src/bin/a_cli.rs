@@ -285,6 +285,14 @@ mod legacy {
         }
     }
 
+    fn human_age_phrase(now: u64, timestamp: Option<u64>) -> String {
+        match human_age(now, timestamp).as_str() {
+            "now" => "just now".to_string(),
+            "—" => "unknown".to_string(),
+            age => format!("{age} ago"),
+        }
+    }
+
     fn fit_column(text: &str, width: usize) -> String {
         if terminal_display_width(text) <= width {
             return format!("{text}{}", " ".repeat(width - terminal_display_width(text)));
@@ -459,8 +467,10 @@ mod legacy {
             };
         }
         let color = color_enabled();
-        let home = env::var_os("HOME").map(PathBuf::from);
-        let workspace = display_workspace(&current.workspace, home.as_deref());
+        let workspace = display_workspace(
+            &current.workspace,
+            env::var_os("HOME").as_deref().map(Path::new),
+        );
         let engine = match &current.profile {
             Some(profile) => format!("{}/{}", current.engine, profile),
             None => current.engine.clone(),
@@ -484,7 +494,7 @@ mod legacy {
             .get("last_activity_ms")
             .and_then(Value::as_u64)
             .or(current.last_activity_ms);
-        println!("  activity    {} ago", human_age(now, activity));
+        println!("  activity    {}", human_age_phrase(now, activity));
         println!(
             "  command     {}",
             current
@@ -689,8 +699,10 @@ mod legacy {
         let raw = live_status(&record);
         let state = ux_state(&record, raw.as_ref(), now_ms());
         let state = format!("{} {}", state.glyph, state.label.to_uppercase());
-        let home = env::var_os("HOME").map(PathBuf::from);
-        let workspace = display_workspace(&record.workspace, home.as_deref());
+        let workspace = display_workspace(
+            &record.workspace,
+            env::var_os("HOME").as_deref().map(Path::new),
+        );
         let mut engine = match &record.profile {
             Some(profile) => format!("{}/{}", record.engine, profile),
             None => record.engine.clone(),
@@ -814,7 +826,7 @@ mod legacy {
                         if !output.is_empty() {
                             actions.push(UxInputAction::Forward(std::mem::take(&mut output)));
                         }
-                        let detach = matches!(action, UxInputAction::Detach);
+                        let detach = matches!(&action, UxInputAction::Detach);
                         actions.push(action);
                         index += 1;
                         if detach {
@@ -1234,6 +1246,13 @@ mod legacy {
             assert_eq!(human_age(10_000, Some(9_000)), "now");
             assert_eq!(human_age(70_000, Some(10_000)), "1m");
             assert_eq!(human_age(7_210_000, Some(10_000)), "2h");
+        }
+
+        #[test]
+        fn human_age_phrase_reads_naturally() {
+            assert_eq!(human_age_phrase(10_000, Some(9_000)), "just now");
+            assert_eq!(human_age_phrase(70_000, Some(10_000)), "1m ago");
+            assert_eq!(human_age_phrase(70_000, None), "unknown");
         }
 
         #[test]
