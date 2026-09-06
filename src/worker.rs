@@ -1294,11 +1294,19 @@ fn enable_child_subreaper() -> Result<()> {
 /// thread-group leader's `children` file can miss children forked by another
 /// thread, which would create a containment escape for multi-threaded tools.
 fn direct_child_pids(pid: u32) -> Result<Vec<u32>> {
-    let tasks_path = format!("/proc/{pid}/task");
+    direct_child_pids_in(Path::new(crate::agent_kind::DEFAULT_PROC_ROOT), pid)
+}
+
+/// `direct_child_pids` against an arbitrary `/proc` root. The containment
+/// code always passes the real `/proc`; `agent_kind`'s detection walk shares
+/// this exact reader so its unit tests can drive a synthetic tree instead of
+/// spawning processes -- one walker, one set of `children` semantics.
+pub(crate) fn direct_child_pids_in(proc_root: &Path, pid: u32) -> Result<Vec<u32>> {
+    let tasks_path = proc_root.join(pid.to_string()).join("task");
     let tasks = match fs::read_dir(&tasks_path) {
         Ok(tasks) => tasks,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("read {tasks_path}")),
+        Err(error) => return Err(error).with_context(|| format!("read {}", tasks_path.display())),
     };
     let mut children = HashSet::new();
     for task in tasks {
@@ -1310,11 +1318,11 @@ fn direct_child_pids(pid: u32) -> Result<Vec<u32>> {
         else {
             continue;
         };
-        let path = format!("/proc/{pid}/task/{tid}/children");
+        let path = tasks_path.join(tid.to_string()).join("children");
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("read {path}")),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
         children.extend(
             text.split_whitespace()
