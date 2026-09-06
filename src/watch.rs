@@ -204,7 +204,7 @@ fn fresh_reported_state(record: &SessionRecord, now: u64) -> Option<&'static str
 /// won, `"heuristic"` otherwise, surfaced on the `agent.state` event as
 /// `metadata.state_source` so a consumer can tell which is authoritative
 /// without hard-coding the staleness window itself.
-fn derive_agent_state_with_source(
+pub fn derive_agent_state_with_source(
     record: &SessionRecord,
     now: u64,
 ) -> (&'static str, &'static str) {

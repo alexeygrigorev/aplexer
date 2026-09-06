@@ -1114,9 +1114,9 @@ fn two_real_attach_clients_see_each_others_changes() {
 
     let id = start_session(&harness, &workspace, "two-real-clients");
     let mut device_a = PtyClient::spawn(&harness, &id, 30, 100);
-    device_a.wait_for(b"[aplexer attached", 0, "device A to attach");
+    device_a.wait_for(b"attached to", 0, "device A to attach");
     let mut device_b = PtyClient::spawn(&harness, &id, 20, 70);
-    device_b.wait_for(b"[aplexer attached", 0, "device B to attach");
+    device_b.wait_for(b"attached to", 0, "device B to attach");
 
     let a_mark = device_a.mark();
     let b_mark = device_b.mark();

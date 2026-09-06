@@ -75,6 +75,24 @@ a kill --workspace "$PWD" --tag shell --signal TERM --grace-ms 2000
 
 Output capture is byte-preserving. `send --stdin` and the Python API also transport bytes directly rather than asking a shell to reinterpret them. `capture --screen` asks for the live screen instead of the byte history: as paintable escape sequences by default, or as plain text with `--plain`. With `--json`, capture returns `{ "id": "...", "bytes": N, "encoding": "base64", "data": "..." }`; `utf8` is added as a convenience only when the captured bytes are valid UTF-8.
 
+## Terminal-first human CLI
+
+The UUID/--workspace/--tag forms above are the automation contract and never change. At a real terminal, the same model is also reachable through a task-shaped vocabulary — see [docs/cli-ux.md](docs/cli-ux.md) for the full design:
+
+```console
+a                         sessions at a glance (workspaces, states, what needs you)
+a here                    create or reattach the main session in this directory
+a here codex review       create or reattach Codex, tagged review
+a open review             attach by tag in the current workspace
+a new --engine shell      start and attach, with start's full flag surface
+a current                 which session is this shell inside?
+a keys                    the attach-mode key reference
+```
+
+`a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations.
+
+Presentation is TTY-aware by construction: richer tables, semantic agent states (`working`/`waiting`/`idle` from a fresh `a state-report`, honest `active`/`quiet` from PTY-recency otherwise), and the one-line attach status bar exist only when stdout is a real terminal. Redirected output and every `--json` path keep their exact pre-existing format, and `Ctrl-b ?` (attach help flash) never sends a byte to the workload. While attached, the status bar keeps task identity, semantic state, sibling sessions, and `^b ?` visible, dropping detail from the right on narrow terminals.
+
 ## Engines, profiles, and shortcuts
 
 Configuration is one TOML file, `~/.config/aplexer/config.toml` (override with `APLEXER_CONFIG`). It declares three related things together, in the same place, so it's clear how they relate:

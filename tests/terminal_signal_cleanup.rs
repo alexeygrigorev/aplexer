@@ -124,7 +124,7 @@ fn termination_signals_restore_real_pty_termios_and_terminal_ui() {
         let mut child = command.spawn().unwrap();
 
         let mut bytes = Vec::new();
-        read_until(&mut master, &mut bytes, b"[aplexer attached");
+        read_until(&mut master, &mut bytes, b"attached to");
         let raw = termios(slave.as_raw_fd());
         assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO), 0);
 
