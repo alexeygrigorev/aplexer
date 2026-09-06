@@ -2197,6 +2197,46 @@ fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// How long `cmd_kill` waits, after an accepted kill RPC, for the worker to
+/// remove the killed session's durable record itself. Normal finalization
+/// lands within milliseconds (bounded above by the worker's attach-drain
+/// window), so this is a settling pause, not a retry campaign; the deadline
+/// only bounds the pathological cases, which are reported, never looped on.
+const KILL_RECORD_REMOVAL_WAIT: Duration = Duration::from_secs(5);
+
+/// Outcome of waiting for a killed session's record to disappear. The
+/// worker that accepted the kill RPC removes the record during
+/// finalization, but only when finalization ran clean and proved the
+/// containment domain empty -- so `Kept` (worker exited, record stayed)
+/// means the worker had something to say about this exit, and `Pending`
+/// (worker still alive at the deadline) means the removal is still in
+/// flight or the worker is holding the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillRecordOutcome {
+    Removed,
+    Kept,
+    Pending,
+}
+
+/// After an accepted kill RPC, watch the record directory until the worker
+/// deletes it (or until [`KILL_RECORD_REMOVAL_WAIT`] runs out). Only the
+/// worker may remove a record whose worker process is still finishing --
+/// deleting it client-side would race the worker's own final record write
+/// into a persist-error retry loop -- so this observes instead of acting.
+fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
+    let deadline = Instant::now() + KILL_RECORD_REMOVAL_WAIT;
+    while Instant::now() < deadline {
+        if !paths.record(id).exists() {
+            return KillRecordOutcome::Removed;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    match read_record(&paths.record(id)) {
+        Ok(record) if record.worker_alive() => KillRecordOutcome::Pending,
+        _ => KillRecordOutcome::Kept,
+    }
+}
+
 /// A worker pid may still exist even though its control socket is gone.
 /// Only this one rare case counts as "force-cleanable": a live, reachable
 /// worker can also fail an RPC, but then it must not be signalled directly.
@@ -2256,17 +2296,57 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         if !record.worker_finished() {
             recover_broken_containment(&record, signal, args.grace_ms)?;
             mark_broken_workload_killed(paths, &record)?;
-        } else {
-            if !record.containment_proven_empty() {
-                recover_broken_containment(&record, signal, args.grace_ms)?;
+            // That finalization was client-side and deliberately kept the
+            // evidence for a broken workload; the worker is already gone,
+            // so there is no worker-side removal to wait for below.
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"id":record.id,"signal":signal,"record_removed":false})
+                );
             }
-            remove_session_state(paths, record.id)
-                .with_context(|| format!("remove finished session {}", record.id))?;
-            eprintln!("a: removed {} session {}", record.phase.name(), record.id);
+            return Ok(());
         }
+        if !record.containment_proven_empty() {
+            recover_broken_containment(&record, signal, args.grace_ms)?;
+        }
+        remove_session_state(paths, record.id)
+            .with_context(|| format!("remove finished session {}", record.id))?;
+        eprintln!("a: removed {} session {}", record.phase.name(), record.id);
+        if json_output {
+            println!(
+                "{}",
+                json!({"id":record.id,"signal":signal,"record_removed":true})
+            );
+        }
+        return Ok(());
+    }
+    // The RPC was accepted, so the worker removes the record itself during
+    // finalization. Give it a moment so `a kill` returns with the session
+    // already gone from `a list` (a client that kills-then-lists must never
+    // observe the exited corpse the old behavior left behind), and say so
+    // plainly on the two outcomes where the record is still there.
+    let removed = wait_for_kill_record_removal(paths, record.id);
+    match removed {
+        KillRecordOutcome::Removed => {}
+        KillRecordOutcome::Kept => eprintln!(
+            "a: killed session {}, but its worker kept the record (a finalize failure worth inspecting: `a status {}`)",
+            record.id, record.id
+        ),
+        KillRecordOutcome::Pending => eprintln!(
+            "a: killed session {}; its worker is still finalizing, the record disappears on its own unless the worker failed",
+            record.id
+        ),
     }
     if json_output {
-        println!("{}", json!({"id":record.id,"signal":signal}));
+        println!(
+            "{}",
+            json!({
+                "id": record.id,
+                "signal": signal,
+                "record_removed": removed == KillRecordOutcome::Removed,
+            })
+        );
     }
     Ok(())
 }
