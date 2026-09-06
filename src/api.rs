@@ -25,9 +25,10 @@ use crate::{
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json,
     kill_grace_duration, list_records, parse_byte_size, process_start_time_ticks,
     public_session_record, read_frame, read_persisted_history_tail, read_record,
-    read_session_record, resolve_record, session_metadata_env, validate_tag, worker_executable,
-    write_frame, write_json, Config, FileLock, FrameKind, Limits, Operation, Paths, Phase, Request,
-    Response, SessionRecord, MAX_FRAME_BYTES, PROTOCOL_VERSION, SCHEMA_VERSION,
+    read_session_record, reap_verdict, resolve_record, session_metadata_env, validate_tag,
+    worker_executable, write_frame, write_json, Config, ContainmentReap, FileLock, FrameKind,
+    Limits, Operation, Paths, Phase, Request, Response, SessionRecord, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -1402,6 +1403,53 @@ pub fn kill_session(paths: &Paths, selector: &str, signal: i32, grace_ms: u64) -
     Ok(())
 }
 
+/// Result of fencing the spawn-to-worker-lock gap for one record.
+enum PrePidFence {
+    /// Nothing can come up under this record while the guard (if any) lives.
+    /// `None` means no fence was needed: the record is past the gap, so its
+    /// `worker_pid` is the authority and `worker_alive()` already answered.
+    Fenced(Option<FileLock>),
+    /// A worker exists for this record even though it has not registered a
+    /// pid yet, so `worker_alive()` reads false for a session that is very
+    /// much coming up. Carries the lock path for the caller's diagnostic.
+    WorkerHoldsLock(PathBuf),
+}
+
+/// Fence a record whose worker may have been spawned but has not reached its
+/// first required lock yet.
+///
+/// `start_session` writes a `Starting` record with `worker_pid: None` before
+/// it spawns anything, so for a few tens of milliseconds a perfectly healthy
+/// session is on disk as `phase: starting, worker_pid: null` -- and
+/// `worker_alive()` is false for a `None` pid. Any predicate that reads "no
+/// live worker" as "free to destroy" will happily take that session's state
+/// out from under a live spawn. The worker's own first action is to acquire
+/// `paths.worker_lock(id)` exclusively, so holding that lock is both the
+/// detector (it is already held => a worker exists) and the fence (we hold
+/// it => a worker that has not got there yet will fail its acquisition and
+/// cannot proceed after we have destroyed the record).
+///
+/// Callers must keep the returned guard alive across every removal, exactly
+/// as `a forget` does.
+fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Result<PrePidFence> {
+    if !record.worker_phase_active() || record.worker_pid.is_some() {
+        return Ok(PrePidFence::Fenced(None));
+    }
+    let lock_path = paths.worker_lock(record.id);
+    match FileLock::exclusive(&lock_path, true) {
+        Ok(lock) => Ok(PrePidFence::Fenced(Some(lock))),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+                .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
+        {
+            Ok(PrePidFence::WorkerHoldsLock(lock_path))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Forget a session record without signalling any process. This preserves the
 /// CLI's registry/startup locking and refuses a worker that may still be live.
 pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Value> {
@@ -1418,33 +1466,18 @@ pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Valu
             current.id
         );
     }
-    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
-        let lock_path = paths.worker_lock(current.id);
-        match FileLock::exclusive(&lock_path, true) {
-            Ok(lock) => Some(lock),
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .and_then(io::Error::raw_os_error)
-                    .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
-            {
-                bail!(
-                    "session {} still has a worker holding {}; refusing to forget it",
-                    current.id,
-                    lock_path.display()
-                )
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "cannot fence session {}'s pre-PID worker; refusing to forget it",
-                        current.id
-                    )
-                })
-            }
-        }
-    } else {
-        None
+    let _startup_absence_lock = match fence_pre_pid_worker(paths, &current).with_context(|| {
+        format!(
+            "cannot fence session {}'s pre-PID worker; refusing to forget it",
+            current.id
+        )
+    })? {
+        PrePidFence::Fenced(lock) => lock,
+        PrePidFence::WorkerHoldsLock(lock_path) => bail!(
+            "session {} still has a worker holding {}; refusing to forget it",
+            current.id,
+            lock_path.display()
+        ),
     };
 
     let containment_proven_empty = current.containment_proven_empty();
@@ -1673,6 +1706,40 @@ fn archive_superseded_session(paths: &Paths, id: Uuid) -> Result<PathBuf> {
     Ok(archived)
 }
 
+/// Retire the predecessor that `start_session` decided it could take the
+/// `workspace+tag` from, re-deciding against the record as it stands on disk
+/// right now.
+///
+/// The verdict formed before the spawn is advisory by construction: a worker
+/// startup can take seconds, and `reap_verdict` is built out of live probes
+/// (`/proc` liveness for the worker and the workload leader, and the
+/// kernel's own view of a recorded cgroup), none of which the registry lock
+/// freezes. It holds off other aplexer commands, not the world: a recycled
+/// pid can make a dead `workload_pid` read alive again, and a containment
+/// domain the caller could not inspect a moment ago may answer now. So
+/// re-read and re-run the same predicate before destroying anything -- the
+/// same rule `a prune`'s `reap_session_state` follows, for the same reason.
+///
+/// Refusing here is a start FAILURE, not a silent downgrade: the caller
+/// rolls the freshly started replacement back rather than leaving two
+/// durable records claiming one selector.
+fn archive_reclaimed_predecessor(paths: &Paths, existing: &SessionRecord) -> Result<PathBuf> {
+    let current = read_session_record(paths, existing.id).with_context(|| {
+        format!(
+            "re-read superseded session {} before retiring it",
+            existing.id
+        )
+    })?;
+    if reap_verdict(&current).is_none() {
+        bail!(
+            "superseded session {} is live again (state: {}); refusing to retire it",
+            current.id,
+            current.observed_state()
+        );
+    }
+    archive_superseded_session(paths, existing.id)
+}
+
 fn restore_superseded_session(paths: &Paths, id: Uuid, archived: &Path) -> Result<()> {
     let destination = paths.state_session(id);
     fs::rename(archived, &destination).with_context(|| {
@@ -1832,16 +1899,43 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     }
     worker_command(id, req.python.as_deref())?;
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    // Read under the registry lock taken above, and keep holding it through
+    // the whole spawn: this read IS the locked read, and no other aplexer
+    // command can modify the registry until this call returns.
     let superseded = list_records(paths)?
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == req.tag);
+    // Held for the rest of the call when the predecessor is a pre-PID stub,
+    // so a worker that was spawned into it cannot come up on top of the
+    // state we are about to archive and delete.
+    let mut _superseded_fence: Option<FileLock> = None;
+    let mut reclaim: Option<ContainmentReap> = None;
     if let Some(existing) = &superseded {
-        if !existing.worker_finished() {
+        // Taking this pair means archiving and then DELETING the holder's
+        // durable state -- the same destruction `a prune` performs -- so it
+        // must clear the same bar, `reap_verdict`. `worker_finished()`, the
+        // old test, required a terminal phase that a SIGKILLed worker never
+        // gets to write, so a zombie (worker dead, `phase` stuck at
+        // `running`) held its `workspace+tag` forever and `a start` could
+        // only succeed if something else pruned it first.
+        let Some(verdict) = reap_verdict(existing) else {
             bail!(
-                "workspace+tag already belongs to session {}; rename it or choose a different tag",
-                existing.id
+                "workspace+tag already belongs to session {} (state: {}); rename it or choose a different tag",
+                existing.id,
+                existing.observed_state()
             );
-        }
+        };
+        _superseded_fence = match fence_pre_pid_worker(paths, existing).with_context(|| {
+            format!("cannot fence session {}'s pre-PID worker", existing.id)
+        })? {
+            PrePidFence::Fenced(lock) => lock,
+            PrePidFence::WorkerHoldsLock(lock_path) => bail!(
+                "workspace+tag already belongs to session {}, whose worker still holds {}; rename it or choose a different tag",
+                existing.id,
+                lock_path.display()
+            ),
+        };
+        reclaim = Some(verdict);
     }
     let mut startup = StartupGuard::new(paths, id);
     let result = (|| -> Result<SessionRecord> {
@@ -1985,7 +2079,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             // startup guard can still roll the new worker back without ever
             // exposing two durable records for one selector.
             let archived = if let Some(existing) = &superseded {
-                match archive_superseded_session(paths, existing.id) {
+                match archive_reclaimed_predecessor(paths, existing) {
                     Ok(path) => Some(path),
                     Err(retire_error) => {
                         return match startup.rollback() {
@@ -2028,6 +2122,18 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                     );
                 }
                 let _ = fs::remove_dir_all(paths.runtime_session(existing.id));
+                // Say plainly when the pair was taken from a record whose
+                // worker never proved its containment domain empty, exactly
+                // as `a prune` reports the same class of removal. The
+                // predecessor's manual-investigation trail is gone with it,
+                // and a caller that only ever sees a successful `a start`
+                // would otherwise have no way to know that happened.
+                if reclaim == Some(ContainmentReap::NoRemainingHandle) {
+                    eprintln!(
+                        "a: reclaimed workspace+tag from broken session {} without a containment proof; its worker died without recording one and nothing addressable remained",
+                        existing.id
+                    );
+                }
             }
             Ok(record)
         }
@@ -2037,6 +2143,178 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 "startup failed: {start_error:#}; rollback also failed: {rollback_error:#}"
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+    use crate::{atomic_write_json, ContainmentReap};
+
+    /// A registry containing exactly one record, with its paths wired to the
+    /// throwaway state/runtime roots so `read_session_record`'s identity
+    /// checks accept it.
+    fn seeded_registry(
+        record: &mut SessionRecord,
+    ) -> (Paths, tempfile::TempDir, tempfile::TempDir) {
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: runtime_dir.path().to_path_buf(),
+            state_root: state_dir.path().to_path_buf(),
+            config_file: state_dir.path().join("config.toml"),
+        };
+        paths.ensure().unwrap();
+        record.socket_path = paths.socket(record.id);
+        record.history_path = paths.history(record.id);
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), record).unwrap();
+        (paths, state_dir, runtime_dir)
+    }
+
+    /// The reported zombie shape: worker dead, `phase` stuck at `running`,
+    /// nothing left running.
+    fn zombie_record() -> SessionRecord {
+        SessionRecord {
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            workspace: PathBuf::from("/ws/zombie"),
+            tag: "zt".to_string(),
+            engine: "shell".to_string(),
+            profile: None,
+            command: vec![],
+            cwd: PathBuf::from("/ws/zombie"),
+            env: Default::default(),
+            env_unset: Default::default(),
+            limits: Default::default(),
+            history_bytes: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
+            phase: Phase::Running,
+            worker_pid: None,
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(false),
+            socket_path: PathBuf::from("/nonexistent"),
+            history_path: PathBuf::from("/nonexistent"),
+            exit: None,
+            error: None,
+        }
+    }
+
+    /// A reclaimable predecessor is retired by the ordinary archive
+    /// transaction: durable state moves to `retired-sessions/<id>`, nothing
+    /// is deleted yet, so the caller can still restore it.
+    #[test]
+    fn a_reclaimable_predecessor_is_archived_not_destroyed() {
+        let mut record = zombie_record();
+        let (paths, _state, _runtime) = seeded_registry(&mut record);
+        assert!(reap_verdict(&record).is_some());
+
+        let archived = archive_reclaimed_predecessor(&paths, &record).expect("archive predecessor");
+        assert!(archived.join("session.json").exists(), "archive is empty");
+        assert!(!paths.state_session(record.id).exists());
+
+        restore_superseded_session(&paths, record.id, &archived).expect("restore predecessor");
+        assert!(paths.record(record.id).exists());
+    }
+
+    /// The verdict `start_session` forms before it spawns is stale by
+    /// construction: worker startup takes time, and `reap_verdict` is built
+    /// from live probes the registry lock does not freeze (`/proc` liveness
+    /// and the kernel's view of a cgroup). So the record is re-read and
+    /// re-judged immediately before it is retired.
+    ///
+    /// Driven here through the fact that can genuinely change under a held
+    /// registry lock: the workload leader pid coming back alive (a recycled
+    /// pid). The caller's copy still says "dead, reclaimable"; disk says a
+    /// process is running; the retire must refuse and leave the predecessor
+    /// exactly where it was.
+    #[test]
+    fn retiring_a_predecessor_re_reads_the_record_before_destroying_it() {
+        let stale = zombie_record();
+        let mut on_disk = stale.clone();
+        let mut leader = Command::new("sleep").arg("30").spawn().unwrap();
+        on_disk.workload_pid = Some(leader.id());
+        let (paths, _state, _runtime) = seeded_registry(&mut on_disk);
+
+        // What the caller believes, formed before the spawn.
+        assert_eq!(
+            reap_verdict(&stale),
+            Some(ContainmentReap::NoRemainingHandle)
+        );
+
+        let error = archive_reclaimed_predecessor(&paths, &stale)
+            .expect_err("retire must refuse a predecessor that is live on disk");
+        let error = format!("{error:#}");
+        assert!(error.contains("is live again"), "{error}");
+        assert!(error.contains(&stale.id.to_string()), "{error}");
+        assert!(
+            paths.record(stale.id).exists(),
+            "a refused retire still moved the predecessor's durable state"
+        );
+        assert!(
+            !paths
+                .state_root
+                .join(RETIRED_SESSIONS_DIR)
+                .join(stale.id.to_string())
+                .exists(),
+            "a refused retire stranded the predecessor in the archive"
+        );
+        assert!(
+            leader.try_wait().unwrap().is_none(),
+            "the retire path must never signal anything"
+        );
+
+        // Same record, leader gone: reclaimable again. Proves the refusal
+        // came from the re-read and not from a blanket refusal.
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::process_alive(on_disk.workload_pid.unwrap()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        archive_reclaimed_predecessor(&paths, &stale).expect("archive once the leader is gone");
+        assert!(!paths.state_session(stale.id).exists());
+    }
+
+    /// The fence itself, without a spawn: a record in the spawn-to-worker-lock
+    /// gap (`phase: starting, worker_pid: null`) reads as `worker_alive:
+    /// false` and is otherwise perfectly reclaimable, so only the worker
+    /// lock stands between a live spawn and having its state taken.
+    #[test]
+    fn a_pre_pid_record_is_fenced_by_its_worker_lock() {
+        let mut record = zombie_record();
+        record.phase = Phase::Starting;
+        let (paths, _state, _runtime) = seeded_registry(&mut record);
+        assert!(!record.worker_alive());
+        assert!(reap_verdict(&record).is_some());
+
+        let held = FileLock::exclusive(&paths.worker_lock(record.id), true).unwrap();
+        assert!(matches!(
+            fence_pre_pid_worker(&paths, &record).unwrap(),
+            PrePidFence::WorkerHoldsLock(_)
+        ));
+        drop(held);
+        assert!(matches!(
+            fence_pre_pid_worker(&paths, &record).unwrap(),
+            PrePidFence::Fenced(Some(_))
+        ));
+
+        // Past the gap, the pid is the authority and no fence is taken --
+        // otherwise every ordinary reclaim would contend on a lock the live
+        // worker legitimately holds.
+        let mut registered = record.clone();
+        registered.worker_pid = Some(std::process::id());
+        assert!(matches!(
+            fence_pre_pid_worker(&paths, &registered).unwrap(),
+            PrePidFence::Fenced(None)
+        ));
     }
 }
 

@@ -1710,9 +1710,9 @@ broken worker
 
 Never treat an enumeration failure as “all sessions are gone”.
 
-### 32.1 Removing a dead record: kill, prune, forget
+### 32.1 Removing a dead record: kill, prune, forget, reclaim
 
-Three commands remove session records, and they differ by what they are
+Four operations remove session records, and they differ by what they are
 willing to claim:
 
 - `a kill SESSION` acts. It signals the workload, and removes the record only
@@ -1744,6 +1744,34 @@ proven-clean reaps, and each gets a line on stderr.
 workers whose own record says they are already terminating -- `a kill`
 returns before its worker has finished exiting, and without that wait a
 kill-then-prune sequence removes nothing.
+
+The fourth remover is `a start` (and `a -`, which hands off to it) taking a
+`workspace+tag` whose holder no longer needs it. That is not a lighter
+operation than prune: the replacement transaction archives the predecessor
+to `retired-sessions/<id>` and, once the new worker is ready and handed off,
+deletes it. So a reclaim must clear exactly prune's bar, and it does -- both
+ask the same predicate. A pair held by a broken record is therefore taken by
+an ordinary `a start`, with no `a prune` or `a kill` needed first; a pair
+whose holder has a live worker, a live workload leader, or a containment
+domain that still holds something is refused, with the holder's derived
+state named in the error. When the reclaimed record's worker never proved
+its containment domain empty, `a start` says so on stderr in the same terms
+`a prune` uses, because the same manual-investigation trail is gone.
+
+Two hazards the broadened predicate opens, and how a reclaim closes them:
+
+- A record in the spawn-to-worker-lock gap (`phase: starting`,
+  `worker_pid: null`) is a healthy session coming up, yet `worker_alive()`
+  is false for a `None` pid. `a start` fences on `worker.lock` exactly as
+  `a forget` does, so it can never take a pair out from under a live spawn.
+- The verdict is formed before the new worker is spawned, and startup takes
+  time. `a start` holds the registry lock throughout, which stops other
+  aplexer commands but not the world -- a recycled pid or a cgroup that
+  answers differently now can flip the answer. The predecessor's record is
+  therefore re-read and re-judged immediately before it is archived; a
+  refusal there fails the start and rolls the replacement back, rather than
+  leaving two durable records claiming one selector.
+
 
 ---
 

@@ -948,13 +948,22 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == tag)
     {
+        // `a -` attaches only to something that can actually be attached
+        // to: a live worker in a non-terminal phase. Everything else falls
+        // through to cmd_start, which owns the single claim decision
+        // (`reap_verdict`, applied by `start_session`) -- so this is not a
+        // second copy of the ownership rule that could drift from it.
+        //
+        // That means a *broken* holder (non-terminal phase, dead worker,
+        // nothing left running) no longer needs an explicit `a kill` or
+        // `a prune` first: start reclaims the pair, archives the corpse and
+        // creates the session, which is what `a -` promised all along. A
+        // holder whose worker or workload is still alive is still refused
+        // there, so `a -` can never create a second session for a pair that
+        // something is still using.
         if existing.worker_phase_active() && existing.worker_alive() {
             return attach(paths, &existing, None);
         }
-        // A finished session falls through to cmd_start, which reclaims a
-        // workspace+tag held by a terminal-phase, worker-dead session. A
-        // "broken" one (non-terminal phase, dead worker) keeps its claim
-        // there too -- it needs an explicit `a kill` first.
     }
     cmd_start(
         paths,
@@ -1010,30 +1019,6 @@ enum ReapResult {
     /// another `a prune`/`a kill`/`a forget` got there first. Neither
     /// removed by us nor still present to retain.
     Vanished,
-}
-
-/// A record is prune-able when nothing that could still be running depends
-/// on it. Three independent facts, all required:
-///
-///  1. no live worker -- `worker_alive()` stays the authority, including its
-///     deliberate fallback to the bare pid check when the identity sidecar
-///     is missing or unreadable, so uncertainty retains rather than reaps;
-///  2. no live workload leader -- the safety property `a forget --force`
-///     exists to override, unchanged;
-///  3. containment holds no remaining handle (see `containment_reap_verdict`).
-///
-/// Note what is deliberately NOT required any more: `worker_finished()`, a
-/// terminal *phase*. A worker killed with SIGKILL never gets to write one,
-/// which is why records at `phase: running, worker_alive: false` could never
-/// be reaped by any number of `a prune` runs.
-fn reap_verdict(record: &SessionRecord) -> Option<ContainmentReap> {
-    if record.worker_alive() || record.workload_leader_alive() {
-        return None;
-    }
-    match containment_reap_verdict(record) {
-        ContainmentReap::Retain => None,
-        verdict => Some(verdict),
-    }
 }
 
 /// Wait, within the run's shared budget, for a worker whose own record says

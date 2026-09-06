@@ -588,6 +588,291 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
     assert!(killed.status.success(), "replacement cleanup failed");
 }
 
+/// A zombie predecessor: a session whose worker was SIGKILLed before it
+/// could record an exit, so `phase` stays at `running` forever, holding
+/// durable evidence (`marker` in its transcript) that a failed reclaim must
+/// not destroy. Returns its session id.
+///
+/// The two tests below are the reclaim twins of the two replacement
+/// transaction tests above: `start_session` reclaiming a `workspace+tag`
+/// from a broken record runs the SAME archive -> start ->
+/// restore-on-failure -> cleanup transaction, over a class of record that
+/// transaction never used to see, so it needs the same fault injection.
+fn zombie_predecessor(harness: &Harness, workspace: &str, tag: &str, marker: &str) -> String {
+    let started = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        tag,
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!("printf '{marker}\\n'; exec sleep 300"),
+    ]);
+    assert!(
+        started.status.success(),
+        "predecessor failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started.stdout).expect("predecessor JSON");
+    let id = started["id"].as_str().expect("predecessor id").to_string();
+    let worker_pid = started["worker_pid"].as_i64().expect("worker pid") as i32;
+    let workload_pid = started["workload_pid"].as_i64().expect("workload pid") as i32;
+
+    // The marker has to be DURABLE before the worker dies, not merely
+    // visible: `a capture` answers from the live worker's in-memory ring
+    // while the worker is up, so polling that would only prove the marker
+    // existed somewhere that a SIGKILL erases. The evidence these tests
+    // protect is the persisted transcript, so wait for that one.
+    let history = harness
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(&id)
+        .join("history.bin");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let persisted = aplexer::read_persisted_history_tail(&history, None).unwrap_or_default();
+        if persisted
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "predecessor never persisted its marker: {}",
+            String::from_utf8_lossy(&persisted)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // Worker first, so it never gets to write a terminal phase; then the
+    // workload, so nothing survives that could legitimately retain the claim.
+    for pid in [worker_pid, workload_pid] {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} did not die");
+    }
+
+    let snapshot = harness.run(&["snapshot"]);
+    let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+    let row = records
+        .as_array()
+        .expect("snapshot array")
+        .iter()
+        .find(|record| record["id"] == id)
+        .expect("predecessor still listed")
+        .clone();
+    assert_eq!(
+        row["phase"], "running",
+        "fixture no longer reproduces the reported stale phase: {row}"
+    );
+    assert_eq!(row["worker_alive"], false, "{row}");
+    assert_eq!(row["state"], "broken", "{row}");
+    id
+}
+
+/// The reclaim twin of `failed_replacement_preserves_finished_session_evidence`.
+/// A reclaim that fails after the predecessor was archived must put it back:
+/// a zombie is still the only record of what the user was running, and
+/// losing it to a failed `a start` would be strictly worse than the refusal
+/// this change replaced.
+#[test]
+fn failed_reclaim_of_a_broken_record_preserves_its_evidence() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let old_id = zombie_predecessor(&harness, workspace, "daily", "important-old-history");
+
+    let capture_before = harness.run(&["capture", &old_id]);
+    assert!(
+        String::from_utf8_lossy(&capture_before.stdout).contains("important-old-history"),
+        "fixture lost its evidence before the test began"
+    );
+
+    let replacement = harness.run(&[
+        "start",
+        "--startup-timeout-ms",
+        "0",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sleep",
+        "30",
+    ]);
+    assert!(
+        !replacement.status.success(),
+        "replacement unexpectedly started"
+    );
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("within 0 ms"));
+
+    let capture_after = harness.run(&["capture", &old_id]);
+    assert!(
+        capture_after.status.success(),
+        "a failed reclaim destroyed the broken session's transcript: {}",
+        String::from_utf8_lossy(&capture_after.stderr)
+    );
+    assert_eq!(capture_after.stdout, capture_before.stdout);
+    assert!(
+        harness
+            .state_dir
+            .path()
+            .join("sessions")
+            .join(&old_id)
+            .exists(),
+        "failed reclaim removed the broken session's durable state"
+    );
+    assert!(
+        !harness
+            .state_dir
+            .path()
+            .join("retired-sessions")
+            .join(&old_id)
+            .exists(),
+        "failed reclaim left the predecessor stranded in the archive"
+    );
+
+    // And the reclaim still works on a retry -- the failure above did not
+    // leave the registry in a state that blocks the pair permanently.
+    let successful = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        "daily",
+        "--",
+        "/bin/sleep",
+        "30",
+    ]);
+    assert!(
+        successful.status.success(),
+        "successful reclaim failed: {}",
+        String::from_utf8_lossy(&successful.stderr)
+    );
+    let successful: Value = serde_json::from_slice(&successful.stdout).expect("replacement JSON");
+    assert!(
+        !harness
+            .state_dir
+            .path()
+            .join("sessions")
+            .join(&old_id)
+            .exists(),
+        "ready replacement did not retire the broken predecessor"
+    );
+    let replacement_id = successful["id"].as_str().expect("replacement id");
+    let killed = harness.run(&[
+        "kill",
+        replacement_id,
+        "--signal",
+        "KILL",
+        "--grace-ms",
+        "0",
+    ]);
+    assert!(killed.status.success(), "replacement cleanup failed");
+}
+
+/// The reclaim twin of
+/// `replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence`.
+/// When the post-handoff archive cleanup fails, the registry must still hold
+/// exactly one usable session for the pair and the broken predecessor's
+/// evidence must be retained where the error message says it is.
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn reclaim_cleanup_failure_keeps_one_usable_session_and_archived_evidence() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let workspace = workspace.path().to_str().expect("UTF-8 workspace");
+    let old_id = zombie_predecessor(&harness, workspace, "daily", "archived-evidence");
+
+    let replacement = harness.run_with_env(
+        &[
+            "start",
+            "--workspace",
+            workspace,
+            "--tag",
+            "daily",
+            "--",
+            "/bin/sleep",
+            "30",
+        ],
+        &[("APLEXER_TEST_FAIL_SUPERSEDED_CLEANUP", "1")],
+    );
+    assert!(
+        !replacement.status.success(),
+        "reclaim ignored cleanup failure"
+    );
+    let stderr = String::from_utf8_lossy(&replacement.stderr);
+    assert!(stderr.contains("ready and manageable by UUID"), "{stderr}");
+    assert!(stderr.contains(&old_id), "{stderr}");
+    assert!(stderr.contains("retired-sessions"), "{stderr}");
+
+    let snapshot = harness.run(&["snapshot"]);
+    assert!(
+        snapshot.status.success(),
+        "registry became unreadable: {}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
+    let matching = records
+        .as_array()
+        .expect("snapshot array")
+        .iter()
+        .filter(|record| record["workspace"] == workspace && record["tag"] == "daily")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "reclaim left duplicate selectors");
+    let replacement_id = matching[0]["id"].as_str().expect("replacement session id");
+    assert_ne!(replacement_id, old_id);
+
+    let status = harness.run(&["status", replacement_id, "--json"]);
+    assert!(
+        status.status.success(),
+        "replacement is not manageable: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let archived = harness
+        .state_dir
+        .path()
+        .join("retired-sessions")
+        .join(&old_id);
+    assert!(
+        archived.join("session.json").exists(),
+        "the broken predecessor's record is not where the error says it is"
+    );
+    assert!(
+        read_persisted_history_tail(&archived.join("history.bin"), None)
+            .expect("recover archived v2 history")
+            .windows(b"archived-evidence".len())
+            .any(|window| window == b"archived-evidence"),
+        "the broken predecessor's transcript was lost"
+    );
+    assert!(!harness
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(&old_id)
+        .exists());
+
+    let killed = harness.run(&[
+        "kill",
+        replacement_id,
+        "--signal",
+        "KILL",
+        "--grace-ms",
+        "0",
+    ]);
+    assert!(killed.status.success(), "replacement cleanup failed");
+}
+
 #[test]
 #[cfg(feature = "startup-test-hooks")]
 fn persisted_running_without_verified_ping_is_not_startup_success() {

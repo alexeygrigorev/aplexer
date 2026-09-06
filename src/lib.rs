@@ -831,6 +831,44 @@ fn recorded_cgroup_observed_empty(
     Ok(!cgroup_path_populated(&path)?)
 }
 
+/// Whether nothing that could still be running depends on this record, and
+/// therefore whether its durable state may be destroyed. Three independent
+/// facts, all required:
+///
+///  1. no live worker -- `worker_alive()` stays the authority, including its
+///     deliberate fallback to the bare pid check when the identity sidecar
+///     is missing or unreadable, so uncertainty retains rather than reaps;
+///  2. no live workload leader -- the safety property `a forget --force`
+///     exists to override, unchanged;
+///  3. containment holds no remaining handle (see `containment_reap_verdict`).
+///
+/// Note what is deliberately NOT required: `worker_finished()`, a terminal
+/// *phase*. A worker killed with SIGKILL never gets to write one, which is
+/// why records at `phase: running, worker_alive: false` could never be
+/// reaped by any number of `a prune` runs.
+///
+/// Every command that destroys a record's durable state answers this one
+/// question, so they cannot drift apart about what "dead" means:
+/// `a prune`'s `reap_session_state`, and `start_session`'s reclaim of a
+/// `workspace+tag` its holder no longer needs (spec.md 32.1) -- a reclaim
+/// archives and then deletes the predecessor, which is the same destruction
+/// prune performs, so it must clear the same bar. `a kill` and
+/// `a forget --force` deliberately do NOT use it: kill acts and must prove
+/// its own cleanup, forget is the operator's explicit override of exactly
+/// the safety this encodes.
+///
+/// `Some(verdict)` means removable, carrying whether containment was proven
+/// empty or merely holds no remaining handle; `None` means retain.
+pub fn reap_verdict(record: &SessionRecord) -> Option<ContainmentReap> {
+    if record.worker_alive() || record.workload_leader_alive() {
+        return None;
+    }
+    match containment_reap_verdict(record) {
+        ContainmentReap::Retain => None,
+        verdict => Some(verdict),
+    }
+}
+
 pub fn read_record(path: &Path) -> Result<SessionRecord> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let record: SessionRecord =
