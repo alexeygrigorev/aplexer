@@ -952,6 +952,13 @@ impl ClientScreen {
         self.screen.cursor_restore()
     }
 
+    /// The same reattach payload `ScreenTracker::snapshot` produces -- used
+    /// by `Ctrl-b r` to repaint the host from this model without a round
+    /// trip to the worker.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.screen.snapshot()
+    }
+
     #[cfg(test)]
     pub fn cursor_position(&self) -> (u16, u16) {
         self.screen.cursor_position()
@@ -1819,6 +1826,16 @@ mod tests {
         let mut tracker = ScreenTracker::new(24, 80);
         tracker.process(b"hello there\r\n");
         assert!(tracker.contents().contains("hello there"));
+    }
+
+    #[test]
+    fn client_screen_snapshot_matches_tracker() {
+        let mut tracker = ScreenTracker::new(24, 80);
+        tracker.process(b"hello there\r\n");
+        let mut client = ClientScreen::try_new(24, 80).unwrap();
+        client.feed(b"hello there\r\n");
+        assert_eq!(client.snapshot(), tracker.snapshot());
+        assert!(String::from_utf8_lossy(&client.snapshot()).contains("hello there"));
     }
 
     // Regression test for the tmux scrollback-garbling bug class (see the

@@ -55,6 +55,8 @@ a attach --workspace "$PWD" --tag shell
 # Ctrl-b d detaches without terminating the workload.
 ```
 
+**Scrolling back** uses the host terminal's own gesture (wheel, Shift+PageUp). It never blocks typing into the session. If the live view looks garbled after scrolling, **Ctrl-b r** repaints it from the session's current screen. Output from while you were detached is `a capture --bytes N | less -R`.
+
 The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. Core commands include `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `forget`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
 
 `a snapshot --json` returns a bare array in stable newest-first creation order.

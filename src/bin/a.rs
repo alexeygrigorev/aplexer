@@ -3172,6 +3172,7 @@ fn cmd_hotkeys() -> Result<()> {
     println!();
     println!("  ?        show this reference in the status bar");
     println!("  d        detach (the workload keeps running)");
+    println!("  r        redraw the live screen (recover a garbled display)");
     println!("  n / p    next / previous session in this workspace");
     println!("  N / P    next / previous session across all workspaces");
     println!("  1-9      jump to the numbered session in the status bar");
@@ -4437,6 +4438,11 @@ struct StatusBarCtx {
     /// flushes it at the first boundary that is safe, so deferring never
     /// means dropping.
     pending: Arc<AtomicBool>,
+    /// Set when `Ctrl-b r` wanted a full live-screen repaint but the stream
+    /// was not at a safe boundary. Flushed by the main frame loop the same
+    /// way as `pending`; a successful refresh also redraws the status bar,
+    /// so it subsumes a pending bar redraw.
+    pending_refresh: Arc<AtomicBool>,
     /// When the current synchronized-output deferral started, so
     /// `STATUS_BAR_SYNC_DEFER_LIMIT` can bound it.
     sync_deferred_since: Arc<Mutex<Option<Instant>>>,
@@ -4454,7 +4460,7 @@ const FLASH_DURATION: Duration = Duration::from_secs(3);
 /// the same chords `a keys`/`a hotkeys` print, compressed to what fits a
 /// terminal line. Consumed locally: no byte reaches the workload.
 const ATTACH_KEY_HELP: &str =
-    "Ctrl-b: d detach · n/p switch · N/P global · 1-9 jump · l last · ? help";
+    "Ctrl-b: d detach · r redraw · n/p switch · N/P global · 1-9 jump · l last · ? help";
 
 /// Shows a transient message on the status bar and redraws immediately --
 /// the single channel for attach hints, help, and switch failures, so
@@ -4634,6 +4640,67 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
         }
         None => false,
     }
+}
+
+/// Repaint the host terminal from the client's live screen model (`Ctrl-b r`).
+///
+/// This is the recovery for a garbled display: native scrollback mixed with
+/// the pre-attach `a` list, a status-bar injection that the inner TUI did
+/// not expect, a missed alt-screen frame. It writes the same snapshot
+/// attach uses -- current grid, cursor, input modes -- then redraws the
+/// status bar, whose reserved row the snapshot's ED2 just blanked.
+///
+/// Same boundary rules as `draw_status_bar`: never splice into a half-
+/// emitted CSI. Deferring sets `pending_refresh`, which the main frame loop
+/// flushes at the next safe chunk.
+fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
+    {
+        let (at_boundary, in_sync) = {
+            let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+            (screen.at_escape_boundary(), screen.in_synchronized_update())
+        };
+        if !at_boundary || sync_defer(ctx, in_sync) {
+            ctx.pending_refresh.store(true, Ordering::Relaxed);
+            return false;
+        }
+    }
+    let mut out = ctx
+        .stdout
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match live_screen_refresh_locked(ctx) {
+        Some(seq) => {
+            let _ = out.write_all(&seq);
+            let _ = out.flush();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Snapshot plus a forced status-bar sequence, or `None` when the stream is
+/// not at a safe boundary (in which case `pending_refresh` is set).
+fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
+    let (at_boundary, in_sync, snapshot) = {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            screen.at_escape_boundary(),
+            screen.in_synchronized_update(),
+            screen.snapshot(),
+        )
+    };
+    if !at_boundary || sync_defer(ctx, in_sync) {
+        ctx.pending_refresh.store(true, Ordering::Relaxed);
+        return None;
+    }
+    ctx.pending_refresh.store(false, Ordering::Relaxed);
+    let mut seq = snapshot;
+    if let Some((geom, text)) = status_bar_render(ctx) {
+        if let Some(bar) = status_bar_redraw_locked(ctx, geom, &text, true) {
+            seq.extend_from_slice(&bar);
+        }
+    }
+    Some(seq)
 }
 
 /// Geometry plus the rendered bar text, or `None` when the terminal has no
@@ -5204,6 +5271,10 @@ enum InputAction {
     /// like every other chord -- no byte reaches the workload, so asking
     /// for help can never type `?` into a prompt.
     Help,
+    /// `Ctrl-b r`: repaint the host from the client's live screen model.
+    /// Local, like Help -- the garbled cells are on this terminal, not in
+    /// the session.
+    Redraw,
 }
 
 /// Byte-scanning state for the `Ctrl-b` prefix state machine, split out of
@@ -5220,11 +5291,11 @@ struct InputScanner {
 
 impl InputScanner {
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
-    /// `Ctrl-b d` detaches; `?` flashes the key reference; `n p N P l 1-9`
-    /// switch. Anything else pending is "not a real prefix" -- the withheld
-    /// `Ctrl-b` byte is forwarded and the current byte is reprocessed
-    /// normally, so unbound `Ctrl-b` sequences still pass through to the
-    /// workload untouched.
+    /// `Ctrl-b d` detaches; `?` flashes the key reference; `r` redraws the
+    /// live screen; `n p N P l 1-9` switch. Anything else pending is "not a
+    /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
+    /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
+    /// still pass through to the workload untouched.
     fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
         let mut actions = Vec::new();
         let mut out: Vec<u8> = Vec::new();
@@ -5242,6 +5313,7 @@ impl InputScanner {
                         return actions;
                     }
                     b'?' => Some(InputAction::Help),
+                    b'r' => Some(InputAction::Redraw),
                     b'n' => Some(InputAction::Switch(SwitchTarget::Next)),
                     b'p' => Some(InputAction::Switch(SwitchTarget::Prev)),
                     b'N' => Some(InputAction::Switch(SwitchTarget::NextGlobal)),
@@ -5487,6 +5559,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         last_drawn: Arc::new(Mutex::new(None)),
         screen: workload_screen.clone(),
         pending: Arc::new(AtomicBool::new(false)),
+        pending_refresh: Arc::new(AtomicBool::new(false)),
         sync_deferred_since: Arc::new(Mutex::new(None)),
     };
 
@@ -5551,9 +5624,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
         // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
-        // Ctrl-b ? flashes the key reference, Ctrl-b n/p/N/P/l/1-9 switch
-        // sessions, anything else pending is not a real prefix (both bytes
-        // forward to the workload). See
+        // Ctrl-b ? flashes the key reference, Ctrl-b r redraws the live
+        // screen, Ctrl-b n/p/N/P/l/1-9 switch sessions, anything else
+        // pending is not a real prefix (both bytes forward to the
+        // workload). See
         // `InputScanner` for the byte-level rules and why this needs to
         // survive across separate read() calls, not just within one
         // buffer.
@@ -5563,7 +5637,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
         // has no such command-prefix system and isn't growing one just for
         // this, so the simplest reasonable behavior is used instead: a
-        // *bound* Ctrl-b sequence (d/?/n/p/N/P/l/1-9) is consumed; anything
+        // *bound* Ctrl-b sequence (d/?/r/n/p/N/P/l/1-9) is consumed; anything
         // else is not a prefix at all -- both bytes are forwarded through as
         // ordinary input, so a program that wants a literal Ctrl-b (some
         // editors and REPLs use it) isn't broken by this feature.
@@ -5610,6 +5684,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     }
                     InputAction::Help => {
                         flash_status(&input_status_ctx, ATTACH_KEY_HELP);
+                    }
+                    InputAction::Redraw => {
+                        redraw_live_screen(&input_status_ctx);
                     }
                     InputAction::Switch(target) => {
                         let result = perform_switch(
@@ -5796,7 +5873,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     // all, and it is by construction a chunk boundary that the
                     // model has just confirmed is also an escape boundary --
                     // see `draw_status_bar`'s boundary gate.
-                    if status_ctx.pending.load(Ordering::Relaxed) {
+                    if status_ctx.pending_refresh.load(Ordering::Relaxed) {
+                        redraw_live_screen(&status_ctx);
+                    } else if status_ctx.pending.load(Ordering::Relaxed) {
                         draw_status_bar(&status_ctx, true);
                     }
                 }
@@ -6014,6 +6093,23 @@ mod switching_tests {
         assert_eq!(bytes(&actions), b"xy");
         assert_eq!(actions.len(), 3);
         assert!(matches!(actions[1], InputAction::Help));
+    }
+
+    #[test]
+    fn ctrl_b_r_redraws_without_forwarding() {
+        let mut scanner = InputScanner::default();
+        let actions = scanner.scan(&[0x02, b'r']);
+        assert!(matches!(actions.as_slice(), [InputAction::Redraw]));
+        assert!(bytes(&actions).is_empty());
+        let mut scanner = InputScanner::default();
+        let actions = scanner.scan(&[b'x', 0x02, b'r', b'y']);
+        assert_eq!(bytes(&actions), b"xy");
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[1], InputAction::Redraw));
+        // Capital R is not the chord -- tmux's refresh-client is lowercase.
+        let mut scanner = InputScanner::default();
+        let actions = scanner.scan(&[0x02, b'R']);
+        assert_eq!(bytes(&actions), &[0x02, b'R']);
     }
 
     fn bytes(actions: &[InputAction]) -> Vec<u8> {
@@ -7217,6 +7313,7 @@ mod switching_tests {
                 aplexer::screen::ClientScreen::try_new(23, 80).unwrap(),
             )),
             pending: Arc::new(AtomicBool::new(false)),
+            pending_refresh: Arc::new(AtomicBool::new(false)),
             sync_deferred_since: Arc::new(Mutex::new(None)),
         }
     }
@@ -7925,6 +8022,38 @@ mod switching_tests {
         let ctx = status_ctx_for_test(false);
         assert!(!draw_status_bar(&ctx, false));
         assert!(!draw_status_bar(&ctx, true));
+    }
+
+    #[test]
+    fn live_screen_refresh_repaints_model_contents_and_the_bar() {
+        let ctx = status_ctx_for_test(true);
+        feed_test_screen(&ctx.screen, b"recover-me\r\n");
+        let bytes = live_screen_refresh_locked(&ctx).expect("ground-state refresh writes");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            bytes.windows(4).any(|w| w == b"\x1b[2J") || bytes.windows(3).any(|w| w == b"\x1b[J"),
+            "refresh must clear before repainting: {text:?}"
+        );
+        assert!(
+            text.contains("recover-me"),
+            "refresh must include the live screen: {text:?}"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == b"\x1b[7m"),
+            "refresh must restore the status bar the snapshot's clear wiped: {text:?}"
+        );
+        assert!(!ctx.pending_refresh.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn live_screen_refresh_defers_mid_escape_sequence() {
+        let ctx = status_ctx_for_test(true);
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+        assert!(live_screen_refresh_locked(&ctx).is_none());
+        assert!(
+            ctx.pending_refresh.load(Ordering::Relaxed),
+            "a deferred refresh must be retried at the next safe boundary"
+        );
     }
 
     #[test]
