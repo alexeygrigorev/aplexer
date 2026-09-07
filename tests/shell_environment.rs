@@ -57,7 +57,25 @@ impl Harness {
         environment: &[&str],
         script: &str,
     ) -> SessionRecord {
+        self.start_from_launcher(workspace, tag, engine, environment, &[], script)
+    }
+
+    /// `start`, plus `launcher_env` applied to the `a start` process itself
+    /// -- the environment the session is launched *from*, as opposed to the
+    /// `--env` values it is launched *with*.
+    fn start_from_launcher(
+        &mut self,
+        workspace: &Path,
+        tag: &str,
+        engine: &str,
+        environment: &[&str],
+        launcher_env: &[(&str, &str)],
+        script: &str,
+    ) -> SessionRecord {
         let mut command = self.command();
+        for (name, value) in launcher_env {
+            command.env(name, value);
+        }
         command
             .args(["--json", "start", "--workspace"])
             .arg(workspace)
@@ -164,4 +182,53 @@ fn shell_keeps_provider_overrides_while_agent_engines_strip_them() {
     let output = harness.capture_until(&agent.id.to_string(), "agent-api=");
     let output = String::from_utf8_lossy(&output);
     assert!(output.contains("agent-api=unset"), "{output}");
+}
+
+/// aplexer owns the workload's PTY, so it must declare the terminal itself
+/// rather than leak whatever the launching process happened to have.
+///
+/// The regression: `a start` run from a cron job, a desktop launcher, or
+/// another agent's non-interactive shell carries `TERM=dumb` or no TERM at
+/// all. That inherited value reached the workload verbatim, so a TUI agent
+/// (Claude Code, Codex) started that way rendered monochrome for the whole
+/// life of the session -- including once a real 256-color terminal attached
+/// to it, which is the only terminal that was ever going to display it.
+#[test]
+fn workload_terminal_is_aplexers_own_not_the_launchers() {
+    let mut harness = Harness::new();
+    let workspace = TempDir::new().unwrap();
+
+    // A launcher with a hostile TERM, and one with none at all.
+    let session = harness.start_from_launcher(
+        workspace.path(),
+        "term-dumb",
+        "shell",
+        &[],
+        &[("TERM", "dumb"), ("COLORTERM", "")],
+        "printf 'term=[%s] colorterm=[%s]\\n' \"${TERM-unset}\" \"${COLORTERM-unset}\"; sleep 30",
+    );
+    let output = harness.capture_until(&session.id.to_string(), "term=[");
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("term=[xterm-256color] colorterm=[truecolor]"),
+        "inherited launcher TERM leaked into the workload: {output}"
+    );
+
+    // An explicit --env still wins: the declaration is a default, not a
+    // lock. Set BEFORE the launch environment is applied, so a profile or
+    // `--env TERM=...` overrides it.
+    let session = harness.start_from_launcher(
+        workspace.path(),
+        "term-override",
+        "shell",
+        &["TERM=screen-256color"],
+        &[("TERM", "dumb")],
+        "printf 'term=[%s]\\n' \"${TERM-unset}\"; sleep 30",
+    );
+    let output = harness.capture_until(&session.id.to_string(), "term=[");
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("term=[screen-256color]"),
+        "explicit --env TERM did not override the default: {output}"
+    );
 }

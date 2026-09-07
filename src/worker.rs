@@ -2164,6 +2164,23 @@ fn recover_control_socket(
     Ok((listener, socket_identity, replacement_lock, lock_identity))
 }
 
+/// The terminal aplexer presents to every workload it spawns.
+///
+/// A session outlives any particular client, and different clients with
+/// different terminals attach to the same session over its life, so the
+/// workload cannot be told "the terminal you have right now". It is told
+/// what aplexer itself guarantees to relay faithfully, which the
+/// `xterm-256color` terminfo entry describes and which is present on
+/// effectively every system a workload runs on. Overridable per session
+/// with `--env TERM=...` or a profile `env` entry.
+const WORKLOAD_TERM: &str = "xterm-256color";
+
+/// Direct-color advertisement for the same relay. Kept separate from
+/// `WORKLOAD_TERM` because it is a separate, independently overridable
+/// claim: TERM names the terminfo entry, COLORTERM says the terminal
+/// understands `CSI 38;2;r;g;b m`.
+const WORKLOAD_COLORTERM: &str = "truecolor";
+
 fn spawn_workload(
     record: &SessionRecord,
     launch_environment: &std::collections::BTreeMap<String, String>,
@@ -2187,6 +2204,30 @@ fn spawn_workload(
     command
         .args(&record.command[1..])
         .current_dir(&record.cwd)
+        // aplexer owns the workload's PTY, so aplexer -- not whatever shell
+        // happened to run `a start` -- is the terminal the workload is
+        // talking to. Inheriting the launcher's TERM is therefore always
+        // wrong, and wrong in both directions: `a start` run from a cron
+        // job, a desktop launcher, or another agent's non-interactive shell
+        // leaks `dumb` (or nothing at all) into a session that a real
+        // 256-color terminal later attaches to, and every TUI workload
+        // downgrades itself to monochrome for the rest of the session's
+        // life. Declare our own emulation instead, exactly as tmux and
+        // screen do.
+        //
+        // `xterm-256color` is the honest declaration: `a attach` is a raw
+        // byte relay (see StreamBoundary in src/screen.rs), so the
+        // workload's escape sequences reach the attached terminal
+        // untouched, and the vt100 grid that repaints the screen on
+        // reattach models indexed and RGB color alike. COLORTERM says the
+        // same thing about direct color, which is the difference between a
+        // workload picking 256 palette entries and picking true RGB.
+        //
+        // Set BEFORE `.envs(launch_environment)` so a profile or an
+        // explicit `--env TERM=...` still wins: later inserts of the same
+        // key replace earlier ones.
+        .env("TERM", WORKLOAD_TERM)
+        .env("COLORTERM", WORKLOAD_COLORTERM)
         .envs(launch_environment)
         .env("APLEXER_SESSION_ID", record.id.to_string())
         .env("APLEXER_WORKSPACE", &record.workspace)
