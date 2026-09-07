@@ -2088,18 +2088,9 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 .create_new(true)
                 .mode(0o600)
                 .open(&launch_environment_path)
-                .with_context(|| {
-                    format!(
-                        "create {}",
-                        launch_environment_path.display()
-                    )
-                })?;
-            serde_json::to_writer_pretty(&mut file, &launch.env).with_context(|| {
-                format!(
-                    "write {}",
-                    launch_environment_path.display()
-                )
-            })?;
+                .with_context(|| format!("create {}", launch_environment_path.display()))?;
+            serde_json::to_writer_pretty(&mut file, &launch.env)
+                .with_context(|| format!("write {}", launch_environment_path.display()))?;
             use std::io::Write as _;
             file.write_all(b"\n")?;
         }
