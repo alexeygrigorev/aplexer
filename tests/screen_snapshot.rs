@@ -2001,21 +2001,47 @@ fn workspace_records(harness: &Harness, workspace: &Path) -> Vec<Value> {
 
 /// Polls until a session other than `exclude` exists in `workspace`. The chord
 /// starts a real worker, so this is a wait, not a read.
+/// Wait for a second session to appear in `workspace` **and be usable**.
+///
+/// The liveness half is not belt-and-braces, it is the whole point. `a list`
+/// shows a session from the moment its record is first written, which is
+/// `Phase::Starting` -- the worker has not necessarily recorded its pid yet,
+/// and has certainly not necessarily bound its control socket. Returning on
+/// mere presence let the caller run `a send` inside that window, where the
+/// CLI correctly refuses with whichever startup-window error applied at that
+/// instant: "worker is not running (state: broken)" before the pid lands,
+/// "its control socket is gone" after. Both were reproduced from this helper
+/// (the second one with `phase: starting, worker_alive: true` and no socket
+/// on disk yet), and both read like a product failure while being nothing but
+/// this poll pouncing on an intermediate record.
+///
+/// Nothing in the product does that: `Ctrl-b n` goes through
+/// `create_sibling_session`, which blocks in `api::start_session` for up to
+/// `NEW_SESSION_STARTUP_TIMEOUT_MS` and hands back a session that is up. So
+/// this waits for the same thing the product waits for.
 fn wait_for_sibling(harness: &Harness, workspace: &Path, exclude: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_seen: Option<Value> = None;
     loop {
         let found = workspace_records(harness, workspace)
             .into_iter()
             .find(|row| row["id"].as_str() != Some(exclude));
         if let Some(found) = found {
-            return found;
+            if found["state"].as_str() == Some("running") && found["worker_alive"] == true {
+                return found;
+            }
+            last_seen = Some(found);
         }
         assert!(
             Instant::now() < deadline,
-            "no second session appeared in {} within 20s",
-            workspace.display()
+            "no usable second session appeared in {} within 20s; last record seen: {}",
+            workspace.display(),
+            last_seen
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "none".into())
         );
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2374,6 +2400,17 @@ fn settled_workload_rows(
     }
 }
 
+/// The scroll-mode status bar as the host terminal is actually showing it --
+/// the row the user reads the retained-line count off.
+fn scroll_bar_line(client: &PtyClient, rows: u16, cols: u16) -> String {
+    let host = host_terminal(&client.output(), rows, cols);
+    let last = usize::from(rows) - 1;
+    host.screen()
+        .contents_between(last as u16, 0, last as u16, cols)
+        .trim_end()
+        .to_string()
+}
+
 fn render_rows(rows: &[Vec<u8>]) -> String {
     rows.iter()
         .enumerate()
@@ -2708,6 +2745,80 @@ fn a_key_pressed_over_the_overlay_runs_its_binding_or_falls_through() {
         "the attach client holds the host on the alternate screen across the overlay"
     );
 
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// **The empty-pager regression, end to end.** A session whose workload holds
+/// a DECSTBM sub-range -- the shape every agent CLI holds while it reserves a
+/// composer at the bottom of the screen -- must still open `Ctrl-b [` on real
+/// history, not on `SCROLL 0/0`.
+///
+/// This is the user-visible half of `seeding_retains_lines_that_scrolled_out_
+/// of_a_scroll_region`: everything here happened *before* the attach, so the
+/// only way any of it can be in the pager is the seed replay. It is written
+/// against a shell holding `\x1b[3;23r` rather than a captured agent
+/// transcript deliberately -- the mechanism is the region, and a fixture of
+/// somebody's real session bytes would carry their content into the repo.
+#[test]
+fn scroll_mode_has_history_in_a_session_that_holds_a_scroll_region() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("region-history");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "region");
+    // Reserve rows 3..23 and print far more than that region holds, so every
+    // early line has scrolled out of the *region* -- which is precisely the
+    // case `vt100` drops on the floor for a live pane.
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "printf '\\033[3;23r'; for i in $(seq -w 1 120); do printf 'REGION-%s\\n' \"$i\"; done",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "REGION-120");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"REGION-120", 0, "the newest line on the attach snapshot");
+
+    let live = host_terminal(&client.output(), 24, 80);
+    let live_text = live.screen().contents();
+    assert!(
+        !live_text.contains("REGION-005"),
+        "the early output must already be off the visible screen:\n{live_text}"
+    );
+
+    let opened_at = client.mark();
+    client.send(&[0x02, b'[']);
+    client.wait_for_offset(b"SCROLL", opened_at, "the scroll-mode status bar");
+
+    // The bar's own count is the thing the user reported as 0/0.
+    let bar = scroll_bar_line(&client, 24, 80);
+    assert!(
+        !bar.contains("SCROLL 0/0"),
+        "the pager opened with no history in a session holding a scroll region -- \
+         this is the bug: the seed replay honoured the region and `vt100` dropped \
+         every row that left it. Bar: {bar:?}"
+    );
+    assert!(
+        !bar.contains("no history"),
+        "...and it must not be claiming there is legitimately nothing: {bar:?}"
+    );
+
+    // And the history is real: page all the way back and read it.
+    let paged_at = client.mark();
+    client.send(b"\x1b[H");
+    client.wait_for_offset(
+        b"REGION-005",
+        paged_at,
+        "output paged back from history written under a scroll region",
+    );
+
+    client.send(b"q");
     client.detach();
     harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
 }

@@ -649,6 +649,23 @@ impl ScreenTracker {
         }
     }
 
+    /// Replay bytes for their *history* only -- `ClientScreen::seed_history`'s
+    /// inner loop, and the one caller that is allowed to skip the margin
+    /// scan `process` does.
+    ///
+    /// Skipping it is not an optimization looking for a justification: the
+    /// seed strips every DECSTBM out of the tail before this sees it
+    /// (`without_scroll_regions`) and resets the tracker immediately
+    /// afterwards, so the scan is guaranteed to find nothing and its result
+    /// is guaranteed to be discarded. It is a second full pass over multiple
+    /// megabytes on the attach path, and the attach path is where it is least
+    /// affordable. `alt_screen` is still tracked, because the seed's epilogue
+    /// relies on it being current.
+    pub fn seed(&mut self, data: &[u8]) {
+        self.parser.process(data);
+        self.alt_screen = self.parser.screen().alternate_screen();
+    }
+
     /// Resizes the parser's grid (content-preserving) and re-fits the margin
     /// tracker to the new row count the same way the grid re-fits its own
     /// scroll region -- it is *not* reset to full-screen, correcting design
@@ -1119,6 +1136,78 @@ fn mode_is_alt_screen(num: &[u8]) -> bool {
     matches!(n, 47 | 1047 | 1048 | 1049)
 }
 
+/// Strip every DECSTBM (`CSI <params> r`) out of a raw history tail before it
+/// is replayed into the client's model.
+///
+/// **This is what makes `Ctrl-b [` show anything at all in an agent session.**
+///
+/// The mechanism, from `vt100` 0.16.2 `grid.rs::scroll_up`: a row is pushed
+/// into the retained scrollback only `if self.scrollback_len > 0 &&
+/// !self.scroll_region_active()`. While a DECSTBM sub-range is in force, rows
+/// scrolled out of the top of that region are **dropped**, not retained. That
+/// is the right behavior for a live pane -- it is tmux's too -- but the seed
+/// replay is not a live pane. It is a one-shot pass whose only product is the
+/// history; its final grid is thrown away moments later by the reattach
+/// snapshot, which repaints the screen from the worker's own model. So a
+/// region has nothing to protect here, and honoring one only discards the
+/// transcript the user is trying to scroll back to.
+///
+/// Measured against 4 MiB of real retained history from thirteen live agent
+/// sessions (codex, claude, opencode), replayed at 23x100 with a 2000-line
+/// grid -- retained lines, before and after this strip:
+///
+/// ```text
+///   0 ->  225   0 ->  2000    53 ->  594   228 ->  570
+/// 1004 -> 2000  1269 -> 2000   728 ->  751  1881 -> 2000
+/// ```
+///
+/// Three of those sessions produced a *completely* empty pager before it. The
+/// rows recovered are ordinary transcript text, spot-checked at several
+/// depths, not the region's static header and footer: an agent CLI reserves
+/// its sub-range for the composer at the bottom and scrolls the transcript
+/// through the region above, so the rows leaving that region are exactly the
+/// ones worth keeping.
+///
+/// Borrowed, not copied, when the tail holds no DECSTBM at all -- which is
+/// every plain shell session, and the case where the seed is already fine.
+///
+/// Only an unprefixed `CSI <digits and semicolons> r` is removed. `CSI ? Ps r`
+/// is XTRESTORE (restore private modes), a different sequence that must
+/// survive, so a parameter list containing anything but digits and `;`
+/// disqualifies the match.
+fn without_scroll_regions(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < data.len() {
+        if data[i] != 0x1b || i + 1 >= data.len() || data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 2;
+        while end < data.len() && matches!(data[end], b'0'..=b'9' | b';') {
+            end += 1;
+        }
+        if end < data.len() && data[end] == b'r' {
+            let buf = out.get_or_insert_with(|| Vec::with_capacity(data.len()));
+            buf.extend_from_slice(&data[copied..i]);
+            copied = end + 1;
+            i = end + 1;
+        } else {
+            // Parameter bytes cannot contain ESC, so resuming at `end` cannot
+            // skip past the start of another sequence.
+            i = end.max(i + 2);
+        }
+    }
+    match out {
+        Some(mut buf) => {
+            buf.extend_from_slice(&data[copied..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(data),
+    }
+}
+
 /// The attached client's own copy of the workload's terminal, kept by feeding
 /// it the very bytes the client is relaying to the user's terminal.
 ///
@@ -1189,11 +1278,14 @@ impl ClientScreen {
     ///   DECSTBM or `?1049h` that happened to be in force at the end of the
     ///   tail cannot outlive the seed and contradict the snapshot that is
     ///   fed next.
+    /// - The tail is replayed with its **scroll regions removed**
+    ///   (`without_scroll_regions`), which is what makes the replay produce
+    ///   history at all for an agent TUI. See that function.
     pub fn seed_history(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        self.screen.process(data);
+        self.screen.seed(&without_scroll_regions(data));
         self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
         self.screen.reset_margins();
         self.boundary.reset();
@@ -2576,6 +2668,87 @@ mod tests {
         // ...and leaving it gives the primary screen's history back.
         client.feed(b"\x1b[?1049l");
         assert!(client.scrollback_available() > 0);
+    }
+
+    /// **The empty-pager regression.** A tail written under a DECSTBM
+    /// sub-range -- the shape every agent CLI holds while it reserves a
+    /// composer at the bottom of the screen -- must still leave history to
+    /// page through.
+    ///
+    /// The control half is what makes this a real test rather than an
+    /// assertion that the code does what it does: the identical bytes, fed
+    /// through the *live* path (`feed`, which is what `relay` uses), retain
+    /// nothing at all. That is `vt100` behaving correctly for a live pane and
+    /// is deliberately left alone; the seed replay is the one place where a
+    /// region has nothing to protect, because its grid is thrown away by the
+    /// reattach snapshot moments later and only its history survives.
+    #[test]
+    fn seeding_retains_lines_that_scrolled_out_of_a_scroll_region() {
+        let mut tail = b"\x1b[3;23r".to_vec();
+        for i in 1..=200 {
+            tail.extend_from_slice(format!("REGION-{i:03}\r\n").as_bytes());
+        }
+
+        let mut live = ClientScreen::try_new_with_scrollback(23, 40, 500).unwrap();
+        live.feed(&tail);
+        assert_eq!(
+            live.scrollback_available(),
+            0,
+            "control: a live pane under a sub-range retains nothing -- if this ever \
+             stops being true, the seed no longer needs its own path"
+        );
+
+        let mut seeded = ClientScreen::try_new_with_scrollback(23, 40, 500).unwrap();
+        seeded.seed_history(&tail);
+        let available = seeded.scrollback_available();
+        assert!(
+            available > 100,
+            "seeding under a scroll region retained only {available} lines: this is the \
+             empty-pager bug -- `Ctrl-b [` opens on SCROLL 0/0 in every agent session"
+        );
+
+        // And the retained rows are the transcript, not blank filler.
+        let (frame, _, _) = seeded.scrolled_frame(available);
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(
+            text.contains("REGION-0"),
+            "the retained history must hold the rows that scrolled out of the region:\n{text}"
+        );
+    }
+
+    /// The strip is narrow on purpose: DECSTBM goes, and the sequence that
+    /// merely looks like it -- `CSI ? Ps r`, XTRESTORE -- stays, because
+    /// swallowing a workload's private-mode restore would be a new bug in
+    /// place of the old one.
+    #[test]
+    fn stripping_scroll_regions_leaves_every_other_sequence_alone() {
+        let kept = b"\x1b[?1049h\x1b[?1000r\x1b[31mred\x1b[0m\rplain text with an r in it";
+        assert_eq!(
+            without_scroll_regions(kept).as_ref(),
+            kept,
+            "only DECSTBM may be removed"
+        );
+        assert!(
+            matches!(without_scroll_regions(kept), std::borrow::Cow::Borrowed(_)),
+            "a tail with no DECSTBM must not be copied -- that is every plain shell \
+             session, on the attach path"
+        );
+
+        for (input, want) in [
+            (b"a\x1b[3;23rb".as_slice(), b"ab".as_slice()),
+            (b"a\x1b[rb".as_slice(), b"ab".as_slice()),
+            (b"\x1b[1;24r\x1b[5;10rX".as_slice(), b"X".as_slice()),
+            // Truncated at the end of the buffer: a tail is a byte slice of a
+            // log and can stop anywhere, so this must be emitted verbatim
+            // rather than eaten while waiting for a final byte.
+            (b"tail\x1b[3;2".as_slice(), b"tail\x1b[3;2".as_slice()),
+        ] {
+            assert_eq!(
+                without_scroll_regions(input).as_ref(),
+                want,
+                "stripping {input:?}"
+            );
+        }
     }
 
     /// Priming from a raw tail gives a freshly attached client a past to

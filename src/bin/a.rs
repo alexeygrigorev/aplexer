@@ -5822,16 +5822,43 @@ fn history_limit() -> usize {
 /// How much of the worker's retained raw history is replayed into a fresh
 /// client model to give it a past (`ClientScreen::seed_history`).
 ///
-/// Sized from the line limit rather than fixed: roughly half a kilobyte of
-/// raw PTY bytes per rendered line is a fair rate for colorized agent output,
-/// so the default 2000-line grid asks for ~1 MiB -- enough to fill it, small
-/// enough that the parse is tens of milliseconds on the attach path, and
-/// capped at the worker's own `DEFAULT_HISTORY_BYTES` because there is never
-/// more than that to fetch.
+/// This used to be sized from the line limit at an assumed ~512 raw bytes per
+/// rendered line, which put the default 2000-line grid at ~1 MiB. **A byte
+/// budget is not a line budget**, and for the workload aplexer exists for the
+/// two diverge in the direction that empties the pager: an agent CLI that has
+/// been idle spends its bytes on animation, not on rows. Measured over the
+/// retained history of thirteen live agent sessions, one had spent 500 KiB on
+/// a spinner containing *zero* line feeds -- 18,000 absolute cursor addresses
+/// and not one row of transcript. Any fixed per-line guess is one idle hour
+/// away from being a budget of pure noise, so this is simply a flat budget
+/// with its cost measured rather than a guess dressed as arithmetic.
+///
+/// A line-feed-counting budget was tried and refused by measurement: agent
+/// CLIs emit many `\n` per *rendered* row (wrapped and redrawn rows), so
+/// "the suffix holding 4000 line feeds" cut four sessions from ~2000 retained
+/// lines to 51-245. Counting line feeds is no better a proxy for rows than
+/// counting bytes is.
+///
+/// **Why 2 MiB.** Replaying real captures through the real seed path, at
+/// 23x100 into a 2000-line grid, minimum of five runs -- retained lines, and
+/// the parse those lines cost:
+///
+/// ```text
+///                  worst session   parse (mean / worst)
+///   1 MiB shipped      0 lines        16.1 / 20.3 ms
+///   2 MiB             83 lines        28.7 / 38.5 ms
+///   4 MiB            225 lines        55.8 / 86.0 ms
+/// ```
+///
+/// The seed is synchronous on the attach path *and* on every `Ctrl-b Right`
+/// switch, where the protocol round trip it sits beside is 0.3-6 ms at p50
+/// and 13-22 ms at p95 (`attach_round_trip_latency`). 2 MiB buys every one of
+/// those thirteen sessions a pager with real content in it for ~13 ms; 4 MiB
+/// spends another ~27 ms on every switch anyone ever makes to take a single
+/// pathological session from 83 rows of history to 225. That is not a trade
+/// worth making, and 83 rows is already three and a half screens.
 fn scrollback_seed_bytes() -> usize {
-    history_limit()
-        .saturating_mul(512)
-        .clamp(64 * 1024, aplexer::DEFAULT_HISTORY_BYTES)
+    (2 * 1024 * 1024).min(aplexer::DEFAULT_HISTORY_BYTES)
 }
 
 /// Whether the client may borrow mouse reporting from the host terminal.
@@ -6072,17 +6099,43 @@ fn scroll_keys(buf: &[u8]) -> ScrollKey {
 /// the way out.
 fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
     let position = format!("SCROLL {}/{}", view.offset, view.available);
-    let note = if view.available == 0 && alt_screen {
-        " · no history: the workload owns the screen"
+    // An empty pager must say *why* it is empty, and must say it on an
+    // ordinary 80-column terminal rather than only on a wide one. So the two
+    // cases get different ladders: with history the row spends its width on
+    // the navigation keys, and with none it spends the width on the reason
+    // instead -- offering PgUp/PgDn for a pager that cannot move is the thing
+    // that reads as a broken feature.
+    let candidates: Vec<String> = if view.available == 0 {
+        let why = if alt_screen {
+            // A full-screen application owns the grid; `vt100` gives the
+            // alternate screen no scrollback, as every real terminal does.
+            "no history: the workload owns the screen"
+        } else {
+            // The primary-screen case, and the one the generic hint used to
+            // hide: a TUI that repaints in place with absolute cursor
+            // addressing never scrolls, so nothing has ever left the top of
+            // the screen for the history to hold. Measured on a real opencode
+            // session whose whole 4 MiB of retained history holds 81,584
+            // cursor addresses and zero line feeds -- there is genuinely
+            // nothing to page back to, and what the user wants is on screen.
+            "no history: nothing has scrolled off this screen"
+        };
+        vec![
+            format!("{position} · {why} · q live"),
+            format!("{position} · {why}"),
+            format!("{position} · no history · q live"),
+            format!("{position} · no history"),
+        ]
     } else {
-        ""
+        vec![
+            format!(
+                "{position} · PgUp/PgDn ↑↓ Home/End · q live · keys go here, not to the session"
+            ),
+            format!("{position} · PgUp/PgDn ↑↓ Home/End · q live"),
+            format!("{position} · q live"),
+        ]
     };
-    let full = format!(
-        "{position}{note} · PgUp/PgDn ↑↓ Home/End · q live · keys go here, not to the session"
-    );
-    let medium = format!("{position}{note} · PgUp/PgDn ↑↓ Home/End · q live");
-    let compact = format!("{position} · q live");
-    for candidate in [full, medium, compact, position.clone()] {
+    for candidate in candidates.into_iter().chain([position.clone()]) {
         if terminal_display_width(&candidate) <= cols {
             return pad_or_truncate(&sanitize_terminal_text(&candidate), cols);
         }
@@ -9630,6 +9683,68 @@ mod switching_tests {
                     "the position must survive at {cols} columns, got {text:?}"
                 );
             }
+        }
+    }
+
+    /// An empty pager must say *why* it is empty, in both of the two ways a
+    /// pager can be empty. The primary-screen case used to show the generic
+    /// "PgUp/PgDn" hint over a pager that could not move, which reads as a
+    /// broken feature rather than an answer -- and it is the case a
+    /// full-screen TUI that repaints in place produces, which is most of what
+    /// runs under aplexer.
+    #[test]
+    fn an_empty_pager_says_why_it_is_empty() {
+        let empty = ScrollView {
+            offset: 0,
+            available: 0,
+        };
+        let alt = scroll_bar_text(empty, 120, true);
+        assert!(
+            alt.contains("no history: the workload owns the screen"),
+            "an alt-screen workload's empty pager must name the reason: {alt:?}"
+        );
+        let primary = scroll_bar_text(empty, 120, false);
+        assert!(
+            primary.contains("no history"),
+            "an empty pager on the primary screen must say so too, not offer \
+             navigation keys that cannot do anything: {primary:?}"
+        );
+        assert!(
+            !primary.contains("the workload owns the screen"),
+            "...and must not blame the alternate screen when it is not in use: {primary:?}"
+        );
+        // The reason has to survive an ordinary terminal, not just a wide one.
+        // It used to be the first thing the width ladder dropped, which left
+        // exactly the row the user reported: `SCROLL 0/0 · q live`, with no
+        // hint that the emptiness was the answer rather than a failure.
+        for cols in [80usize, 100, 200] {
+            for alt in [true, false] {
+                let text = scroll_bar_text(empty, cols, alt);
+                assert!(
+                    text.contains("no history"),
+                    "the reason must fit a {cols}-column terminal (alt={alt}): {text:?}"
+                );
+                assert!(
+                    !text.contains("PgUp"),
+                    "a pager that cannot move must not offer keys to move it: {text:?}"
+                );
+                assert_eq!(terminal_display_width(&text), cols);
+            }
+        }
+        // A pager with history says nothing of the sort, at any width.
+        for cols in [40usize, 80, 200] {
+            let full = scroll_bar_text(
+                ScrollView {
+                    offset: 0,
+                    available: 900,
+                },
+                cols,
+                false,
+            );
+            assert!(
+                !full.contains("no history"),
+                "a pager with 900 lines behind it must not apologise: {full:?}"
+            );
         }
     }
 
