@@ -305,6 +305,8 @@ fn make_live_worker_dead_leader(
         containment_cgroup: None,
         containment_cgroup_identity: None,
         containment_empty: Some(false),
+        worker_cgroup: None,
+        workload_cgroup: None,
         socket_path: paths.socket(id),
         history_path: paths.history(id),
         exit: None,
