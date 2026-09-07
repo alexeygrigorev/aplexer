@@ -329,7 +329,12 @@ fn fresh_start_reclaims_a_dead_holder_under_its_exact_name() {
         "the reclaimed session kept the corpse's identity"
     );
     assert!(
-        !harness.state.path().join("sessions").join(id.to_string()).exists(),
+        !harness
+            .state
+            .path()
+            .join("sessions")
+            .join(id.to_string())
+            .exists(),
         "the reclaim left the predecessor's durable state behind"
     );
 }

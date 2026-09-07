@@ -7,7 +7,6 @@ use std::fs;
 #[cfg(feature = "startup-test-hooks")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 #[cfg(feature = "startup-test-hooks")]
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -16,6 +15,7 @@ use std::thread;
 #[cfg(feature = "startup-test-hooks")]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime_dir: TempDir,
@@ -440,11 +440,8 @@ fn failed_replacement_preserves_finished_session_evidence() {
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
 
-    let old_id = harness.plant_finished_session(
-        Path::new(workspace),
-        "daily",
-        b"important-old-history\r\n",
-    );
+    let old_id =
+        harness.plant_finished_session(Path::new(workspace), "daily", b"important-old-history\r\n");
     let capture_before = harness.run(&["capture", &old_id]);
     assert_eq!(capture_before.stdout, b"important-old-history\r\n");
 
@@ -528,7 +525,8 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
 
-    let old_id = harness.plant_finished_session(Path::new(workspace), "daily", b"archived-evidence\r\n");
+    let old_id =
+        harness.plant_finished_session(Path::new(workspace), "daily", b"archived-evidence\r\n");
 
     let replacement = harness.run_with_env(
         &[
@@ -671,13 +669,17 @@ fn zombie_predecessor(harness: &Harness, workspace: &str, tag: &str, marker: &st
 
     // Worker first, so it never gets to write a terminal phase; then the
     // workload, so nothing survives that could legitimately retain the claim.
+    // Liveness through `aplexer::process_alive`, not a bare `kill(pid, 0)`:
+    // the signal probe succeeds for a zombie, and a worker killed here
+    // reparents onto whatever child subreaper this suite runs under, so it
+    // stays signalable until that subreaper reaps it.
     for pid in [worker_pid, workload_pid] {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        while aplexer::process_alive(pid as u32) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} did not die");
+        assert!(!aplexer::process_alive(pid as u32), "pid {pid} did not die");
     }
 
     let snapshot = harness.run(&["snapshot"]);

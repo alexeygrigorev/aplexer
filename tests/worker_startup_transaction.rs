@@ -27,16 +27,15 @@ fn process_state(pid: u32) -> Option<char> {
         .next()
 }
 
-/// True when `pid` is gone or only a zombie. `process_alive` is `kill(pid, 0)`,
-/// which reports a zombie as alive. This test inspects the pid from a third
-/// process after the worker is gone, and a workload the worker did not reap is
-/// a zombie for as long as its new parent (often this suite's enclosing aplexer
-/// subreaper) takes to collect it. The original point assertion had no retry
-/// and would have read that window as a leak; treating zombies as exited
-/// removes the window without weakening the check -- a leaked workload stays
-/// in a non-zombie state forever.
+/// True when `pid` is gone or only a zombie. This test inspects the pid from
+/// a third process after the worker is gone, and a workload the worker did
+/// not reap is a zombie for as long as its new parent (often this suite's
+/// enclosing aplexer subreaper) takes to collect it. Treating zombies as
+/// exited removes that window without weakening the check -- a leaked
+/// workload stays in a non-zombie state forever. This is now exactly what
+/// `aplexer::process_alive` answers.
 fn process_has_exited(pid: u32) -> bool {
-    matches!(process_state(pid), None | Some('Z'))
+    !aplexer::process_alive(pid)
 }
 
 fn assert_workload_exited(pid: u32, point: &str) {
@@ -174,6 +173,7 @@ fn post_spawn_and_partial_thread_failures_kill_workload_and_clean_runtime() {
         "thread_3",
         "thread_4",
         "thread_5",
+        "thread_6",
         "after_thread_setup",
         "after_running_record",
     ] {

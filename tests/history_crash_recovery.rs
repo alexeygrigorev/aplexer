@@ -102,12 +102,16 @@ fn worker_crash_recovers_the_latest_committed_byte_exact_tail() {
     );
 
     assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
-    let exit_deadline = Instant::now() + Duration::from_secs(2);
-    while PathBuf::from(format!("/proc/{worker_pid}")).exists() && Instant::now() < exit_deadline {
+    // A `/proc/<pid>` directory outlives the process for as long as its
+    // parent leaves it unreaped, and this worker reparents onto whatever
+    // child subreaper the suite runs under. Ask whether it can still run
+    // code, which is what the rest of this test depends on.
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while aplexer::process_alive(worker_pid as u32) && Instant::now() < exit_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        !PathBuf::from(format!("/proc/{worker_pid}")).exists(),
+        !aplexer::process_alive(worker_pid as u32),
         "worker did not exit after SIGKILL"
     );
 

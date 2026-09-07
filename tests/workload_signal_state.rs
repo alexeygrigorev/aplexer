@@ -142,10 +142,22 @@ fn workload_signal_probe() {
         );
         assert_eq!(current.sa_sigaction, libc::SIG_DFL);
 
+        // The worker installs its own SIGCHLD handler to drive adopted-
+        // descendant reaping. That is the worker's business and must never
+        // leak into the workload: a shell that inherited a foreign SIGCHLD
+        // disposition would mismanage its own job control.
+        assert_eq!(
+            libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current),
+            0
+        );
+        assert_eq!(current.sa_sigaction, libc::SIG_DFL);
+        assert_eq!(current.sa_flags & libc::SA_NOCLDSTOP, 0);
+
         let mut mask: libc::sigset_t = std::mem::zeroed();
         let rc = libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask);
         assert_eq!(rc, 0);
         assert_eq!(libc::sigismember(&mask, libc::SIGUSR1), 0);
+        assert_eq!(libc::sigismember(&mask, libc::SIGCHLD), 0);
     }
     println!("signal-state-clean");
 

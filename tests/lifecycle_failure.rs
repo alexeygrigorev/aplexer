@@ -41,23 +41,35 @@ impl Harness {
     }
 }
 
+/// Backstop cleanup for a pid this test caused to exist, pinned by start
+/// time so a recycled number is never signalled.
+///
+/// The start time is optional on purpose. This guard is constructed from a
+/// pid the worker is concurrently tearing down, and the worker now reaps the
+/// descendants it adopts -- so `/proc/<pid>` can be gone before the guard is
+/// even built. That is the success case, not a test failure: there is
+/// nothing left to guard. Insisting on reading the start time here made the
+/// test lose a race with its own subject about a third of the time.
 struct PidGuard {
     pid: u32,
-    start_time: u64,
+    start_time: Option<u64>,
 }
 
 impl PidGuard {
     fn new(pid: u32) -> Self {
         Self {
             pid,
-            start_time: process_start_time_ticks(pid).expect("process start time"),
+            start_time: process_start_time_ticks(pid).ok(),
         }
     }
 }
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        if process_start_time_ticks(self.pid).ok() == Some(self.start_time) {
+        let Some(start_time) = self.start_time else {
+            return;
+        };
+        if process_start_time_ticks(self.pid).ok() == Some(start_time) {
             unsafe {
                 libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
             }
@@ -95,23 +107,14 @@ fn wait_for_pid_file(path: &Path) -> u32 {
     }
 }
 
-fn process_state(pid: u32) -> Option<char> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rfind(')')
-        .and_then(|end| stat.get(end + 1..))?
-        .split_whitespace()
-        .next()?
-        .chars()
-        .next()
-}
-
-/// True when `pid` is gone or only a zombie. `process_alive` is `kill(pid, 0)`,
-/// which still reports a zombie; this suite often runs nested inside another
-/// aplexer worker that adopts the test's children as subreaper and does not
-/// reap them promptly. A zombie is an exited process -- treating it as live
-/// makes "the worker finalized" an environment property instead of a test one.
+/// True when `pid` is gone or only a zombie. This suite often runs nested
+/// inside another aplexer worker that adopts the test's children as
+/// subreaper and may not reap them promptly. A zombie is an exited process
+/// -- treating it as live would make "the worker finalized" an environment
+/// property instead of a test one. That is exactly what
+/// `aplexer::process_alive` answers.
 fn process_has_exited(pid: u32) -> bool {
-    matches!(process_state(pid), None | Some('Z'))
+    !aplexer::process_alive(pid)
 }
 
 /// The worker empties its domain before exiting, so the descendant is dead by
@@ -178,7 +181,7 @@ fn waiter_failure_kills_detached_descendant_before_worker_exits() {
         let record = read_record(&record_path).expect("read session record");
         if record.phase == Phase::Failed
             && record.containment_empty == Some(true)
-            && record.worker_pid.is_some_and(|pid| process_has_exited(pid))
+            && record.worker_pid.is_some_and(process_has_exited)
         {
             break record;
         }

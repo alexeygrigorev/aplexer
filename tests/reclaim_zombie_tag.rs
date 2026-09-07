@@ -206,7 +206,10 @@ impl Drop for ProcessCleanup {
 }
 
 fn process_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    // Deliberately the production predicate, not a bare `kill(pid, 0)`:
+    // that call SUCCEEDS for a zombie, so a suite using it waits forever
+    // for a process that is already dead and only awaiting a reaper.
+    aplexer::process_alive(pid as u32)
 }
 
 /// SIGKILL a pid and wait for it to leave /proc. Tolerates a pid that is

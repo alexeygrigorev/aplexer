@@ -257,14 +257,7 @@ fn run_detached_descendant_case(retain_pty: bool, inherit_ignored_sigchld: bool)
     );
     child_guard.disarm();
     wait_until(
-        || {
-            !harness
-                .state_dir
-                .path()
-                .join("sessions")
-                .join(&id)
-                .exists()
-        },
+        || !harness.state_dir.path().join("sessions").join(&id).exists(),
         "worker finalization after descendants drain",
     );
     worker_guard.disarm();

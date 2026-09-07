@@ -646,12 +646,19 @@ impl SessionRecord {
             .unwrap_or_else(|| self.exit.is_some())
     }
 
-    /// Whether the worker process is present in `/proc`. This is a cheap,
-    /// pessimistic check for legacy records. New records also pin the
-    /// worker's boot and process start time, so a recycled numeric pid does
-    /// not keep a dead session alive forever. An absent or unreadable
-    /// identity sidecar deliberately falls back to the legacy pid check:
-    /// uncertainty must not let prune/tag replacement delete a live worker.
+    /// Whether the worker process is still running. This is a cheap,
+    /// pessimistic check for legacy records.
+    ///
+    /// A worker that exited but has not been reaped by its parent is dead,
+    /// not alive -- see `process_alive`. That is the common shape when the
+    /// session was started from inside another aplexer session, whose worker
+    /// is a child subreaper and therefore inherits the corpse.
+    ///
+    /// New records also pin the worker's boot and process start time, so a
+    /// recycled numeric pid does not keep a dead session alive forever. An
+    /// absent or unreadable identity sidecar deliberately falls back to the
+    /// legacy pid check: uncertainty must not let prune/tag replacement
+    /// delete a live worker.
     pub fn worker_alive(&self) -> bool {
         let Some(pid) = self.worker_pid else {
             return false;
@@ -697,7 +704,8 @@ impl SessionRecord {
         matches!(self.phase, Phase::Exited | Phase::Failed) && !self.worker_alive()
     }
 
-    /// Whether the recorded workload leader is still in `/proc`. A record
+    /// Whether the recorded workload leader is still running (an unreaped
+    /// zombie leader is not: see `process_alive`). A record
     /// with no leader pid never had one recorded; that is not a liveness
     /// claim either way, only the absence of this particular handle.
     pub fn workload_leader_alive(&self) -> bool {
@@ -1205,9 +1213,97 @@ fn record_is_not_written_yet(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether `pid` names a process that can still run code.
+///
+/// `kill(pid, 0)` alone is NOT that question. It succeeds for a zombie: an
+/// exited process whose parent has not yet reaped it still occupies its pid
+/// slot and still accepts (and discards) signals. Every liveness decision in
+/// aplexer -- `worker_alive`, `workload_leader_alive`, and through them
+/// `reap_verdict` and `a prune` -- is really asking "is there anything left
+/// that could act", and a zombie's answer is no.
+///
+/// This matters because aplexer workers are child subreapers
+/// (`PR_SET_CHILD_SUBREAPER`), so a session started from inside another
+/// aplexer session reparents to that outer worker when its own parent goes
+/// away. If the outer worker does not reap it, the dead session's pid stays
+/// signalable indefinitely and every probe here reported it alive forever:
+/// `a prune` retained records it should have removed, and tests that wait
+/// for a pid to die failed with "pid NNNN did not die".
+///
+/// Uncertainty still fails closed: an unreadable `/proc/<pid>/stat` (a
+/// hardened procfs, a racing exit) leaves the answer at the signalable
+/// result, so a live process is never mistaken for a dead one.
 pub fn process_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let signalable = rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    signalable && !process_is_zombie(pid)
+}
+
+/// The single-character run state from field 3 of `/proc/<pid>/stat`
+/// (`R` running, `S`/`D` sleeping, `T` stopped, `Z` zombie, `X` dead).
+pub fn process_state(pid: u32) -> Result<char> {
+    process_state_in(Path::new(crate::agent_kind::DEFAULT_PROC_ROOT), pid)
+}
+
+/// `process_state` against an arbitrary `/proc` root, so the zombie rules
+/// below can be pinned by ordinary unit tests on a synthetic tree instead of
+/// requiring a real process in a specific state -- the same split
+/// `direct_child_pids_in` uses.
+fn process_state_in(proc_root: &Path, pid: u32) -> Result<char> {
+    let stat_path = proc_root.join(pid.to_string()).join("stat");
+    let stat =
+        fs::read_to_string(&stat_path).with_context(|| format!("read {}", stat_path.display()))?;
+    // The parenthesized comm field may itself contain spaces or `)`, so the
+    // state is the first token after its final close-paren, never field 3 of
+    // a naive whitespace split.
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .and_then(|after_comm| after_comm.split_whitespace().next())
+        .and_then(|state| state.chars().next())
+        .ok_or_else(|| anyhow!("malformed {}", stat_path.display()))
+}
+
+/// Whether `pid` has exited but has not been reaped by its parent.
+///
+/// The `Z` in `/proc/<pid>/stat` is necessary but not sufficient. A thread
+/// group leader that called `pthread_exit` (or bare `exit(2)`) while its
+/// sibling threads keep running also reads as `Z`, and that process is very
+/// much still executing code -- measured, not assumed: such a leader shows
+/// `state=Z` with two entries under `/proc/<pid>/task`. Calling it dead
+/// would let a multi-threaded workload be declared contained while its
+/// threads ran on. So the thread group must also be down to nothing but the
+/// leader's corpse, which is exactly the state `waitpid` will return for.
+///
+/// Every unreadable answer is reported as "not a zombie": callers use this
+/// to subtract the dead from a liveness answer, and an unknown state must
+/// never subtract a process that may still be running.
+pub fn process_is_zombie(pid: u32) -> bool {
+    process_is_zombie_in(Path::new(crate::agent_kind::DEFAULT_PROC_ROOT), pid)
+}
+
+fn process_is_zombie_in(proc_root: &Path, pid: u32) -> bool {
+    matches!(process_state_in(proc_root, pid), Ok('Z'))
+        && thread_group_holds_only_the_leader(proc_root, pid)
+}
+
+/// Whether `<proc>/<pid>/task` contains exactly one entry, i.e. no sibling
+/// thread of `pid` is left. Any read failure answers `false`, keeping the
+/// caller on the "may still be running" side.
+fn thread_group_holds_only_the_leader(proc_root: &Path, pid: u32) -> bool {
+    let Ok(tasks) = fs::read_dir(proc_root.join(pid.to_string()).join("task")) else {
+        return false;
+    };
+    let mut seen = 0_usize;
+    for task in tasks {
+        if task.is_err() {
+            return false;
+        }
+        seen += 1;
+        if seen > 1 {
+            return false;
+        }
+    }
+    seen == 1
 }
 
 /// Linux process start time (field 22 of `/proc/<pid>/stat`), measured in
@@ -3535,12 +3631,17 @@ pub struct Cgroup {
 }
 
 fn release_anchor_child(anchor: &mut std::process::Child) -> Result<()> {
+    let pid = anchor.id();
     match anchor.kill() {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
         Err(error) => return Err(error).context("kill systemd-run anchor"),
     }
-    anchor.wait().context("reap systemd-run anchor")?;
+    let waited = anchor.wait().context("reap systemd-run anchor");
+    // Released only after the wait has returned, so the worker's descendant
+    // reaper can never consume this status first.
+    crate::worker::disown_child_pid(pid);
+    waited?;
     Ok(())
 }
 
@@ -3635,6 +3736,10 @@ impl Cgroup {
         let mut anchor = command
             .spawn()
             .context("spawn systemd-run anchor; limits fail closed")?;
+        // The worker waits on this pid itself (`release_anchor_child`), so
+        // register it before anything else in the process can observe it as
+        // a child. See `worker::OWNED_CHILD_PIDS`.
+        crate::worker::own_child_pid(anchor.id());
         // From this point, systemd may own a scope member outside the worker's
         // procfs descendant tree. Let the caller preserve recovery evidence
         // until an authoritative cgroup path has been recorded.
@@ -4154,6 +4259,18 @@ fn wait_for_scope_cgroup_with(
     }
 }
 
+/// Reap a startup helper off the caller's critical path. The pid stays
+/// registered as worker-owned (see `worker::OWNED_CHILD_PIDS`) until this
+/// thread's `wait` returns, so the worker's descendant reaper cannot take
+/// the status out from under it and cannot be handed a recycled pid early.
+fn reap_helper_child_async(mut child: std::process::Child) {
+    let pid = child.id();
+    thread::spawn(move || {
+        let _ = child.wait();
+        crate::worker::disown_child_pid(pid);
+    });
+}
+
 /// Run a small setup query without allowing a wedged helper to defeat the
 /// caller's wall-clock timeout. Stdout is intentionally bounded: systemctl's
 /// ControlGroup value is one short path, and anything larger is malformed.
@@ -4169,6 +4286,11 @@ fn command_output_until(
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn helper to {operation}"))?;
+    // This helper's status belongs to this function (or to the detached
+    // waiter `reap_helper_child_async` starts), never to the worker's
+    // descendant reaper.
+    let helper_pid = child.id();
+    crate::worker::own_child_pid(helper_pid);
     let mut child_stdout = child
         .stdout
         .take()
@@ -4185,9 +4307,7 @@ fn command_output_until(
     {
         let error = io::Error::last_os_error();
         let _ = child.kill();
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
+        reap_helper_child_async(child);
         return Err(error).with_context(|| format!("make {operation} output nonblocking"));
     }
     let mut stdout = Vec::new();
@@ -4205,9 +4325,7 @@ fn command_output_until(
                     stdout.extend_from_slice(&buffer[..count]);
                     if stdout.len() > 64 * 1024 {
                         let _ = child.kill();
-                        thread::spawn(move || {
-                            let _ = child.wait();
-                        });
+                        reap_helper_child_async(child);
                         bail!("output from {operation} exceeds 64 KiB");
                     }
                 }
@@ -4215,9 +4333,7 @@ fn command_output_until(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = child.kill();
-                    thread::spawn(move || {
-                        let _ = child.wait();
-                    });
+                    reap_helper_child_async(child);
                     return Err(error).with_context(|| format!("read output from {operation}"));
                 }
             }
@@ -4230,14 +4346,13 @@ fn command_output_until(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = child.kill();
-                    thread::spawn(move || {
-                        let _ = child.wait();
-                    });
+                    reap_helper_child_async(child);
                     return Err(error).with_context(|| format!("wait for {operation}"));
                 }
             }
         }
         if let (Some(status), true) = (status, stdout_eof) {
+            crate::worker::disown_child_pid(helper_pid);
             return Ok(std::process::Output {
                 status,
                 stdout,
@@ -4250,9 +4365,9 @@ fn command_output_until(
                 let _ = child.kill();
                 // A helper stuck in uninterruptible sleep must not extend the
                 // startup deadline. Reap asynchronously once the kernel permits.
-                thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                reap_helper_child_async(child);
+            } else {
+                crate::worker::disown_child_pid(helper_pid);
             }
             bail!("timed out waiting to {operation}");
         }
@@ -6102,6 +6217,110 @@ mod tests {
         .expect_err("inherited helper pipe must not defeat deadline");
         assert!(error.to_string().contains("timed out waiting"));
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// `kill(pid, 0)` succeeds for a zombie, so the raw signalability test
+    /// reported exited-but-unreaped processes as alive. Under a worker's
+    /// child subreaper that is not a corner case: a session started inside
+    /// another session reparents onto the outer worker, and until it is
+    /// reaped every liveness answer about it -- `worker_alive`,
+    /// `workload_leader_alive`, and therefore `reap_verdict` and `a prune` --
+    /// was wrong in the direction of "still running, keep it".
+    #[test]
+    fn process_alive_reports_an_unreaped_zombie_as_dead() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_zombie(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} never became a zombie"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            process_state(pid).unwrap(),
+            'Z',
+            "the test needs a real unreaped zombie"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "a zombie is still signalable, which is exactly the trap"
+        );
+        assert!(
+            !process_alive(pid),
+            "zombie {pid} must not be reported alive"
+        );
+
+        child.wait().unwrap();
+        assert!(!process_alive(pid));
+        assert!(
+            !process_is_zombie(pid),
+            "a reaped pid has no state to read, so it is not a zombie either"
+        );
+    }
+
+    /// A `Z` in `/proc/<pid>/stat` is not by itself proof that a process is
+    /// finished: a thread group leader that exited while its siblings kept
+    /// running reads exactly the same (verified against a real process --
+    /// `state=Z` with two entries under `/proc/<pid>/task`). Treating that
+    /// as dead would let a multi-threaded workload be declared contained
+    /// while it was still executing, so the thread group must be down to the
+    /// leader's corpse alone.
+    #[test]
+    fn zombie_detection_requires_an_empty_thread_group() {
+        let root = tempfile::tempdir().unwrap();
+        let write_process = |pid: u32, state: char, threads: &[u32]| {
+            let dir = root.path().join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            // A comm containing spaces and a ')' is legal and must not shift
+            // the state field.
+            fs::write(
+                dir.join("stat"),
+                format!("{pid} (od d) ba) {state} 1 {pid} 0 -1 4194304 0 0\n"),
+            )
+            .unwrap();
+            for tid in threads {
+                fs::create_dir_all(dir.join("task").join(tid.to_string())).unwrap();
+            }
+        };
+
+        write_process(11, 'Z', &[11]);
+        write_process(12, 'Z', &[12, 13]);
+        write_process(14, 'S', &[14]);
+        write_process(15, 'R', &[15, 16]);
+
+        assert_eq!(process_state_in(root.path(), 11).unwrap(), 'Z');
+        assert_eq!(process_state_in(root.path(), 12).unwrap(), 'Z');
+
+        assert!(
+            process_is_zombie_in(root.path(), 11),
+            "a Z leader alone in its thread group is a reapable zombie"
+        );
+        assert!(
+            !process_is_zombie_in(root.path(), 12),
+            "a Z leader with a live sibling thread is still running code"
+        );
+        assert!(!process_is_zombie_in(root.path(), 14));
+        assert!(!process_is_zombie_in(root.path(), 15));
+        assert!(
+            !process_is_zombie_in(root.path(), 99),
+            "an unreadable process must not be subtracted from liveness"
+        );
+    }
+
+    /// A live process must never be mistaken for a zombie by the state read.
+    #[test]
+    fn process_alive_still_reports_a_running_child_as_alive() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        assert!(process_alive(pid));
+        assert!(!process_is_zombie(pid));
+        assert!(matches!(process_state(pid).unwrap(), 'R' | 'S' | 'D'));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

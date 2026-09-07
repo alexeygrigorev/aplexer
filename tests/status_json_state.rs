@@ -185,8 +185,16 @@ impl Drop for ProcessCleanup {
     }
 }
 
+/// `kill(pid, 0)` alone is not a liveness test: it succeeds for a zombie.
+/// A worker SIGKILLed by this suite reparents onto whatever child subreaper
+/// the suite itself runs under (another aplexer worker, when the tests are
+/// run from inside a session), and stays signalable until that subreaper
+/// reaps it -- so the bare signal probe reported the pid alive forever and
+/// this suite failed with "pid NNNN did not die". `aplexer::process_alive`
+/// subtracts the zombie state, which is the same answer `a prune` and
+/// `a status` now give.
 fn process_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    aplexer::process_alive(pid as u32)
 }
 
 fn kill_and_wait(pid: i32) {

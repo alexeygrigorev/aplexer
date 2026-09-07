@@ -1,7 +1,7 @@
 use aplexer::api::{start_session, StartRequest};
 use aplexer::{
-    atomic_write_json, read_record, ExitInfo, Limits, Paths, Phase, SessionRecord, MAX_HISTORY_BYTES,
-    SCHEMA_VERSION,
+    atomic_write_json, read_record, ExitInfo, Limits, Paths, Phase, SessionRecord,
+    MAX_HISTORY_BYTES, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::fs;

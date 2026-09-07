@@ -1,17 +1,15 @@
 //! Product-path regressions for fail-closed broken-session recovery.
 
-use aplexer::{
-    atomic_write_json, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION,
-};
+use aplexer::{atomic_write_json, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime: TempDir,

@@ -1,4 +1,4 @@
-use aplexer::{process_start_time_ticks, read_record, Phase};
+use aplexer::{process_is_zombie, process_start_time_ticks, read_record, Phase};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,11 @@ impl Drop for Harness {
     }
 }
 
+/// Worker threads that must be completely idle in a quiet session: the
+/// termination monitor, the lifecycle loop, and the adopted-descendant
+/// reaper.
+const IDLE_THREADS_PER_WORKER: usize = 3;
+
 #[derive(Debug)]
 struct ThreadCounter {
     status_path: PathBuf,
@@ -113,7 +118,13 @@ fn idle_thread_counters(worker_pid: u32) -> Vec<ThreadCounter> {
             .expect("read thread name")
             .trim()
             .to_owned();
-        if name.starts_with("aplexer-termin") || name.starts_with("aplexer-lifec") {
+        // The reaper is included deliberately: it is SIGCHLD-driven with no
+        // timer at all, so an idle worker must never wake it. A periodic
+        // `waitpid` sweep would show up right here.
+        if name.starts_with("aplexer-termin")
+            || name.starts_with("aplexer-lifec")
+            || name.starts_with("aplexer-reaper")
+        {
             let status_path = entry.path().join("status");
             counters.push(ThreadCounter {
                 before: voluntary_switches(&status_path),
@@ -128,12 +139,12 @@ fn wait_for_idle_threads(worker_pid: u32) -> Vec<ThreadCounter> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let counters = idle_thread_counters(worker_pid);
-        if counters.len() == 2 {
+        if counters.len() == IDLE_THREADS_PER_WORKER {
             return counters;
         }
         assert!(
             Instant::now() < deadline,
-            "worker {worker_pid} did not expose termination and lifecycle threads: {counters:?}"
+            "worker {worker_pid} did not expose termination, lifecycle and reaper threads: {counters:?}"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -154,7 +165,7 @@ fn multiple_idle_workers_do_not_timer_wake_termination_or_lifecycle_threads() {
         .into_iter()
         .flat_map(wait_for_idle_threads)
         .collect();
-    assert_eq!(counters.len(), SESSION_COUNT * 2);
+    assert_eq!(counters.len(), SESSION_COUNT * IDLE_THREADS_PER_WORKER);
     thread::sleep(Duration::from_millis(350));
 
     let delta: u64 = counters
@@ -163,18 +174,27 @@ fn multiple_idle_workers_do_not_timer_wake_termination_or_lifecycle_threads() {
         .sum();
     eprintln!(
         "idle wakeup measurement: {delta} voluntary switches in 350ms across \
-         {} termination/lifecycle threads from {SESSION_COUNT} sessions",
+         {} termination/lifecycle/reaper threads from {SESSION_COUNT} sessions",
         counters.len()
     );
     assert!(
-        delta <= SESSION_COUNT as u64 * 2,
-        "idle termination/lifecycle threads woke {delta} times in 350ms across \
+        delta <= SESSION_COUNT as u64 * IDLE_THREADS_PER_WORKER as u64,
+        "idle termination/lifecycle/reaper threads woke {delta} times in 350ms across \
          {SESSION_COUNT} sessions: {counters:?}"
     );
 }
 
+/// The same process, still able to run code.
+///
+/// The start-time pin answers "is this the same process, not a pid reuse";
+/// it does not answer "is it alive", because `/proc/<pid>/stat` outlives the
+/// process itself for as long as its parent leaves it unreaped. That matters
+/// here in practice: a worker spawned by this suite reparents onto whatever
+/// child subreaper the suite is itself running under -- another aplexer
+/// worker, when the tests are run from inside a session -- and an exited
+/// worker that subreaper has not reaped is a `Z`, not a survivor.
 fn same_process_is_alive(pid: u32, start_time: u64) -> bool {
-    process_start_time_ticks(pid).ok() == Some(start_time)
+    process_start_time_ticks(pid).ok() == Some(start_time) && !process_is_zombie(pid)
 }
 
 fn wait_for_pid_file(path: &Path) -> u32 {
