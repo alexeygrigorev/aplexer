@@ -174,9 +174,11 @@ That is no longer remotely true. Verified against the built binary and source:
 
 **Still absent or deliberately limited:**
 
-- No `a state-report`-style hook ingestion endpoint. `a watch` derives coarse activity state from
-  process/phase/output recency; it does not ingest PocketShell's exact hook-written semantic
-  state.
+- Hook ingestion is wired end to end: `a state-report` is the push
+  endpoint and `a init` installs per-engine hooks that call it (see Open
+  question 2); `a watch` merges a fresh push over its coarse
+  activity-state derivation. What remains is the PocketShell client
+  wiring to display it.
 - No durable/global snapshot generation. `a watch`'s `sequence` and `generation` counters start
   over for each stream, so reconnecting clients must take a fresh snapshot rather than compare a
   new stream to a global cursor.
@@ -355,9 +357,12 @@ host". The SSH question does not arise: the host CLI and aplexer are co-located 
 - **Phase B live UX** — `a watch --jsonl` now exists. What remains is PocketShell client wiring,
   SSH reconnect/backoff, and a reliable fresh-snapshot-to-new-stream handoff because watch
   sequence/generation counters are not durable cursors.
-- **Agent-state ingestion** — no `a state-report`-style push endpoint exists; spec §20 still
-  lists only derivation. `a whoami` provides the hook-side identity half; the ingestion verb and
-  storage are undesigned. Prerequisite for Phase B reaching Android's current state-badge UX.
+- Agent-state ingestion is shipped on both halves: `a state-report` is the
+  push endpoint and `a init` installs the hooks that call it (see Open
+  question 2). Spec §20 still lists only derivation because the spec
+  predates the implementation; `a whoami` remains the hook-side identity
+  half. What reached Android's current state-badge UX is the remaining
+  client wiring, not a missing primitive.
 - **Inter-agent messaging** — now implemented (`a message ...`), but it is session-to-session
   within a workspace, not client-to-host: nothing in Phases A–C depends on it. Its inbox/pane
   machinery may later be useful as a Phase B notification substrate, but that is speculative —
@@ -513,9 +518,41 @@ Example lines:
    skip-permissions argv variant are shipped. The remaining risk is integration behavior:
    preserve PocketShell's tmux metadata, compare native and delegated launch specs, define the
    fallback when aplexer is absent/older, and roll out behind a kill switch.
-2. **Agent-state ingestion:** **the aplexer-side primitive is resolved; hook installation is
-   still open.** `a state-report <idle|waiting|working>` now exists (`Operation::ReportState` in
-   `src/lib.rs`/`src/worker.rs`), resolving its target exactly like `a whoami` does — via
+2. **Agent-state ingestion:** **both halves are now implemented.**
+   The aplexer-side primitive (`a state-report <idle|waiting|working>`,
+   `Operation::ReportState`, `reported_state`/`reported_state_at_ms` on
+   `SessionRecord`, `REPORTED_STATE_STALE_MS` merge in `src/watch.rs`) is
+   unchanged — see below for its semantics. What changed: **hook
+   installation is designed and shipped as `a init`** (`src/hooks.rs`,
+   `Init` in `src/bin/a.rs`), resolving the "hook installation...
+   undecided" product question on the aplexer side: installation lives in
+   aplexer's own machine setup, alongside `a start`/`a launch-exec`'s
+   launch ownership, rather than as a PocketShell-side concern.
+   `a init` merges a `state-report` hook into every engine aplexer
+   launches — Claude `Stop`/`SubagentStop`→`idle`,
+   `Notification`→`waiting`, `UserPromptSubmit`/`SessionStart`→`working`;
+   Codex `hooks.json` (`Stop`, `UserPromptSubmit`, `SessionStart`) plus
+   legacy `notify` when absent (never clobbering a foreign program such as
+   PocketShell's own handler); OpenCode plugin (`session.idle`→`idle`,
+   `permission.asked`/`session.error`→`waiting`,
+   `session.created`→`working`); Grok personal hooks (Claude-compatible
+   `~/.grok/hooks/aplexer.json`); Gemini `settings.json`
+   (`AfterAgent`→`idle`, `BeforeAgent`→`working`,
+   `Notification`→`waiting`, `SessionStart`→`working`) — including each
+   profile's `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, so `zcodex` is covered via
+   the shared codex dirs. Merge-never-clobber, idempotent, every command
+   ending in `|| true` so a hook can never hold the agent open; `a init
+   --uninstall` removes only `state-report` entries. `a init --check
+   [--json]` is the automation seam: exit 0 only when fully initialized,
+   `--json` reporting `{"initialized": bool, "engines": [...]}` — the
+   PocketShell host CLI runs that form on startup and runs `a init` when
+   it says `initialized: false`. A companion fix honors a fresh push for
+   `shell`-engine sessions too (`session_ui_state` in `src/bin/a.rs`
+   checks the reported state before the `running` early return), because
+   the normal PocketShell session *is* `engine: "shell"` with the agent
+   started by hand — without that, an idle opencode/grok in a shell
+   session would still read `RUNNING` despite the hooks firing.
+   The primitive itself resolves its target exactly like `a whoami` does — via
    `APLEXER_SESSION_ID`, never a selector, so a hook script has no addressing to get wrong.
    `SessionRecord` gains `reported_state`/`reported_state_at_ms`; `a watch --jsonl`'s
    `agent.state` event treats a push fresher than `REPORTED_STATE_STALE_MS` (8s, `src/watch.rs`)
@@ -531,16 +568,15 @@ Example lines:
    documented there, that still self-heals because control simply passes back to the heuristic,
    which reads real PTY activity on its own.
 
-   Left **explicitly undesigned**, per this section's own "hook installation... undecided" call:
-   nothing in this repo calls `a state-report` from inside a live Claude/Codex/OpenCode session.
-   Whether that wiring becomes an aplexer-side hook-installation step (alongside `a start`/
-   `a launch-exec`) or stays a PocketShell-side concern (pointing `hooks.py`'s existing Claude
-   Stop/Notification handlers, Codex `notify`, and the OpenCode plugin at this command instead
-   of/in addition to `tmux set-option @ps_agent_state`) is still an open product decision — this
-   repo only ships the primitive that decision builds on either way. A future hook that also
-   fires at resume/tool-start boundaries (which PocketShell's current tmux mechanism does not)
-   could push `working` explicitly too, rather than relying on the heuristic to infer it once a
-   `waiting`/`idle` push goes stale.
+   PocketShell coexistence: `a init` appends alongside `hooks.py`'s tmux-writing
+   handlers rather than replacing them — both fire, each feeding its own
+   consumer (tmux options for the Android app's current readers, `a
+   state-report` for aplexer). The one shared slot is Codex's top-level
+   `notify`, where `a init` defers to whatever is already there. A future
+   hook that also fires at resume/tool-start boundaries (which PocketShell's
+   current tmux mechanism does not) could push `working` explicitly too,
+   rather than relying on the heuristic to infer it once a `waiting`/`idle`
+   push goes stale.
 3. **Desktop panes/splits vs aplexer's no-panes model** — *resolved by the repo correction*:
    this was the biggest product conflict when the desktop was the archived VS Code fork, but
    pocketshell-electron has no split/pane UI (one full-screen terminal per session tab), so

@@ -60,11 +60,11 @@ const ACTIVITY_THRESHOLD_MS: u64 = 3_000;
 /// exit" from the design brief for free -- a dead workload's exit event
 /// always wins over a stale push.
 ///
-/// In ordinary operation this window rarely matters: a hook fires at every
-/// stop/waiting boundary (and, if a future hook installation also fires on
-/// resume/tool-start, at every "back to work" boundary too -- see the CLI
-/// doc comment on `a state-report` for what is and is not wired up in this
-/// repo), so `reported_state_at_ms` keeps refreshing well inside the
+/// In ordinary operation this window rarely matters: `a init` installs a
+/// hook firing at every stop/waiting/submit/start boundary (and, if a
+/// future hook also fires on resume/tool-start, at every "back to work"
+/// boundary too -- see `aplexer::hooks` for the installed per-engine
+/// mapping), so `reported_state_at_ms` keeps refreshing well inside the
 /// window. The window exists as a safety net for the case that motivates
 /// "or process exit" in the first place: a hook process that reported once
 /// and then the engine was killed, crashed, or the session was torn down

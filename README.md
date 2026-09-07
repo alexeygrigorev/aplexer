@@ -264,6 +264,22 @@ a watch --jsonl --all   # also include shell (non-agent) sessions
 
 **`a watch` never looks at what an agent is actually saying or doing** — it only sees host-level lifecycle (created/exited/oom/a running-vs-waiting heuristic). `a transcript` (below) is the complementary capability: parsing an agent's real conversation — messages, tool calls, tool results, usage — into the same `UnifiedEvent` envelope. Use `a watch` to know a session changed state; use `a transcript` to know what the agent actually said or did.
 
+## Agent-state hooks (`a init`)
+
+Without hooks, `working`/`waiting`/`idle` is a guess from PTY-output recency — an idle agent sitting in a `shell`-engine session reads `RUNNING` forever. `a init` fixes that by merging an `a state-report` hook into every agent engine aplexer knows how to launch, so the agent itself reports its turn boundaries:
+
+```bash
+a init                  # install hooks for claude, codex (+zcodex), grok, gemini, opencode
+a init --check          # check only: exit 0 when fully initialized, 1 otherwise
+a init --check --json   # machine contract: {"initialized": bool, "engines": [...]}
+a init --engine grok    # limit any mode to one engine
+a init --uninstall      # remove our hooks again
+```
+
+Install is non-destructive and idempotent: existing hook groups, unrelated config keys, and other plugins are preserved (a second run changes nothing), and an existing Codex `notify` program pointing elsewhere is never clobbered. Every generated hook ends in `|| true`, so it can never hold the agent open — outside an aplexer session it just exits silently. Profile config dirs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) are covered too, so a `codex/zodex` session reports state like a plain one. A fresh push stays authoritative for a few seconds (`REPORTED_STATE_STALE_MS` in `src/watch.rs`), then the display falls back to the honest `active`/`quiet` activity words; `shell` sessions with a fresh push show the reported state instead of `running`. See `src/hooks.rs` for the per-engine mechanisms and event mapping.
+
+The `--check --json` form is the automation seam: the PocketShell host CLI runs it on startup and runs `a init` when it reports `initialized: false`, so a fresh machine self-heals without user intervention.
+
 ## Conversation events (`a transcript`)
 
 PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`). Variant engines identified with a built-in family — currently `zcodex`, a codex variant — locate and parse through their family's machinery while keeping their own engine id on the emitted events.
