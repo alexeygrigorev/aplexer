@@ -9109,6 +9109,26 @@ mod switching_tests {
         );
     }
 
+    /// An accepted kill persists `phase: exiting` before teardown (issue
+    /// #18), so the whole finalization window must render as a dying
+    /// session, not as healthy -- and once the worker dies mid-finalization
+    /// it must fall through to `broken`, the shape prune reaps, never back
+    /// to a live-looking word.
+    #[test]
+    fn ui_state_shows_a_killed_session_as_stopping_while_it_dies() {
+        let now: u64 = 20_000;
+        // Worker still alive mid-finalization (the kill window, however long
+        // finalization takes): "stopping", not "running".
+        let dying = mk_record("/ws/state", "dying", Phase::Exiting);
+        assert_eq!(session_ui_state(&dying, now), ("stopping", "lifecycle"));
+
+        // Worker gone before finalization wrote a terminal phase: the
+        // contradicted-phase rule owns the row now.
+        let mut corpse = mk_record("/ws/state", "dying", Phase::Exiting);
+        corpse.worker_pid = None;
+        assert_eq!(session_ui_state(&corpse, now), ("broken", "lifecycle"));
+    }
+
     /// Issue #9's second half. The worker persists the record, then its pid,
     /// then binds the control socket -- so a client racing a healthy start
     /// finds either no pid or no socket. Both used to be reported as

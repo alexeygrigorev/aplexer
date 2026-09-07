@@ -1100,6 +1100,22 @@ between those two records, so a consumer must not re-derive this rule from
 the same bound and does not report a session still inside the startup window
 as broken or stale.
 
+One more rule keeps a dying session from reading as a healthy one (issue
+#18): when a worker accepts a kill, it persists `phase: exiting` BEFORE
+teardown starts, so the whole window between the accepted kill and
+finalization's record removal -- bounded by the kill client's five-second
+record-removal wait, indefinite if finalization wedges -- reads `exiting`
+in `state` (rendered "stopping" in the terminal UI) instead of replaying
+the pre-kill phase. A kill-then-snapshot consumer therefore sees either
+`exiting` or no record at all, never a row byte-for-byte identical to a
+healthy session, and a finalization stuck `exiting` is diagnosable from
+the record itself. If the worker then dies mid-finalization, the row
+becomes the ordinary contradicted shape: `exiting` with a dead worker
+past any startup window is `broken` -- the startup-window grace applies
+to `Starting` only -- which keeps it visible to `a doctor` and reclaimable
+by `a prune` (prune never required a terminal phase, and `a start`'s
+reclaim clears the same bar).
+
 `agent` names the coding agent aplexer can see running inside the session
 right now: `claude`, `codex`, `opencode`, `grok`, or `null`. Like `state` it
 is derived rather than persisted, and it is present on every `a list --json`
@@ -1764,8 +1780,11 @@ willing to claim:
   signals the workload, and the worker that accepted the kill then removes
   the record itself during finalization (`a kill` waits briefly for that
   and reports if the record survived), so a killed session stops appearing
-  in every listing client instead of lingering as an `exited` row. That
-  removal keeps the same proof bar as every other remover: the worker
+  in every listing client instead of lingering as an `exited` row. Before
+  signalling, the accepted kill persists `phase: exiting` (issue #18), so
+  the finalization window itself reads as a dying session (`state:
+  exiting`, "stopping" in the UI) rather than as healthy; see section 18.
+  The removal keeps the same proof bar as every other remover: the worker
   deletes the record only when finalization ran clean and proved the
   containment domain empty. For a broken unlimited session it refuses
   ("no authoritative containment locator") and preserves both the durable

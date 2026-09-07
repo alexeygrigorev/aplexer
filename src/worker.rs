@@ -1788,7 +1788,32 @@ impl WorkerRuntime {
         let grace = kill_grace_duration(grace_ms)?;
         let _serialized = lock(&self.kill_gate)?;
         if !self.workload_populated()? {
+            // Already empty: no teardown will start from this call, and the
+            // lifecycle thread owns the record from here (its ChildExit
+            // handler writes `Exiting`, issue #18). Writing again here would
+            // race that finalization's record removal and could resurrect a
+            // removed state dir (atomic_write_json recreates parents).
             return Ok(());
+        }
+        // The kill is accepted and teardown is about to start: persist the
+        // transition BEFORE signalling (issue #18). Until now the durable
+        // record kept its pre-kill phase, so for the whole window between
+        // the accepted Kill RPC and finalization's record removal -- bounded
+        // by the CLI's KILL_RECORD_REMOVAL_WAIT, indefinite if finalization
+        // wedges -- `a snapshot` reported the dying session byte-for-byte
+        // like a healthy one. Writing under the same record mutex
+        // `update_record` holds, and strictly before the signal that leads
+        // to the ChildExit -> finalization sequence, this write is always
+        // first: the removal that follows can only delete it, never be
+        // preceded by it. Best-effort on purpose -- a failed write must not
+        // stop a kill or flip the accepted RPC to an error; the next writer
+        // (ChildExit handler, finalization) retries the transition or
+        // removes the record outright, and `record_persistence_error` keeps
+        // surfacing the failure meanwhile. The termination monitor's
+        // SIGTERM teardown shares this method, which is the same dying
+        // fact about that session and gets the same honest record.
+        if let Err(error) = self.update_record(|record| record.phase = Phase::Exiting) {
+            eprintln!("aplexer worker: mark accepted-kill session exiting: {error:#}");
         }
         let grace_deadline = Instant::now()
             .checked_add(grace)
@@ -3225,6 +3250,13 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
                 }
                 LifeEvent::ChildExit { code, signal } => {
                     child_exit = Some((code, signal));
+                    // Natural exits (Ctrl-D, `exit`, a command that ran to
+                    // completion, an externally signalled workload) get their
+                    // exiting transition here, at the leader's death. An
+                    // accepted `a kill` writes the same phase earlier, at
+                    // acceptance, before teardown starts (issue #18) -- this
+                    // write is then a no-op refresh that only stamps
+                    // `updated_at_ms`.
                     let _ = runtime.update_record(|r| r.phase = Phase::Exiting);
                 }
             },
@@ -3578,7 +3610,11 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
                 // Accepted before the response is written: from here the
                 // lifecycle finalization owns removing this session's
                 // durable record (see run_lifecycle), so `a kill` leaves
-                // nothing behind in `a list`. A failed kill never reaches
+                // nothing behind in `a list`. The record also already says
+                // `phase: exiting` by this point -- `runtime.kill` persists
+                // that before teardown, so a client that gets this ok and
+                // immediately snapshots sees a dying session, never the
+                // pre-kill phase (issue #18). A failed kill never reaches
                 // that path -- the record stays as evidence for the
                 // client-side recovery paths.
                 write_json(&mut stream, &Response::ok(id, json!({"signalled":true})))?
