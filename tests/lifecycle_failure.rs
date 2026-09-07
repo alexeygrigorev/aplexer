@@ -4,7 +4,7 @@
 //! empty its whole subreaper domain before it exits, including a detached
 //! descendant which ignores the graceful signals normally used by shells.
 
-use aplexer::{process_alive, process_start_time_ticks, read_record, Phase};
+use aplexer::{process_start_time_ticks, read_record, Phase};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,19 +95,36 @@ fn wait_for_pid_file(path: &Path) -> u32 {
     }
 }
 
-/// `process_alive` is `kill(pid, 0)`, which still reports a process that has
-/// exited but not yet been reaped by its new parent. The worker empties its
-/// domain before exiting, so the descendant is dead by the time the record says
-/// so -- but "dead" and "gone from the process table" are two different
-/// instants, and only the second one `kill(pid, 0)` can see. Poll rather than
-/// assert at a point: a descendant that genuinely survived stays alive forever,
-/// so this cannot pass by waiting.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
+/// True when `pid` is gone or only a zombie. `process_alive` is `kill(pid, 0)`,
+/// which still reports a zombie; this suite often runs nested inside another
+/// aplexer worker that adopts the test's children as subreaper and does not
+/// reap them promptly. A zombie is an exited process -- treating it as live
+/// makes "the worker finalized" an environment property instead of a test one.
+fn process_has_exited(pid: u32) -> bool {
+    matches!(process_state(pid), None | Some('Z'))
+}
+
+/// The worker empties its domain before exiting, so the descendant is dead by
+/// the time the record says so -- but "dead" and "gone from the process table"
+/// are two different instants. Poll rather than assert at a point: a descendant
+/// that genuinely survived stays in a non-zombie state forever, so this cannot
+/// pass by waiting.
 fn assert_process_gone(pid: u32, what: &str) {
     let deadline = Instant::now() + LIVENESS_BACKSTOP;
-    while process_alive(pid) && Instant::now() < deadline {
+    while !process_has_exited(pid) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(!process_alive(pid), "{what}");
+    assert!(process_has_exited(pid), "{what}");
 }
 
 #[test]
@@ -161,7 +178,7 @@ fn waiter_failure_kills_detached_descendant_before_worker_exits() {
         let record = read_record(&record_path).expect("read session record");
         if record.phase == Phase::Failed
             && record.containment_empty == Some(true)
-            && !record.worker_alive()
+            && record.worker_pid.is_some_and(|pid| process_has_exited(pid))
         {
             break record;
         }

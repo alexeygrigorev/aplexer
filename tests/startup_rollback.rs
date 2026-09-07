@@ -161,16 +161,28 @@ fn assert_directory_empty(path: &Path) {
 #[cfg(feature = "startup-test-hooks")]
 const LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 
+/// True when `pid` is gone from the table or is only a zombie.
+///
+/// `kill(pid, 0)` and `/proc/<pid>` both still see a zombie, and this suite
+/// often runs nested inside another aplexer worker -- a subreaper that
+/// adopts the test's children and does not reap them promptly. A zombie is
+/// an exited process, so treating it as still alive makes "did rollback
+/// kill the tree?" an environment property instead of a test one.
+#[cfg(feature = "startup-test-hooks")]
+fn process_has_exited(pid: u32) -> bool {
+    matches!(process_state(pid), None | Some('Z'))
+}
+
 #[cfg(feature = "startup-test-hooks")]
 fn assert_process_exited(pid: u32) {
-    let process_path = PathBuf::from(format!("/proc/{pid}"));
     let deadline = Instant::now() + LIVENESS_BACKSTOP;
-    while process_path.exists() && Instant::now() < deadline {
+    while !process_has_exited(pid) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        !process_path.exists(),
-        "workload process {pid} survived startup rollback"
+        process_has_exited(pid),
+        "workload process {pid} survived startup rollback (state {:?})",
+        process_state(pid)
     );
 }
 
@@ -255,6 +267,29 @@ fn reported_descendant_limit(stderr: &str) -> Option<usize> {
 #[cfg(feature = "startup-test-hooks")]
 const LAUNCHER_FD_OVERHEAD: libc::rlim_t = 16 + 1;
 
+/// A soft `RLIMIT_NOFILE` below every budget `pin_open_files` is asked for.
+/// Dropping to this first forces the subsequent pin to *raise*, so a
+/// clamp-only regression (`rlim_cur.min(soft_limit)`) cannot stay green on a
+/// runner whose inherited soft limit is already larger than the target --
+/// the GitHub-runner default of 1024, which is how finding 2 stayed latent.
+#[cfg(feature = "startup-test-hooks")]
+const STARVED_OPEN_FILES: libc::rlim_t = 8;
+
+/// Set the current process's soft `RLIMIT_NOFILE` to `soft_limit`, raising
+/// or lowering as needed, never above the hard limit.
+#[cfg(feature = "startup-test-hooks")]
+fn set_open_files_soft_limit(soft_limit: libc::rlim_t) -> std::io::Result<()> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    limit.rlim_cur = soft_limit.min(limit.rlim_max);
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Pin the launched process's soft `RLIMIT_NOFILE` to exactly `soft_limit`,
 /// raising it as well as lowering it.
 ///
@@ -268,6 +303,9 @@ const LAUNCHER_FD_OVERHEAD: libc::rlim_t = 16 + 1;
 ///
 /// The hard limit is checked here in the parent so an impossible request names
 /// itself instead of surfacing as an opaque `spawn` failure from `pre_exec`.
+/// The child first drops to `STARVED_OPEN_FILES` so the pin must raise even
+/// when this process inherited a large soft limit; without that, CI only
+/// ever exercises the lowering direction.
 #[cfg(feature = "startup-test-hooks")]
 fn pin_open_files(command: &mut Command, soft_limit: libc::rlim_t) {
     let mut current: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -284,15 +322,8 @@ fn pin_open_files(command: &mut Command, soft_limit: libc::rlim_t) {
     );
     unsafe {
         command.pre_exec(move || {
-            let mut limit: libc::rlimit = std::mem::zeroed();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            limit.rlim_cur = soft_limit.min(limit.rlim_max);
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+            set_open_files_soft_limit(STARVED_OPEN_FILES)?;
+            set_open_files_soft_limit(soft_limit)
         });
     }
 }
@@ -898,6 +929,62 @@ fn persisted_running_without_verified_ping_is_not_startup_success() {
         String::from_utf8_lossy(&output.stderr)
     );
     harness.assert_no_session_artifacts();
+}
+
+/// Prove `pin_open_files` actually raises. On a normal runner the inherited
+/// soft limit is 1024, so both descriptor-budget tests only ever lower unless
+/// the helper first starves the child; a clamp-only `.min()` would then leave
+/// the child at `STARVED_OPEN_FILES` and this assertion would fail, instead of
+/// staying green until someone reruns under `ulimit -S -n 64`.
+#[test]
+#[cfg(feature = "startup-test-hooks")]
+fn pin_open_files_raises_from_a_starved_soft_limit() {
+    const TARGET: libc::rlim_t = 256;
+    let mut current: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+        0,
+        "read RLIMIT_NOFILE: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        current.rlim_max >= TARGET,
+        "this test needs a hard RLIMIT_NOFILE of at least {TARGET}, got {}",
+        current.rlim_max
+    );
+    assert!(
+        TARGET > STARVED_OPEN_FILES,
+        "target must be above the starved floor so the pin has to raise"
+    );
+
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "awk '/^Max open files/ { print $4 }' /proc/self/limits",
+    ]);
+    pin_open_files(&mut command, TARGET);
+    let output = command.output().expect("spawn limit reporter");
+    assert!(
+        output.status.success(),
+        "limit reporter failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported: libc::rlim_t = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| {
+            panic!(
+                "limit reporter did not print a soft limit: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(
+        reported, TARGET,
+        "pin_open_files left the child at {reported} instead of raising from \
+         {STARVED_OPEN_FILES} to {TARGET}; a clamp-only helper would stay at the \
+         starved floor"
+    );
 }
 
 /// The workload shell plus the children it spawns: containment has to pin this

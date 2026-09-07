@@ -1,8 +1,7 @@
 #![cfg(feature = "startup-test-hooks")]
 
 use aplexer::{
-    atomic_write_json, now_ms, process_alive, Limits, Paths, Phase, SessionRecord,
-    DEFAULT_HISTORY_BYTES,
+    atomic_write_json, now_ms, Limits, Paths, Phase, SessionRecord, DEFAULT_HISTORY_BYTES,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,19 +17,38 @@ use uuid::Uuid;
 /// only bounds how long a broken run takes to say so.
 const LIVENESS_BACKSTOP: Duration = Duration::from_secs(30);
 
-/// `process_alive` is `kill(pid, 0)`, which reports a process that has exited
-/// but not yet been reaped as alive. The worker reaps its workload before
-/// exiting, so the ordering is sound -- but this test inspects the pid from a
-/// third process, after the worker is gone, and a workload the worker did not
-/// reap is a zombie reparented to init for as long as init takes to collect it.
-/// The original point assertion had no retry at all and would have read that
-/// window as a leak. Polling removes the window without weakening the check.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
+/// True when `pid` is gone or only a zombie. `process_alive` is `kill(pid, 0)`,
+/// which reports a zombie as alive. This test inspects the pid from a third
+/// process after the worker is gone, and a workload the worker did not reap is
+/// a zombie for as long as its new parent (often this suite's enclosing aplexer
+/// subreaper) takes to collect it. The original point assertion had no retry
+/// and would have read that window as a leak; treating zombies as exited
+/// removes the window without weakening the check -- a leaked workload stays
+/// in a non-zombie state forever.
+fn process_has_exited(pid: u32) -> bool {
+    matches!(process_state(pid), None | Some('Z'))
+}
+
 fn assert_workload_exited(pid: u32, point: &str) {
     let deadline = Instant::now() + LIVENESS_BACKSTOP;
-    while process_alive(pid) && Instant::now() < deadline {
+    while !process_has_exited(pid) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(!process_alive(pid), "workload {pid} leaked at {point}");
+    assert!(
+        process_has_exited(pid),
+        "workload {pid} leaked at {point} (state {:?})",
+        process_state(pid)
+    );
 }
 
 struct Harness {

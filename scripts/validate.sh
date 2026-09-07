@@ -23,12 +23,29 @@ scripts/check-test-execution.sh --min 250 -- cargo test --all-targets
 scripts/check-test-execution.sh --min 12 -- cargo test --features startup-test-hooks \
   --test startup_rollback --test worker_startup_transaction --test lifecycle_failure
 
-if [ -d python ]; then
-  printf '==> Python syntax and tests\n'
-  python3 -m compileall -q python
+# Python suites must actually run. Skipping when pytest is missing is the
+# same "green that ran nothing" shape check-test-execution.sh exists to
+# reject, in this same script. Prefer system pytest; fall back to uv (what
+# CI uses) so a machine with uv but no system pytest still runs the suites
+# instead of going green. Missing both is a hard failure.
+run_python_suite() {
+  local dir=$1
+  printf '==> Python syntax and tests (%s)\n' "$dir"
+  python3 -m compileall -q "$dir"
   if python3 -c 'import pytest' >/dev/null 2>&1; then
-    python3 -m pytest -q
+    (cd "$dir" && python3 -m pytest -q)
+  elif command -v uv >/dev/null 2>&1 && [ -f "$dir/uv.lock" ]; then
+    (cd "$dir" && uv run --frozen --with pytest python -m pytest -q)
   else
-    echo 'pytest is not installed; Python unit tests were not run' >&2
+    echo "pytest is not installed; ${dir} tests were not run" >&2
+    echo "install pytest or uv so a missing Python suite cannot pass silently" >&2
+    exit 1
   fi
+}
+
+if [ -d python ]; then
+  run_python_suite python
+fi
+if [ -d python-cli ]; then
+  run_python_suite python-cli
 fi

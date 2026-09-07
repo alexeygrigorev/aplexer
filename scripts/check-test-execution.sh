@@ -27,13 +27,15 @@ usage() {
 }
 
 # Sum of the executed tests reported by every `test result:` line on stdin.
-# `filtered out` is deliberately NOT counted: filtered tests are exactly the
-# ones that did not run.
+# Count passed + failed only. `filtered out` is the glob-as-name-filter
+# vacuity this guard exists to reject. `ignored` is the other one: a suite
+# that became entirely `#[ignore]` still prints `test result: ok` with exit
+# 0, and counting those as executed would let it clear the floor.
 count_executed() {
     awk '
         /^test result:/ {
             for (i = 1; i <= NF; i++) {
-                if ($(i + 1) ~ /^(passed;?|failed;?|ignored;?)$/) {
+                if ($(i + 1) ~ /^(passed;?|failed;?)$/) {
                     total += $i
                 }
             }
@@ -58,8 +60,10 @@ self_test() {
         'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s'
     check 'a real run counts its tests' 12 \
         'test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.26s'
-    check 'failures and ignores count as executed' 3 \
+    check 'failures count as executed, ignores do not' 2 \
         'test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 11 filtered out; finished in 5.06s'
+    check 'an all-ignored suite counts as zero' 0 \
+        'test result: ok. 0 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.00s'
     check 'multi-binary runs add up' 17 \
         'test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.26s
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s'

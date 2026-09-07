@@ -31,15 +31,18 @@ use tempfile::TempDir;
 /// updating one is expected to grep for the other.
 const REPORTED_STATE_STALE_MS: u64 = 8_000;
 
-/// How long a poll for something that must eventually become true is allowed
-/// to run before the test gives up.
+/// How long a poll for something that must eventually become true, or a
+/// command that must eventually finish, is allowed to run before the test
+/// gives up.
 ///
 /// Every `wait_for` below is armed only after `await_watch_ready` has proved
 /// the watcher is live, so the event it waits for is guaranteed to be emitted:
 /// the budget decides how long a genuinely broken run takes to report itself,
-/// not whether a healthy one passes. It is therefore sized for a saturated CI
-/// runner rather than for an idle laptop -- raising it cannot mask a defect,
-/// because none of these loops can ever pass by timing out.
+/// not whether a healthy one passes. The same is true of `run_with_timeout`
+/// around `a start` / `a state-report`: those commands either complete or
+/// hang, and a hang is never a pass. Sized for a saturated CI runner rather
+/// than an idle laptop -- raising it cannot mask a defect, because none of
+/// these waits can ever pass by timing out.
 const LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 
 /// How long one readiness probe waits for its own `session.created` before the
@@ -118,7 +121,7 @@ impl Harness {
                 "/bin/sleep",
                 "300",
             ],
-            Duration::from_secs(10),
+            LIVENESS_BACKSTOP,
         );
         let record: Value = serde_json::from_slice(&output.stdout).expect("start record JSON");
         self.sessions
@@ -132,7 +135,7 @@ impl Harness {
     fn state_report(&self, session_id: &str, state: &str) {
         let mut command = self.command_inside(session_id);
         command.args(["state-report", state]);
-        let output = run_with_timeout(command, Duration::from_secs(5));
+        let output = run_with_timeout(command, LIVENESS_BACKSTOP);
         assert!(
             output.status.success(),
             "a state-report {state} failed (status {:?}): stdout={} stderr={}",
@@ -529,7 +532,7 @@ fn state_report_outside_a_session_fails_with_a_clear_exit_code() {
     let mut command = h.command();
     command.env_remove("APLEXER_SESSION_ID");
     command.args(["state-report", "waiting"]);
-    let output = run_with_timeout(command, Duration::from_secs(5));
+    let output = run_with_timeout(command, LIVENESS_BACKSTOP);
     assert!(
         !output.status.success(),
         "state-report must fail outside a session"
@@ -547,7 +550,7 @@ fn state_report_rejects_an_unrecognised_state_value_at_the_cli_layer() {
     let h = Harness::new();
     let mut command = h.command();
     command.args(["state-report", "bogus"]);
-    let output = run_with_timeout(command, Duration::from_secs(5));
+    let output = run_with_timeout(command, LIVENESS_BACKSTOP);
     assert!(
         !output.status.success(),
         "clap's ValueEnum should reject a state outside idle/waiting/working"
