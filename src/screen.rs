@@ -568,6 +568,13 @@ impl ScreenTracker {
         self.parser.screen().size().0
     }
 
+    /// The screen's column count. Needed to recognize `vt100`'s pending-wrap
+    /// state, which it reports as a cursor column equal to the width (see
+    /// `ClientScreen::wrap_would_walk`).
+    pub fn cols(&self) -> u16 {
+        self.parser.screen().size().1
+    }
+
     /// Escape sequences that put a host terminal's cursor and drawing
     /// attributes back exactly where this model says the workload left them,
     /// **without touching the shared DECSC/DECRC save-cursor register**.
@@ -704,6 +711,27 @@ impl StreamBoundary {
         for &byte in data {
             self.step(byte);
         }
+    }
+
+    /// How many leading bytes of `data` this stream needs before it is back
+    /// at a boundary (a complete sequence / complete character), or all of
+    /// `data` when it does not get there inside this chunk.
+    ///
+    /// Non-mutating: `ClientScreen::relay` uses it to hand a whole escape
+    /// sequence to the model in **one** `process` call instead of walking it
+    /// a byte at a time, while still guaranteeing that the model's cursor is
+    /// re-read at every point where a printable character could actually be
+    /// printed. Deliberately a probe over a clone of the state machine rather
+    /// than a second, subtly-different recognizer.
+    pub fn bytes_to_ground(&self, data: &[u8]) -> usize {
+        let mut probe = self.clone();
+        for (n, &byte) in data.iter().enumerate() {
+            probe.step(byte);
+            if probe.at_escape_boundary() {
+                return n + 1;
+            }
+        }
+        data.len()
     }
 
     fn step(&mut self, byte: u8) {
@@ -948,8 +976,10 @@ fn mode_is_alt_screen(num: &[u8]) -> bool {
 ///   (`at_safe_boundary`),
 /// - put the cursor and pen back absolutely rather than through the shared
 ///   DECSC register (`ScreenTracker::cursor_restore`), and
-/// - keep the host's cursor from walking onto the reserved row while a
-///   workload scroll-region sub-range is in force (`relay`).
+/// - keep the host's cursor on the row the workload believes it is on --
+///   line feeds, wraps and downward cursor moves off the workload's last row
+///   under a scroll-region sub-range, and the window a workload's own
+///   `\x1b[r` opens over the reserved row (`relay`).
 ///
 /// Sized to the workload's geometry -- the physical terminal minus the
 /// reserved status row -- so its coordinates are the host's coordinates for
@@ -997,75 +1027,265 @@ impl ClientScreen {
     }
 
     /// Feed a live PTY chunk and return the bytes the client should actually
-    /// write, or `None` when the chunk goes out unchanged (the common case,
-    /// and the only one when the workload has no scroll-region sub-range).
+    /// write, or `None` when the chunk goes out unchanged (the common case).
     ///
-    /// The rewrite exists solely for docs/terminal-state-design.md section
-    /// 7.1's reserved-row walk. While the client is re-asserting a workload's
-    /// own DECSTBM sub-range, the host terminal's bottom row is the *screen*
-    /// bottom rather than a margin boundary, so a line feed on the workload's
-    /// own last row moves the host cursor down onto the reserved row while
-    /// the workload's screen -- one row shorter -- clamps and stays put.
-    /// Everything the workload writes afterwards then lands a row below where
-    /// it believes it is, and stays there: the old code could only repaint
-    /// the bar text over the damage, never re-align the cursor.
+    /// The rewrite exists for exactly one class of bug: the host terminal's
+    /// cursor ending up on a **different row** from the workload's own screen
+    /// model. Nothing re-aligns that on its own, and every later
+    /// column-addressed partial repaint -- Ink paints words at absolute
+    /// columns, `\x1b[2GQuick\x1b[8Gsafety\x1b[15Gcheck:` -- then welds onto
+    /// whatever the wrong row already held, which is the reported "two frames
+    /// interleaved on one row" garbling. Three mechanisms produce it, each
+    /// measured against a real `vt100::Parser` at the *host's* geometry (one
+    /// row taller than this model, because the client reserved the bottom row
+    /// for the status bar):
     ///
-    /// With a model of the workload's screen the divergence is detectable at
-    /// the byte that causes it. The chunk is split at line-feed controls
-    /// (`LF`/`VT`/`FF`); whenever one of them executes while the model's
-    /// cursor is on the model's last row -- and that row is outside the
-    /// sub-range, so the model clamps instead of scrolling -- an absolute
-    /// reposition to the model's own cursor is spliced in directly after it.
-    /// A line feed never leaves a pending-wrap state, so a plain `CUP` is an
-    /// exact restore here.
+    /// 1. **A line feed off the model's last row while a sub-range is in
+    ///    force** -- docs/terminal-state-design.md section 7.1. While the
+    ///    client is re-asserting a workload's own DECSTBM sub-range, the
+    ///    host's bottom row is the *screen* bottom rather than a margin
+    ///    boundary, so a line feed on the workload's last row (which is
+    ///    outside that sub-range) walks the host cursor down onto the
+    ///    reserved row while this model, one row shorter, clamps and stays.
+    /// 2. **A wrap off the last column of that same row.** Section 7.1
+    ///    recorded this as residue that "self-heals because every status
+    ///    redraw restores the cursor absolutely". It does not heal fast
+    ///    enough -- up to 450 ms idle, 3 s forced -- and every Ink repaint in
+    ///    between lands a row low. Same divergence, same repair, except that
+    ///    the reposition is spliced *before* the character that wraps, so the
+    ///    character itself also lands on the right row instead of on the bar.
+    /// 3. **The workload resetting DECSTBM.** Claude Code opens with
+    ///    `ESC 7`, `ESC [ r`, `ESC 8`. That bare `ESC [ r` widens the
+    ///    *host's* scroll region back over the reserved row, and the client's
+    ///    own re-assert only comes back around one socket round-trip later
+    ///    (the worker's `Layout` event, `src/bin/a.rs`). Inside that window
+    ///    -- which starts in the middle of the very chunk that reset it --
+    ///    every line feed, wrap and downward cursor move on the model's last
+    ///    row walks the host onto the reserved row, and this time the host
+    ///    also fails to *scroll* where the model does. A cursor repair after
+    ///    the fact cannot put back a scroll that never happened, so the
+    ///    reservation is re-asserted *in the stream*, immediately after the
+    ///    sequence that reset it and before the workload's next byte can use
+    ///    it. Re-asserting `1;{rows}` here is the documented rule, not a new
+    ///    one: it happens only while the workload is on full-screen margins,
+    ///    which is precisely when section 7 says the client's own reservation
+    ///    is the region to assert.
     ///
-    /// Engages only while a sub-range whose bottom is above the workload's
-    /// last row is in force; every other stream takes one `Option` check and
-    /// the untouched bulk path. The residual case -- a *wrap* off the last
-    /// column of that same last row -- is not rewritten (detecting it needs
-    /// per-byte column tracking through the whole chunk, for a workload that
-    /// is simultaneously using a scroll-region sub-range and printing to the
-    /// far column of a row outside it); unlike the line-feed walk it now
-    /// self-heals, because every status-bar redraw restores the cursor
-    /// absolutely from this model.
+    /// A fourth, `CSI B` / `CSI E` / `CSI e` (and `ESC E`) off the last row
+    /// under a sub-range, is mechanism 1's clamp mismatch driven by a
+    /// cursor-motion sequence instead of a control, and is repaired the same
+    /// way.
+    ///
+    /// **What is not reachable**, measured rather than assumed: with the
+    /// client's own `1;{rows}` reservation in force -- which is what this
+    /// method now *guarantees* whenever the workload is on full-screen
+    /// margins -- a line feed, a wrap, `CSI B`, `CSI E` and `CSI e` on the
+    /// model's last row all leave the host and the model in agreement,
+    /// because that row is the bottom of the host's region and both sides
+    /// scroll identically. Pinned by
+    /// `relay_client_reservation_never_walks_onto_the_reserved_row`.
+    ///
+    /// Cost. A chunk with no `ESC` in it, arriving on a stream that is
+    /// between sequences while no sub-range excludes the last row, cannot
+    /// diverge at all and takes the same single bulk `process` call it always
+    /// did -- that is bulk program output, the throughput case. Otherwise the
+    /// chunk is walked in runs, never byte-by-byte for its own sake: a whole
+    /// escape sequence per run (`StreamBoundary::bytes_to_ground`), and
+    /// printable text in one run bounded by the number of columns still
+    /// between the cursor and the far end of the last row, which is what
+    /// makes the model's cursor guaranteed-current at every byte that could
+    /// wrap off that row.
     pub fn relay(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        self.boundary.feed(data);
-        if !data.iter().any(|b| matches!(b, b'\n' | 0x0b | 0x0c)) {
-            // No line-feed control in this chunk, so no walk is possible --
-            // whatever else it does to the margins takes effect for the next
-            // one. The overwhelmingly common path: one bulk parse, no scan.
+        if self.boundary.at_escape_boundary() && !self.exposed() && !data.contains(&0x1b) {
+            // No `ESC` anywhere and a stream that is between sequences: this
+            // chunk cannot set, reset or otherwise move a scroll region, so
+            // the host keeps the client's own reservation for all of it and
+            // (see above) cannot diverge. One bulk parse, no per-run walk.
+            self.boundary.feed(data);
             self.screen.process(data);
             return None;
         }
+
         let mut out: Option<Vec<u8>> = None;
-        let mut segment_start = 0usize;
-        for i in 0..data.len() {
-            if !matches!(data[i], b'\n' | 0x0b | 0x0c) {
-                continue;
+        // How much of `data` has already been copied into `out`.
+        let mut copied = 0usize;
+        let mut i = 0usize;
+        // Set once the host has been repositioned ahead of a character that
+        // is about to wrap, so the guard cannot fire again on that
+        // character's UTF-8 continuation bytes.
+        let mut wrap_guarded = false;
+
+        while i < data.len() {
+            if !wrap_guarded && self.wrap_would_walk(data[i]) {
+                let row = self.screen.cursor_position().0;
+                // The model will wrap this character to column 1 of the row
+                // it is already on (it is outside the sub-range, so it clamps
+                // instead of scrolling); the host, one row taller, would wrap
+                // it onto the reserved row. Cancel the host's pending wrap by
+                // putting it where the model is about to be.
+                Self::splice(
+                    &mut out,
+                    data,
+                    &mut copied,
+                    i,
+                    format!("\x1b[{};1H", row + 1).as_bytes(),
+                );
+                wrap_guarded = true;
             }
-            // Everything up to (not including) the control, then the control
-            // on its own, so both the margins and the cursor row immediately
-            // before it are known -- the chunk may well be the one that set
-            // the sub-range in the first place.
-            self.screen.process(&data[segment_start..i]);
-            let last_row = self.screen.rows().saturating_sub(1);
-            let exposed = matches!(self.screen.margins(), Some((_, bottom)) if bottom <= last_row);
+
+            let run = self.run_len(data, i);
+            let end = i + run;
+            let line_feed = run == 1 && matches!(data[i], b'\n' | 0x0b | 0x0c);
+            let sequence = data[i] == 0x1b || !self.boundary.at_escape_boundary();
+            let final_byte = data[end - 1];
+            let exposed = self.exposed();
             let before_row = self.screen.cursor_position().0;
-            self.screen.process(&data[i..=i]);
-            if !exposed || before_row != last_row {
-                continue;
-            }
+            let change = self.screen.process(&data[i..end]);
+            self.boundary.feed(&data[i..end]);
+            i = end;
+
+            let last_row = self.last_row();
             let (row, col) = self.screen.cursor_position();
-            let buf = out.get_or_insert_with(Vec::new);
-            buf.extend_from_slice(&data[segment_start..=i]);
-            buf.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
-            segment_start = i + 1;
+            let at_boundary = self.boundary.at_escape_boundary();
+
+            // Mechanisms 1 and 4: the model clamped on its last row where the
+            // host, one row taller, walked onto the reserved row.
+            let walked = exposed
+                && before_row == last_row
+                && row == last_row
+                && (line_feed
+                    || (sequence && at_boundary && matches!(final_byte, b'B' | b'E' | b'e')));
+            if walked {
+                // Neither a line feed nor a downward cursor move leaves a
+                // pending-wrap state, so a plain `CUP` is an exact restore.
+                let col = col.min(self.screen.cols().saturating_sub(1));
+                Self::splice(
+                    &mut out,
+                    data,
+                    &mut copied,
+                    i,
+                    format!("\x1b[{};{}H", row + 1, col + 1).as_bytes(),
+                );
+            }
+
+            if wrap_guarded && at_boundary {
+                if row == last_row && col >= self.screen.cols() {
+                    // The character attached to the preceding cell -- a
+                    // zero-width combining mark -- instead of wrapping, so the
+                    // model is still in pending wrap and the host is not. Put
+                    // the host's pending wrap back; a `CUP` cannot express it,
+                    // `cursor_state_formatted` (inside `cursor_restore`) can.
+                    let restore = self.screen.cursor_restore();
+                    Self::splice(&mut out, data, &mut copied, i, &restore);
+                }
+                wrap_guarded = false;
+            }
+
+            // Mechanism 3: close the reservation window in the stream itself.
+            if at_boundary
+                && matches!(change, Some(c) if c.margins_reset)
+                && self.screen.margins().is_none()
+                && self.screen.rows() >= 2
+            {
+                let mut seq = format!("\x1b[1;{}r", self.screen.rows()).into_bytes();
+                // DECSTBM homes the cursor on a real terminal, so the
+                // reposition is not optional. Absolute, from the model, and
+                // never through the shared DECSC register.
+                seq.extend_from_slice(&self.screen.cursor_restore());
+                Self::splice(&mut out, data, &mut copied, i, &seq);
+            }
         }
-        self.screen.process(&data[segment_start..]);
+
         if let Some(buf) = out.as_mut() {
-            buf.extend_from_slice(&data[segment_start..]);
+            buf.extend_from_slice(&data[copied..]);
         }
         out
+    }
+
+    /// The model's own last row index -- the row the host terminal has one
+    /// more of.
+    fn last_row(&self) -> u16 {
+        self.screen.rows().saturating_sub(1)
+    }
+
+    /// True while a workload DECSTBM sub-range leaves the model's last row
+    /// *outside* the scroll region. That is the whole precondition for the
+    /// reserved-row walk: the model clamps on its last row while the host,
+    /// whose screen is a row taller, has somewhere to go.
+    fn exposed(&self) -> bool {
+        matches!(self.screen.margins(), Some((_, bottom)) if bottom <= self.last_row())
+    }
+
+    /// True when `byte` is the start of a character that the model is about
+    /// to wrap off the far end of its last row while that row is outside the
+    /// scroll region -- `vt100` reports the pending-wrap state as a cursor
+    /// column equal to the screen width.
+    fn wrap_would_walk(&self, byte: u8) -> bool {
+        if byte < 0x20 || byte == 0x7f || !self.boundary.at_escape_boundary() || !self.exposed() {
+            return false;
+        }
+        let (row, col) = self.screen.cursor_position();
+        row == self.last_row() && col >= self.screen.cols()
+    }
+
+    /// How many bytes of `data[i..]` can be handed to the model in one
+    /// `process` call without the cursor being able to wrap off the last row
+    /// unobserved.
+    ///
+    /// Three shapes, in order: a line-feed control on its own (so the walk
+    /// check sees the row immediately before and after it); a whole escape
+    /// sequence (nothing prints inside one, and handing it over whole is also
+    /// what makes a DECSTBM reset arrive as a single `LayoutChange` at the
+    /// byte that caused it); or a run of printable text bounded by the
+    /// columns still between the cursor and the far end of the last row.
+    /// Bytes are never fewer than columns -- multi-byte and wide characters
+    /// consume more of them per column, combining marks consume none -- so
+    /// that bound is conservative in the safe direction.
+    fn run_len(&self, data: &[u8], i: usize) -> usize {
+        let byte = data[i];
+        if matches!(byte, b'\n' | 0x0b | 0x0c) {
+            return 1;
+        }
+        if byte == 0x1b || !self.boundary.at_escape_boundary() {
+            return self.boundary.bytes_to_ground(&data[i..]).max(1);
+        }
+        // A printable run cannot change the margins (that needs an `ESC`,
+        // which ends the run), so when the last row is not exposed there is
+        // nothing to look for and the run is bounded only by the next
+        // control.
+        let budget = if self.exposed() {
+            let (row, col) = self.screen.cursor_position();
+            let cols = usize::from(self.screen.cols());
+            let rows_left = usize::from(self.last_row().saturating_sub(row));
+            rows_left * cols + cols.saturating_sub(usize::from(col))
+        } else {
+            usize::MAX
+        };
+        let mut n = 0usize;
+        while i + n < data.len() && n < budget {
+            // TAB advances by up to a whole tab stop rather than one column
+            // per byte, so it ends a budgeted run.
+            if matches!(data[i + n], 0x1b | b'\n' | 0x0b | 0x0c | b'\t') {
+                break;
+            }
+            n += 1;
+        }
+        n.max(1)
+    }
+
+    /// Copy `data[copied..upto]` into the rewrite buffer, then `extra`, and
+    /// remember how far the copy got.
+    fn splice(
+        out: &mut Option<Vec<u8>>,
+        data: &[u8],
+        copied: &mut usize,
+        upto: usize,
+        extra: &[u8],
+    ) {
+        let buf = out.get_or_insert_with(Vec::new);
+        buf.extend_from_slice(&data[*copied..upto]);
+        buf.extend_from_slice(extra);
+        *copied = upto;
     }
 
     /// Re-fit both the model and the tracked margins to a new workload
@@ -2284,5 +2504,266 @@ mod boundary_tests {
         let cell = host.screen().cell(6, 12).unwrap();
         assert!(cell.bold(), "the workload's pen must be restored");
         assert_eq!(cell.fgcolor(), vt100::Color::Idx(42));
+    }
+
+    /// The three pieces `relay` sits between, all real: the client's
+    /// `ClientScreen` at the workload's geometry, a real `vt100` host at the
+    /// *physical* geometry (one row taller) carrying the client's
+    /// `1;{rows-1}` reservation and its status-bar text, and a second real
+    /// `vt100` standing in for the workload's own screen. Bytes are fed
+    /// exactly the way `relay_to_terminal` (src/bin/a.rs) feeds them: the
+    /// workload sees the raw chunk, the host sees whatever `relay` returns.
+    struct RelayRig {
+        client: ClientScreen,
+        host: vt100::Parser,
+        workload: vt100::Parser,
+        rows: u16,
+        cols: u16,
+    }
+
+    impl RelayRig {
+        /// `rows` is the *physical* terminal height; the workload gets
+        /// `rows - 1` (`reserved_rows` in src/bin/a.rs).
+        fn new(rows: u16, cols: u16) -> Self {
+            let mut host = vt100::Parser::new(rows, cols, 0);
+            // What `apply_terminal_layout` + the first `draw_status_bar`
+            // leave on the host before a single workload byte is relayed.
+            host.process(format!("\x1b[{rows};1HBAR\x1b[1;{}r\x1b[1;1H", rows - 1).as_bytes());
+            Self {
+                client: ClientScreen::try_new(rows - 1, cols).unwrap(),
+                host,
+                workload: vt100::Parser::new(rows - 1, cols, 0),
+                rows,
+                cols,
+            }
+        }
+
+        /// Returns whether `relay` rewrote the chunk.
+        fn relay(&mut self, data: &[u8]) -> bool {
+            self.workload.process(data);
+            let rewritten = self.client.relay(data);
+            self.host.process(rewritten.as_deref().unwrap_or(data));
+            rewritten.is_some()
+        }
+
+        /// The host and the workload must agree on the cursor and on every
+        /// row the workload owns -- a one-row offset shows up here as both.
+        fn assert_agrees(&self, what: &str) {
+            assert_eq!(
+                self.host.screen().cursor_position(),
+                self.workload.screen().cursor_position(),
+                "host and workload must agree on the cursor {what}"
+            );
+            for row in 0..self.rows - 1 {
+                assert_eq!(
+                    self.host.screen().contents_between(row, 0, row, self.cols),
+                    self.workload
+                        .screen()
+                        .contents_between(row, 0, row, self.cols),
+                    "host and workload must agree on row {} {what}",
+                    row + 1
+                );
+            }
+        }
+
+        fn assert_bar_intact(&self, what: &str) {
+            assert_eq!(
+                self.host
+                    .screen()
+                    .contents_between(self.rows - 1, 0, self.rows - 1, self.cols)
+                    .trim_end(),
+                "BAR",
+                "the reserved row must not be written over or scrolled {what}"
+            );
+        }
+    }
+
+    /// docs/terminal-state-design.md section 7.1's *residual* case, which the
+    /// doc recorded as merely self-healing: a wrap off the last column of the
+    /// workload's last row while a sub-range excludes that row. The model
+    /// clamps and wraps onto the same row; a host one row taller wraps onto
+    /// the reserved row and stays a row low forever after. The repair is
+    /// spliced *before* the wrapping character, so the character lands on the
+    /// right row too and the two grids stay byte-identical.
+    #[test]
+    fn relay_keeps_a_wrap_off_the_reserved_row_under_a_sub_range() {
+        let mut rig = RelayRig::new(24, 20);
+        rig.relay(b"\x1b[5;15r");
+        // Exactly one screen width, so the cursor ends in pending wrap on the
+        // workload's last row -- which is outside its own scroll region.
+        rig.relay(b"\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+        assert!(
+            rig.relay(b"X"),
+            "a wrap off the last row under a sub-range must be repaired"
+        );
+        rig.assert_agrees("after a wrap off the workload's last row");
+        assert_eq!(
+            rig.workload.screen().cursor_position(),
+            (22, 1),
+            "the workload wrapped onto its own last row, not off it"
+        );
+        rig.assert_bar_intact("by a wrap");
+    }
+
+    /// The same wrap, but the character that trips it is multi-byte and
+    /// arrives in its own chunk: the pending-wrap state has to survive the
+    /// chunk boundary, and the guard must fire once, not once per UTF-8 byte.
+    #[test]
+    fn relay_keeps_a_multibyte_wrap_off_the_reserved_row_across_chunks() {
+        let mut rig = RelayRig::new(24, 20);
+        // Split the DECSTBM across chunks too, to pin that `run_len` picks up
+        // a half-parsed sequence rather than restarting it.
+        rig.relay(b"\x1b[5;1");
+        rig.relay(b"5r\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+        assert!(
+            rig.relay("\u{e9}".as_bytes()),
+            "a multi-byte wrap off the last row must be repaired"
+        );
+        rig.assert_agrees("after a multi-byte wrap off the workload's last row");
+        rig.assert_bar_intact("by a multi-byte wrap");
+    }
+
+    /// The reported user-visible symptom, end to end: after a wrap has put
+    /// the host a row low, Ink's next partial repaint paints words at
+    /// absolute columns (`\x1b[2GQuick\x1b[8Gsafety`) and welds them into
+    /// whatever the wrong row already held. With the repair the two grids
+    /// stay identical, which is what stops the welding.
+    #[test]
+    fn relay_stops_column_addressed_repaints_welding_onto_the_wrong_row() {
+        let mut rig = RelayRig::new(24, 20);
+        rig.relay(b"\x1b[5;15r");
+        rig.relay(b"\x1b[22;1Hprevious frame");
+        rig.relay(b"\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+        rig.relay(b"X");
+        rig.relay(b"\x1b[2GQuick\x1b[8Gsafe");
+        rig.assert_agrees("after a column-addressed repaint following a wrap");
+        assert_eq!(
+            rig.host
+                .screen()
+                .contents_between(21, 0, 21, 20)
+                .trim_end()
+                .to_string(),
+            "previous frame",
+            "the previous frame's row must not be welded into"
+        );
+        rig.assert_bar_intact("by a column-addressed repaint");
+    }
+
+    /// A downward *cursor move* off the last row under a sub-range is the
+    /// same clamp mismatch as the line feed: the model has nowhere to go, the
+    /// host has the reserved row.
+    #[test]
+    fn relay_keeps_a_cursor_down_off_the_reserved_row_under_a_sub_range() {
+        for probe in [&b"\x1b[B"[..], &b"\x1b[E"[..], &b"\x1b[3e"[..]] {
+            let mut rig = RelayRig::new(24, 20);
+            rig.relay(b"\x1b[5;15r\x1b[23;1HX");
+            assert!(
+                rig.relay(probe),
+                "{probe:?} off the last row under a sub-range must be repaired"
+            );
+            rig.assert_agrees("after a downward cursor move off the last row");
+            rig.assert_bar_intact("by a downward cursor move");
+        }
+    }
+
+    /// Mechanism 3: Claude Code opens with `ESC 7`, `ESC [ r`, `ESC 8`. The
+    /// bare `ESC [ r` widens the *host's* scroll region back over the
+    /// reserved row, and the client's own re-assert is a socket round-trip
+    /// away (the worker's `Layout` event), so everything in between walks --
+    /// and, unlike the sub-range case, the host also fails to scroll where
+    /// the workload does. `relay` re-asserts the reservation in the stream,
+    /// right behind the sequence that reset it.
+    #[test]
+    fn relay_reasserts_the_reservation_when_the_workload_resets_decstbm() {
+        let mut rig = RelayRig::new(24, 20);
+        assert!(
+            rig.relay(b"\x1b7\x1b[r\x1b8"),
+            "a workload margin reset must re-assert the client's reservation"
+        );
+        // Fill the top row so a scroll is observable, then line-feed off the
+        // workload's last row: both sides must scroll rows 1..23 together.
+        rig.relay(b"\x1b[1;1Htop row\x1b[23;1Hbottom row\n");
+        rig.assert_agrees("after a line feed following a margin reset");
+        assert_eq!(
+            rig.host.screen().contents_between(0, 0, 0, 20).trim_end(),
+            "",
+            "the host must have scrolled the top row away like the workload did"
+        );
+        rig.assert_bar_intact("by a line feed after a margin reset");
+    }
+
+    /// The same window, reached by a wrap instead of a line feed, and by
+    /// `ESC c` (RIS) instead of `ESC [ r`.
+    #[test]
+    fn relay_reasserts_the_reservation_after_ris_and_survives_a_wrap() {
+        let mut rig = RelayRig::new(24, 20);
+        assert!(
+            rig.relay(b"\x1bc"),
+            "RIS must re-assert the client's reservation"
+        );
+        rig.relay(b"\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+        rig.relay(b"X");
+        rig.assert_agrees("after a wrap following RIS");
+        // No `assert_bar_intact` here on purpose: RIS clears the *whole*
+        // host screen, the reserved row included, exactly like the ED2
+        // residue design doc section 7 records. That is the status bar's
+        // next redraw to repaint; what matters here is that the cursor and
+        // the workload's own rows still line up afterwards.
+    }
+
+    /// The audited case that turns out **not** to be reachable, recorded as
+    /// evidence rather than as a guess: with the client's own `1;{rows-1}`
+    /// reservation in force -- which is what the margin-reset re-assert above
+    /// now guarantees whenever the workload is on full-screen margins -- the
+    /// workload's last row *is* the bottom of the host's scroll region, so a
+    /// line feed, a wrap and every downward cursor move scroll or clamp
+    /// identically on both sides. Nothing is rewritten and nothing diverges.
+    #[test]
+    fn relay_client_reservation_never_walks_onto_the_reserved_row() {
+        for probe in [
+            &b"\n"[..],
+            &b"\x0b"[..],
+            &b"\x0c"[..],
+            &b"\x1b[B"[..],
+            &b"\x1b[E"[..],
+            &b"\x1b[3e"[..],
+            &b"WRAPS-OFF-THE-FAR-END"[..],
+        ] {
+            let mut rig = RelayRig::new(24, 20);
+            rig.relay(b"\x1b[23;1HX");
+            assert!(
+                !rig.relay(probe),
+                "{probe:?} under the client's own reservation needs no repair"
+            );
+            rig.assert_agrees("under the client's own reservation");
+            rig.assert_bar_intact("under the client's own reservation");
+        }
+    }
+
+    /// A bottom-anchored sub-range covers the workload's last row, so that
+    /// row is inside the region on both sides and nothing can walk.
+    #[test]
+    fn relay_leaves_a_bottom_anchored_sub_range_alone() {
+        let mut rig = RelayRig::new(24, 20);
+        rig.relay(b"\x1b[5;23r");
+        assert!(!rig.relay(b"\x1b[23;1HABCDEFGHIJKLMNOPQRST"));
+        assert!(!rig.relay(b"X"));
+        assert!(!rig.relay(b"\n"));
+        rig.assert_agrees("under a bottom-anchored sub-range");
+        rig.assert_bar_intact("under a bottom-anchored sub-range");
+    }
+
+    /// The throughput path must stay a single bulk parse: an escape-free
+    /// chunk arriving on a stream that is between sequences cannot diverge,
+    /// however many line feeds and wraps it contains.
+    #[test]
+    fn relay_bulk_escape_free_output_is_never_rewritten() {
+        let mut client = ClientScreen::try_new(23, 20).unwrap();
+        let bulk: Vec<u8> = (0..200)
+            .flat_map(|i| format!("line {i} with enough text to wrap the row\n").into_bytes())
+            .collect();
+        assert!(client.relay(&bulk).is_none());
+        // ...and it still tracks: the model has scrolled to the last row.
+        assert_eq!(client.cursor_position().0, 22);
     }
 }
