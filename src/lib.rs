@@ -10,6 +10,10 @@ pub mod screen;
 pub mod watch;
 pub mod worker;
 
+mod persist;
+pub use persist::{atomic_write_json, atomic_write_bytes, FileLock};
+use persist::*;
+
 #[cfg(feature = "python")]
 mod python;
 
@@ -27,7 +31,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1035,48 +1039,6 @@ pub fn read_session_record(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
     Ok(record)
 }
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct AtomicTempGuard(PathBuf);
-
-impl Drop for AtomicTempGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
-    ensure_private_dir(parent)?;
-    let value = serde_json::to_value(value)?;
-    persist_worker_identity_once(path, &value)?;
-    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .unwrap_or(OsStr::new("record"))
-            .to_string_lossy(),
-        std::process::id(),
-        seq
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .with_context(|| format!("create {}", temp.display()))?;
-    let _temp_guard = AtomicTempGuard(temp.clone());
-    serde_json::to_writer_pretty(&mut file, &value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temp, path)
-        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct ProcessIdentity {
     pid: u32,
@@ -1176,59 +1138,6 @@ fn persist_worker_identity_once(path: &Path, value: &Value) -> Result<()> {
     })();
     let _ = fs::remove_file(&temp);
     result
-}
-
-pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
-    ensure_private_dir(parent)?;
-    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".history.{}.{}.tmp", std::process::id(), seq));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)?;
-    let _temp_guard = AtomicTempGuard(temp.clone());
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-pub struct FileLock {
-    file: File,
-}
-impl FileLock {
-    pub fn exclusive(path: &Path, nonblocking: bool) -> Result<Self> {
-        let parent = path.parent().ok_or_else(|| anyhow!("lock has no parent"))?;
-        ensure_private_dir(parent)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
-        let mut op = libc::LOCK_EX;
-        if nonblocking {
-            op |= libc::LOCK_NB;
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("lock {}", path.display()));
-        }
-        Ok(Self { file })
-    }
-}
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
 }
 
 pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
