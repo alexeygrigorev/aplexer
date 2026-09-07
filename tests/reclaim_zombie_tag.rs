@@ -20,12 +20,17 @@
 //! The safety property this must never break is tested here alongside: a
 //! record whose *workload* is still alive keeps its claim, because taking
 //! the pair archives and then deletes the holder's durable state, which is
-//! the last handle to that running process.
+//! the last handle to that running process. A live *worker* whose leader
+//! is already gone keeps its claim for the same reason; every other live
+//! fixture here has both pids, so deleting `worker_alive()` from
+//! `reap_verdict` used to stay green in this suite.
 //!
 //! Harness style follows tests/prune_dead_records.rs (direct CLI, real
 //! sessions, real signals).
 
+use aplexer::{atomic_write_json, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -34,6 +39,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime: TempDir,
@@ -271,6 +277,98 @@ fn make_zombie(harness: &Harness, workspace: &TempDir, tag: &str) -> Session {
     session
 }
 
+/// A live worker whose workload leader is already gone. `reap_verdict`
+/// retains when *either* pid is alive; every other live fixture in this
+/// file has both, so this is the only row that goes red if the
+/// `worker_alive()` guard is deleted.
+///
+/// Seeded, not spawned: a real aplexer worker exits shortly after its
+/// leader, so the live worker here is a throwaway `sleep` that will not.
+/// No cgroup locator, so containment cannot retain on its own and hide
+/// the same mutation.
+fn make_live_worker_dead_leader(
+    harness: &Harness,
+    workspace: &TempDir,
+    tag: &str,
+) -> (Session, std::process::Child) {
+    let paths = Paths {
+        runtime_root: harness.runtime.path().to_path_buf(),
+        state_root: harness.state.path().to_path_buf(),
+        config_file: harness.config.clone(),
+    };
+    paths.ensure().expect("session roots");
+
+    let mut gone = Command::new("/bin/true").spawn().expect("dead leader");
+    let workload_pid = gone.id() as i32;
+    gone.wait().expect("reap dead leader");
+    assert!(
+        !process_alive(workload_pid),
+        "reaped leader {workload_pid} still in /proc"
+    );
+
+    let stand_in = Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("live worker stand-in");
+    let worker_pid = stand_in.id() as i32;
+
+    let id = Uuid::new_v4();
+    let record = SessionRecord {
+        parent_session: None,
+        schema_version: SCHEMA_VERSION,
+        id,
+        workspace: workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace"),
+        tag: tag.into(),
+        engine: "shell".into(),
+        profile: None,
+        command: vec!["/bin/sleep".into(), "300".into()],
+        cwd: PathBuf::from("/tmp"),
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        limits: Limits::default(),
+        history_bytes: 1024,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_activity_ms: None,
+        last_accessed_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
+        phase: Phase::Running,
+        worker_pid: Some(worker_pid as u32),
+        workload_pid: Some(workload_pid as u32),
+        containment_cgroup: None,
+        containment_cgroup_identity: None,
+        containment_empty: Some(false),
+        socket_path: paths.socket(id),
+        history_path: paths.history(id),
+        exit: None,
+        error: None,
+    };
+    fs::create_dir_all(paths.state_session(id)).expect("state session");
+    atomic_write_json(&paths.record(id), &record).expect("write record");
+
+    let rows = harness.rows_for(workspace, tag);
+    assert_eq!(rows.len(), 1, "fixture lost its record: {rows:?}");
+    assert_eq!(rows[0]["worker_alive"], true, "{}", rows[0]);
+    assert_eq!(rows[0]["state"], "running", "{}", rows[0]);
+    assert!(process_alive(worker_pid), "fixture lost its live worker");
+    assert!(
+        !process_alive(workload_pid),
+        "fixture still has a live workload leader"
+    );
+    (
+        Session {
+            id: record.id.to_string(),
+            worker_pid,
+            workload_pid,
+        },
+        stand_in,
+    )
+}
+
 /// The reported bug, end to end: `a start` on a pair held by a zombie had to
 /// be preceded by something that pruned the zombie first. It must now
 /// succeed on its own.
@@ -419,6 +517,85 @@ fn start_refuses_a_workspace_tag_held_by_a_live_session() {
     );
 
     harness.run_ok(&["kill", &session.id, "--signal", "KILL", "--grace-ms", "0"]);
+}
+
+/// The other claim-check arm: the worker is still in `/proc` (so `a status`
+/// says `state: running`) even though its workload leader is already gone.
+/// Taking the pair would archive and then delete that worker's durable
+/// state. Once the worker is gone too, the same pair is reclaimable; that
+/// proves the refusal came from `worker_alive()`, not from a blanket
+/// refusal to touch this shape.
+#[test]
+fn start_refuses_a_workspace_tag_whose_worker_is_alive_even_if_the_leader_is_gone() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let (session, mut worker) = make_live_worker_dead_leader(&harness, &workspace, "worker-only");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid]);
+
+    let refused = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "--tag",
+        "worker-only",
+        "--",
+        "/bin/sleep",
+        "300",
+    ]);
+    assert!(
+        !refused.status.success(),
+        "start replaced a live worker to take its tag: stdout={}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("workspace+tag already belongs"), "{stderr}");
+    assert!(stderr.contains(&session.id), "{stderr}");
+    assert!(
+        stderr.contains("state: running"),
+        "refusal must name the live worker, not a broken record: {stderr}"
+    );
+
+    let rows = harness.rows_for(&workspace, "worker-only");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], session.id, "{}", rows[0]);
+    assert_eq!(rows[0]["state"], "running", "{}", rows[0]);
+    assert!(
+        harness.state_dir_exists(&session.id),
+        "refused start still destroyed the live worker's last handle"
+    );
+    assert!(
+        process_alive(session.worker_pid),
+        "start signalled a worker it was refused permission to replace"
+    );
+
+    worker.kill().expect("kill stand-in worker");
+    worker.wait().expect("reap stand-in worker");
+    let started = harness.run(&[
+        "--json",
+        "start",
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "--tag",
+        "worker-only",
+        "--",
+        "/bin/sleep",
+        "300",
+    ]);
+    assert!(
+        started.status.success(),
+        "a worker that has since died must no longer hold the pair: stderr={}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let record: Value = serde_json::from_slice(&started.stdout).expect("start JSON");
+    let _replacement = ProcessCleanup(vec![
+        record["worker_pid"].as_i64().unwrap() as i32,
+        record["workload_pid"].as_i64().unwrap() as i32,
+    ]);
+    assert_ne!(record["id"], session.id, "start returned the corpse itself");
+    assert!(!harness.state_dir_exists(&session.id));
+    let replacement = record["id"].as_str().expect("replacement id");
+    harness.run_ok(&["kill", replacement, "--signal", "KILL", "--grace-ms", "0"]);
 }
 
 /// A record that `start_session` can no longer see as blocking, because it

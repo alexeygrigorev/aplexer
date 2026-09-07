@@ -12,17 +12,24 @@
 //! The safety property those retained records were supposed to protect is
 //! tested here too: a record whose workload leader is still alive must
 //! survive prune, because prune deletes the last durable handle to it.
+//! The other retention arm is a live worker whose leader is already gone --
+//! every other live fixture here starts a sleeper and leaves both pids
+//! running, so deleting `worker_alive()` from `reap_verdict` used to stay
+//! green in this suite.
 //!
 //! Harness style follows tests/containment_recovery.rs (direct CLI, real
 //! sessions, real signals).
 
+use aplexer::{atomic_write_json, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime: TempDir,
@@ -212,6 +219,99 @@ fn make_zombie(harness: &Harness, workspace: &TempDir, tag: &str) -> Session {
     session
 }
 
+/// A live worker whose workload leader is already gone. `reap_verdict`
+/// retains when *either* pid is alive; every other live fixture in this
+/// file has both, so this is the only row that goes red if the
+/// `worker_alive()` guard is deleted.
+///
+/// Seeded, not spawned: a real aplexer worker exits shortly after its
+/// leader (the window `settle_terminating_record` waits out), so the
+/// live worker here is a throwaway `sleep` that will not. No cgroup
+/// locator, so containment cannot retain on its own and hide the same
+/// mutation.
+fn make_live_worker_dead_leader(
+    harness: &Harness,
+    workspace: &TempDir,
+    tag: &str,
+) -> (Session, std::process::Child) {
+    let paths = Paths {
+        runtime_root: harness.runtime.path().to_path_buf(),
+        state_root: harness.state.path().to_path_buf(),
+        config_file: harness.config.clone(),
+    };
+    paths.ensure().expect("session roots");
+
+    let mut gone = Command::new("/bin/true").spawn().expect("dead leader");
+    let workload_pid = gone.id() as i32;
+    gone.wait().expect("reap dead leader");
+    assert!(
+        !process_alive(workload_pid),
+        "reaped leader {workload_pid} still in /proc"
+    );
+
+    let stand_in = Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("live worker stand-in");
+    let worker_pid = stand_in.id() as i32;
+
+    let id = Uuid::new_v4();
+    let record = SessionRecord {
+        parent_session: None,
+        schema_version: SCHEMA_VERSION,
+        id,
+        workspace: workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace"),
+        tag: tag.into(),
+        engine: "shell".into(),
+        profile: None,
+        command: vec!["/bin/sleep".into(), "300".into()],
+        cwd: PathBuf::from("/tmp"),
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        limits: Limits::default(),
+        history_bytes: 1024,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_activity_ms: None,
+        last_accessed_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
+        phase: Phase::Running,
+        worker_pid: Some(worker_pid as u32),
+        workload_pid: Some(workload_pid as u32),
+        containment_cgroup: None,
+        containment_cgroup_identity: None,
+        containment_empty: Some(false),
+        socket_path: paths.socket(id),
+        history_path: paths.history(id),
+        exit: None,
+        error: None,
+    };
+    fs::create_dir_all(paths.state_session(id)).expect("state session");
+    atomic_write_json(&paths.record(id), &record).expect("write record");
+
+    let snapshot = harness.snapshot();
+    let listed = row(&snapshot, &record.id.to_string()).expect("record still listed");
+    assert_eq!(listed["worker_alive"], true, "{listed}");
+    assert_eq!(listed["state"], "running", "{listed}");
+    assert!(process_alive(worker_pid), "fixture lost its live worker");
+    assert!(
+        !process_alive(workload_pid),
+        "fixture still has a live workload leader"
+    );
+    (
+        Session {
+            id: record.id.to_string(),
+            worker_pid,
+            workload_pid,
+        },
+        stand_in,
+    )
+}
+
 /// The reported bug: a record stuck at `phase: running` with both pids gone
 /// was structurally unreapable -- `a prune` returned `{"removed": [],
 /// "retained_count": N}` no matter how often it ran. Nothing about that
@@ -325,6 +425,46 @@ fn prune_retains_a_live_session() {
     let listed = row(&snapshot, &session.id).expect("live record still listed");
     assert_eq!(listed["state"], "running", "{listed}");
     assert_eq!(listed["worker_alive"], true, "{listed}");
+}
+
+/// The other retention arm: the worker is still in `/proc`, the leader is
+/// not. Prune must keep the record -- it is the last durable handle to a
+/// live worker -- and must never signal that worker. Once the worker is
+/// gone too, the same record becomes an ordinary zombie and is reaped;
+/// that proves the retention came from `worker_alive()`, not from a
+/// blanket refusal to touch this shape.
+#[test]
+fn prune_retains_a_live_worker_whose_workload_leader_is_gone() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let (session, mut worker) = make_live_worker_dead_leader(&harness, &workspace, "worker-only");
+    let _cleanup = ProcessCleanup(vec![session.worker_pid, session.workload_pid]);
+
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([]),
+        "prune deleted the last handle to a live worker: {pruned}"
+    );
+    assert_eq!(pruned["retained_count"], 1, "{pruned}");
+    assert!(
+        harness.state_dir_exists(&session.id),
+        "durable evidence for a live worker was removed"
+    );
+    assert!(
+        process_alive(session.worker_pid),
+        "prune must never signal a live worker"
+    );
+
+    worker.kill().expect("kill stand-in worker");
+    worker.wait().expect("reap stand-in worker");
+    let pruned = harness.json(&["--json", "prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!([session.id]),
+        "a worker that has since died must be reapable: {pruned}"
+    );
+    assert!(!harness.state_dir_exists(&session.id));
 }
 
 /// Second reported defect: `a kill` left the record behind at

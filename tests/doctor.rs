@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -172,6 +173,95 @@ fn doctor_keeps_kill_and_forget_advice_for_a_record_prune_retains() {
             .is_some_and(|detail| !detail.contains("a prune")),
         "human advice must not name prune here: {}",
         sessions["detail"]
+    );
+}
+
+/// The other retention arm of `reap_verdict`: a live worker whose recorded
+/// workload leader is already gone. Doctor used to stay green if the
+/// `worker_alive()` guard was deleted, because every other fixture that
+/// pins kill/forget advice had a live *workload*. Recovery must follow
+/// prune: not `a prune`, because prune will not touch this record while
+/// the worker is in `/proc`.
+#[test]
+fn doctor_does_not_advise_prune_for_a_live_worker_whose_leader_is_gone() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut record = stale_running_record(&paths);
+    let mut worker = Command::new("sleep").arg("30").spawn().unwrap();
+    record.worker_pid = Some(worker.id());
+    let mut gone = Command::new("sleep").arg("30").spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.kill().unwrap();
+    gone.wait().unwrap();
+    record.workload_pid = Some(gone_pid);
+    std::fs::create_dir_all(paths.state_session(record.id)).unwrap();
+    atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .unwrap();
+    let broken = &sessions["broken_sessions"][0];
+    assert_eq!(broken["id"], record.id.to_string());
+    assert_eq!(broken["worker_alive"], true);
+    assert_eq!(broken["recovery"]["kill"], format!("a kill {}", record.id));
+    assert_eq!(
+        broken["recovery"]["forget"],
+        format!("a forget {} --force", record.id)
+    );
+    assert!(
+        broken["recovery"]["prune"].is_null(),
+        "doctor advised prune for a live worker: {broken}"
+    );
+    assert!(
+        sessions["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.contains("a prune")),
+        "human advice must not name prune here: {}",
+        sessions["detail"]
+    );
+    assert!(
+        worker.try_wait().unwrap().is_none(),
+        "doctor must never signal a live worker"
+    );
+
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(record.worker_pid.unwrap() as i32, 0) == 0 }
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .unwrap();
+    let broken = &sessions["broken_sessions"][0];
+    assert_eq!(
+        broken["recovery"]["prune"], "a prune",
+        "a worker that has since died must be advised as reapable: {broken}"
     );
 }
 
