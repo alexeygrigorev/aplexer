@@ -59,7 +59,10 @@ pub(super) enum LifecycleWake {
 /// post-exit PTY is still held open by a descendant). Timed containment scans
 /// are needed only after both the leader exit and PTY EOF are known: at that
 /// point an adopted descendant can exit without producing another LifeEvent.
-pub(super) fn wait_for_lifecycle_wake(rx: &mpsc::Receiver<LifeEvent>, cleanup_polling: bool) -> LifecycleWake {
+pub(super) fn wait_for_lifecycle_wake(
+    rx: &mpsc::Receiver<LifeEvent>,
+    cleanup_polling: bool,
+) -> LifecycleWake {
     if !cleanup_polling {
         return match rx.recv() {
             Ok(event) => LifecycleWake::Event(event),

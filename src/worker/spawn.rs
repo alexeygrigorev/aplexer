@@ -352,7 +352,11 @@ pub(super) fn run_termination_monitor(runtime: Arc<WorkerRuntime>) {
     }
 }
 
-pub(super) fn run_pty_reader(mut master: File, runtime: Arc<WorkerRuntime>, tx: mpsc::Sender<LifeEvent>) {
+pub(super) fn run_pty_reader(
+    mut master: File,
+    runtime: Arc<WorkerRuntime>,
+    tx: mpsc::Sender<LifeEvent>,
+) {
     let mut buffer = vec![0u8; 32 * 1024];
     loop {
         match master.read(&mut buffer) {
@@ -397,4 +401,3 @@ pub(super) fn run_child_waiter(mut child: Child, tx: mpsc::Sender<LifeEvent>) {
     disown_child_pid(pid);
     let _ = tx.send(event);
 }
-

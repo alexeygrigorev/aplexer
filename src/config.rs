@@ -461,164 +461,199 @@ impl Config {
     }
 
     pub fn load(paths: &Paths) -> Result<Self> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut config = Config {
             version: 1,
             default_engine: Some("shell".into()),
+            engines: Self::builtin_engines(),
+            // Auto-discovered profiles (spec.md 9.2/23) go in as defaults
+            // before the user's file is merged, exactly like the built-in
+            // engines above -- an explicit `[profiles.<id>]` entry in the
+            // user's config still wins on the extend in merge_user_file.
+            profiles: discover_profiles(),
+            shortcuts: Self::builtin_shortcuts(),
             ..Config::default()
         };
-        config.engines.insert(
-            "shell".into(),
-            EngineConfig {
-                command: vec![shell, "-l".into()],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                skip_permissions_argv: Vec::new(),
-            },
-        );
-        config.engines.insert(
+        config.merge_user_file(paths)?;
+        config.add_profile_shortcuts();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The engines every installation gets, before user config extends or
+    /// overrides them. `zcodex` is a codex variant (see `engine_family`): a
+    /// codex-rs fork with the same CLI surface and the same rollout log, so
+    /// its launch spec mirrors codex's exactly, with the fork's own binary
+    /// name. `opencode` is the PocketShell built-in
+    /// (tools/pocketshell/src/pocketshell/engines.py ::builtin_manifests)
+    /// that aplexer's engine set was missing -- required for aplexer to
+    /// become authoritative for pocketshell's engine registry
+    /// (pocketshell-integration-plan.md 0.1).
+    fn builtin_engines() -> BTreeMap<String, EngineConfig> {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let mut engines = BTreeMap::new();
+engines.insert(
+    "shell".into(),
+    EngineConfig {
+        command: vec![shell, "-l".into()],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        skip_permissions_argv: Vec::new(),
+    },
+);
+engines.insert(
+    "codex".into(),
+    EngineConfig {
+        command: vec![
             "codex".into(),
-            EngineConfig {
-                command: vec![
-                    "codex".into(),
-                    "-c".into(),
-                    "check_for_update_on_startup=false".into(),
-                ],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                // ported from pocketshell engines.py's codex LaunchSpec
-                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-            },
-        );
-        config.engines.insert(
-            "claude".into(),
-            EngineConfig {
-                command: vec!["claude".into()],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                // ported from pocketshell engines.py's claude LaunchSpec
-                skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
-            },
-        );
-        // `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
-        // with the same CLI surface and the same rollout log, so its launch
-        // spec mirrors codex's exactly, with the fork's own binary name.
-        config.engines.insert(
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+        ],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        // ported from pocketshell engines.py's codex LaunchSpec
+        skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+    },
+);
+engines.insert(
+    "claude".into(),
+    EngineConfig {
+        command: vec!["claude".into()],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        // ported from pocketshell engines.py's claude LaunchSpec
+        skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
+    },
+);
+// `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
+// with the same CLI surface and the same rollout log, so its launch
+// spec mirrors codex's exactly, with the fork's own binary name.
+engines.insert(
+    "zcodex".into(),
+    EngineConfig {
+        command: vec![
             "zcodex".into(),
-            EngineConfig {
-                command: vec![
-                    "zcodex".into(),
-                    "-c".into(),
-                    "check_for_update_on_startup=false".into(),
-                ],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-            },
-        );
-        config.engines.insert(
-            "gemini".into(),
-            EngineConfig {
-                command: vec!["gemini".into()],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                // no pocketshell source for a gemini skip-permissions flag
-                // (gemini is an aplexer-only extra, not in pocketshell's
-                // built-in manifest) -- left empty.
-                skip_permissions_argv: Vec::new(),
-            },
-        );
-        config.engines.insert(
-            "grok".into(),
-            EngineConfig {
-                command: vec!["grok".into()],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                // ported from pocketshell engines.py's grok LaunchSpec
-                skip_permissions_argv: vec!["--always-approve".into()],
-            },
-        );
-        // PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
-        // ::builtin_manifests) that aplexer's engine set was missing --
-        // required for aplexer to become authoritative for pocketshell's
-        // engine registry (pocketshell-integration-plan.md 0.1).
-        config.engines.insert(
-            "opencode".into(),
-            EngineConfig {
-                command: vec!["opencode".into()],
-                env: BTreeMap::new(),
-                env_unset: Vec::new(),
-                // opencode has no skip-permissions flag in pocketshell's
-                // manifest -- permissions are config-driven (opencode.json).
-                skip_permissions_argv: Vec::new(),
-            },
-        );
-        // Auto-discovered profiles (spec.md 9.2/23) go in as defaults before
-        // the user's file is merged, exactly like the built-in engines above
-        // -- an explicit `[profiles.<id>]` entry in the user's config still
-        // wins on a key collision via the `extend()` below.
-        config.profiles.extend(discover_profiles());
-        // Built-in quick-launch shortcuts (`a - <id>`, see cmd_quick_launch
-        // in src/bin/a.rs): short mnemonics onto an (engine, profile) pair.
-        // Same defaults-then-user-file-extends layering as engines/profiles
-        // above, so `[shortcuts.<id>]` in the user's config can add new ones
-        // or override these. "cl"/"co"/"g" are the plain engines; "clz"/
-        // "coz"/"cog" additionally select the Z.AI/Go sibling profiles
-        // discovered above (ids match those profiles' own dir-stem ids).
-        config.shortcuts.insert(
-            "cl".into(),
-            ShortcutConfig {
-                engine: "claude".into(),
-                profile: None,
-            },
-        );
-        config.shortcuts.insert(
-            "co".into(),
-            ShortcutConfig {
-                engine: "codex".into(),
-                profile: None,
-            },
-        );
-        config.shortcuts.insert(
-            "g".into(),
-            ShortcutConfig {
-                engine: "grok".into(),
-                profile: None,
-            },
-        );
-        if paths.config_file.exists() {
-            let text = fs::read_to_string(&paths.config_file)?;
-            let user: Config = toml::from_str(&text)
-                .with_context(|| format!("parse {}", paths.config_file.display()))?;
-            if user.version != 1 {
-                bail!("unsupported config version {}", user.version);
-            }
-            if user.default_engine.is_some() {
-                config.default_engine = user.default_engine;
-            }
-            if user.default_profile.is_some() {
-                config.default_profile = user.default_profile;
-            }
-            config.engines.extend(user.engines);
-            config.profiles.extend(user.profiles);
-            config.shortcuts.extend(user.shortcuts);
-            // A bool has no "unset" value to test the way the options above
-            // do, and the built-in default is `false`, so the user's parsed
-            // value simply is the answer.
-            config.keep_exited = user.keep_exited;
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+        ],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+    },
+);
+engines.insert(
+    "gemini".into(),
+    EngineConfig {
+        command: vec!["gemini".into()],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        // no pocketshell source for a gemini skip-permissions flag
+        // (gemini is an aplexer-only extra, not in pocketshell's
+        // built-in manifest) -- left empty.
+        skip_permissions_argv: Vec::new(),
+    },
+);
+engines.insert(
+    "grok".into(),
+    EngineConfig {
+        command: vec!["grok".into()],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        // ported from pocketshell engines.py's grok LaunchSpec
+        skip_permissions_argv: vec!["--always-approve".into()],
+    },
+);
+// PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
+// ::builtin_manifests) that aplexer's engine set was missing --
+// required for aplexer to become authoritative for pocketshell's
+// engine registry (pocketshell-integration-plan.md 0.1).
+engines.insert(
+    "opencode".into(),
+    EngineConfig {
+        command: vec!["opencode".into()],
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        // opencode has no skip-permissions flag in pocketshell's
+        // manifest -- permissions are config-driven (opencode.json).
+        skip_permissions_argv: Vec::new(),
+    },
+);
+        engines
+    }
+
+    /// Built-in quick-launch shortcuts (`a - <id>`, see cmd_quick_launch in
+    /// src/bin/a.rs): short mnemonics onto an (engine, profile) pair. Same
+    /// defaults-then-user-file-extends layering as engines/profiles, so
+    /// `[shortcuts.<id>]` in the user's config can add new ones or override
+    /// these. "cl"/"co"/"g" are the plain engines; "clz"/"coz"/"cog"
+    /// additionally select the Z.AI/Go sibling profiles discovered above
+    /// (ids match those profiles' own dir-stem ids).
+    fn builtin_shortcuts() -> BTreeMap<String, ShortcutConfig> {
+        let mut shortcuts = BTreeMap::new();
+shortcuts.insert(
+    "cl".into(),
+    ShortcutConfig {
+        engine: "claude".into(),
+        profile: None,
+    },
+);
+shortcuts.insert(
+    "co".into(),
+    ShortcutConfig {
+        engine: "codex".into(),
+        profile: None,
+    },
+);
+shortcuts.insert(
+    "g".into(),
+    ShortcutConfig {
+        engine: "grok".into(),
+        profile: None,
+    },
+);
+        shortcuts
+    }
+
+    /// Merges the user's config file over the built-in defaults. Options
+    /// with an "unset" state (default engine/profile) only override when
+    /// set; maps extend so a user entry wins on key collision.
+    fn merge_user_file(&mut self, paths: &Paths) -> Result<()> {
+        if !paths.config_file.exists() {
+            return Ok(());
         }
-        // Profile-specific built-ins are useful only when discovery or user
-        // config supplied their target profile. Insert them after merging so
-        // they never create dangling references, while an explicit user
-        // shortcut with the same id still wins.
+        let text = fs::read_to_string(&paths.config_file)?;
+        let user: Config = toml::from_str(&text)
+            .with_context(|| format!("parse {}", paths.config_file.display()))?;
+        if user.version != 1 {
+            bail!("unsupported config version {}", user.version);
+        }
+        if user.default_engine.is_some() {
+            self.default_engine = user.default_engine;
+        }
+        if user.default_profile.is_some() {
+            self.default_profile = user.default_profile;
+        }
+        self.engines.extend(user.engines);
+        self.profiles.extend(user.profiles);
+        self.shortcuts.extend(user.shortcuts);
+        // A bool has no "unset" value to test the way the options above
+        // do, and the built-in default is `false`, so the user's parsed
+        // value simply is the answer.
+        self.keep_exited = user.keep_exited;
+        Ok(())
+    }
+
+    /// Profile-specific built-ins are useful only when discovery or user
+    /// config supplied their target profile. Insert them after merging so
+    /// they never create dangling references, while an explicit user
+    /// shortcut with the same id still wins.
+    fn add_profile_shortcuts(&mut self) {
         for (shortcut, engine, profile) in [
             ("clz", "claude", "zlaude"),
             ("coz", "codex", "zodex"),
             ("cog", "codex", "godex"),
         ] {
-            if config.profiles.contains_key(profile) {
-                config
-                    .shortcuts
+            if self.profiles.contains_key(profile) {
+                self.shortcuts
                     .entry(shortcut.into())
                     .or_insert_with(|| ShortcutConfig {
                         engine: engine.into(),
@@ -626,8 +661,6 @@ impl Config {
                     });
             }
         }
-        config.validate()?;
-        Ok(config)
     }
 
     #[allow(clippy::too_many_arguments)]

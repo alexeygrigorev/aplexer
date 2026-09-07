@@ -23,8 +23,8 @@ use hub::*;
 mod termination;
 use termination::*;
 mod procs;
-use procs::*;
 pub(crate) use procs::direct_child_pids_in;
+use procs::*;
 mod lifecycle;
 use lifecycle::*;
 mod spawn;
@@ -104,7 +104,6 @@ const KILL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 type FileIdentity = (u64, u64);
 type RecoveredControlSocket = (UnixListener, FileIdentity, Option<FileLock>, FileIdentity);
-
 
 fn startup_checkpoint(point: &str) -> Result<()> {
     if TERMINATION_REQUESTED.load(Ordering::SeqCst) {
@@ -628,7 +627,6 @@ fn record_history_persistence_error(inner: &mut HubInner, error: impl std::fmt::
     message
 }
 
-
 /// Owns every resource created before the worker's accept loop is committed.
 /// Drop is a last-resort rollback; normal error paths call `rollback` so the
 /// persisted failure contains the original error rather than a generic one.
@@ -837,7 +835,6 @@ fn load_launch_environment(
             .with_context(|| format!("read private launch environment {}", path.display())),
     }
 }
-
 
 /// Runs the worker for session `id`.
 ///
@@ -1229,7 +1226,6 @@ fn recover_control_socket(
     let socket_identity = trusted_socket_identity(&runtime.socket_path)?;
     Ok((listener, socket_identity, replacement_lock, lock_identity))
 }
-
 
 fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Result<()> {
     stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
