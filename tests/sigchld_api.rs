@@ -62,6 +62,7 @@ fn invalid_start_request(workspace: PathBuf) -> StartRequest {
         worker_rows: None,
         worker_cols: None,
         python: None,
+        fresh: false,
     }
 }
 
@@ -84,6 +85,7 @@ fn successful_start_request(workspace: PathBuf, tag: &str) -> StartRequest {
         worker_rows: None,
         worker_cols: None,
         python: None,
+        fresh: false,
     }
 }
 

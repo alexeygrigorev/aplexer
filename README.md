@@ -92,12 +92,14 @@ a                         sessions at a glance (workspaces, states, what needs y
 a here                    create or reattach the main session in this directory
 a here codex review       create or reattach Codex, tagged review
 a open review             attach by tag in the current workspace
+a new                     another fresh session in this workspace, attached
+                          (tag already live? it takes the next free main-2, main-3, …)
 a new --engine shell      start and attach, with start's full flag surface
 a current                 which session is this shell inside?
 a keys                    the attach-mode key reference
 ```
 
-`a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations.
+`a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations. The create verbs split cleanly: `here`/`a -` are **create-or-attach** (a live session with that tag is reattached), `new` is **always creates** (`--fresh` on `start`: a live holder moves the start to the next free `<tag>-2` suffix instead of refusing). The same `--fresh` flag is the machine path — `a --json start --workspace W --tag main --fresh` returns the record with the tag it actually claimed, so a client can add a session to a workspace without inventing unique names itself.
 
 Presentation is TTY-aware by construction: richer tables, semantic agent states (`working`/`waiting`/`idle` from a fresh `a state-report`, honest `active`/`quiet` from PTY-recency otherwise), and the one-line attach status bar exist only when stdout is a real terminal. Redirected output and every `--json` path keep their exact pre-existing format, and `Ctrl-b ?` (attach help flash) never sends a byte to the workload. While attached, the status bar keeps task identity, semantic state, sibling sessions, and `^b ?` visible, dropping detail from the right on narrow terminals.
 

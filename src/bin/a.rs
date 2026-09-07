@@ -29,7 +29,7 @@ use uuid::Uuid;
     name = "a",
     version,
     about = "Run, inspect, and switch between durable agent sessions",
-    after_help = "Common workflows:\n  a                         sessions at a glance\n  a here                    create or reattach the main session here\n  a here codex review       create or reattach Codex, tagged review\n  a open review             attach by tag in the current workspace\n  a new --engine shell      start and attach using full start options\n  a current                 show the session containing this shell\n  a keys                    show keys available while attached"
+    after_help = "Common workflows:\n  a                         sessions at a glance\n  a here                    create or reattach the main session here\n  a here codex review       create or reattach Codex, tagged review\n  a new                     another fresh session in this workspace, attached\n  a new --engine shell      start and attach using full start options\n  a open review             attach by tag in the current workspace\n  a current                 show the session containing this shell\n  a keys                    show keys available while attached"
 )]
 struct Cli {
     #[arg(
@@ -46,8 +46,10 @@ struct Cli {
 enum Commands {
     /// Start a new session (workspace + tag + engine/profile) and its worker.
     Start(StartArgs),
-    /// Start a new session and immediately attach to it (`--attach` implied;
-    /// every other flag is `start`'s).
+    /// Start a new session and immediately attach to it (`--attach` and
+    /// `--fresh` implied; every other flag is `start`'s). When the requested
+    /// workspace+tag is already live, the next free `<tag>-2` suffix is
+    /// started instead -- `new` always creates, `here`/`a -` create-or-attach.
     New(StartArgs),
     /// Create-or-attach in the current workspace -- the typed-out form of
     /// `a -`: `a here [engine [tag]]`, or `a here <command...>` to run a
@@ -178,6 +180,12 @@ struct StartArgs {
     /// and-sandbox` / `--dangerously-skip-permissions` / `--always-approve`).
     #[arg(long)]
     no_skip_permissions: bool,
+    /// When the requested workspace+tag is already held by a live session,
+    /// claim the next free `<tag>-2`, `<tag>-3`, … suffix instead of
+    /// failing. `a new` implies this; `start` without it keeps the strict
+    /// create-by-exact-tag contract.
+    #[arg(long)]
+    fresh: bool,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
 }
@@ -537,6 +545,10 @@ fn run() -> Result<()> {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
         Commands::New(mut args) => {
             args.attach = true;
+            // `new` is the "always creates" verb: a live session holding the
+            // tag is a reason to take the next free suffix, never an error.
+            // `here`/`a -` stay create-or-attach.
+            args.fresh = true;
             cmd_start(&paths, args, cli.json)
         }
         Commands::Here(args) => {
@@ -768,6 +780,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         worker_rows,
         worker_cols,
         python: None,
+        fresh: args.fresh,
     };
     let ready = aplexer::api::start_session(paths, &req)?;
     if json_output {
@@ -966,7 +979,7 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         paint(
             color,
             ANSI_DIM,
-            "Attach: a <workspace#> [session#|tag] · Start here: a here [engine] [tag] · Help: a help"
+            "Attach: a <workspace#> [session#|tag] · Here: a here [engine] [tag] · Another: a new · Help: a help"
         )
     );
     Ok(())
@@ -1439,6 +1452,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             attach: true,
             startup_timeout_ms: 10_000,
             no_skip_permissions: false,
+            fresh: false,
             command,
         },
         false,

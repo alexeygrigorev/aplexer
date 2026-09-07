@@ -113,7 +113,15 @@ That is no longer remotely true. Verified against the built binary and source:
 
 - `a start` — `--workspace/--tag/--engine/--profile/--cwd/--env KEY=VALUE/--memory/--pids/
   --cpu-quota-us/--history-bytes/--attach/-- <command>`, `--json`. Reclaims a workspace+tag held
-  by a finished session; refuses live/broken claims.
+  by a finished session; refuses live/broken claims. `--fresh` (0.1.4) turns a live claim from
+  an error into "take the next free `<tag>-2` suffix", decided under the registry lock;
+  `a new` is that behavior with `--attach` implied — the "another session in this workspace"
+  verb, where `a here`/`a -` stay create-or-attach. PocketShell seam: once the pinned
+  `aplexer` dep reaches 0.1.4, the client-side blocker-reaping machinery in
+  `sessions.py` (`_reap_aplexer_blockers` et al., the #2554 workaround for 0.1.3 refusing
+  corpse-held tags) can be dropped — plain `a start` reclaims those itself — and any
+  "create another session here" flow becomes one `--fresh` call that reads the claimed
+  `tag` back from the record, instead of snapshot probing + client-side `name-2` uniquing.
 - `a list` / `a snapshot` (aliases of the same listing; `--running`, `--json`). JSON is the
   public `SessionRecord` per session (launch environment redacted to config-directory metadata)
   enriched with `worker_alive`; human output is a workspace-grouped tree. Cheap by design (pid
