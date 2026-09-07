@@ -56,7 +56,6 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -109,4 +108,3 @@ impl Drop for FileLock {
         }
     }
 }
-

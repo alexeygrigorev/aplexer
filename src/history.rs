@@ -9,13 +9,13 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{MAX_FRAME_BYTES, atomic_write_bytes, atomic_write_json};
+use crate::{atomic_write_bytes, atomic_write_json, MAX_FRAME_BYTES};
 
 pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 /// Global per-session raw-history ceiling. The ring is resident in every
@@ -100,7 +100,11 @@ pub(crate) fn validate_optional_history_node(path: &Path, label: &str) -> Result
     }
 }
 
-pub(crate) fn open_optional_history_file(path: &Path, label: &str, write: bool) -> Result<Option<File>> {
+pub(crate) fn open_optional_history_file(
+    path: &Path,
+    label: &str,
+    write: bool,
+) -> Result<Option<File>> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -459,7 +463,10 @@ pub(crate) fn recover_history_candidate(
     })
 }
 
-pub(crate) fn recover_v2_history(path: &Path, tail_limit: usize) -> Result<(Option<RecoveredHistory>, bool)> {
+pub(crate) fn recover_v2_history(
+    path: &Path,
+    tail_limit: usize,
+) -> Result<(Option<RecoveredHistory>, bool)> {
     validate_history_artifacts(path)?;
     let marker = read_history_marker(path)?;
     let mut metadata_seen = false;
@@ -987,4 +994,3 @@ impl History {
             .collect()
     }
 }
-

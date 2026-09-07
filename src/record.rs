@@ -37,7 +37,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// window, which is the conservative direction.
 pub const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 10_000;
 
-
 pub fn validate_tag(tag: &str) -> Result<()> {
     if tag.is_empty() || tag.len() > 64 {
         bail!("tag must contain 1..64 bytes");
@@ -338,7 +337,8 @@ pub struct SessionRecord {
 /// Environment entries that are session metadata rather than launch
 /// secrets. Transcript discovery needs these profile-specific roots after
 /// the worker exits; every other launch value remains one-shot/private.
-pub(crate) const SESSION_METADATA_ENV_KEYS: &[&str] = &["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"];
+pub(crate) const SESSION_METADATA_ENV_KEYS: &[&str] =
+    &["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"];
 
 pub fn session_metadata_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
@@ -634,7 +634,6 @@ pub fn reap_verdict(record: &SessionRecord) -> Option<ContainmentReap> {
     }
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ProcessIdentity {
     pub(crate) pid: u32,
@@ -736,7 +735,6 @@ pub(crate) fn persist_worker_identity_once(path: &Path, value: &Value) -> Result
     result
 }
 
-
 /// Signal the worker recorded for a session only if it is still the exact
 /// Linux process registered at startup. The pidfd pins the verified process
 /// across the final check/signal boundary, so an exit and pid reuse cannot
@@ -835,4 +833,3 @@ pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()>
     }
     Ok(())
 }
-

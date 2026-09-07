@@ -214,4 +214,3 @@ pub fn canonical_workspace(path: &Path) -> Result<PathBuf> {
         Ok::<PathBuf, anyhow::Error>(fs::canonicalize(parent)?.join(leaf))
     })
 }
-

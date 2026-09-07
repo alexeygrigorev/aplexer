@@ -9,8 +9,8 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::{
-    CgroupIdentity, Limits, ensure_sigchld_compatible_for_child_management, linux_boot_id,
+    ensure_sigchld_compatible_for_child_management, linux_boot_id, CgroupIdentity, Limits,
 };
 
 pub(crate) const MAX_CGROUP_RECOVERY_MEMBERS: usize = 4096;
@@ -102,7 +102,9 @@ pub fn current_cgroup_identity() -> Result<CgroupIdentity> {
     })
 }
 
-pub(crate) fn verify_recorded_cgroup_identity(recorded: Option<&CgroupIdentity>) -> Result<CgroupIdentity> {
+pub(crate) fn verify_recorded_cgroup_identity(
+    recorded: Option<&CgroupIdentity>,
+) -> Result<CgroupIdentity> {
     let recorded = recorded.ok_or_else(|| {
         anyhow!(
             "recorded cgroup has no boot/namespace/mount identity; refusing legacy destructive recovery"
@@ -1128,4 +1130,3 @@ pub(crate) fn read_counter(path: &Path, key: &str) -> Result<u64> {
     }
     bail!("counter {key} not found in {}", path.display())
 }
-

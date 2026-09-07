@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::{Paths, SessionRecord, SCHEMA_VERSION, canonical_workspace, reap_verdict};
+use crate::{canonical_workspace, reap_verdict, Paths, SessionRecord, SCHEMA_VERSION};
 
 pub fn read_record(path: &Path) -> Result<SessionRecord> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -59,7 +59,6 @@ pub fn read_session_record(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
     // before every new worker allocation.
     Ok(record)
 }
-
 
 pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
     let mut out = Vec::new();
@@ -134,7 +133,6 @@ pub(crate) fn record_is_not_written_yet(error: &anyhow::Error) -> bool {
     })
 }
 
-
 pub fn resolve_record(
     paths: &Paths,
     selector: Option<&str>,
@@ -197,4 +195,3 @@ pub fn resolve_record(
         }
     }
 }
-

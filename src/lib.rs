@@ -32,17 +32,16 @@ mod record;
 pub use record::*;
 
 mod registry;
-pub use registry::{read_record, read_session_record, list_records, resolve_record};
+pub use registry::{list_records, read_record, read_session_record, resolve_record};
 
 mod paths;
-pub use paths::{Paths, ensure_private_dir, canonical_workspace};
+pub use paths::{canonical_workspace, ensure_private_dir, Paths};
 
 mod persist;
-pub use persist::{atomic_write_json, atomic_write_bytes, FileLock};
+pub use persist::{atomic_write_bytes, atomic_write_json, FileLock};
 
 #[cfg(feature = "python")]
 mod python;
-
 
 #[cfg(test)]
 mod tests;

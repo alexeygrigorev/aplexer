@@ -6,13 +6,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
 use std::ffi::CString;
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::paths::home_dir;
-use crate::{Limits, Paths, DEFAULT_HISTORY_BYTES, validate_history_bytes, validate_limits};
+use crate::{validate_history_bytes, validate_limits, Limits, Paths, DEFAULT_HISTORY_BYTES};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -777,4 +777,3 @@ pub fn executable_available(program: &str) -> bool {
         .map(|path| env::split_paths(&path).any(|dir| is_executable_file(&dir.join(program))))
         .unwrap_or(false)
 }
-

@@ -66,7 +66,6 @@ pub fn kill_grace_duration(grace_ms: u64) -> Result<Duration> {
     Ok(Duration::from_millis(grace_ms))
 }
 
-
 /// Session identity for `a whoami` / bare `a transcript` / messaging.
 ///
 /// Prefer `APLEXER_SESSION_ID` on this process (the worker stamps it on the
@@ -273,7 +272,6 @@ pub(crate) fn pidfd_open(pid: u32) -> io::Result<File> {
     }
 }
 
-
 pub fn command_exists(command: &[String]) -> bool {
     command
         .first()
@@ -436,4 +434,3 @@ pub fn shell_quote(value: &str) -> String {
 pub fn c_string(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).context("path contains NUL")
 }
-

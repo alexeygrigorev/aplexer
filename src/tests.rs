@@ -2,24 +2,24 @@
 //! view of the root re-exports; module-local tests live in their modules.
 
 use super::*;
+use crate::paths::{absolute_override_path, absolute_xdg_path};
+use anyhow::{anyhow, bail, Result};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::os::unix::fs::{symlink, PermissionsExt};
-use anyhow::{anyhow, bail, Result};
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
 use std::io;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use crate::paths::{absolute_override_path, absolute_xdg_path};
-use serde::Deserialize;
-use std::io::Write;
 
 fn load_config_text(text: &str) -> Result<Config> {
     let root = tempfile::tempdir().unwrap();
@@ -660,8 +660,7 @@ impl DelegatedCgroup {
                 });
             }
             candidate = candidate.parent()?.to_path_buf();
-            if !candidate.starts_with(CGROUP_V2_ROOT) || candidate == Path::new(CGROUP_V2_ROOT)
-            {
+            if !candidate.starts_with(CGROUP_V2_ROOT) || candidate == Path::new(CGROUP_V2_ROOT) {
                 return None;
             }
         }
@@ -1123,9 +1122,7 @@ fn history_compaction_is_bounded_and_amortized_by_new_output() {
     for slot in 0..HISTORY_BANK_COUNT {
         let data_path = history_data_path(&path, slot);
         if let Ok(metadata) = fs::metadata(data_path) {
-            assert!(
-                metadata.len() <= HISTORY_BANK_HEADER_BYTES as u64 + 2 * history.cap as u64
-            );
+            assert!(metadata.len() <= HISTORY_BANK_HEADER_BYTES as u64 + 2 * history.cap as u64);
         }
     }
     assert_eq!(History::open(path, 4).unwrap().snapshot(None), b"fghi");
@@ -1521,8 +1518,7 @@ fn control_group_locator_is_uuid_bound_and_cannot_escape_root() {
         Path::new(CGROUP_V2_ROOT).join(valid.trim_start_matches('/'))
     );
     assert!(
-        control_group_locator(id, &format!("/user.slice/../aplexer-workload-{id}.scope"))
-            .is_err()
+        control_group_locator(id, &format!("/user.slice/../aplexer-workload-{id}.scope")).is_err()
     );
     assert!(control_group_locator(id, "relative.scope").is_err());
     assert!(control_group_locator(

@@ -15,7 +15,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-
 pub fn parse_byte_size(raw: &str) -> Result<u64> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -57,4 +56,3 @@ pub fn os_to_utf8(value: &OsStr, what: &str) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("{what} must be valid UTF-8"))
 }
-

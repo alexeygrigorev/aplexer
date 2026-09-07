@@ -245,4 +245,3 @@ pub enum AttachControl {
     Signal { signal: i32 },
     Detach,
 }
-
