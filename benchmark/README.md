@@ -74,3 +74,6 @@ Dated runs live next to this file: `results-YYYY-MM-DD.md` (analysis) +
 for attach/capture ops and `heavy/retained-bytes`). Compare runs, don't
 over-read one: ±2x run-to-run noise on this box is normal under load;
 p50 is the headline, p90/max show the tail.
+
+`PLAN.md` is the benchmark-driven improvement plan from the latest
+baseline.
