@@ -1,35 +1,35 @@
 //! Crate-root unit tests, grouped into one file per module under test.
 
-mod config;
 mod cgroup;
+mod config;
 mod history;
-mod record;
-mod registry;
 mod paths;
 mod persist;
 mod process;
 mod protocol;
+mod record;
+mod registry;
 mod util;
 
 use super::*;
+use crate::paths::{absolute_override_path, absolute_xdg_path};
+use anyhow::{anyhow, bail, Result};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::os::unix::fs::{symlink, PermissionsExt};
-use anyhow::{anyhow, bail, Result};
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
 use std::io;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use crate::paths::{absolute_override_path, absolute_xdg_path};
-use serde::Deserialize;
-use std::io::Write;
 
 /// A cgroup created inside the caller's own delegated subtree, named
 /// exactly the way a real session's containment scope is named, so
@@ -64,8 +64,7 @@ impl DelegatedCgroup {
                 });
             }
             candidate = candidate.parent()?.to_path_buf();
-            if !candidate.starts_with(CGROUP_V2_ROOT) || candidate == Path::new(CGROUP_V2_ROOT)
-            {
+            if !candidate.starts_with(CGROUP_V2_ROOT) || candidate == Path::new(CGROUP_V2_ROOT) {
                 return None;
             }
         }

@@ -236,9 +236,7 @@ fn history_compaction_is_bounded_and_amortized_by_new_output() {
     for slot in 0..HISTORY_BANK_COUNT {
         let data_path = history_data_path(&path, slot);
         if let Ok(metadata) = fs::metadata(data_path) {
-            assert!(
-                metadata.len() <= HISTORY_BANK_HEADER_BYTES as u64 + 2 * history.cap as u64
-            );
+            assert!(metadata.len() <= HISTORY_BANK_HEADER_BYTES as u64 + 2 * history.cap as u64);
         }
     }
     assert_eq!(History::open(path, 4).unwrap().snapshot(None), b"fghi");

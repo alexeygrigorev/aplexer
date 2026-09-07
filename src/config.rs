@@ -491,92 +491,92 @@ impl Config {
     fn builtin_engines() -> BTreeMap<String, EngineConfig> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut engines = BTreeMap::new();
-engines.insert(
-    "shell".into(),
-    EngineConfig {
-        command: vec![shell, "-l".into()],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        skip_permissions_argv: Vec::new(),
-    },
-);
-engines.insert(
-    "codex".into(),
-    EngineConfig {
-        command: vec![
+        engines.insert(
+            "shell".into(),
+            EngineConfig {
+                command: vec![shell, "-l".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                skip_permissions_argv: Vec::new(),
+            },
+        );
+        engines.insert(
             "codex".into(),
-            "-c".into(),
-            "check_for_update_on_startup=false".into(),
-        ],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        // ported from pocketshell engines.py's codex LaunchSpec
-        skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-    },
-);
-engines.insert(
-    "claude".into(),
-    EngineConfig {
-        command: vec!["claude".into()],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        // ported from pocketshell engines.py's claude LaunchSpec
-        skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
-    },
-);
-// `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
-// with the same CLI surface and the same rollout log, so its launch
-// spec mirrors codex's exactly, with the fork's own binary name.
-engines.insert(
-    "zcodex".into(),
-    EngineConfig {
-        command: vec![
+            EngineConfig {
+                command: vec![
+                    "codex".into(),
+                    "-c".into(),
+                    "check_for_update_on_startup=false".into(),
+                ],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's codex LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            },
+        );
+        engines.insert(
+            "claude".into(),
+            EngineConfig {
+                command: vec!["claude".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's claude LaunchSpec
+                skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
+            },
+        );
+        // `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
+        // with the same CLI surface and the same rollout log, so its launch
+        // spec mirrors codex's exactly, with the fork's own binary name.
+        engines.insert(
             "zcodex".into(),
-            "-c".into(),
-            "check_for_update_on_startup=false".into(),
-        ],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-    },
-);
-engines.insert(
-    "gemini".into(),
-    EngineConfig {
-        command: vec!["gemini".into()],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        // no pocketshell source for a gemini skip-permissions flag
-        // (gemini is an aplexer-only extra, not in pocketshell's
-        // built-in manifest) -- left empty.
-        skip_permissions_argv: Vec::new(),
-    },
-);
-engines.insert(
-    "grok".into(),
-    EngineConfig {
-        command: vec!["grok".into()],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        // ported from pocketshell engines.py's grok LaunchSpec
-        skip_permissions_argv: vec!["--always-approve".into()],
-    },
-);
-// PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
-// ::builtin_manifests) that aplexer's engine set was missing --
-// required for aplexer to become authoritative for pocketshell's
-// engine registry (pocketshell-integration-plan.md 0.1).
-engines.insert(
-    "opencode".into(),
-    EngineConfig {
-        command: vec!["opencode".into()],
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        // opencode has no skip-permissions flag in pocketshell's
-        // manifest -- permissions are config-driven (opencode.json).
-        skip_permissions_argv: Vec::new(),
-    },
-);
+            EngineConfig {
+                command: vec![
+                    "zcodex".into(),
+                    "-c".into(),
+                    "check_for_update_on_startup=false".into(),
+                ],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            },
+        );
+        engines.insert(
+            "gemini".into(),
+            EngineConfig {
+                command: vec!["gemini".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // no pocketshell source for a gemini skip-permissions flag
+                // (gemini is an aplexer-only extra, not in pocketshell's
+                // built-in manifest) -- left empty.
+                skip_permissions_argv: Vec::new(),
+            },
+        );
+        engines.insert(
+            "grok".into(),
+            EngineConfig {
+                command: vec!["grok".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // ported from pocketshell engines.py's grok LaunchSpec
+                skip_permissions_argv: vec!["--always-approve".into()],
+            },
+        );
+        // PocketShell built-in (tools/pocketshell/src/pocketshell/engines.py
+        // ::builtin_manifests) that aplexer's engine set was missing --
+        // required for aplexer to become authoritative for pocketshell's
+        // engine registry (pocketshell-integration-plan.md 0.1).
+        engines.insert(
+            "opencode".into(),
+            EngineConfig {
+                command: vec!["opencode".into()],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                // opencode has no skip-permissions flag in pocketshell's
+                // manifest -- permissions are config-driven (opencode.json).
+                skip_permissions_argv: Vec::new(),
+            },
+        );
         engines
     }
 
@@ -589,27 +589,27 @@ engines.insert(
     /// (ids match those profiles' own dir-stem ids).
     fn builtin_shortcuts() -> BTreeMap<String, ShortcutConfig> {
         let mut shortcuts = BTreeMap::new();
-shortcuts.insert(
-    "cl".into(),
-    ShortcutConfig {
-        engine: "claude".into(),
-        profile: None,
-    },
-);
-shortcuts.insert(
-    "co".into(),
-    ShortcutConfig {
-        engine: "codex".into(),
-        profile: None,
-    },
-);
-shortcuts.insert(
-    "g".into(),
-    ShortcutConfig {
-        engine: "grok".into(),
-        profile: None,
-    },
-);
+        shortcuts.insert(
+            "cl".into(),
+            ShortcutConfig {
+                engine: "claude".into(),
+                profile: None,
+            },
+        );
+        shortcuts.insert(
+            "co".into(),
+            ShortcutConfig {
+                engine: "codex".into(),
+                profile: None,
+            },
+        );
+        shortcuts.insert(
+            "g".into(),
+            ShortcutConfig {
+                engine: "grok".into(),
+                profile: None,
+            },
+        );
         shortcuts
     }
 

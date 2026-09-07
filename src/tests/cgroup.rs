@@ -126,8 +126,7 @@ fn control_group_locator_is_uuid_bound_and_cannot_escape_root() {
         Path::new(CGROUP_V2_ROOT).join(valid.trim_start_matches('/'))
     );
     assert!(
-        control_group_locator(id, &format!("/user.slice/../aplexer-workload-{id}.scope"))
-            .is_err()
+        control_group_locator(id, &format!("/user.slice/../aplexer-workload-{id}.scope")).is_err()
     );
     assert!(control_group_locator(id, "relative.scope").is_err());
     assert!(control_group_locator(

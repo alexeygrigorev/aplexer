@@ -211,8 +211,6 @@ fn containment_reap_verdict_treats_a_previous_boot_as_empty() {
     );
 }
 
-
-
 /// The real kernel probe, end to end, against a genuinely delegated
 /// cgroup: empty, then POPULATED (the arm that must retain), then empty
 /// again, then collected. `#[ignore]`d for the same reason
