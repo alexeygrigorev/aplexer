@@ -1374,10 +1374,7 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     // -- with 25 sessions that triple-probe was the ~7 ms table-over-json
     // gap, since `--json` probes once. The map below makes plain rendering
     // probe exactly once per record.
-    let alive: BTreeMap<Uuid, bool> = records
-        .iter()
-        .map(|r| (r.id, r.worker_alive()))
-        .collect();
+    let alive: BTreeMap<Uuid, bool> = records.iter().map(|r| (r.id, r.worker_alive())).collect();
     let alive_of = |r: &SessionRecord| alive.get(&r.id).copied().unwrap_or(false);
     // Group by workspace as a compact tree -- spec.md's own presentation of
     // the model (sections 2 and 22.1) is a workspace tree with tags
@@ -3674,6 +3671,9 @@ fn cmd_hotkeys() -> Result<()> {
         );
     }
     println!();
+    println!("Hold Ctrl-b without pressing anything and this list appears on screen;");
+    println!("the next key runs its binding and takes it away again.");
+    println!();
     println!("Any other key after Ctrl-b is forwarded through untouched.");
     println!();
     println!("Scrolling back (aplexer's copy-mode, like tmux's Ctrl-b [):");
@@ -4886,20 +4886,21 @@ fn relay_to_terminal(
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     stdout: &Arc<Mutex<io::Stdout>>,
     scroll: &Arc<ScrollMode>,
+    overlay: &Arc<KeyOverlay>,
     data: &[u8],
 ) -> io::Result<()> {
     let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
     {
         let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
         let rewritten = s.relay(data);
-        // Scroll mode: the model still consumes every byte -- that is what
-        // grows the retained history the user is reading and what makes the
-        // repaint on the way out show everything that arrived meanwhile --
-        // but nothing reaches the host, because the pager owns the screen.
-        // Checked here, under the same stdout lock `enter_scroll_mode` flips
-        // the flag under, so a chunk can never be half-written across the
-        // pager's first frame.
-        if scroll.is_active() {
+        // A client modal -- the pager, or the `Ctrl-b` key overlay -- owns
+        // the screen: the model still consumes every byte (that is what grows
+        // the retained history the user is reading, and what makes the
+        // repaint on the way out show everything that arrived meanwhile) but
+        // nothing reaches the host. Checked here, under the same stdout lock
+        // `enter_scroll_mode` and `show_key_overlay` flip their flags under,
+        // so a chunk can never be half-written across a modal's first frame.
+        if scroll.is_active() || overlay.is_active() {
             return Ok(());
         }
         let src = rewritten.as_deref().unwrap_or(data);
@@ -5246,6 +5247,11 @@ struct StatusBarCtx {
     /// and where in the retained history it is looking. Read by the relay on
     /// every chunk to decide whether the host may be written to at all.
     scroll: Arc<ScrollMode>,
+    /// The which-key overlay: whether the `Ctrl-b` keymap is currently drawn
+    /// over the screen. Read by the relay on every chunk for the same reason
+    /// `scroll` is -- while a modal owns the host, the model keeps eating
+    /// bytes and the terminal is written nothing.
+    overlay: Arc<KeyOverlay>,
     /// Who currently owns mouse reporting on the host: `Some(true)` this
     /// client (so the wheel reaches `a`), `Some(false)` the workload,
     /// `None` nothing asserted yet. See `sync_client_mouse`.
@@ -5262,15 +5268,19 @@ type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
 /// rather than two: help text has to be readable, not merely noticed.
 const FLASH_DURATION: Duration = Duration::from_secs(3);
 
-/// One attach-mode chord, as both renderings need it.
+/// One attach-mode chord, as every rendering of it needs it.
 ///
-/// The keymap is defined **once**, here: the `Ctrl-b ?` status-bar flash and
-/// the `a keys`/`a hotkeys` listing are both generated from
-/// `ATTACH_BINDINGS`, so a binding can no longer be changed in the scanner
-/// and updated in only one of the two places that document it. (It used to be
-/// two hand-maintained lists with a comment asking future editors to keep
-/// them in sync.) Anything else that has to show the keymap should read this
-/// table too rather than adding a third copy.
+/// The keymap is defined **once**, here. Three things render it -- the
+/// `Ctrl-b ?` status-bar flash (`attach_key_help`, from `brief`), the
+/// `a keys`/`a hotkeys` listing (`cmd_hotkeys`, from `keys` + `description`)
+/// and the which-key overlay a held `Ctrl-b` raises (`key_overlay_lines`,
+/// from the same two) -- and none of them holds a string of its own, so a
+/// binding can no longer be changed in the scanner and updated in only some
+/// of the places that document it. (It used to be two hand-maintained lists
+/// with a comment asking future editors to keep them in sync.) Anything else
+/// that has to show the keymap reads this table too rather than adding
+/// another copy; if it needs something the table does not carry, the field
+/// belongs here.
 struct AttachBinding {
     /// The keys, as the `a keys` listing's left column shows them.
     keys: &'static str,
@@ -6470,6 +6480,354 @@ fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The key overlay -- which-key for `Ctrl-b`
+// ---------------------------------------------------------------------------
+//
+// `Ctrl-b` on its own is a mode with nothing on screen to say so. The overlay
+// makes it visible the way which-key does in an editor: hesitate on the
+// prefix and the keymap appears, press a key and it is gone. It renders from
+// `ATTACH_BINDINGS`, so it is a third *view* of the one keymap the scanner
+// implements rather than a third copy of it -- there is no string here that
+// can drift from what `Ctrl-b <key>` actually does.
+//
+// Four properties it has to hold, each of which decided a design point:
+//
+// - **Muscle memory must never see it.** It is armed on a delay
+//   (`KEY_OVERLAY_DELAY`) instead of being drawn by the prefix key, so a
+//   `Ctrl-b Right` typed at speed draws nothing at all -- not a frame of it.
+// - **The screen underneath must come back exactly.** Dismissal does not
+//   restore a saved rectangle of cells; it repaints from
+//   `ClientScreen::snapshot`, the same full-model repaint `Ctrl-b r` and the
+//   pager's exit already use. The model was fed every byte that arrived while
+//   the box was up, so the repaint is the *live* screen -- grid, cursor, SGR
+//   pen, margins, input modes -- not a photograph of the one the box covered.
+// - **Nothing may paint over it while it is up.** Like the pager, the overlay
+//   suspends the relay: `relay_to_terminal` reads `KeyOverlay::is_active`
+//   under the stdout lock and keeps feeding the model while writing nothing.
+//   That is also what makes the previous point true.
+// - **It must degrade honestly.** A terminal the box cannot fit into gets the
+//   one-line `Ctrl-b ?` reference flashed on the status bar instead, and
+//   nothing is suspended in that case.
+
+/// How long a lone `Ctrl-b` waits for its second key before the keymap is
+/// drawn for it.
+///
+/// which-key's whole trick is being invisible to anyone who already knows the
+/// chord, so the delay has to sit above a typed two-key sequence and below
+/// the point where hesitation stops feeling answered. 350ms is comfortably
+/// both: a `Ctrl-b Right` from muscle memory lands in well under 200ms and
+/// never draws anything.
+///
+/// **Its relationship with `CHORD_ESCAPE_TIMEOUT` is exclusion, not
+/// ordering.** The two deadlines are armed in different scanner states and
+/// can never be armed at the same moment: this one only while a *lone*
+/// `Ctrl-b` is held (`InputScanner::awaiting_key`), that one only once an
+/// `ESC` has arrived after the prefix and a partial arrow chord is being
+/// withheld (`InputScanner::awaiting_escape`). Two consequences worth
+/// spelling out, because they are what "they cannot fight each other" means
+/// here: a half-typed `Ctrl-b Left` can never pop the overlay -- by the time
+/// the chord deadline exists, the overlay's own is gone -- and a bare
+/// `Ctrl-b ESC` still reaches the workload after exactly
+/// `CHORD_ESCAPE_TIMEOUT`, not after that plus this.
+const KEY_OVERLAY_DELAY: Duration = Duration::from_millis(350);
+
+/// Rows the box spends on things that are not bindings: its two borders and
+/// the footer line.
+const KEY_OVERLAY_CHROME_ROWS: usize = 3;
+
+/// Fewer binding rows than this and the box has stopped being a reference;
+/// the one-line status-bar flash says more in less space.
+const KEY_OVERLAY_MIN_BINDINGS: usize = 3;
+
+/// The narrowest description column worth drawing. Below it the rows stop
+/// being sentences and become ellipses, which is again worse than the flash.
+const KEY_OVERLAY_MIN_DESC: usize = 14;
+
+/// Whether the key overlay currently owns the host terminal.
+///
+/// An atomic for exactly the reason `ScrollMode::active` is one: the relay
+/// reads it on every chunk, under the stdout lock, purely to decide whether
+/// to write.
+#[derive(Default)]
+struct KeyOverlay {
+    active: AtomicBool,
+}
+
+impl KeyOverlay {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
+/// Rows the overlay may draw into: the physical terminal less the status
+/// bar's reserved row, which the box must never write over.
+fn key_overlay_rows(geom: TermGeom) -> u16 {
+    if geom.reserved {
+        geom.rows.saturating_sub(1)
+    } else {
+        geom.rows
+    }
+}
+
+/// Fit `text` into exactly `width` display cells, ellipsing rather than
+/// silently amputating when it is too long.
+///
+/// `pad_or_truncate` is the right tool for the status bar, where a cut line
+/// is obviously cut because it runs to the edge of the terminal. Inside a box
+/// with a border on the right there is no such cue, so an over-long
+/// description would read as a complete sentence that happens to be wrong.
+fn fit_overlay_cell(text: &str, width: usize) -> String {
+    let text = sanitize_terminal_text(text);
+    if terminal_display_width(&text) <= width || width < 2 {
+        return pad_or_truncate(&text, width);
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let cells = terminal_display_width(grapheme);
+        if used + cells > width - 1 {
+            break;
+        }
+        out.push_str(grapheme);
+        used += cells;
+    }
+    out.push('\u{2026}');
+    used += 1;
+    out.push_str(&" ".repeat(width - used));
+    out
+}
+
+/// The box, as text rows already padded to a uniform display width -- or
+/// `None` when this terminal cannot hold one worth drawing, which is the
+/// caller's cue to fall back to the status-bar flash.
+///
+/// `rows` is `key_overlay_rows`, i.e. the status row is already excluded, so
+/// the box can never be laid out over the bar. Bindings come from
+/// `ATTACH_BINDINGS` in table order, and that order is already "most worth
+/// seeing first" (it is the order the one-line flash truncates from the right
+/// of), so a short terminal trims from the end and the footer says how many
+/// went.
+fn key_overlay_lines(rows: usize, cols: usize) -> Option<Vec<String>> {
+    let capacity = rows.checked_sub(KEY_OVERLAY_CHROME_ROWS)?;
+    if capacity < KEY_OVERLAY_MIN_BINDINGS {
+        return None;
+    }
+    let shown = ATTACH_BINDINGS.len().min(capacity);
+    let hidden = ATTACH_BINDINGS.len() - shown;
+    let bindings = &ATTACH_BINDINGS[..shown];
+
+    let keys_width = bindings
+        .iter()
+        .map(|b| terminal_display_width(b.keys))
+        .max()
+        .unwrap_or(0);
+    // "|" + " " + keys + "  " + description + " " + "|"
+    let chrome = keys_width + 6;
+    if cols < chrome + KEY_OVERLAY_MIN_DESC {
+        return None;
+    }
+    let widest = bindings
+        .iter()
+        .map(|b| terminal_display_width(b.description))
+        .max()
+        .unwrap_or(0);
+    let desc_width = widest.max(KEY_OVERLAY_MIN_DESC).min(cols - chrome);
+    let width = chrome + desc_width;
+    let inner = width - 2;
+
+    let mut lines = Vec::with_capacity(shown + KEY_OVERLAY_CHROME_ROWS);
+    // The title doubles as the answer to "what is this box": it names the key
+    // the user just pressed and is waiting on.
+    let title = " Ctrl-b ";
+    let title_cells = terminal_display_width(title) + 1;
+    lines.push(format!(
+        "\u{250c}\u{2500}{title}{}\u{2510}",
+        "\u{2500}".repeat(inner - title_cells)
+    ));
+    for binding in bindings {
+        lines.push(format!(
+            "\u{2502} {}  {} \u{2502}",
+            pad_or_truncate(binding.keys, keys_width),
+            fit_overlay_cell(binding.description, desc_width)
+        ));
+    }
+    let footer = if hidden > 0 {
+        format!("{hidden} more \u{b7} ? for all \u{b7} Esc dismiss")
+    } else {
+        "Esc dismiss \u{b7} any other key passes through".to_string()
+    };
+    lines.push(format!(
+        "\u{2502} {} \u{2502}",
+        fit_overlay_cell(&footer, inner - 2)
+    ));
+    lines.push(format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner)));
+    Some(lines)
+}
+
+/// Position the box on the host: bottom-left, its last row immediately above
+/// the status bar, which is where which-key puts it and where it covers the
+/// least of what a user is usually reading.
+///
+/// Absolute row addressing, so the caller must have the client's own
+/// full-height reservation in force -- see `paint_key_overlay`, which
+/// re-asserts it for exactly this reason.
+fn key_overlay_sequence(geom: TermGeom, lines: &[String]) -> Vec<u8> {
+    let mut seq = Vec::new();
+    let top = key_overlay_rows(geom).saturating_sub(lines.len() as u16) + 1;
+    seq.extend_from_slice(b"\x1b[?25l");
+    for (offset, line) in lines.iter().enumerate() {
+        seq.extend_from_slice(format!("\x1b[{};1H", top + offset as u16).as_bytes());
+        seq.extend_from_slice(b"\x1b[0m\x1b[7m");
+        seq.extend_from_slice(line.as_bytes());
+        seq.extend_from_slice(b"\x1b[0m");
+    }
+    seq.extend_from_slice(b"\x1b[?25l");
+    seq
+}
+
+/// Paint the overlay: the live screen from the model, then the box on top of
+/// it, then the ordinary status bar.
+///
+/// Repainting the whole screen first rather than only the box's rows is what
+/// makes this idempotent, which is what lets the resize thread simply call it
+/// again at the new geometry instead of having to know what the old box
+/// covered.
+///
+/// The DECSTBM re-assertion after the snapshot mirrors `paint_scroll_view`'s
+/// and is there for the same reason: the box addresses rows absolutely, and
+/// the snapshot may have just restored a workload sub-range (and, with it,
+/// an origin mode that would make those rows relative to it). The dismissal
+/// repaint puts the workload's own region back.
+fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
+    let geom = match ctx.term.lock() {
+        Ok(g) => *g,
+        Err(_) => return false,
+    };
+    let Some(lines) = key_overlay_lines(key_overlay_rows(geom) as usize, geom.cols as usize) else {
+        return false;
+    };
+    // Reads session records off disk; must not happen under the stdout lock.
+    let bar = status_bar_render(ctx);
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let snapshot = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = screen.snapshot();
+        screen.filter_host(&snapshot).unwrap_or(snapshot)
+    };
+    let mut seq = SCROLL_CANCEL.to_vec();
+    seq.extend_from_slice(&snapshot);
+    if geom.reserved {
+        seq.extend_from_slice(format!("\x1b[1;{}r", geom.rows - 1).as_bytes());
+    }
+    seq.extend_from_slice(&key_overlay_sequence(geom, &lines));
+    if let Some((bar_geom, text)) = bar {
+        // The pager's flavour of the bar row: no workload cursor restore, and
+        // the cursor left hidden. The workload's cursor is not what the user
+        // is looking at while a modal is up, and parking it inside the box
+        // would just make the box look broken.
+        seq.extend_from_slice(&scroll_bar_sequence(bar_geom, &text));
+        *ctx.last_drawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((text, bar_geom.rows, bar_geom.cols, None));
+    }
+    write_client_locked(
+        &mut *out,
+        &ctx.screen,
+        &seq,
+        BoundaryPolicy::StreamSuspended,
+    )
+}
+
+/// Put the keymap on screen for a `Ctrl-b` the user is still thinking about,
+/// and suspend the relay behind it.
+///
+/// Returns whether the box actually went up. `false` means this terminal is
+/// too small for one and the one-line reference was flashed on the status bar
+/// instead -- the honest degradation, decided *before* anything is suspended
+/// so the fallback path never suspends the relay at all.
+fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
+    if ctx.scroll.is_active() {
+        // The pager has its own key routing (`ScrollInput::route`) and its own
+        // full-screen view; a second modal on top of it would describe keys
+        // that are not the ones in force.
+        return false;
+    }
+    let fits = match ctx.term.lock() {
+        Ok(geom) => {
+            key_overlay_lines(key_overlay_rows(*geom) as usize, geom.cols as usize).is_some()
+        }
+        Err(_) => false,
+    };
+    if !fits {
+        flash_status(ctx, attach_key_help());
+        return false;
+    }
+    {
+        // Flipped under the stdout lock -- the same lock `relay_to_terminal`
+        // reads it under -- so a workload chunk cannot be half-written across
+        // the overlay's first frame. Exactly `enter_scroll_mode`'s reasoning.
+        let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+        if ctx.overlay.active.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+    }
+    // The bar is about to be drawn by a writer that is not the dirty-check's
+    // usual one, and again on the way out.
+    *ctx.last_drawn
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    if paint_key_overlay(ctx) {
+        true
+    } else {
+        // Never leave the relay suspended behind a box that did not get
+        // drawn: the user would be looking at a frozen terminal.
+        dismiss_key_overlay(ctx);
+        false
+    }
+}
+
+/// Take the overlay down, put the screen back, and let the relay resume.
+/// Returns whether there was an overlay to take down.
+///
+/// The restore is `ClientScreen::snapshot` -- the same repaint `Ctrl-b r` and
+/// `exit_scroll_mode` write, and deliberately not a saved rectangle of cells.
+/// A rectangle would be a photograph of the screen as it was when the box
+/// went up; the model has been fed every byte that arrived since, so the
+/// snapshot is the screen as it *is*. The bar is rewritten in the same
+/// sequence because the snapshot's `ED2` blanks its reserved row.
+fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
+    if !ctx.overlay.is_active() {
+        return false;
+    }
+    // Reads session records off disk; must not happen under the stdout lock.
+    let bar = status_bar_render(ctx);
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let (snapshot, restore, margins) = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = screen.snapshot();
+        let snapshot = screen.filter_host(&snapshot).unwrap_or(snapshot);
+        (snapshot, screen.cursor_restore(), screen.margins())
+    };
+    let mut seq = SCROLL_CANCEL.to_vec();
+    seq.extend_from_slice(&snapshot);
+    if let Some((geom, text)) = bar {
+        seq.extend_from_slice(&status_bar_sequence(geom, &text, margins, &restore));
+    }
+    write_client_locked(
+        &mut *out,
+        &ctx.screen,
+        &seq,
+        BoundaryPolicy::StreamSuspended,
+    );
+    *ctx.last_drawn
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    ctx.overlay.active.store(false, Ordering::SeqCst);
+    true
+}
+
 /// Prime a freshly built client model with a tail of the worker's retained
 /// raw history, so `Ctrl-b [` has a past to page through from the first
 /// second of the attach rather than only what arrives afterwards.
@@ -7135,6 +7493,26 @@ impl InputScanner {
         !self.pending_escape.is_empty()
     }
 
+    /// True while a *lone* `Ctrl-b` is held with nothing after it yet -- the
+    /// hesitation the key overlay is armed on (`KEY_OVERLAY_DELAY`).
+    ///
+    /// Deliberately spelled as "prefix pending **and** nothing withheld after
+    /// it", even though `scan` already clears `pending_ctrl_b` before it ever
+    /// fills `pending_escape`: this is the predicate that makes the overlay's
+    /// deadline and `CHORD_ESCAPE_TIMEOUT` mutually exclusive, so it states
+    /// that exclusion rather than relying on a reader knowing the other
+    /// invariant.
+    fn awaiting_key(&self) -> bool {
+        self.pending_ctrl_b && self.pending_escape.is_empty()
+    }
+
+    /// True when nothing at all is withheld: no prefix, no partial chord.
+    /// The input thread reads this as "whatever the user was in the middle of
+    /// is resolved", which is when the overlay comes down.
+    fn settled(&self) -> bool {
+        !self.pending_ctrl_b && self.pending_escape.is_empty()
+    }
+
     /// Give up on a partial arrow chord and release what was withheld -- the
     /// `Ctrl-b` and the escape bytes -- as ordinary input, exactly as the
     /// "not a bound chord" fall-through in `scan` does.
@@ -7493,6 +7871,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         )?,
     ));
     let scroll_mode = Arc::new(ScrollMode::new());
+    let key_overlay = Arc::new(KeyOverlay::default());
     let status_ctx = StatusBarCtx {
         stdout: stdout.clone(),
         term: term.clone(),
@@ -7506,6 +7885,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         pending_layout: Arc::new(Mutex::new(None)),
         sync_deferred_since: Arc::new(Mutex::new(None)),
         scroll: scroll_mode.clone(),
+        overlay: key_overlay.clone(),
         mouse_owned: Arc::new(Mutex::new(None)),
         mouse_capture: display_tty && input_tty && mouse_capture_enabled(),
     };
@@ -7614,15 +7994,56 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // mouse it consumes mouse reports the workload never asked for and
         // turns a wheel roll up into the pager.
         let mut scroll_input = ScrollInput::default();
+        // Whether `KEY_OVERLAY_DELAY` has already fired for the `Ctrl-b`
+        // currently being held. Not "is the box up" -- that lives in
+        // `KeyOverlay::active`, which the resize thread can also clear -- but
+        // "this prefix has had its one chance to raise it", which is what
+        // keeps a terminal too small for the box from flashing on a loop.
+        let mut overlay_armed = false;
         'outer: while input_active.load(Ordering::Relaxed) {
-            // The only place this loop does not simply block on stdin: while
-            // the scanner holds a half-typed arrow chord, the rest of it has
-            // a deadline (see `CHORD_ESCAPE_TIMEOUT`), after which the
-            // withheld bytes are released to the workload as ordinary input.
-            let actions = if scanner.awaiting_escape()
-                && !readable(libc::STDIN_FILENO, CHORD_ESCAPE_TIMEOUT)
+            // The only two places this loop does not simply block on stdin,
+            // and they are mutually exclusive by construction (see
+            // `KEY_OVERLAY_DELAY`, which spells out why that matters):
+            //
+            // - a half-typed arrow chord has `CHORD_ESCAPE_TIMEOUT` to
+            //   complete, after which the withheld bytes are released to the
+            //   workload as ordinary input;
+            // - a lone `Ctrl-b` has `KEY_OVERLAY_DELAY` before the keymap is
+            //   drawn for it. The short-circuit is what keeps this free: with
+            //   nothing pending, neither `readable` call is even reached.
+            let chord_expired =
+                scanner.awaiting_escape() && !readable(libc::STDIN_FILENO, CHORD_ESCAPE_TIMEOUT);
+            if !chord_expired
+                && !overlay_armed
+                && scanner.awaiting_key()
+                && !input_status_ctx.scroll.is_active()
+                && !readable(libc::STDIN_FILENO, KEY_OVERLAY_DELAY)
             {
-                scanner.flush_pending()
+                // Hesitation on the prefix rather than a chord typed from
+                // muscle memory. Draw the keymap and go straight back to
+                // waiting for the key it explains -- the prefix is still
+                // pending, so that key runs its binding exactly as it would
+                // have. `overlay_armed` latches the deadline for *this*
+                // prefix so a terminal too small for the box flashes the
+                // one-line reference once instead of every 350ms.
+                overlay_armed = true;
+                show_key_overlay(&input_status_ctx);
+                continue;
+            }
+            let actions = if chord_expired {
+                let flushed = scanner.flush_pending();
+                overlay_armed = false;
+                if dismiss_key_overlay(&input_status_ctx) {
+                    // `Esc` with the box up means "never mind", and taking
+                    // the box down is the whole of it: the withheld
+                    // `Ctrl-b ESC` is consumed rather than typed into the
+                    // workload, which is what every menu of this shape does.
+                    // Without the box this is unchanged -- both bytes go
+                    // through, so an editor still gets its Escape.
+                    Vec::new()
+                } else {
+                    flushed
+                }
             } else {
                 let n = match input.read(&mut buffer) {
                     Ok(0) => {
@@ -7645,7 +8066,19 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     }
                     continue;
                 }
-                scanner.scan(&buffer[..n])
+                let actions = scanner.scan(&buffer[..n]);
+                if scanner.settled() {
+                    overlay_armed = false;
+                    // A key arrived, so the overlay is over *before* its
+                    // action runs: everything below -- a switch's replayed
+                    // screen, a `?` flash, the pager's first frame -- draws
+                    // onto the restored screen instead of onto the box. A
+                    // key that turned out not to be a chord has already been
+                    // put back into `actions` as ordinary input by `scan`,
+                    // so the fall-through contract is untouched.
+                    dismiss_key_overlay(&input_status_ctx);
+                }
+                actions
             };
             for action in actions {
                 match action {
@@ -7724,6 +8157,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 }
             }
         }
+        // Whatever ended this thread -- stdin EOF, a read error, a dead
+        // socket, `Ctrl-b d` -- must not leave the relay suspended behind a
+        // box nobody can dismiss any more: this thread is the only one that
+        // takes keys. A no-op in the ordinary case, because a key arriving is
+        // what dismisses the overlay and `Ctrl-b d` is a key.
+        dismiss_key_overlay(&input_status_ctx);
     });
     if display_tty {
         let resize_writer = writer.clone();
@@ -7766,6 +8205,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // because the relay is suspended.
                         if resize_ctx.scroll.is_active() {
                             paint_scroll_view(&resize_ctx);
+                        }
+                        // Same for the key overlay, with one extra case: the
+                        // new geometry may be one the box does not fit into
+                        // at all, and a repaint that cannot happen must take
+                        // the overlay down rather than leave a stale box over
+                        // a suspended relay.
+                        if resize_ctx.overlay.is_active() && !paint_key_overlay(&resize_ctx) {
+                            dismiss_key_overlay(&resize_ctx);
                         }
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
@@ -7830,6 +8277,13 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 // expire on a workload that stopped mid-escape-sequence.
                 // Cheap: one uncontended mutex peek that returns immediately
                 // when nothing is deferred, which is the overwhelming case.
+                if thread_status_ctx.overlay.is_active() {
+                    // The overlay owns the terminal for the moment it is up.
+                    // Nothing about the bar, the mouse or a deferred resize is
+                    // worth painting into it: each keeps waiting, and the
+                    // repaint `dismiss_key_overlay` writes delivers them.
+                    continue;
+                }
                 // Cheap and idempotent: returns immediately unless the
                 // workload's own mouse wishes changed since the last tick.
                 sync_client_mouse(&thread_status_ctx);
@@ -7899,16 +8353,22 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             };
             match frame.kind {
                 FrameKind::Data => {
-                    relay_to_terminal(&workload_screen, &stdout, &scroll_mode, &frame.payload)?;
+                    relay_to_terminal(
+                        &workload_screen,
+                        &stdout,
+                        &scroll_mode,
+                        &key_overlay,
+                        &frame.payload,
+                    )?;
                     if let Ok(mut t) = last_activity.lock() {
                         *t = Instant::now();
                     }
-                    // While the pager is up nothing may paint over it: the
-                    // deferred resize, the deferred bar and the deferred
+                    // While a client modal is up nothing may paint over it:
+                    // the deferred resize, the deferred bar and the deferred
                     // `Ctrl-b r` all keep waiting, and are delivered by the
-                    // repaint `exit_scroll_mode` performs (or by the first
-                    // chunk after it).
-                    if scroll_mode.is_active() {
+                    // repaint `exit_scroll_mode`/`dismiss_key_overlay`
+                    // performs (or by the first chunk after it).
+                    if scroll_mode.is_active() || key_overlay.is_active() {
                         continue;
                     }
                     // A redraw the status thread wanted while the stream was
@@ -8633,12 +9093,34 @@ mod switching_tests {
         ));
     }
 
-    /// The keymap has exactly one definition; the two renderings are views of
-    /// it. This is the guard on that: both must mention every bound key.
+    /// The keymap has exactly one definition; the three renderings are views
+    /// of it. This is the guard on that: each must mention every bound key,
+    /// and the table must still spell the bindings the scanner implements.
     #[test]
     fn the_key_reference_is_generated_from_the_binding_table() {
         let help = attach_key_help();
         assert!(help.starts_with("Ctrl-b: "));
+        // The overlay is the third view. Rendered at a size with room for
+        // everything, it has to carry every key the table does -- a binding
+        // that only reaches two of the three renderings is exactly the drift
+        // this table exists to make impossible.
+        let overlay = key_overlay_lines(40, 120).expect("40x120 fits the whole keymap");
+        for binding in ATTACH_BINDINGS {
+            assert!(
+                overlay.iter().any(|line| line.contains(binding.keys)),
+                "the key overlay dropped {:?}:\n{}",
+                binding.keys,
+                overlay.join("\n")
+            );
+            assert!(
+                overlay
+                    .iter()
+                    .any(|line| line.contains(binding.description)),
+                "the key overlay dropped {:?}:\n{}",
+                binding.description,
+                overlay.join("\n")
+            );
+        }
         for binding in ATTACH_BINDINGS {
             if let Some(brief) = binding.brief {
                 assert!(
@@ -8665,6 +9147,234 @@ mod switching_tests {
                 "r",
                 "?"
             ]
+        );
+    }
+
+    /// The overlay is the third *view* of `ATTACH_BINDINGS`, not a third
+    /// copy of it: on a terminal with room for the whole table, every key and
+    /// every description the table holds is on screen verbatim. A binding
+    /// added to the scanner and the table shows up here for free; one written
+    /// out by hand could not.
+    #[test]
+    fn key_overlay_renders_every_binding_from_the_table() {
+        let lines = key_overlay_lines(40, 100).expect("40x100 has room for the whole keymap");
+        assert_eq!(
+            lines.len(),
+            ATTACH_BINDINGS.len() + KEY_OVERLAY_CHROME_ROWS,
+            "every binding gets a row, plus two borders and the footer: {lines:#?}"
+        );
+        for (binding, line) in ATTACH_BINDINGS.iter().zip(&lines[1..]) {
+            assert!(
+                line.contains(binding.keys),
+                "the overlay dropped the keys {:?}: {line}",
+                binding.keys
+            );
+            assert!(
+                line.contains(binding.description),
+                "the overlay truncated {:?} on a terminal with room for it: {line}",
+                binding.description
+            );
+        }
+        assert!(
+            lines[0].contains("Ctrl-b"),
+            "the box has to name the key the user is waiting on: {}",
+            lines[0]
+        );
+    }
+
+    /// Every row is one uniform width that fits inside the terminal, and the
+    /// box never claims more rows than it was given. This is the "do not draw
+    /// outside the screen" guarantee stated over the layout rather than left
+    /// to the sequence writer, because the sequence addresses rows absolutely
+    /// and a box one row too tall would land on the status bar.
+    #[test]
+    fn key_overlay_lines_are_uniform_and_stay_inside_the_terminal() {
+        for rows in [6usize, 9, 13, 23, 40, 200] {
+            for cols in [32usize, 40, 46, 80, 100, 200] {
+                let Some(lines) = key_overlay_lines(rows, cols) else {
+                    continue;
+                };
+                assert!(
+                    lines.len() <= rows,
+                    "a {rows}x{cols} box claimed {} rows",
+                    lines.len()
+                );
+                let width = terminal_display_width(&lines[0]);
+                assert!(width <= cols, "a {rows}x{cols} box is {width} cells wide");
+                for line in &lines {
+                    assert_eq!(
+                        terminal_display_width(line),
+                        width,
+                        "ragged row in a {rows}x{cols} box: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Honest degradation, part one: a terminal with room for some of the
+    /// keymap gets some of it -- trimmed from the end, because the table is
+    /// ordered most-useful-first -- and is told how much it is not seeing.
+    #[test]
+    fn key_overlay_trims_from_the_end_and_says_how_much_it_dropped() {
+        let rows = KEY_OVERLAY_CHROME_ROWS + 4;
+        let lines = key_overlay_lines(rows, 80).expect("four bindings still fit");
+        assert_eq!(lines.len(), rows);
+        let dropped = ATTACH_BINDINGS.len() - 4;
+        let footer = &lines[lines.len() - 2];
+        assert!(
+            footer.contains(&format!("{dropped} more")),
+            "a trimmed box must say how many bindings it dropped: {footer}"
+        );
+        for binding in &ATTACH_BINDINGS[..4] {
+            assert!(
+                lines[1..5].iter().any(|l| l.contains(binding.keys)),
+                "the first four table entries are the ones kept, missing {:?}",
+                binding.keys
+            );
+        }
+        let full = key_overlay_lines(40, 80).expect("40 rows fit everything");
+        assert!(
+            full[full.len() - 2].contains("Esc dismiss"),
+            "an untrimmed box says how to get out, not how much is missing: {}",
+            full[full.len() - 2]
+        );
+    }
+
+    /// Honest degradation, part two: below a box worth drawing there is no
+    /// box. `show_key_overlay` reads this `None` as "flash the one-line
+    /// reference instead", which is the whole of the small-terminal story --
+    /// no half-drawn border, no writing past the last column.
+    #[test]
+    fn key_overlay_refuses_a_terminal_it_cannot_fit() {
+        // Too short: chrome plus fewer than KEY_OVERLAY_MIN_BINDINGS rows.
+        for rows in 0..KEY_OVERLAY_CHROME_ROWS + KEY_OVERLAY_MIN_BINDINGS {
+            assert!(
+                key_overlay_lines(rows, 200).is_none(),
+                "{rows} rows is not enough for a box worth reading"
+            );
+        }
+        assert!(
+            key_overlay_lines(KEY_OVERLAY_CHROME_ROWS + KEY_OVERLAY_MIN_BINDINGS, 200).is_some()
+        );
+        // Too narrow: the description column would stop being sentences.
+        let keys_width = ATTACH_BINDINGS[..KEY_OVERLAY_MIN_BINDINGS]
+            .iter()
+            .map(|b| terminal_display_width(b.keys))
+            .max()
+            .unwrap();
+        let narrowest = keys_width + 6 + KEY_OVERLAY_MIN_DESC;
+        assert!(key_overlay_lines(40, narrowest - 1).is_none());
+        assert!(key_overlay_lines(40, narrowest).is_some());
+        assert!(key_overlay_lines(40, 0).is_none());
+    }
+
+    /// The sequence addresses rows absolutely, so the rows it addresses are
+    /// the guarantee: never row 0, never the reserved status row, never past
+    /// the bottom of the terminal.
+    #[test]
+    fn key_overlay_sequence_never_addresses_the_status_bar_row() {
+        for (rows, reserved) in [(24u16, true), (24, false), (13, true), (40, true)] {
+            let geom = TermGeom {
+                rows,
+                cols: 80,
+                reserved,
+            };
+            let usable = key_overlay_rows(geom);
+            let lines = key_overlay_lines(usable as usize, 80).expect("80 columns fit a box");
+            let seq = key_overlay_sequence(geom, &lines);
+            let text = String::from_utf8(seq).expect("the sequence is utf-8");
+            let mut addressed: Vec<u16> = Vec::new();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("\x1b[") {
+                rest = &rest[at + 2..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if !digits.is_empty() && rest[digits.len()..].starts_with(";1H") {
+                    addressed.push(digits.parse().expect("a row number"));
+                }
+            }
+            assert_eq!(
+                addressed.len(),
+                lines.len(),
+                "one absolute address per row, got {addressed:?}"
+            );
+            assert_eq!(*addressed.first().unwrap(), usable - lines.len() as u16 + 1);
+            assert_eq!(
+                *addressed.last().unwrap(),
+                usable,
+                "the box sits directly above the status bar"
+            );
+            for row in addressed {
+                assert!(
+                    (1..=usable).contains(&row),
+                    "the box addressed row {row} on a {rows}-row terminal (usable {usable})"
+                );
+            }
+        }
+    }
+
+    /// The two deadlines a held prefix can be under -- `KEY_OVERLAY_DELAY`
+    /// and `CHORD_ESCAPE_TIMEOUT` -- are armed by mutually exclusive scanner
+    /// states, which is what stops them fighting: a partial arrow chord can
+    /// never pop the overlay, and a bare `Ctrl-b ESC` never waits for one
+    /// deadline plus the other.
+    #[test]
+    fn the_overlay_deadline_and_the_chord_deadline_are_never_armed_together() {
+        let mut s = InputScanner::default();
+        assert!(s.settled(), "an idle scanner is under neither deadline");
+        assert!(!s.awaiting_key() && !s.awaiting_escape());
+
+        assert!(s.scan(&[0x02]).is_empty());
+        assert!(
+            s.awaiting_key(),
+            "a lone Ctrl-b arms the overlay's deadline"
+        );
+        assert!(!s.awaiting_escape());
+        assert!(!s.settled());
+
+        // The moment the arrow's ESC arrives the overlay's deadline is gone
+        // and the chord's is the only one left.
+        assert!(s.scan(&[0x1b]).is_empty());
+        assert!(s.awaiting_escape());
+        assert!(!s.awaiting_key());
+        assert!(!s.settled());
+
+        // ... and completing the chord leaves neither armed.
+        assert!(matches!(
+            s.scan(b"[C").as_slice(),
+            [InputAction::Switch(SwitchTarget::Next)]
+        ));
+        assert!(s.settled());
+        assert!(!s.awaiting_key() && !s.awaiting_escape());
+
+        // A bound key resolves the prefix in one step, which is what makes
+        // the input thread take the overlay down before running its action.
+        let mut fast = InputScanner::default();
+        assert!(matches!(
+            fast.scan(&[0x02, b'd']).as_slice(),
+            [InputAction::Detach]
+        ));
+        assert!(fast.settled());
+        // So does an unbound one, which also still falls through.
+        let mut through = InputScanner::default();
+        assert_eq!(bytes(&through.scan(&[0x02, b'p'])), vec![0x02, b'p']);
+        assert!(through.settled());
+    }
+
+    /// The delay has to be long enough that a chord typed from muscle memory
+    /// resolves first, and its whole point is that it is a *different* wait
+    /// from the arrow chord's -- long enough to read as hesitation where 100ms
+    /// reads as a split escape sequence.
+    #[test]
+    fn the_overlay_delay_is_a_hesitation_not_a_chord_gap() {
+        assert!(
+            KEY_OVERLAY_DELAY > CHORD_ESCAPE_TIMEOUT,
+            "an overlay that can fire inside the arrow chord's own deadline \
+             would flicker on every Ctrl-b Left"
+        );
+        assert!(
+            KEY_OVERLAY_DELAY < FLASH_DURATION,
+            "hesitation has to be answered faster than a message is read"
         );
     }
 
@@ -10064,6 +10774,7 @@ mod switching_tests {
             pending_layout: Arc::new(Mutex::new(None)),
             sync_deferred_since: Arc::new(Mutex::new(None)),
             scroll: Arc::new(ScrollMode::new()),
+            overlay: Arc::new(KeyOverlay::default()),
             mouse_owned: Arc::new(Mutex::new(None)),
             mouse_capture: false,
         }
@@ -11166,6 +11877,8 @@ mod switching_tests {
         "refresh_scroll_bar",
         "exit_scroll_mode",
         "sync_client_mouse",
+        "paint_key_overlay",
+        "dismiss_key_overlay",
     ];
 
     /// `write_locked` writes unconditionally, so it is a second route to the
@@ -11346,14 +12059,18 @@ mod switching_tests {
     }
 
     /// `BoundaryPolicy::StreamSuspended` says "the relay is not writing to
-    /// the host at all right now", which is true of exactly one thing: scroll
-    /// mode. Pinned the same way the deadline exemption is, so it cannot
-    /// quietly become a general-purpose way around the gate.
+    /// the host at all right now", which is true of exactly one class of
+    /// thing: a *client modal* that has taken the host terminal away from the
+    /// relay entirely -- the scroll-mode pager, and the `Ctrl-b` key overlay,
+    /// which suspends the relay the same way and for the same reason (see
+    /// `KeyOverlay`). Pinned the same way the deadline exemption is, so it
+    /// cannot quietly become a general-purpose way around the gate.
     ///
     /// Two properties, both of which the variant's correctness rests on:
-    /// only scroll-mode writers may pass it, and every write that does must
-    /// lead with `SCROLL_CANCEL` -- the `CAN` that ends whatever sequence the
-    /// host was part-way through when the relay was suspended.
+    /// only a modal's writers may pass it, and every write that is the *first*
+    /// one after the suspension must lead with `SCROLL_CANCEL` -- the `CAN`
+    /// that ends whatever sequence the host was part-way through when the
+    /// relay was suspended.
     #[test]
     fn scroll_mode_writes_are_the_only_stream_suspended_ones() {
         use std::collections::BTreeSet;
@@ -11364,6 +12081,12 @@ mod switching_tests {
             // (name, must build its own SCROLL_CANCEL-led sequence)
             ("paint_scroll_view", true),
             ("exit_scroll_mode", true),
+            // The overlay's two frames. Either can be the first write after
+            // the relay was suspended -- `paint_key_overlay` always is, and
+            // `dismiss_key_overlay` is whenever nothing was repainted in
+            // between (a resize, say) -- so both build their own.
+            ("paint_key_overlay", true),
+            ("dismiss_key_overlay", true),
             // The bar row is drawn *into* a screen the pager already owns
             // and already cancelled; it is not the first write after the
             // suspension, so it needs no CAN of its own.

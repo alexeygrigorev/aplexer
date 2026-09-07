@@ -2308,3 +2308,406 @@ fn ctrl_b_down_and_up_hop_workspaces_at_their_most_recent_session() {
         harness.run_ok(&["kill", id, "--signal", "KILL"], Duration::from_secs(5));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `Ctrl-b` key overlay (which-key)
+// ---------------------------------------------------------------------------
+
+/// The box's opening bytes -- the corner plus the title naming the prefix.
+/// Nothing else the client or a shell writes contains it, so its presence or
+/// absence in the captured stream is an exact answer to "was the overlay
+/// drawn".
+const OVERLAY_TITLE: &[u8] = "\u{250c}\u{2500} Ctrl-b ".as_bytes();
+
+/// The box's closing border, written after every one of its rows. Waiting on
+/// this rather than on the title is what makes "the whole frame has arrived"
+/// an observation instead of a sleep.
+const OVERLAY_BOTTOM: &[u8] = "\u{2514}\u{2500}".as_bytes();
+
+/// The client's picture of the *workload*: every workload row with its
+/// formatting, plus the cursor. This is the oracle for the overlay's restore.
+///
+/// The status row is excluded deliberately -- it belongs to the client, not
+/// the workload, and it moves on its own timer, so including it would make
+/// the comparison a race rather than a statement about the restore. The rows
+/// are `rows_formatted`, not plain text: a restore that re-typed the
+/// characters but lost the workload's colours would pass a text comparison
+/// and fails this one.
+fn workload_rows_formatted(bytes: &[u8], rows: u16, cols: u16) -> (Vec<Vec<u8>>, (u16, u16)) {
+    let host = host_terminal(bytes, rows, cols);
+    let screen = host.screen();
+    let grid: Vec<Vec<u8>> = screen
+        .rows_formatted(0, cols)
+        .take(rows as usize - 1)
+        .collect();
+    (grid, screen.cursor_position())
+}
+
+/// Wait until the client has stopped changing the workload's rows, and
+/// return them.
+///
+/// The "before" half of the restore oracle has to be a screen the client is
+/// *done* writing, and a fixed sleep is the wrong way to establish that: under
+/// load the attach's own opening redraws simply land later, and a `before`
+/// sampled mid-repaint is a state nothing will ever restore. Two identical
+/// samples a beat apart is the same intent stated as an observation.
+fn settled_workload_rows(
+    client: &PtyClient,
+    rows: u16,
+    cols: u16,
+    what: &str,
+) -> (Vec<Vec<u8>>, (u16, u16)) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = workload_rows_formatted(&client.output(), rows, cols);
+    let mut quiet = 0;
+    loop {
+        thread::sleep(Duration::from_millis(400));
+        let now = workload_rows_formatted(&client.output(), rows, cols);
+        quiet = if now == last { quiet + 1 } else { 0 };
+        if quiet >= 3 {
+            return now;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what} to stop changing");
+        }
+        last = now;
+    }
+}
+
+fn render_rows(rows: &[Vec<u8>]) -> String {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| format!("{i:>3}: {}", escape(r)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The which-key overlay, end to end on a real terminal: a `Ctrl-b` the user
+/// hesitates on raises the keymap, and any key takes it away again and leaves
+/// the screen exactly as it was.
+///
+/// The last assertion is the one this test exists for. The overlay never
+/// saves and restores a rectangle of cells; dismissal repaints the whole
+/// screen from the client's own model (`ClientScreen::snapshot`), the same
+/// path `Ctrl-b r` and the pager's exit already use. So the oracle can be
+/// byte-exact -- every workload row with its formatting, plus the cursor,
+/// identical before the prefix and after the dismissal. It fails not only if
+/// the box is left behind, but if the restore loses a colour, a cursor
+/// column, or a row.
+#[test]
+fn ctrl_b_key_overlay_appears_on_hesitation_and_restores_the_screen_byte_for_byte() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("key-overlay");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "overlay");
+    // A one-line prompt, because the oracle below is byte-exact and the
+    // machine's own multi-line login prompt is not: readline reprints a
+    // multi-line prompt on the SIGWINCH an attach delivers, which scrolls the
+    // screen for reasons that have nothing to do with the overlay.
+    harness.run_ok(
+        &["send", &id, "PROMPT_COMMAND=; PS1='READY$ '", "--enter"],
+        Duration::from_secs(5),
+    );
+    // Coloured, and enough rows to reach down into where the box will sit, so
+    // the box demonstrably covers something and the restore has something to
+    // get wrong.
+    // Twelve rows, not more: the screen is 23 and the point is that nothing
+    // scrolls off it between the worker printing this and the client
+    // attaching, so the "before" screen is the one the box will cover.
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            r#"printf '\033[33mOVERLAY-ROW-%02d\033[0m\n' $(seq 1 12)"#,
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "OVERLAY-ROW-12");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"OVERLAY-ROW-12", 0, "the session's snapshot");
+
+    // The workload is an idle shell, so the only thing still writing is the
+    // status bar -- on a row this oracle excludes. Waiting for the rows to
+    // stop moving is what makes `before` a screen the restore can actually be
+    // held to.
+    let before = settled_workload_rows(&client, 24, 80, "the attach's opening redraws");
+    let before_at = client.mark();
+
+    // The prefix, and nothing after it: exactly the hesitation the overlay is
+    // for.
+    client.send(&[0x02]);
+    client.wait_for(
+        OVERLAY_TITLE,
+        before_at,
+        "the key overlay, raised by a Ctrl-b left hanging",
+    );
+    client.wait_for(OVERLAY_BOTTOM, before_at, "the whole overlay frame");
+
+    let raised = host_terminal(&client.output(), 24, 80);
+    let raised_text = raised.screen().contents();
+    for expected in [
+        "Ctrl-b",
+        "detach (the workload keeps running)",
+        "create another session in this workspace and switch to it",
+    ] {
+        assert!(
+            raised_text.contains(expected),
+            "the overlay does not show {expected:?}; host screen:\n{raised_text}"
+        );
+    }
+    assert!(
+        raised.screen().alternate_screen(),
+        "the overlay must not take the host off the alternate screen"
+    );
+    let covered = workload_rows_formatted(&client.output(), 24, 80);
+    assert_ne!(
+        covered.0, before.0,
+        "the overlay was drawn but covered none of the workload's screen, so the \
+         restore assertion below would pass trivially"
+    );
+
+    // Any key dismisses; `Esc` is the one that dismisses without also being
+    // typed into the workload.
+    client.send(&[0x1b]);
+
+    // The restore is one write, but the capture thread sees it in whatever
+    // chunks the pty hands over, so this waits for the repaint to finish
+    // rather than asserting on a half-read frame. It is still an exact
+    // comparison: nothing but the real restore can make it hold, and a
+    // restore that never comes fails on the deadline with both screens.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let after = workload_rows_formatted(&client.output(), 24, 80);
+        if after == before {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the screen under the key overlay did not come back byte for byte.\n\
+                 cursor before {:?}, after {:?}\nbefore:\n{}\nafter:\n{}",
+                before.1,
+                after.1,
+                render_rows(&before.0),
+                render_rows(&after.0),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// Muscle memory must never see the overlay -- not for a frame.
+///
+/// Two shapes of "typed at speed", because they take different paths through
+/// the scanner and only one of them is covered by the delay alone:
+///
+/// - `Ctrl-b ?`, a single-byte binding, which resolves inside
+///   `KEY_OVERLAY_DELAY` and is observable by its own effect on the bar;
+/// - `Ctrl-b ESC`, which puts the scanner into the *other* deadline
+///   (`CHORD_ESCAPE_TIMEOUT`, the partial-arrow-chord wait). A held partial
+///   chord must not pop the overlay either, which is a property of the two
+///   deadlines being armed by mutually exclusive scanner states rather than
+///   of the delay being long.
+#[test]
+fn a_ctrl_b_chord_typed_at_speed_never_draws_the_key_overlay() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("overlay-fast");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "fast");
+    harness.run_ok(
+        &["send", &id, r#"printf 'FAST-CHORD-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "FAST-CHORD-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"FAST-CHORD-MARK", 0, "the session's snapshot");
+
+    let chord_at = client.mark();
+    client.send(&[0x02, b'?']);
+    // The binding's own effect proves the chord really ran, so the negative
+    // assertion below is scoped to a window the client demonstrably reacted
+    // in rather than to a bare sleep.
+    client.wait_for(
+        b"N/P global",
+        chord_at,
+        "the Ctrl-b ? key reference on the status bar",
+    );
+    // Well past KEY_OVERLAY_DELAY: if a resolved chord could still raise the
+    // box, it would have by now.
+    thread::sleep(Duration::from_millis(900));
+    let out = client.output();
+    assert!(
+        find_bytes(&out[chord_at..], OVERLAY_TITLE).is_none(),
+        "a Ctrl-b chord typed at speed flickered the key overlay; captured:\n{}",
+        escape(&out[chord_at..])
+    );
+
+    // The other deadline: `Ctrl-b ESC` is withheld as a possible arrow chord
+    // for CHORD_ESCAPE_TIMEOUT and then forwarded. The overlay must stay out
+    // of that entirely.
+    let escape_at = client.mark();
+    client.send(&[0x02, 0x1b]);
+    thread::sleep(Duration::from_millis(900));
+    let out = client.output();
+    assert!(
+        find_bytes(&out[escape_at..], OVERLAY_TITLE).is_none(),
+        "a partial arrow chord popped the key overlay while it was being held; captured:\n{}",
+        escape(&out[escape_at..])
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// Honest degradation on a terminal the box does not fit: 31 columns cannot
+/// hold the keys column plus a description column still made of sentences, so
+/// a hesitated `Ctrl-b` flashes the existing one-line reference on the status
+/// bar instead of drawing a broken box or writing past the last column.
+#[test]
+fn a_terminal_too_narrow_for_the_box_falls_back_to_the_status_bar_flash() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("overlay-narrow");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "narrow");
+    harness.run_ok(
+        &["send", &id, r#"printf 'NARROW-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "NARROW-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 31);
+    client.wait_for(b"NARROW-MARK", 0, "the session's snapshot");
+    thread::sleep(Duration::from_millis(500));
+
+    let hesitate_at = client.mark();
+    client.send(&[0x02]);
+    client.wait_for(
+        b"Ctrl-b:",
+        hesitate_at,
+        "the one-line key reference flashed in place of a box",
+    );
+    thread::sleep(Duration::from_millis(500));
+    let out = client.output();
+    assert!(
+        find_bytes(&out[hesitate_at..], OVERLAY_TITLE).is_none(),
+        "a terminal too narrow for the box drew one anyway; captured:\n{}",
+        escape(&out[hesitate_at..])
+    );
+
+    // And the flash stayed inside the terminal: nothing wrapped onto a row it
+    // does not own, and the host is still on the alternate screen.
+    let host = host_terminal(&out, 24, 31);
+    assert!(
+        host.screen().alternate_screen(),
+        "the fallback must not take the host off the alternate screen"
+    );
+    let contents = host.screen().contents();
+    assert!(
+        contents.contains("Ctrl-b:"),
+        "the fallback reference is not on the narrow terminal's screen:\n{contents}"
+    );
+
+    // Release the still-pending prefix before detaching, so `Ctrl-b d` is
+    // scanned from a clean state.
+    client.send(&[0x1b]);
+    thread::sleep(Duration::from_millis(300));
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// What the second key does, once the box is up: a *bound* key runs its
+/// binding, and an *unbound* one dismisses the box and still falls through to
+/// the workload untouched -- the fall-through contract the prefix has always
+/// had, which the overlay must not quietly take away.
+#[test]
+fn a_key_pressed_over_the_overlay_runs_its_binding_or_falls_through() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("overlay-keys");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "keys");
+    harness.run_ok(
+        &["send", &id, r#"printf 'UNBOUND-ROW-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "UNBOUND-ROW-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"UNBOUND-ROW-MARK", 0, "the session's snapshot");
+    thread::sleep(Duration::from_millis(500));
+
+    // A bound key: `?` is consumed, its binding runs, and the box is gone.
+    let bound_at = client.mark();
+    client.send(&[0x02]);
+    client.wait_for(OVERLAY_BOTTOM, bound_at, "the overlay for the bound key");
+    client.send(b"?");
+    // A needle only the `?` reference carries: the attach's own opening
+    // banner says "Ctrl-b d detach" too, and is redrawn on the bar's timer
+    // for `FLASH_DURATION` after the attach.
+    client.wait_for(
+        b"N/P global",
+        bound_at,
+        "the `?` binding's own reference on the status bar",
+    );
+    assert!(
+        !host_terminal(&client.output(), 24, 80)
+            .screen()
+            .contents()
+            .contains("detach (the workload keeps running)"),
+        "the box is still on screen after its key ran"
+    );
+
+    // An unbound key: the box goes, and both withheld bytes reach the shell.
+    let unbound_at = client.mark();
+    client.send(&[0x02]);
+    client.wait_for(
+        OVERLAY_BOTTOM,
+        unbound_at,
+        "the overlay for the unbound key",
+    );
+    client.send(b"p");
+    client.wait_for(
+        b"UNBOUND-ROW-MARK",
+        unbound_at,
+        "the repaint that takes the box back down",
+    );
+    // `Ctrl-b p` landed in the shell's line editor, so finishing the word it
+    // started gives a command the session actually runs. `%s` keeps the
+    // marker out of the echoed command text, so finding it means it ran.
+    client.send(b"rintf 'FELL-THROUGH-%s\\n' MARK\r");
+    client.wait_for(
+        b"FELL-THROUGH-MARK",
+        unbound_at,
+        "the unbound key falling through to the workload",
+    );
+
+    let host = host_terminal(&client.output(), 24, 80);
+    let contents = host.screen().contents();
+    assert!(
+        !contents.contains("detach (the workload keeps running)"),
+        "the box outlived the key that dismissed it; screen:\n{contents}"
+    );
+    assert!(
+        contents.contains("FELL-THROUGH-MARK"),
+        "the workload's reply to the fallen-through key is not on screen:\n{contents}"
+    );
+    assert!(
+        host.screen().alternate_screen(),
+        "the attach client holds the host on the alternate screen across the overlay"
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
