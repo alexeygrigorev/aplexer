@@ -539,6 +539,40 @@ frame (or drops it for non-`want_screen` subscribers).
 >   tracks `CSI ? 2026 h/l` and prefers to stay out of a workload's declared
 >   frame, bounded by `STATUS_BAR_SYNC_DEFER_LIMIT` so an unclosed block
 >   cannot starve the bar.
+>
+>   **Amended again by issue #14.** "Before writing anything of its own" was
+>   an overclaim when it was written: the gate lived inside `draw_status_bar`,
+>   so it covered the eight status-bar callers and not `apply_terminal_layout`,
+>   which the resize poller drives on a wall clock and which wrote DECSTBM
+>   straight to stdout. Measured at the time: 36 resize writes under a dense
+>   stream at load 42, 0 unsafe splices -- real but far rarer than the
+>   status-bar case, since it needs a physical resize to land inside a
+>   half-emitted sequence. It is now true as written, and true by
+>   construction rather than by discipline: the gate moved out of
+>   `draw_status_bar` into `write_client_locked`, the single funnel every
+>   client-originated injection writes through, so **every** such write is
+>   gated -- a new writer is gated because it cannot reach the terminal any
+>   other way. The two paths differ only in their escape hatches, and
+>   deliberately:
+>
+>   | | status bar (`draw_status_bar`) | layout (`apply_terminal_layout`) |
+>   |---|---|---|
+>   | escape boundary | required | required |
+>   | synchronized-output deferral | yes, bounded by `STATUS_BAR_SYNC_DEFER_LIMIT` | no -- staying out of a declared frame is cosmetic, and the scroll region is not |
+>   | deadline that writes anyway | none; a stale bar is harmless | `LAYOUT_DEFER_LIMIT`; an undelivered resize leaves the host scrolling the old geometry for the rest of the attach, which is worse than one spliced frame |
+>   | where a deferral is parked | `ctx.pending` / `ctx.pending_refresh` | `ctx.pending_layout` (coalesced; deadline runs from the *first* deferral) |
+>   | who delivers the deferral | main frame loop, after each relayed chunk | main frame loop **and** the status thread's tick, because a workload that stops mid-sequence sends no more chunks |
+>
+>   A deferred resize is delivered late, never dropped. `TermGeom` is still
+>   updated at the moment of the resize even when the bytes wait: it is
+>   internal state rather than output, and the bar must target the physical
+>   terminal's real last row immediately.
+>
+>   The gate is enforced structurally, not by convention:
+>   `every_client_terminal_write_site_is_gated_or_explicitly_exempt` in
+>   src/bin/a.rs's test module enumerates every function in that file that can
+>   put bytes on fd 1 and fails on a new one that is neither gated nor listed
+>   with a reason -- so writer eleven cannot be added ungated by forgetting.
 > - **No `\x1b7`/`\x1b8` bracket anywhere in the client.** A terminal has one
 >   save-cursor register; writing to it from a relayed stream destroys the
 >   workload's own saved position (Claude Code opens with `\x1b7\x1b[r\x1b8`;

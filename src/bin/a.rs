@@ -4187,6 +4187,30 @@ const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// cannot freeze the bar indefinitely.
 const STATUS_BAR_SYNC_DEFER_LIMIT: Duration = Duration::from_millis(500);
 
+/// How long a terminal resize's DECSTBM may be held back by the escape
+/// boundary gate before it is written anyway (issue #14).
+///
+/// The gate is the same one `draw_status_bar` uses, but the escape hatch is
+/// not. A status redraw that never happens costs a stale bar; a *resize* that
+/// never happens leaves the host terminal scrolling a region sized for the
+/// old geometry for the rest of the attach, which is exactly the "workload
+/// renders at the wrong size indefinitely" outcome that is worse than the
+/// splice the gate exists to prevent. A stream normally reaches a boundary
+/// within one PTY chunk, so this deadline only fires when a workload has
+/// stopped emitting part-way through an escape sequence -- a state in which
+/// the host terminal is already stuck waiting for bytes that are not coming.
+const LAYOUT_DEFER_LIMIT: Duration = Duration::from_millis(500);
+
+/// A terminal resize whose DECSTBM the boundary gate held back, and when it
+/// was first held back (`LAYOUT_DEFER_LIMIT`'s deadline is measured from the
+/// first deferral, not from the most recent resize).
+#[derive(Clone, Copy)]
+struct PendingLayout {
+    rows: u16,
+    cols: u16,
+    since: Instant,
+}
+
 /// Physical terminal geometry as last observed by the resize-poll thread,
 /// shared with the status-bar thread so its redraws always target the
 /// current last row/width without a second ioctl.
@@ -4231,12 +4255,77 @@ fn reserved_rows(rows: u16) -> u16 {
 /// holding `term` or `screen`: `apply_terminal_layout` writes and only then
 /// records the new geometry, and the switch path reads the geometry before
 /// taking `stdout`.
+///
+/// **Not for live injections.** This helper writes unconditionally, so it is
+/// only correct where there is no relayed stream to splice: attach start
+/// (before the first workload byte) and detach (after the last one). A
+/// status redraw, a `Ctrl-b r` refresh, or a resize DECSTBM goes through
+/// `write_client_locked`, which is the boundary gate. `write_locked`'s two
+/// call sites are pinned by
+/// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`.
 fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()> {
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     out.write_all(bytes)?;
     out.flush()
+}
+
+/// Whether a client-originated write may still go out when the relayed
+/// stream is *not* between complete escape sequences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoundaryPolicy {
+    /// Refuse and let the caller park the write for the next boundary.
+    /// Everything the user can wait for: the status bar, `Ctrl-b r`, and a
+    /// resize that has not yet hit `LAYOUT_DEFER_LIMIT`.
+    Defer,
+    /// Write anyway. **The one narrow exemption in the client** (issue #14):
+    /// a resize whose DECSTBM has already been held back for
+    /// `LAYOUT_DEFER_LIMIT`, i.e. a workload that stopped emitting part-way
+    /// through an escape sequence and is never going to finish it. One
+    /// spliced frame beats a host terminal left scrolling the old geometry
+    /// for the rest of the attach. Exactly one call site may pass this, and
+    /// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`
+    /// fails if a second one appears.
+    PastDeadline,
+}
+
+/// **The single funnel for client-originated bytes**, and therefore the one
+/// place the escape-boundary gate has to live.
+///
+/// Issue #5 put the gate inside `draw_status_bar`, which covered its eight
+/// callers and silently did not cover `apply_terminal_layout` -- a ninth
+/// writer that reached stdout by another route and spliced DECSTBM into
+/// half-emitted CSI sequences from the resize poller's wall clock (issue
+/// #14). A gate that each new writer has to *remember* is a gate that the
+/// next writer forgets, so it moved here: writer eleven is gated because it
+/// cannot put bytes on the terminal any other way.
+///
+/// The caller must already hold the stdout lock. That is not tidiness: the
+/// first version of the #5 fix checked the boundary in the status thread and
+/// wrote afterwards, and a real capture caught 4 of 39 redraws still landing
+/// mid-CSI, because the frame loop wrote another chunk in the gap. Checking
+/// and writing under one lock is what closes it -- see `write_locked`.
+///
+/// Returns whether the bytes went out. `false` means the stream was
+/// mid-sequence and the caller must park the write for a later boundary
+/// rather than drop it.
+fn write_client_locked(
+    out: &mut impl Write,
+    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+    bytes: &[u8],
+    policy: BoundaryPolicy,
+) -> bool {
+    let at_boundary = screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .at_escape_boundary();
+    if !at_boundary && policy == BoundaryPolicy::Defer {
+        return false;
+    }
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+    true
 }
 
 /// The DECSTBM reservation (or its removal, on a terminal too small to spare
@@ -4266,29 +4355,156 @@ fn terminal_layout_sequence(rows: u16, restore: &[u8]) -> Vec<u8> {
 /// there. The cursor is restored from `ClientScreen` instead -- absolutely,
 /// and including the workload's pen -- so the register stays the workload's
 /// private property.
-fn apply_terminal_layout(
-    stdout: &Arc<Mutex<io::Stdout>>,
-    term: &Arc<Mutex<TermGeom>>,
-    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+///
+/// **Boundary-gated, exactly like `draw_status_bar`** (issue #14). This is
+/// client-originated output spliced into a stream the client is only
+/// relaying, so the same rule applies: a resize landing while the workload is
+/// mid-escape-sequence would make the host terminal abandon the workload's
+/// half-emitted CSI and print its remaining parameter bytes as literal text.
+/// The resize poller fires from a wall clock, so its writes land at arbitrary
+/// byte offsets by construction -- the identical defect the status bar had.
+///
+/// Two deliberate differences from `draw_status_bar`'s use of the same gate:
+///
+/// - **No synchronized-output deferral.** Holding a *status bar* out of a
+///   workload's declared frame is a cosmetic preference (see
+///   `STATUS_BAR_SYNC_DEFER_LIMIT`); holding the *scroll region* back is not
+///   cosmetic, because until DECSTBM is reasserted the host is scrolling a
+///   region sized for the old terminal. An injection at a genuine escape
+///   boundary is transparent anyway, so the escape boundary is the whole
+///   requirement here.
+/// - **A deadline** (`BoundaryPolicy::PastDeadline`, the client's only
+///   exemption), because an undelivered resize is worse than a spliced one.
+///
+/// What is *not* deferred is the workload's own notification: the resize
+/// poller's `AttachControl::Resize` goes to the worker unconditionally, so
+/// the PTY is resized and SIGWINCH delivered on time no matter what the
+/// host-side reservation is doing. A workload blocked on the new size never
+/// waits on this gate -- only the client's own row reservation does.
+///
+/// Returns whether bytes actually reached the terminal. A deferral is
+/// recorded in `ctx.pending_layout` and flushed by `flush_pending_layout`;
+/// see that function for why deferring here never loses a resize.
+fn apply_terminal_layout(ctx: &StatusBarCtx, rows: u16, cols: u16) -> bool {
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    apply_terminal_layout_to(&mut *out, ctx, rows, cols)
+}
+
+/// `apply_terminal_layout` with the destination passed in, the stdout lock
+/// already held by the caller.
+///
+/// Split out for the reason `status_bar_redraw` exists: a test can drive the
+/// real gate, and the real bytes, into a `vt100` host terminal without
+/// redirecting the process's fd 1 out from under a concurrently-running test
+/// harness. Production has exactly one caller pair -- `apply_terminal_layout`
+/// and `flush_pending_layout` -- and both hold the lock across it, because
+/// the boundary check and the write must not be separable.
+fn apply_terminal_layout_to(
+    out: &mut impl Write,
+    ctx: &StatusBarCtx,
     rows: u16,
     cols: u16,
-) {
+) -> bool {
     let reserved = rows > 2;
-    {
-        let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
-        let restore = screen
+    // The deadline is a clock rather than stream state, so unlike the
+    // boundary check it cannot go stale under the lock.
+    let policy = match layout_deferred_since(ctx) {
+        Some(since) if since.elapsed() >= LAYOUT_DEFER_LIMIT => BoundaryPolicy::PastDeadline,
+        _ => BoundaryPolicy::Defer,
+    };
+    let wrote = {
+        let restore = ctx
+            .screen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .cursor_restore();
-        let _ = out.write_all(&terminal_layout_sequence(rows, &restore));
-        let _ = out.flush();
+        let seq = terminal_layout_sequence(rows, &restore);
+        write_client_locked(out, &ctx.screen, &seq, policy)
+    };
+    {
+        // Park or clear the deferral. Re-parking keeps the *original*
+        // deadline, so a stream that never reaches a boundary cannot
+        // postpone delivery indefinitely by resizing again; the geometry is
+        // overwritten, because only the latest physical size is correct.
+        let mut pending = ctx
+            .pending_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *pending = if wrote {
+            None
+        } else {
+            let since = pending.map(|p| p.since).unwrap_or_else(Instant::now);
+            Some(PendingLayout { rows, cols, since })
+        };
     }
-    if let Ok(mut g) = term.lock() {
+    // Recorded even when the bytes were deferred, and deliberately so: the
+    // physical terminal has *already* changed size, so the status bar must
+    // start targeting the new last row immediately or it draws over a row
+    // the workload now owns. `TermGeom` is internal state, not output --
+    // recording it puts nothing on the wire, and the bar's own write is
+    // independently gated. `term` is taken under `stdout`, which is the
+    // order `write_locked` documents.
+    if let Ok(mut g) = ctx.term.lock() {
         *g = TermGeom {
             rows,
             cols,
             reserved,
         };
+    }
+    wrote
+}
+
+/// When the currently-parked resize was *first* held back, if there is one.
+fn layout_deferred_since(ctx: &StatusBarCtx) -> Option<Instant> {
+    ctx.pending_layout
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .map(|p| p.since)
+}
+
+/// Delivers a resize whose DECSTBM was deferred by the boundary gate.
+///
+/// Deferring must never mean dropping (issue #14): a lost resize leaves the
+/// host scrolling a region sized for the old terminal for the rest of the
+/// attach. Two independent callers guarantee delivery, and they cover
+/// disjoint failure modes:
+///
+/// - the main frame loop, after every relayed chunk -- the boundary the gate
+///   was waiting for is by construction reached by relaying more bytes, so
+///   this is the normal path and it fires within one PTY chunk;
+/// - the status-bar thread's tick, every `STATUS_BAR_POLL_INTERVAL` -- the
+///   frame loop only runs when the workload sends something, so a workload
+///   that stops mid-sequence would otherwise park the resize forever. This
+///   is also what makes `LAYOUT_DEFER_LIMIT` actually fire.
+///
+/// Peeks rather than takes: `apply_terminal_layout` clears the slot when it
+/// writes and re-parks it (keeping the original deadline) when it cannot, so
+/// a flush that loses the race with a still-unsafe stream does not drop the
+/// resize on the floor.
+fn flush_pending_layout(ctx: &StatusBarCtx) -> bool {
+    // Cheap pre-check, before the stdout lock. The frame loop calls this
+    // after *every* PTY chunk and there is almost never a resize parked, so
+    // the common case must not queue behind the status thread's redraw for
+    // nothing. Released before `stdout` is taken, so this adds no nesting to
+    // the lock order; the authoritative read happens under the lock below.
+    if layout_deferred_since(ctx).is_none() {
+        return false;
+    }
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    flush_pending_layout_to(&mut *out, ctx)
+}
+
+/// `flush_pending_layout` with the destination passed in and the stdout lock
+/// already held. Calls `apply_terminal_layout_to`, never
+/// `apply_terminal_layout`: the lock is not reentrant.
+fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) -> bool {
+    let pending = *ctx
+        .pending_layout
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match pending {
+        Some(PendingLayout { rows, cols, .. }) => apply_terminal_layout_to(out, ctx, rows, cols),
+        None => false,
     }
 }
 
@@ -4646,6 +4862,12 @@ struct StatusBarCtx {
     /// way as `pending`; a successful refresh also redraws the status bar,
     /// so it subsumes a pending bar redraw.
     pending_refresh: Arc<AtomicBool>,
+    /// The physical geometry a terminal resize wanted to reserve a row out
+    /// of, parked here because the relayed stream was mid-escape-sequence
+    /// when the resize poller fired (issue #14). Flushed by
+    /// `flush_pending_layout` from both the frame loop and the status
+    /// thread, so a deferred resize is delivered late, never dropped.
+    pending_layout: Arc<Mutex<Option<PendingLayout>>>,
     /// When the current synchronized-output deferral started, so
     /// `STATUS_BAR_SYNC_DEFER_LIMIT` can bound it.
     sync_deferred_since: Arc<Mutex<Option<Instant>>>,
@@ -4837,9 +5059,17 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match status_bar_redraw_locked(ctx, geom, &text, force) {
         Some(seq) => {
-            let _ = out.write_all(&seq);
-            let _ = out.flush();
-            true
+            // `status_bar_redraw_locked` already refused at an unsafe
+            // boundary, so this can only say no if the stream moved under a
+            // lock nothing else can hold -- but the funnel is where the
+            // guarantee lives, not in each caller remembering, so the
+            // deferral is re-armed rather than assumed impossible.
+            if write_client_locked(&mut *out, &ctx.screen, &seq, BoundaryPolicy::Defer) {
+                true
+            } else {
+                ctx.pending.store(true, Ordering::Relaxed);
+                false
+            }
         }
         None => false,
     }
@@ -4873,9 +5103,12 @@ fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match live_screen_refresh_locked(ctx) {
         Some(seq) => {
-            let _ = out.write_all(&seq);
-            let _ = out.flush();
-            true
+            if write_client_locked(&mut *out, &ctx.screen, &seq, BoundaryPolicy::Defer) {
+                true
+            } else {
+                ctx.pending_refresh.store(true, Ordering::Relaxed);
+                false
+            }
         }
         None => false,
     }
@@ -5767,6 +6000,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         screen: workload_screen.clone(),
         pending: Arc::new(AtomicBool::new(false)),
         pending_refresh: Arc::new(AtomicBool::new(false)),
+        pending_layout: Arc::new(Mutex::new(None)),
         sync_deferred_since: Arc::new(Mutex::new(None)),
     };
 
@@ -5782,7 +6016,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             .hold_host_on_alt_screen();
         let _ = write_locked(&stdout, ATTACH_ALT_SCREEN_ENTER);
         if let Some((rows, cols)) = initial_geometry {
-            apply_terminal_layout(&stdout, &term, &workload_screen, rows, cols);
+            // Nothing has been relayed yet, so the model is at a boundary by
+            // construction and this always writes -- the gate is free here
+            // and costs nothing to keep uniform.
+            apply_terminal_layout(&status_ctx, rows, cols);
         }
     }
     // Scanned before the bar is drawn: the snapshot re-emits the workload's
@@ -5952,16 +6189,18 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // re-clamp the region to the new row count rather
                         // than dropping it (see `MarginTracker::set_rows`
                         // and design doc section 5.3's correction).
-                        if let Ok(mut m) = resize_screen.lock() {
+                        if let Ok(mut m) = resize_ctx.screen.lock() {
                             m.set_size(reserved_rows(rows), cols);
                         }
-                        apply_terminal_layout(
-                            &resize_stdout,
-                            &resize_term,
-                            &resize_screen,
-                            rows,
-                            cols,
-                        );
+                        // May defer the DECSTBM write when the relayed
+                        // stream is mid-escape-sequence (issue #14). The
+                        // *workload* is never made to wait on that: the
+                        // Resize control below goes out unconditionally, so
+                        // the PTY is resized and SIGWINCH delivered on time
+                        // whatever the host-side reservation is doing. Only
+                        // the client's own row reservation waits, and only
+                        // for as long as `LAYOUT_DEFER_LIMIT`.
+                        apply_terminal_layout(&resize_ctx, rows, cols);
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
                         // perform_switch); if a real terminal resize races
@@ -6018,6 +6257,14 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     last_seen_activity = activity;
                     drawn_for_current_idle = false;
                 }
+                // A resize the boundary gate deferred is delivered here even
+                // when the workload has gone completely silent, which the
+                // frame loop's flush cannot cover: it only runs when a chunk
+                // arrives. This tick is also what lets `LAYOUT_DEFER_LIMIT`
+                // expire on a workload that stopped mid-escape-sequence.
+                // Cheap: one uncontended mutex peek that returns immediately
+                // when nothing is deferred, which is the overwhelming case.
+                flush_pending_layout(&thread_status_ctx);
                 let idle_for = activity.elapsed();
                 let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
                 if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
@@ -6085,6 +6332,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     // all, and it is by construction a chunk boundary that the
                     // model has just confirmed is also an escape boundary --
                     // see `draw_status_bar`'s boundary gate.
+                    //
+                    // The deferred *resize* goes first: a bar redraw is laid
+                    // out against `TermGeom`, so reasserting the new scroll
+                    // region before drawing keeps the two consistent within
+                    // the same chunk instead of one chunk apart.
+                    flush_pending_layout(&status_ctx);
                     if status_ctx.pending_refresh.load(Ordering::Relaxed) {
                         redraw_live_screen(&status_ctx);
                     } else if status_ctx.pending.load(Ordering::Relaxed) {
@@ -7596,6 +7849,7 @@ mod switching_tests {
             )),
             pending: Arc::new(AtomicBool::new(false)),
             pending_refresh: Arc::new(AtomicBool::new(false)),
+            pending_layout: Arc::new(Mutex::new(None)),
             sync_deferred_since: Arc::new(Mutex::new(None)),
         }
     }
@@ -8378,6 +8632,497 @@ mod switching_tests {
                 aplexer::screen::DEFAULT_TERMINAL_ROWS,
                 aplexer::screen::DEFAULT_TERMINAL_COLS,
             ))
+        );
+    }
+
+    // -- Issue #14: the resize path is a client-originated writer too ------
+    //
+    // `2db19d0` put the escape-boundary gate inside `draw_status_bar`, which
+    // covered its eight callers and silently did not cover
+    // `apply_terminal_layout` -- a ninth writer, driven by the resize
+    // poller's wall clock, that wrote DECSTBM straight to stdout. Nothing
+    // failed; a reviewer found it by reading. These tests are what fails
+    // instead, and the last one is what fails for writer eleven.
+
+    /// Runs the real resize path into a buffer instead of fd 1. Nothing here
+    /// re-implements production's decision -- `apply_terminal_layout_to` is
+    /// what `apply_terminal_layout` calls under the stdout lock -- and
+    /// keeping the process's fd 1 out of it means these tests neither
+    /// serialize on `FD1_GUARD` nor can catch another thread's stray write.
+    fn resize_capturing(ctx: &StatusBarCtx, rows: u16, cols: u16) -> (bool, Vec<u8>) {
+        let mut sink = Vec::new();
+        let wrote = apply_terminal_layout_to(&mut sink, ctx, rows, cols);
+        assert_eq!(
+            wrote,
+            !sink.is_empty(),
+            "the resize path's return value must agree with what it actually wrote"
+        );
+        (wrote, sink)
+    }
+
+    fn flush_capturing(ctx: &StatusBarCtx) -> (bool, Vec<u8>) {
+        let mut sink = Vec::new();
+        let wrote = flush_pending_layout_to(&mut sink, ctx);
+        (wrote, sink)
+    }
+
+    /// Backdates the parked resize's deadline, standing in for
+    /// `LAYOUT_DEFER_LIMIT` having elapsed without the stream ever reaching
+    /// a boundary -- a workload that stopped mid-escape-sequence.
+    fn expire_layout_deferral(ctx: &StatusBarCtx) {
+        let mut pending = ctx
+            .pending_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = pending.as_mut() {
+            p.since = Instant::now()
+                .checked_sub(LAYOUT_DEFER_LIMIT * 2)
+                .expect("backdate the layout deadline");
+        }
+    }
+
+    /// A resize raised while the workload is mid-escape-sequence must put
+    /// nothing on the wire. This is the splice the issue describes: the host
+    /// terminal would abandon the workload's half-emitted CSI and print its
+    /// remaining parameter bytes as literal text.
+    ///
+    /// The geometry is still recorded on the spot, deliberately: the
+    /// physical terminal has already changed size, and `TermGeom` is
+    /// internal state rather than output, so the status bar must start
+    /// targeting the real last row immediately.
+    #[test]
+    fn resize_mid_escape_sequence_defers_decstbm_instead_of_splicing() {
+        let ctx = status_ctx_for_test(true);
+
+        // Control: at a boundary the same call writes, so a later "nothing
+        // was written" assertion means the gate, not a broken fixture.
+        let (wrote, bytes) = resize_capturing(&ctx, 24, 80);
+        assert!(wrote, "a resize at an escape boundary must be written");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[1;23r"),
+            "expected the row reservation for a 24-row terminal, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            ctx.pending_layout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "a resize that was written must leave nothing parked"
+        );
+
+        // Now mid-CSI, exactly as a PTY read boundary leaves the stream
+        // about half the time under a streaming TUI.
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+        assert!(
+            !ctx.screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .at_escape_boundary(),
+            "the fixture must actually be mid-sequence for this test to mean anything"
+        );
+        let (wrote, bytes) = resize_capturing(&ctx, 30, 100);
+        assert!(!wrote, "a resize raised mid-sequence must not be written");
+        assert!(
+            bytes.is_empty(),
+            "nothing may reach the terminal mid-sequence, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let parked = *ctx
+            .pending_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let parked = parked.expect("a deferred resize must be parked, not dropped");
+        assert_eq!((parked.rows, parked.cols), (30, 100));
+        let geom = *ctx.term.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            (geom.rows, geom.cols),
+            (30, 100),
+            "the new physical geometry must be recorded even while the bytes wait"
+        );
+    }
+
+    /// Deferral is not dropping. The parked resize must reach the terminal
+    /// at the next boundary -- and must carry the *latest* geometry, since a
+    /// superseded size would leave the workload rendering at the wrong
+    /// geometry just as surely as dropping it would.
+    #[test]
+    fn deferred_resize_is_delivered_at_the_next_boundary_with_the_latest_geometry() {
+        let ctx = status_ctx_for_test(true);
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+
+        assert!(!resize_capturing(&ctx, 28, 80).0);
+        // A second resize while the first is still parked: the user kept
+        // dragging the window edge.
+        assert!(!resize_capturing(&ctx, 32, 100).0);
+        let (wrote, bytes) = flush_capturing(&ctx);
+        assert!(
+            !wrote && bytes.is_empty(),
+            "a flush while still mid-sequence must stay silent, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // The workload completes its sequence: the stream is at a boundary
+        // again, which is exactly what the frame loop's flush waits for.
+        feed_test_screen(&ctx.screen, b"91m");
+        let (wrote, bytes) = flush_capturing(&ctx);
+        assert!(wrote, "the deferred resize must be delivered, not dropped");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            text.contains("\x1b[1;31r"),
+            "the latest geometry (32 rows -> DECSTBM 1;31) must be the one delivered, got {text:?}"
+        );
+        assert!(
+            !text.contains("\x1b[1;27r"),
+            "a superseded deferred resize must not be the one delivered, got {text:?}"
+        );
+        assert!(
+            ctx.pending_layout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "a delivered resize must clear the parking slot"
+        );
+        // Idempotent: nothing parked, nothing written.
+        let (wrote, bytes) = flush_capturing(&ctx);
+        assert!(
+            !wrote && bytes.is_empty(),
+            "flushing with nothing parked must be a no-op, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// The one case the boundary gate cannot wait out: a workload that stops
+    /// emitting part-way through an escape sequence. There is no next
+    /// boundary, so `LAYOUT_DEFER_LIMIT` writes anyway -- one spliced frame
+    /// beats a host terminal left scrolling the old geometry for the rest of
+    /// the attach, which is the failure the issue calls worse than the
+    /// splice. This asserts the exemption rather than describing it.
+    #[test]
+    fn deferred_resize_is_written_once_the_defer_limit_expires() {
+        let ctx = status_ctx_for_test(true);
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+        assert!(!resize_capturing(&ctx, 20, 80).0);
+
+        expire_layout_deferral(&ctx);
+        assert!(
+            !ctx.screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .at_escape_boundary(),
+            "the stream must still be mid-sequence: the point is that the deadline, \
+             not a recovered boundary, is what delivers this"
+        );
+        let (wrote, bytes) = flush_capturing(&ctx);
+        assert!(
+            wrote,
+            "past LAYOUT_DEFER_LIMIT the resize must go out rather than be stranded"
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[1;19r"),
+            "expected the row reservation for a 20-row terminal, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            ctx.pending_layout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the deadline write must also clear the parking slot"
+        );
+    }
+
+    /// The screen-level statement of the same thing, through a real `vt100`
+    /// host terminal: after a resize raised in the middle of a workload's
+    /// absolute-positioning sequence, every row the workload can reach must
+    /// still render exactly what the workload drew.
+    ///
+    /// The second half is the control. It replays the identical resize the
+    /// *ungated* code would have written at the same offset, and asserts the
+    /// host screen is then wrong -- so this test fails if the gate is
+    /// removed, rather than passing because the splice happened to be
+    /// harmless.
+    #[test]
+    fn resize_across_a_mid_sequence_split_leaves_the_host_screen_intact() {
+        let ctx = status_ctx_for_test(true);
+        let (rows, cols) = (24u16, 80u16);
+        let mut host = vt100::Parser::new(rows, cols, 0);
+        let mut ungated = vt100::Parser::new(rows, cols, 0);
+        let mut workload = vt100::Parser::new(rows - 1, cols, 0);
+        for p in [&mut host, &mut ungated] {
+            p.process(format!("\x1b[1;{}r", rows - 1).as_bytes());
+        }
+
+        // Ink-shaped output: words painted at absolute columns, which is
+        // what makes a misaligned injection weld two frames onto one row.
+        let frame = b"\x1b[2;1H\x1b[0m\x1b[2GQuick\x1b[8Gsafety\x1b[16Gcheck";
+        // Split inside `\x1b[16G` -- a CSI with its parameters half emitted,
+        // which is what a PTY read boundary looks like about half the time
+        // under a streaming TUI.
+        let split = frame.len() - 7;
+        for p in [&mut host, &mut ungated] {
+            p.process(&frame[..split]);
+        }
+        workload.process(&frame[..split]);
+        feed_test_screen(&ctx.screen, &frame[..split]);
+
+        // What the resize poller does at this instant.
+        let (wrote, _) = resize_capturing(&ctx, 20, cols);
+        assert!(!wrote, "the resize must be deferred here, not written");
+        // What it used to do: DECSTBM straight onto the wire, mid-CSI.
+        let restore = ctx
+            .screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursor_restore();
+        ungated.process(&terminal_layout_sequence(20, &restore));
+
+        for p in [&mut host, &mut ungated] {
+            p.process(&frame[split..]);
+        }
+        workload.process(&frame[split..]);
+        feed_test_screen(&ctx.screen, &frame[split..]);
+        let (wrote, bytes) = flush_capturing(&ctx);
+        assert!(wrote, "the deferred resize must still be delivered");
+        host.process(&bytes);
+
+        let row_of = |p: &vt100::Parser| p.screen().contents_between(1, 0, 1, cols);
+        assert_eq!(
+            row_of(&host),
+            row_of(&workload),
+            "the gated resize must leave the host row exactly as the workload drew it"
+        );
+        assert_ne!(
+            row_of(&ungated),
+            row_of(&workload),
+            "control: the ungated resize must actually corrupt this row, otherwise \
+             this test would pass with the gate removed"
+        );
+    }
+
+    // -- The structural guard --------------------------------------------
+    //
+    // Issue #14 was a missed *caller*, not a subtle race, and the next one
+    // will be too: someone adds a writer, does not know the gate exists,
+    // and no test notices. So the rule is enforced over the source text --
+    // every function in this file that can put bytes on the host terminal
+    // is enumerated here, with how it is allowed to do so.
+
+    /// Every function in src/bin/a.rs, outside this test module, that calls
+    /// `write_all` -- i.e. that reaches the terminal without going through
+    /// the funnel -- and the reason it is allowed to. A new one fails
+    /// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`.
+    const RAW_TERMINAL_WRITERS: &[(&str, &str)] = &[
+        (
+            "write_client_locked",
+            "the gate itself: it performs the boundary check it is named for",
+        ),
+        (
+            "write_locked",
+            "attach start and detach only, pinned by WRITE_LOCKED_CALLERS below -- there is \
+             no relayed stream to splice before the first workload byte or after the last, \
+             and neither may be deferrable",
+        ),
+        (
+            "relay_to_terminal",
+            "relays the workload's own bytes; it *is* the stream, not an injection",
+        ),
+        (
+            "feed_and_write",
+            "the attach snapshot and a switch's replayed screen: a full repaint that replaces \
+             the stream rather than splicing into it, fed to the model under the same lock",
+        ),
+        (
+            "cmd_capture",
+            "`a capture` on a plain stdout; no attach, no relayed stream",
+        ),
+    ];
+
+    /// Every client-originated injection into a live relayed stream. Each
+    /// goes through `write_client_locked`, so each is boundary-gated by
+    /// construction rather than by remembering. Listed so the census is
+    /// visible: `apply_terminal_layout` was the ninth writer that nobody had
+    /// written down (issue #14).
+    const FUNNELLED_WRITERS: &[&str] = &[
+        "apply_terminal_layout_to",
+        "draw_status_bar",
+        "redraw_live_screen",
+    ];
+
+    /// `write_locked` writes unconditionally, so it is a second route to the
+    /// terminal and would be a hole in the funnel if it could be called from
+    /// anywhere. These are the only two places allowed to.
+    const WRITE_LOCKED_CALLERS: &[&str] = &["attach", "reset_terminal"];
+
+    /// This file's source with the test module cut out. Compiled in, so it
+    /// is the same text the rest of the binary was built from.
+    fn production_source_lines() -> Vec<&'static str> {
+        let src = include_str!("a.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("mod switching_tests {"))
+            .expect("src/bin/a.rs must contain the switching_tests module");
+        let end = start
+            + 1
+            + lines[start + 1..]
+                .iter()
+                .position(|l| *l == "}")
+                .expect("the test module must close at column 0");
+        let mut production = lines[..start].to_vec();
+        production.extend_from_slice(&lines[end + 1..]);
+        production
+    }
+
+    /// Maps each line matching `needle` to the name of the nearest
+    /// preceding `fn` declaration. Comment lines are skipped so a doc
+    /// comment mentioning a call is not mistaken for one.
+    fn enclosing_fns_of(lines: &[&str], needle: &str) -> Vec<(String, String)> {
+        let mut current = String::new();
+        let mut hits = Vec::new();
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for prefix in ["fn ", "pub fn ", "pub(crate) fn ", "unsafe fn "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    current = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    break;
+                }
+            }
+            if trimmed.contains(needle) {
+                hits.push((current.clone(), trimmed.to_string()));
+            }
+        }
+        hits
+    }
+
+    /// The body of a top-level `fn`, from its declaration to the `}` that
+    /// closes it at column 0.
+    fn top_level_fn_body(lines: &[&str], name: &str) -> String {
+        let decl = format!("fn {name}(");
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(&decl))
+            .unwrap_or_else(|| panic!("no top-level `fn {name}` in src/bin/a.rs"));
+        let end = start
+            + 1
+            + lines[start + 1..]
+                .iter()
+                .position(|l| *l == "}")
+                .unwrap_or_else(|| panic!("`fn {name}` is not closed at column 0"));
+        lines[start..=end].join("\n")
+    }
+
+    /// The criterion the issue calls the most valuable one: a *new* ungated
+    /// writer fails here, instead of shipping and being found by a reviewer
+    /// reading the file (which is how #14 was found, after #5 declared the
+    /// class fixed).
+    ///
+    /// Four things are pinned:
+    ///
+    /// 1. the exact set of functions that can write to the terminal;
+    /// 2. that each one either goes through `write_client_locked` or carries
+    ///    a written reason why it is not an injection;
+    /// 3. that `write_client_locked` really is the boundary check, and that
+    ///    `write_locked` -- the unconditional second route -- is reachable
+    ///    only from attach start and detach;
+    /// 4. that the deadline exemption stays a single call site.
+    #[test]
+    fn every_client_terminal_write_site_is_gated_or_explicitly_exempt() {
+        use std::collections::BTreeSet;
+
+        let lines = production_source_lines();
+
+        // 1. Nobody new may reach `write_all` directly.
+        let raw: BTreeSet<String> = enclosing_fns_of(&lines, "write_all")
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        let declared_raw: BTreeSet<String> = RAW_TERMINAL_WRITERS
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        let undeclared: Vec<&String> = raw.difference(&declared_raw).collect();
+        assert!(
+            undeclared.is_empty(),
+            "new raw write(s) to the host terminal, not listed in RAW_TERMINAL_WRITERS: \
+             {undeclared:?}. Client-originated bytes must go through `write_client_locked` \
+             (the escape-boundary gate) instead; if the write genuinely cannot splice a \
+             relayed stream, add it to RAW_TERMINAL_WRITERS with that reason. This is issue \
+             #14: an ungated writer corrupts a workload's half-emitted escape sequences."
+        );
+        let stale: Vec<&String> = declared_raw.difference(&raw).collect();
+        assert!(
+            stale.is_empty(),
+            "RAW_TERMINAL_WRITERS lists function(s) that no longer call write_all: {stale:?}. \
+             Drop them, so the list stays an accurate census rather than folklore."
+        );
+
+        // 2. The injection census: gated by construction, but written down,
+        //    because #14 was a writer nobody had written down.
+        let funnelled: BTreeSet<String> = enclosing_fns_of(&lines, "write_client_locked(")
+            .into_iter()
+            .map(|(f, _)| f)
+            .filter(|f| f != "write_client_locked")
+            .collect();
+        let declared_funnelled: BTreeSet<String> =
+            FUNNELLED_WRITERS.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(
+            funnelled, declared_funnelled,
+            "the set of client-originated injections changed. A new one is already \
+             boundary-gated (that is what `write_client_locked` is for) -- add its name to \
+             FUNNELLED_WRITERS so the census stays true, and check that it parks a refused \
+             write for a later boundary instead of dropping it."
+        );
+        for name in FUNNELLED_WRITERS {
+            let body = top_level_fn_body(&lines, name);
+            assert!(
+                body.contains("write_client_locked("),
+                "`{name}` no longer goes through `write_client_locked`, so its bytes are not \
+                 boundary-gated (issue #14)"
+            );
+        }
+
+        let gate = top_level_fn_body(&lines, "write_client_locked");
+        assert!(
+            gate.contains("at_escape_boundary()"),
+            "`write_client_locked` must be the escape-boundary check; every Funnelled writer \
+             above relies on it being one"
+        );
+
+        let raw_callers: Vec<String> = enclosing_fns_of(&lines, "write_locked(")
+            .into_iter()
+            .map(|(f, _)| f)
+            .filter(|f| f != "write_locked" && f != "write_client_locked")
+            .collect();
+        for caller in &raw_callers {
+            assert!(
+                WRITE_LOCKED_CALLERS.contains(&caller.as_str()),
+                "`{caller}` calls `write_locked`, which writes without consulting the escape \
+                 boundary. Only attach start and detach may (there is no relayed stream to \
+                 splice at either); a live injection must use `write_client_locked`."
+            );
+        }
+
+        let past_deadline: Vec<(String, String)> =
+            enclosing_fns_of(&lines, "BoundaryPolicy::PastDeadline")
+                .into_iter()
+                .filter(|(f, _)| f != "write_client_locked")
+                .collect();
+        assert_eq!(
+            past_deadline.len(),
+            1,
+            "`BoundaryPolicy::PastDeadline` is the client's only exemption from the boundary \
+             gate and must stay one narrow call site (the resize deadline), found: {past_deadline:?}"
+        );
+        assert_eq!(
+            past_deadline[0].0, "apply_terminal_layout_to",
+            "the deadline exemption belongs to the resize path and nothing else"
         );
     }
 }
