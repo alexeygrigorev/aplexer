@@ -140,7 +140,7 @@ impl Harness {
     fn wait_until_record_gone(&self, id: &str, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if !self.state_session(id).exists() {
+            if !self.state_session(id).exists() && !self.runtime_session(id).exists() {
                 return true;
             }
             thread::sleep(Duration::from_millis(25));
@@ -188,12 +188,9 @@ fn kill_removes_record_runtime_dir_and_listing() {
 
     assert!(
         harness.wait_until_record_gone(&id, Duration::from_secs(10)),
-        "durable state dir still present after kill: {}",
-        harness.state_session(&id).display()
-    );
-    assert!(
-        !harness.runtime_session(&id).exists(),
-        "runtime dir still present after kill"
+        "state or runtime dir still present after kill: state={} runtime={}",
+        harness.state_session(&id).display(),
+        harness.runtime_session(&id).display()
     );
     assert!(
         !harness.list_ids().contains(&id),

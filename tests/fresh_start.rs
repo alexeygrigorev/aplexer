@@ -16,7 +16,9 @@
 //! Harness style follows tests/reclaim_zombie_tag.rs (direct CLI, real
 //! sessions, real signals).
 
+use aplexer::{atomic_write_json, ExitInfo, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -24,6 +26,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime: TempDir,
@@ -255,58 +258,63 @@ fn fresh_start_never_touches_the_live_holder_it_skips() {
 /// requested tag is reclaimable, so the exact name is taken (reclaimed)
 /// rather than skipped to a suffix -- the same verdict plain `start` applies.
 ///
-/// The holder's record is rewritten into its real dead shape (no live pids)
-/// rather than waited for: a worker that exits on its own may linger as an
-/// unreaped zombie when the suite runs nested inside another aplexer worker
-/// (the subreaper that adopts it does not reap promptly), which would make
-/// "wait for worker_alive false" an environment property instead of a test
-/// one. Everything else about the record is real.
+/// Clean natural exits now delete their record, so this plants a finished
+/// leftover (the shape Failed/OOM still keep) instead of waiting for
+/// `/bin/true` to linger.
 #[test]
 fn fresh_start_reclaims_a_dead_holder_under_its_exact_name() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");
-    let corpse = harness.json(&[
-        "--json",
-        "start",
-        "--workspace",
-        workspace.path().to_str().expect("UTF-8 workspace"),
-        "--tag",
-        "main",
-        "--",
-        "/bin/true",
-    ]);
-
-    // Wait for the workload's exit to be durably recorded (workload long
-    // gone by then), then drop the worker pids the zombie may still hold.
-    let id = corpse["id"].as_str().expect("session id").to_string();
-    let record_path = harness
-        .state
+    let paths = Paths {
+        runtime_root: harness.runtime.path().to_path_buf(),
+        state_root: harness.state.path().to_path_buf(),
+        config_file: harness.config.clone(),
+    };
+    paths.ensure().unwrap();
+    let id = Uuid::now_v7();
+    let workspace_path = workspace
         .path()
-        .join("sessions")
-        .join(&id)
-        .join("session.json");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the /bin/true session never recorded its exit"
-        );
-        if let Ok(bytes) = std::fs::read(&record_path) {
-            if let Ok(record) = serde_json::from_slice::<Value>(&bytes) {
-                if record["exit"].is_object() && record["containment_empty"] == true {
-                    break;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let mut record: Value =
-        serde_json::from_slice(&std::fs::read(&record_path).expect("read record for rewrite"))
-            .expect("parse record for rewrite");
-    record["worker_pid"] = Value::Null;
-    record["workload_pid"] = Value::Null;
-    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap())
-        .expect("write rewritten record");
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.path().to_path_buf());
+    let record = SessionRecord {
+        parent_session: None,
+        schema_version: SCHEMA_VERSION,
+        id,
+        workspace: workspace_path,
+        tag: "main".into(),
+        engine: "shell".into(),
+        profile: None,
+        command: vec!["/bin/true".into()],
+        cwd: workspace.path().to_path_buf(),
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        limits: Limits::default(),
+        history_bytes: 4096,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_activity_ms: None,
+        last_accessed_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
+        phase: Phase::Exited,
+        worker_pid: None,
+        workload_pid: None,
+        containment_cgroup: None,
+        containment_cgroup_identity: None,
+        containment_empty: Some(true),
+        socket_path: paths.socket(id),
+        history_path: paths.history(id),
+        exit: Some(ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 1,
+        }),
+        error: None,
+    };
+    std::fs::create_dir_all(paths.state_session(id)).unwrap();
+    std::fs::write(&record.history_path, b"").unwrap();
+    atomic_write_json(&paths.record(id), &record).unwrap();
 
     let fresh = harness.start(&workspace, "main", &["--fresh"]);
     let _cleanup = cleanup_handles(std::slice::from_ref(&fresh));
@@ -316,11 +324,12 @@ fn fresh_start_reclaims_a_dead_holder_under_its_exact_name() {
         fresh
     );
     assert_ne!(
-        fresh["id"], corpse["id"],
+        fresh["id"],
+        id.to_string(),
         "the reclaimed session kept the corpse's identity"
     );
     assert!(
-        !harness.state.path().join("sessions").join(&id).exists(),
+        !harness.state.path().join("sessions").join(id.to_string()).exists(),
         "the reclaim left the predecessor's durable state behind"
     );
 }

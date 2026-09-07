@@ -41,8 +41,9 @@ iteration; `list` runs with `--scale` sessions present.
 | send | `send-keys … Enter` | `send --enter-delay-ms 0` | `a send --enter` | one line, no attach |
 | capture | `capture-pane -p` | — (no capture cmd; it's a plain tmux server) | `a capture`, `a capture --screen --plain` | read back idle output |
 | roundtrip | send + poll `capture-pane` | — | send + poll `a capture` | unique marker → visible; includes shell scheduling |
-| kill | `kill-session` | `kill --yes` | `a kill` (default grace **and** `--grace-ms 0`) | session pre-created; default `a kill` waits `--grace-ms 2000` by design |
+| kill | `kill-session` | `kill --yes` | `a kill` (default grace **and** `--grace-ms 0`) | session pre-created; default `a kill` is HUP-first with `--grace-ms 2000` (interactive shells ignore TERM, so TERM-first always ate the full grace -- PLAN P0.1); the `grace-0` row is the mechanism cost comparable to `kill-session` |
 | attach | `attach` under a pty, `C-b d` chord, wait exit | — (execs tmux attach; raw numbers apply) | `a attach` under a pty, `C-b d`, wait exit | full cycle; banner/client-render asserted, rc checked |
+| switch | `display-message` alternating A/B | `describe` alternating A/B | `a status` alternating A/B | PLAN P2.2 chord-to-first-byte proxy (resolve + handshake); budget 20 ms, over-budget p50 is a WARNING not a failure |
 | heavy | same attach/capture ops | same via dedicated socket | `a attach` (screen + `--history-bytes 32768`), `a capture` (full + screen) | sessions flooded with `--heavy-mb` (default 4) MiB of ANSI-heavy output first; scrollback parity enforced (see quirks) |
 
 `attach` breaks the wait as soon as the client is demonstrably live
@@ -61,9 +62,14 @@ iteration; `list` runs with `--scale` sessions present.
   drops window 0.
 - **`TERM` is forced to `xterm-256color`**: tmux clients refuse to attach
   on `TERM=dumb`.
-- **`a kill` default includes ~2s of intentional waiting** (TERM, wait
-  `--grace-ms`, escalate). The `grace-0` row is the mechanism cost
-  comparable to `kill-session`.
+- **`a kill` default includes ~2s of intentional waiting** (HUP, wait
+  `--grace-ms`, escalate to KILL). The `grace-0` row is the mechanism cost
+  comparable to `kill-session`. Default used to be TERM-first; interactive
+  shells started by `a start` (`bash -l` on a PTY) legitimately ignore
+  SIGTERM, so every default kill ate the full grace and escalated (PLAN
+  P0.1). HUP is the session-hangup signal and kills both shells and
+  typical agents; pass `--signal TERM` explicitly for a TERM-first
+  shutdown.
 - **tmuxctl `send` defaults to a 200ms enter delay**; the harness passes
   `--enter-delay-ms 0`.
 
@@ -77,3 +83,18 @@ p50 is the headline, p90/max show the tail.
 
 `PLAN.md` is the benchmark-driven improvement plan from the latest
 baseline.
+
+## CI shape (PLAN P2.3)
+
+- `--quick` is the smoke shape: same harness, fewer iterations
+  (`--iters 8 --scale 10`), exits non-zero on any op failure. Suitable for
+  CI as a correctness smoke test, not a latency gate -- absolute numbers
+  move ±2x run to run on a loaded box, so CI must never assert on
+  milliseconds.
+- Full runs (`--json-out results-<date>.json`, default iters/scale, plus
+  `--scale 100` for the spec §30 "dozens of sessions" check with
+  `scale/a-worker-rss` in the JSON) stay manual; results are checked in
+  dated next to this file. Compare ratios across runs (p50/p90), not
+  absolutes.
+- The 20 ms chord-to-first-byte budget (switch proxy + attach upper bound)
+  is a report-time WARNING, never a CI failure, for the same noise reason.

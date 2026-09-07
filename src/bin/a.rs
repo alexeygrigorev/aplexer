@@ -1366,6 +1366,19 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     if args.running {
         records.retain(|r| r.worker_phase_active() && r.worker_alive());
     }
+    // Liveness is probed once per record here and reused for the workspace
+    // header (`running_count`/`running_summary`) and every row below.
+    // Benchmark PLAN P1.1: the old code called `worker_alive()` three times
+    // per record (header count + header summary which recounts + row), and
+    // each probe reads /proc, the identity sidecar, and (now cached) boot_id
+    // -- with 25 sessions that triple-probe was the ~7 ms table-over-json
+    // gap, since `--json` probes once. The map below makes plain rendering
+    // probe exactly once per record.
+    let alive: BTreeMap<Uuid, bool> = records
+        .iter()
+        .map(|r| (r.id, r.worker_alive()))
+        .collect();
+    let alive_of = |r: &SessionRecord| alive.get(&r.id).copied().unwrap_or(false);
     // Group by workspace as a compact tree -- spec.md's own presentation of
     // the model (sections 2 and 22.1) is a workspace tree with tags
     // underneath, not a flat table repeating the workspace on every row.
@@ -1381,7 +1394,7 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
         if workspace_index > 0 {
             println!();
         }
-        let (running, total) = running_count(group);
+        let (running, total) = running_count(group, &alive);
         let (dot, dot_color) = workspace_glyph(running, total);
         let badge = paint(
             color,
@@ -1396,7 +1409,7 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
         let summary = paint(
             color,
             dot_color,
-            &format!("{dot} {}", running_summary(group)),
+            &format!("{dot} {}", running_summary(group, &alive)),
         );
         println!("{badge} {name} ({summary})");
         let last = group.len().saturating_sub(1);
@@ -1414,7 +1427,7 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
                 None => r.engine.clone(),
             };
             let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
-            let state = observed_state(&r.phase, r.worker_alive());
+            let state = observed_state(&r.phase, alive_of(r));
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));
             println!("{connector} {idx}  {tag} {ep} {state}");
@@ -1683,16 +1696,18 @@ fn display_workspace(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-fn running_count(group: &[SessionRecord]) -> (usize, usize) {
+fn running_count(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> (usize, usize) {
     let running = group
         .iter()
-        .filter(|r| observed_state(&r.phase, r.worker_alive()) == "running")
+        .filter(|r| {
+            observed_state(&r.phase, alive.get(&r.id).copied().unwrap_or(false)) == "running"
+        })
         .count();
     (running, group.len())
 }
 
-fn running_summary(group: &[SessionRecord]) -> String {
-    let (running, total) = running_count(group);
+fn running_summary(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> String {
+    let (running, total) = running_count(group, alive);
     if running == total {
         format!("running {running}")
     } else if running == 0 {
@@ -2747,11 +2762,15 @@ enum KillRecordOutcome {
 /// into a persist-error retry loop -- so this observes instead of acting.
 fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
     let deadline = Instant::now() + KILL_RECORD_REMOVAL_WAIT;
+    // Polled at 5 ms, not 25 ms: the worker's fast-path finalization for an
+    // accepted kill (benchmark PLAN P0.2) removes the record in tens of
+    // milliseconds, so a 25 ms quantum here is a large fraction of the whole
+    // `a kill` latency. Short-lived and infrequent -- one wait per kill.
     while Instant::now() < deadline {
         if !paths.record(id).exists() {
             return KillRecordOutcome::Removed;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(5));
     }
     match read_record(&paths.record(id)) {
         Ok(record) if record.worker_alive() => KillRecordOutcome::Pending,
@@ -2781,13 +2800,20 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     );
     if let Err(error) = rpc {
         let worker_alive = record.worker_alive();
-        // Only a missing socket file proves an alive worker is unreachable.
-        // A mere RPC failure can be transient, so it still returns below.
+        // A missing socket file, or a leftover socket with no listener
+        // (SIGKILL leaves the file; connect then fails with
+        // ConnectionRefused), proves an "alive" pid is unreachable. A
+        // mere RPC timeout/reset can be transient, so those still return.
         let socket_missing = worker_alive && !record.socket_path.exists();
-        if worker_alive && !socket_missing {
+        let stale_socket = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|cause| cause.kind() == io::ErrorKind::ConnectionRefused)
+        });
+        if worker_alive && !socket_missing && !stale_socket {
             return Err(error);
         }
-        if socket_missing {
+        if socket_missing || stale_socket {
             preflight_broken_containment_recovery(&record)?;
             force_kill_stale_worker(&record)?;
             if record.containment_proven_empty() {
@@ -6455,9 +6481,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     if display_tty {
         let resize_writer = writer.clone();
         let resize_active = active.clone();
-        let resize_stdout = stdout.clone();
-        let resize_term = term.clone();
-        let resize_screen = workload_screen.clone();
+        let resize_ctx = status_ctx.clone();
         let resize_initial = initial_geometry;
         thread::spawn(move || {
             // Seeded with the geometry `attach()` already applied and already
@@ -6750,18 +6774,23 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // After restoration, so the message lands on a clean cooked
         // terminal: what happened to the session, not just that the client
         // came back -- "Detached" means it is still running, "Session
-        // ended" means the workload is gone and the record is worth
-        // inspecting.
+        // ended" means the workload is gone. A clean exit (including
+        // Ctrl-D) removes the record; only Failed/OOM leftovers remain to
+        // inspect.
         let current_record = shared_record
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if session_ended {
-            eprintln!(
-                "Session ended: {}. Inspect output with `a capture {} --screen --plain`.",
-                current_record.selector(),
-                &current_record.id.to_string()[..8]
-            );
+            if paths.record(current_record.id).exists() {
+                eprintln!(
+                    "Session ended: {}. Inspect output with `a capture {} --screen --plain`.",
+                    current_record.selector(),
+                    &current_record.id.to_string()[..8]
+                );
+            } else {
+                eprintln!("Session ended: {}.", current_record.selector());
+            }
         } else {
             eprintln!("Detached from {}.", current_record.selector());
         }

@@ -3,7 +3,7 @@
 //! process-wide.
 
 use aplexer::api::{start_session, StartRequest};
-use aplexer::{read_record, Cgroup, Limits, Paths, Phase};
+use aplexer::{Cgroup, Limits, Paths};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
@@ -127,15 +127,14 @@ fn exercise_successful_worker_reaping() {
     for ready in sessions {
         let worker_pid = ready.worker_pid.expect("ready worker pid");
         loop {
-            let record = read_record(&paths.record(ready.id)).expect("read final session record");
             let worker_reaped = !PathBuf::from(format!("/proc/{worker_pid}")).exists();
-            if matches!(record.phase, Phase::Exited | Phase::Failed) && worker_reaped {
+            let record_gone = !paths.record(ready.id).exists();
+            if record_gone && worker_reaped {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "completed in-process worker {worker_pid} remained as a child/zombie; phase={:?}",
-                record.phase
+                "completed in-process worker {worker_pid} remained as a child/zombie; record_gone={record_gone}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

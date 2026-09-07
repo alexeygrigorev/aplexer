@@ -256,7 +256,7 @@ fn capture<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     selector,
-    signal=libc::SIGTERM,
+    signal=libc::SIGHUP,
     grace_ms=2_000,
     state_dir=None,
     runtime_dir=None,

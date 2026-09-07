@@ -10,7 +10,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,8 +43,28 @@ enum OutputEvent {
 /// the backlog was negligible. A lagging client is still disconnected and
 /// can reattach for a fresh tail or screen snapshot, but only when its
 /// backlog is actually large.
+///
+/// Live-screen (`want_screen`) subscribers never take that eviction path in
+/// practice: once their backlog passes the coalescing threshold below, the
+/// queued backlog is replaced by a fresh screen snapshot -- the current
+/// screen, not a fast-forward replay -- so a client that went quiet (tab in
+/// the background, slow link, slept laptop) jumps straight to live instead
+/// of watching everything it missed at 10x speed. Raw-tail (`--history-bytes`)
+/// subscribers keep the old evict-and-reattach contract, since replacing
+/// their bytes with a repaint would break byte-exact consumers.
 const MAX_SUBSCRIBER_QUEUED_BYTES: usize = 1024 * 1024;
 const MAX_SUBSCRIBER_QUEUED_EVENTS: usize = 1024;
+/// When a live-screen subscriber falls this far behind, stop queuing raw PTY
+/// bytes for it and replace its backlog with the current screen snapshot
+/// instead. Must exceed one max-size PTY read (32 KiB) so a single large
+/// burst to a caught-up client still streams normally; 64 KiB is roughly two
+/// such reads -- a brief stall replays briefly, a sustained stall jumps to
+/// live. The event threshold sits halfway to the eviction cap so pathological
+/// tiny-write streams coalesce rather than disconnect; the ordinary
+/// dozens-of-small-reads TUI repaint (~200 events, ~40KB) stays well under
+/// both and still streams.
+const COALESCE_SUBSCRIBER_QUEUED_BYTES: usize = 64 * 1024;
+const COALESCE_SUBSCRIBER_QUEUED_EVENTS: usize = 512;
 const MAX_SUBSCRIBERS: usize = 64;
 /// Attach connections are long-lived, while ordinary RPCs are short-lived.
 /// Leave room above the subscriber ceiling for status/capture/kill calls,
@@ -58,6 +78,14 @@ const HISTORY_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Kill-path responsiveness (benchmark PLAN P0.2): the graceful-signal wait
+/// in `WorkerRuntime::kill` and the post-kill connection drain poll with
+/// `DESCENDANT_POLL_INTERVAL` (25 ms) by default, adding up to ~25 ms of
+/// quantization after the workload is already gone. The kill path is
+/// short-lived and infrequent (one RPC per session teardown), so poll it at
+/// 5 ms instead -- ~20 ms saved on every HUP/TERM kill without touching the
+/// steady-state lifecycle cadence.
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 type FileIdentity = (u64, u64);
 type RecoveredControlSocket = (UnixListener, FileIdentity, Option<FileLock>, FileIdentity);
@@ -359,9 +387,47 @@ impl SubscriberShared {
 
 struct SubscriberSender {
     shared: Arc<SubscriberShared>,
+    /// Whether this subscriber asked for the live screen (`AttachPayload::Screen`)
+    /// rather than a raw tail. Only screen subscribers are eligible for
+    /// backlog coalescing in `OutputHub::append`; tail subscribers keep the
+    /// evict-and-reattach contract so `--history-bytes` stays byte-exact.
+    want_screen: bool,
 }
 
 impl SubscriberSender {
+    fn backlog(&self) -> (usize, usize) {
+        let state = self.shared.poisoned_lock();
+        (state.queue.len(), state.queued_bytes)
+    }
+
+    /// Replace whatever this subscriber has queued with the current screen
+    /// snapshot plus a layout nudge so the client redraws its status bar
+    /// (the snapshot's own ED2 blanked the bar row). Returns false when the
+    /// receiver is gone and the subscriber should be dropped, true otherwise.
+    /// A pending terminal outcome is never disturbed -- it still wins once
+    /// the (now tiny) queue drains.
+    fn coalesce_to_snapshot(&self, snapshot: Vec<u8>) -> bool {
+        let mut state = self.shared.poisoned_lock();
+        if !state.receiver_alive {
+            return false;
+        }
+        if state.terminal.is_some() {
+            return true;
+        }
+        state.queue.clear();
+        state.queued_bytes = snapshot.len();
+        state.queue.push_back(OutputEvent::Data(snapshot));
+        state
+            .queue
+            .push_back(OutputEvent::Layout(screen::LayoutChange {
+                alt_screen: false,
+                margins_reset: false,
+                erase_reset: true,
+            }));
+        self.shared.cvar.notify_all();
+        true
+    }
+
     fn try_event(&self, event: OutputEvent) -> bool {
         let mut state = self.shared.poisoned_lock();
         if !state.receiver_alive {
@@ -488,13 +554,63 @@ impl OutputHub {
         // per-subscriber mpsc channel under the same lock hold, so a Layout
         // event always arrives after the Data frame that caused it (design
         // doc section 5.1).
-        inner
-            .subscribers
-            .retain(|_, subscriber| subscriber.try_event(OutputEvent::Data(data.to_vec())));
+        //
+        // A screen subscriber that fell behind does not get a fast-forward
+        // replay of everything it missed: its backlog is replaced by the
+        // current screen snapshot, which already includes this chunk (the
+        // model above processed it before the snapshot is rendered). Skipped
+        // bytes are not lost -- the history ring keeps them for `a capture`.
+        //
+        // The snapshot is rendered once, before the subscriber scan, so the
+        // retain closures below never borrow `inner` while `subscribers` is
+        // mutably borrowed.
+        let mut needs_coalesce = false;
+        for subscriber in inner.subscribers.values() {
+            if subscriber.want_screen {
+                let (queued_events, queued_bytes) = subscriber.backlog();
+                if queued_bytes.saturating_add(data.len()) > COALESCE_SUBSCRIBER_QUEUED_BYTES
+                    || queued_events >= COALESCE_SUBSCRIBER_QUEUED_EVENTS
+                {
+                    needs_coalesce = true;
+                    break;
+                }
+            }
+        }
+        let snapshot_cache: Option<Vec<u8>> = if needs_coalesce {
+            Some(inner.screen.snapshot())
+        } else {
+            None
+        };
+        // Ids coalesced on the Data phase skip the Layout phase below: the
+        // snapshot carries an erase nudge of its own, and the per-chunk
+        // Layout would just be a redundant extra event behind it.
+        let mut coalesced: Vec<u64> = Vec::new();
+        inner.subscribers.retain(|id, subscriber| {
+            if subscriber.want_screen {
+                let (queued_events, queued_bytes) = subscriber.backlog();
+                if queued_bytes.saturating_add(data.len()) > COALESCE_SUBSCRIBER_QUEUED_BYTES
+                    || queued_events >= COALESCE_SUBSCRIBER_QUEUED_EVENTS
+                {
+                    let snapshot = snapshot_cache
+                        .as_ref()
+                        .expect("snapshot rendered when any subscriber needs it")
+                        .clone();
+                    let kept = subscriber.coalesce_to_snapshot(snapshot);
+                    if kept {
+                        coalesced.push(*id);
+                    }
+                    return kept;
+                }
+            }
+            subscriber.try_event(OutputEvent::Data(data.to_vec()))
+        });
         if let Some(change) = layout {
-            inner
-                .subscribers
-                .retain(|_, subscriber| subscriber.try_event(OutputEvent::Layout(change)));
+            inner.subscribers.retain(|id, subscriber| {
+                if coalesced.contains(id) {
+                    return true;
+                }
+                subscriber.try_event(OutputEvent::Layout(change))
+            });
         }
         Ok(())
     }
@@ -561,6 +677,7 @@ impl OutputHub {
     }
     fn subscribe(&self, payload: AttachPayload) -> Result<(u64, Vec<u8>, OutputReceiver)> {
         let mut inner = lock(&self.inner)?;
+        let want_screen = matches!(payload, AttachPayload::Screen);
         let initial = match payload {
             AttachPayload::Screen => {
                 let data = inner.screen.snapshot();
@@ -587,6 +704,7 @@ impl OutputHub {
         });
         let subscriber = SubscriberSender {
             shared: Arc::clone(&shared),
+            want_screen,
         };
         let receiver = OutputReceiver { shared };
         if let Some(terminal) = inner.terminal.clone() {
@@ -619,6 +737,25 @@ impl OutputHub {
             if let Err(error) = fs::write(&self.screen_txt_path, inner.screen.contents()) {
                 eprintln!("aplexer worker: write screen.txt at exit: {error:#}");
             }
+            for (_, subscriber) in inner.subscribers.drain() {
+                subscriber.terminate(terminal.clone());
+            }
+        }
+    }
+    /// Terminate subscribers without any durable writes, for sessions the
+    /// worker is about to delete (benchmark PLAN P0.2): `run_lifecycle`
+    /// removes the whole state dir moments later, so `finish`'s history
+    /// `flush_final` (fsync) plus `screen.txt` write are fsync-and-delete
+    /// waste. The Exit event still reaches attached clients; only the
+    /// post-mortem files are skipped. Called only on the clean-and-proven
+    /// removal path (natural exit, Ctrl-D / shell EOF, or `a kill`); any
+    /// failure or OOM keeps the evidence via the regular `finish` path.
+    fn finish_killed(&self, exit: ExitInfo) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let terminal = inner
+                .terminal
+                .get_or_insert_with(|| OutputEvent::Exit(exit.clone()))
+                .clone();
             for (_, subscriber) in inner.subscribers.drain() {
                 subscriber.terminate(terminal.clone());
             }
@@ -722,6 +859,98 @@ mod tests {
             rx.recv().unwrap(),
             OutputEvent::Error(message) if message.contains("fell behind")
         ));
+    }
+
+    #[test]
+    fn screen_subscriber_coalesces_to_snapshot_instead_of_replaying() {
+        // The reported UX bug: a client whose screen went quiet (background
+        // tab, slow link, slept laptop) came back to a 10x fast-forward
+        // replay of everything it missed. A live-screen subscriber must jump
+        // straight to the current screen instead.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Screen).unwrap();
+
+        // Two max-size PTY reads fit under the coalescing threshold and
+        // stream; the third pushes the backlog past 64 KiB and coalesces.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..3 {
+            hub.append(&chunk).unwrap();
+        }
+
+        assert!(
+            !hub.inner.lock().unwrap().subscribers.is_empty(),
+            "a lagging screen subscriber must coalesce, not be evicted"
+        );
+        // The backlog was replaced: the first thing out is the live snapshot
+        // (which already includes all three chunks), followed by the layout
+        // nudge that redraws the status bar the snapshot's ED2 blanked --
+        // not two 32 KiB replays and not a "fell behind" error.
+        let first = rx.recv().unwrap();
+        let OutputEvent::Data(snapshot) = first else {
+            panic!("expected coalesced snapshot Data, got something else");
+        };
+        assert_eq!(snapshot, hub.screen_snapshot().unwrap());
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Layout(change) if change.erase_reset
+        ));
+    }
+
+    #[test]
+    fn screen_subscriber_coalesces_on_event_count_not_just_bytes() {
+        // A pathological stream of tiny writes would previously evict even a
+        // screen subscriber at 1024 queued events. It must coalesce instead
+        // and stay attached; the tail path keeps the old eviction contract
+        // (see event_cap_still_bounds_a_pathological_stream_of_tiny_writes).
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Screen).unwrap();
+
+        for _ in 0..=MAX_SUBSCRIBER_QUEUED_EVENTS {
+            hub.append(b"y").unwrap();
+        }
+
+        assert!(
+            !hub.inner.lock().unwrap().subscribers.is_empty(),
+            "screen subscriber must survive a tiny-write flood via coalescing"
+        );
+        let first = rx.recv().unwrap();
+        let OutputEvent::Data(snapshot) = first else {
+            panic!("expected coalesced snapshot Data");
+        };
+        // A raw 1-byte write never starts with ESC; a vt100 snapshot always
+        // does (attribute reset / clear). This distinguishes "jumped to live"
+        // from "replaying the 1-byte writes one by one".
+        assert!(
+            snapshot.first() == Some(&0x1b),
+            "first frame should be a snapshot repaint, got {} bytes starting with {:?}",
+            snapshot.len(),
+            snapshot.first()
+        );
+    }
+
+    #[test]
+    fn tail_subscriber_does_not_coalesce_small_backlog() {
+        // `--history-bytes` stays byte-exact: the same backlog that coalesces
+        // a screen subscriber must stream verbatim for a tail subscriber.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..3 {
+            hub.append(&chunk).unwrap();
+        }
+
+        assert!(!hub.inner.lock().unwrap().subscribers.is_empty());
+        for _ in 0..3 {
+            let event = rx.recv().unwrap();
+            let OutputEvent::Data(data) = event else {
+                panic!("tail subscriber must replay raw bytes, not a snapshot");
+            };
+            assert_eq!(data, chunk);
+        }
     }
 
     #[test]
@@ -1002,7 +1231,6 @@ mod tests {
             record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
-            kill_requested: AtomicBool::new(false),
         };
 
         assert!(runtime
@@ -1104,12 +1332,6 @@ struct WorkerRuntime {
     /// thread piggybacks on that same tick to persist this into
     /// `SessionRecord::last_activity_ms`, and only when it actually changed.
     last_activity_ms: AtomicU64,
-    /// Set when a `kill` RPC was accepted (the `Operation::Kill` arm): the
-    /// operator asked for this session to end, so the lifecycle finalization
-    /// removes the durable record instead of parking an `exited` row in
-    /// `a list`. A natural exit never sets it, which keeps post-mortem
-    /// capture/status for sessions that ended on their own.
-    kill_requested: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -1348,9 +1570,11 @@ impl WorkerRuntime {
         // is gone there is nothing to escalate to SIGKILL, and the response
         // to this request should not be delayed (the worker exits shortly
         // after the workload does, so a response stuck behind a long sleep
-        // could be lost entirely).
+        // could be lost entirely). Polled at KILL_POLL_INTERVAL (5 ms), not
+        // the 25 ms lifecycle cadence, so a workload that dies on the first
+        // signal does not pay a quantization delay (benchmark PLAN P0.2).
         while self.workload_populated()? && Instant::now() < grace_deadline {
-            thread::sleep(DESCENDANT_POLL_INTERVAL);
+            thread::sleep(KILL_POLL_INTERVAL);
         }
         if self.workload_populated()? {
             if let Some(cg) = &cgroup {
@@ -1892,11 +2116,21 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             startup.cgroup_setup_started = true;
         })?;
         startup.cgroup = cgroup.clone();
-        record.containment_cgroup = cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
-        record.containment_cgroup_identity =
-            cgroup.as_ref().map(|cgroup| cgroup.identity().clone());
-        startup.failure_record = record.clone();
-        atomic_write_json(&record_path, &record)?;
+        // Unlimited sessions (the common case: no memory/pids/cpu limits) have
+        // no cgroup, so this second record write would persist byte-identical
+        // containment fields plus a fresh timestamp -- a full fsync + parent
+        // fsync for no new information (benchmark PLAN P0.3). Skip the write
+        // and keep the already-persisted worker_pid record as the durable
+        // state; the in-memory failure record is still updated for rollback.
+        if cgroup.is_some() {
+            record.containment_cgroup = cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
+            record.containment_cgroup_identity =
+                cgroup.as_ref().map(|cgroup| cgroup.identity().clone());
+            startup.failure_record = record.clone();
+            atomic_write_json(&record_path, &record)?;
+        } else {
+            startup.failure_record = record.clone();
+        }
         startup_checkpoint("after_cgroup")?;
         let (master_read, slave) = open_pty(rows, cols)?;
         let master_write = master_read.try_clone()?;
@@ -1956,7 +2190,6 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
-            kill_requested: AtomicBool::new(false),
         });
         start_worker_threads(
             Arc::clone(&runtime),
@@ -2851,11 +3084,12 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     // Unlink the socket first so new clients fail fast and fall back to
     // the persisted record/history, then give in-flight connections
     // (the `kill` response, attach Exit events) a bounded window to
-    // drain before exiting the process.
+    // drain before exiting the process. Drained at the 5 ms kill cadence
+    // (benchmark PLAN P0.2), not the 25 ms lifecycle one.
     let _ = fs::remove_file(&runtime.socket_path);
     let drain_deadline = Instant::now() + Duration::from_secs(3);
     while runtime.active_connections.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(KILL_POLL_INTERVAL);
     }
     let _ = fs::remove_dir_all(&runtime.runtime_session_dir);
     std::process::exit(0);
@@ -2978,10 +3212,9 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
                 // Accepted before the response is written: from here the
                 // lifecycle finalization owns removing this session's
                 // durable record (see run_lifecycle), so `a kill` leaves
-                // nothing behind in `a list`. A failed kill never sets the
-                // flag -- the record stays as evidence for the client-side
-                // recovery paths.
-                runtime.kill_requested.store(true, Ordering::Relaxed);
+                // nothing behind in `a list`. A failed kill never reaches
+                // that path -- the record stays as evidence for the
+                // client-side recovery paths.
                 write_json(&mut stream, &Response::ok(id, json!({"signalled":true})))?
             }
             Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
@@ -3040,9 +3273,29 @@ fn handle_attach(
     // `a list --sort accessed`. A persist failure must not refuse the
     // attach; the next successful attach (or a later record write that
     // races this one) will stamp it.
-    let _ = runtime.update_record(|record| {
-        record.last_accessed_ms = Some(now_ms());
-    });
+    //
+    // Throttled to one durable write per minute per session (benchmark PLAN
+    // P1.2): the old code fsync'd the record on EVERY attach, putting a
+    // 5-20 ms fsync plus its variance directly on the attach handshake's
+    // critical path -- the p90 tail the benchmark flagged. Recency sorting
+    // only needs coarse granularity, so repeat attaches within the window
+    // skip the write entirely after the first stamps it.
+    {
+        let now = now_ms();
+        let stale = runtime
+            .record()
+            .map(|record| {
+                record
+                    .last_accessed_ms
+                    .is_none_or(|at| now.saturating_sub(at) >= 60_000)
+            })
+            .unwrap_or(true);
+        if stale {
+            let _ = runtime.update_record(|record| {
+                record.last_accessed_ms = Some(now);
+            });
+        }
+    }
     let _attach_guard = AttachGuard {
         runtime: runtime.clone(),
         client_id,

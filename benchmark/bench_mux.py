@@ -12,16 +12,30 @@ Ops measured (wall time around the CLI, perf_counter):
   create      detached session creation (unique name/tag per iteration)
   list        listing with --scale sessions already present
   status      single-session status/describe
+  switch      chord-to-first-byte proxy (PLAN P2.2): resolve the *other*
+              seeded session + status handshake, alternating A/B so no
+              lookup can hit a hot cache entry. Design budget is < 20 ms;
+              the report flags an over-budget aplexer p50 as a WARNING
+              (not a failure -- loaded-box noise is ±2x, see results doc).
+              In-process Ctrl-b n/p itself is resolve + attach handshake,
+              bounded above by the attach op.
   send        injecting one line without attaching
   capture     reading output back (raw; aplexer also --screen --plain)
   roundtrip   send a unique marker, poll capture until visible (user-visible
               input-to-output latency, includes shell scheduling)
   kill        destroying a session created just before timing starts
+              (default `a kill` is HUP-first since interactive shells
+              ignore TERM -- PLAN P0.1 -- plus a `--grace-ms 0` row for
+              the mechanism cost comparable to kill-session)
   attach      full attach+detach cycle under a pty:
                 tmux: attach, wait for client, detach-client, wait for exit
                 a:    attach, wait for banner, send Ctrl-], wait for exit
               (tmuxctl attach is interactive-only; it execs tmux attach, so
               raw-tmux attach numbers apply to it.)
+  scale       (implicit, PLAN P2.1) with --scale N>=25: per-worker RSS
+              (N workers/sockets/locks is the known daemonless cost) is
+              recorded as scale/worker-rss alongside the list/status rows.
+              Run --scale 100 for the spec §30 "dozens of sessions" check.
 
 Switching note: aplexer's in-process switch (docs/fast-session-switching-
 design.md) is resolve (list scan) + attach handshake. The attach op above
@@ -29,7 +43,12 @@ is its upper bound; the design target is chord-to-first-byte < 20ms.
 
 Usage:
   python3 benchmark/bench_mux.py [--quick] [--scale N] [--only create,list]
-                                 [--json-out results.json] [--keep]
+                                  [--json-out results.json] [--keep]
+
+  --scale 100 runs list/status/switch against 100 sessions and records
+  per-worker RSS (spec §30 scale check). --quick is the CI smoke shape:
+  it exits non-zero on any op failure; full runs stay manual with dated
+  results checked in (see README.md).
 
 Stdlib only.
 """
@@ -220,6 +239,55 @@ class Bench:
             p = self.a_create(tag)
             self.check(p.returncode == 0, f"seed a failed: {p.stderr[:300]!r}")
             self.a_tags.append(tag)
+        self.collect_scale_stats(scale)
+
+    def collect_scale_stats(self, scale):
+        """Record the daemonless scale cost (PLAN P2.1): N workers/sockets/
+        locks is the known price of no central server. Read worker PIDs
+        straight from the state dir (no RPC per session) and sum VmRSS
+        from /proc, so the measurement itself does not perturb timings."""
+        rss_kb = []
+        sessions_root = os.path.join(self.astate, "sessions")
+        try:
+            for entry in os.listdir(sessions_root):
+                rec_path = os.path.join(sessions_root, entry, "session.json")
+                try:
+                    with open(rec_path) as f:
+                        rec = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                pid = rec.get("worker_pid")
+                if not isinstance(pid, int):
+                    continue
+                try:
+                    with open(f"/proc/{pid}/status") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                rss_kb.append(int(line.split()[1]))
+                                break
+                except (OSError, ValueError, IndexError):
+                    continue
+        except OSError:
+            pass
+        # Runtime sockets/locks: one control socket + worker lock per live
+        # session, plus the registry lock.
+        runtime_files = 0
+        for _, _, files in os.walk(self.arun):
+            runtime_files += len(files)
+        stat = {
+            "sessions_seeded": scale,
+            "worker_count": len(rss_kb),
+            "worker_rss_kb_total": int(sum(rss_kb)),
+            "worker_rss_kb_mean": int(statistics.fmean(rss_kb)) if rss_kb else 0,
+            "worker_rss_kb_max": int(max(rss_kb)) if rss_kb else 0,
+            "runtime_files": runtime_files,
+        }
+        self.results["scale/a-worker-rss"] = stat
+        print(f"  scale: {stat['worker_count']} workers, "
+              f"RSS total={stat['worker_rss_kb_total'] // 1024} MiB "
+              f"mean={stat['worker_rss_kb_mean'] // 1024} MiB "
+              f"max={stat['worker_rss_kb_max'] // 1024} MiB "
+              f"runtime_files={runtime_files}", flush=True)
 
     # -- attach/detach under a pty ---------------------------------------
     def _spawn_pty(self, argv, env):
@@ -545,8 +613,48 @@ class Bench:
                          lambda: timed([A_BIN, "status", "--workspace", self.ws,
                                         "--tag", at], self.a_env), it)
             self.measure("status/a-status-json",
-                         lambda: timed([A_BIN, "--json", "status", "--workspace",
-                                        self.ws, "--tag", at], self.a_env), it)
+                          lambda: timed([A_BIN, "--json", "status", "--workspace",
+                                         self.ws, "--tag", at], self.a_env), it)
+
+        if self.selected("switch"):
+            # PLAN P2.2 chord-to-first-byte proxy: resolve the *other* seeded
+            # session + status handshake, alternating A/B so neither the
+            # registry scan nor the worker connection can sit hot. This is
+            # the resolve + handshake half of an in-process Ctrl-b n/p
+            # switch; the full attach handshake above remains its upper
+            # bound. Budget: 20 ms (design doc); over-budget aplexer p50 is
+            # reported as a WARNING, not a failure (see report()).
+            print("switch resolve+handshake proxy (alternating A/B):", flush=True)
+            tmux_a = self.tmux_names[0]
+            tmux_b = self.tmux_names[1] if len(self.tmux_names) > 1 else self.tmux_names[0]
+            tc_a = self.tc_names[0]
+            tc_b = self.tc_names[1] if len(self.tc_names) > 1 else self.tc_names[0]
+            a_a = self.a_tags[0]
+            a_b = self.a_tags[1] if len(self.a_tags) > 1 else self.a_tags[0]
+            flip = {"i": 0}
+
+            def fn_tmux_switch():
+                flip["i"] += 1
+                name = tmux_b if flip["i"] % 2 else tmux_a
+                return timed([TMUX_BIN, "-S", self.sock, "display-message",
+                              "-p", "-t", name, "-F",
+                              "#{session_name} #{session_created}"],
+                             self.raw_env)
+
+            def fn_tc_switch():
+                flip["i"] += 1
+                name = tc_b if flip["i"] % 2 else tc_a
+                return timed([TMUXCTL_BIN, "describe", name], self.tc_env)
+
+            def fn_a_switch():
+                flip["i"] += 1
+                tag = a_b if flip["i"] % 2 else a_a
+                return timed([A_BIN, "status", "--workspace", self.ws,
+                              "--tag", tag], self.a_env)
+
+            self.measure("switch/tmux-resolve-handshake", fn_tmux_switch, it)
+            self.measure("switch/tmuxctl-resolve-handshake", fn_tc_switch, it)
+            self.measure("switch/a-resolve-handshake", fn_a_switch, it)
 
         if self.selected("send"):
             print("send (one line, no attach):", flush=True)
@@ -765,6 +873,23 @@ class Bench:
             b = base.get(fam)
             rel = f"{v['p50'] / b:.2f}x" if b else "n/a (no tmux baseline)"
             print(f"  {k:<34} p50={v['p50']:7.1f} ms  vs-tmux={rel}")
+        # PLAN P2.2: 20 ms chord-to-first-byte budget. Attach is the upper
+        # bound for an in-process switch (resolve + handshake); the switch
+        # proxy above is the direct resolve + handshake number. Flag, don't
+        # fail: loaded-box noise is ±2x run to run.
+        for key, budget in (("switch/a-resolve-handshake", 20.0),
+                            ("attach/a-attach-detach", 20.0)):
+            v = stat_items.get(key)
+            if v and v["p50"] > budget:
+                print(f"  WARNING: {key} p50={v['p50']:.1f} ms exceeds "
+                      f"{budget:.0f} ms chord-to-first-byte budget")
+        rss = self.results.get("scale/a-worker-rss")
+        if isinstance(rss, dict):
+            print(f"\nscale: {rss.get('worker_count')} aplexer workers, "
+                  f"RSS total={rss.get('worker_rss_kb_total', 0) // 1024} MiB "
+                  f"mean={rss.get('worker_rss_kb_mean', 0) // 1024} MiB "
+                  f"max={rss.get('worker_rss_kb_max', 0) // 1024} MiB "
+                  f"runtime_files={rss.get('runtime_files')}")
 
 
 def main():
@@ -774,7 +899,7 @@ def main():
     ap.add_argument("--roundtrips", type=int, default=6)
     ap.add_argument("--attach-iters", type=int, default=5)
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--only", default="", help="comma list: create,list,status,send,capture,roundtrip,kill,attach,heavy")
+    ap.add_argument("--only", default="", help="comma list: create,list,status,switch,send,capture,roundtrip,kill,attach,heavy")
     ap.add_argument("--heavy-mb", type=int, default=4)
     ap.add_argument("--json-out", default="")
     ap.add_argument("--keep", action="store_true")

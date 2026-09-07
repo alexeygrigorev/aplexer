@@ -1,13 +1,14 @@
 use aplexer::api::{start_session, StartRequest};
-use aplexer::{atomic_write_json, read_record, Paths, MAX_HISTORY_BYTES};
-use serde_json::Value;
+use aplexer::{
+    atomic_write_json, read_record, ExitInfo, Limits, Paths, Phase, SessionRecord, MAX_HISTORY_BYTES,
+    SCHEMA_VERSION,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct Harness {
     runtime: TempDir,
@@ -128,43 +129,53 @@ fn terminal_legacy_oversized_record_remains_recoverable() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace");
     let paths = harness.paths();
-    let started = harness.run(&[
-        "--json",
-        "start",
-        "--workspace",
-        workspace.path().to_str().unwrap(),
-        "--tag",
-        "legacy",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'legacy-history\\n'",
-    ]);
-    assert!(
-        started.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
-    let started: Value = serde_json::from_slice(&started.stdout).expect("start JSON");
-    let id = started["id"].as_str().expect("session id");
+    paths.ensure().unwrap();
+    let id = Uuid::now_v7();
+    let workspace = workspace
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.path().to_path_buf());
+    let planted = SessionRecord {
+        parent_session: None,
+        schema_version: SCHEMA_VERSION,
+        id,
+        workspace,
+        tag: "legacy".into(),
+        engine: "shell".into(),
+        profile: None,
+        command: vec!["/bin/sh".into()],
+        cwd: paths.state_root.clone(),
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        limits: Limits::default(),
+        history_bytes: 4096,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_activity_ms: None,
+        last_accessed_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
+        phase: Phase::Exited,
+        worker_pid: None,
+        workload_pid: None,
+        containment_cgroup: None,
+        containment_cgroup_identity: None,
+        containment_empty: Some(true),
+        socket_path: paths.socket(id),
+        history_path: paths.history(id),
+        exit: Some(ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 1,
+        }),
+        error: None,
+    };
+    fs::create_dir_all(paths.state_session(id)).unwrap();
+    fs::write(&planted.history_path, b"legacy-history\r\n").unwrap();
+    atomic_write_json(&paths.record(id), &planted).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = harness.run(&["snapshot"]);
-        assert!(snapshot.status.success());
-        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
-        if records.as_array().is_some_and(|records| {
-            records.iter().any(|record| {
-                record["id"] == id && record["phase"] == "exited" && record["worker_alive"] == false
-            })
-        }) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "session did not become terminal");
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let mut record = read_record(&paths.record(id.parse().unwrap())).expect("read record");
+    let mut record = read_record(&paths.record(id)).expect("read record");
     record.history_bytes = MAX_HISTORY_BYTES + 1;
     atomic_write_json(&paths.record(record.id), &record).expect("write legacy record");
 
@@ -174,13 +185,14 @@ fn terminal_legacy_oversized_record_remains_recoverable() {
         "legacy record hid registry: {}",
         String::from_utf8_lossy(&snapshot.stderr)
     );
-    let status = harness.run(&["status", id, "--json"]);
+    let id = id.to_string();
+    let status = harness.run(&["status", &id, "--json"]);
     assert!(
         status.status.success(),
         "legacy status failed: {}",
         String::from_utf8_lossy(&status.stderr)
     );
-    let capture = harness.run(&["capture", id]);
+    let capture = harness.run(&["capture", &id]);
     assert!(
         capture.status.success(),
         "legacy capture failed: {}",
@@ -188,7 +200,7 @@ fn terminal_legacy_oversized_record_remains_recoverable() {
     );
     assert_eq!(capture.stdout, b"legacy-history\r\n");
 
-    let forgotten = harness.run(&["forget", id, "--force"]);
+    let forgotten = harness.run(&["forget", &id, "--force"]);
     assert!(
         forgotten.status.success(),
         "legacy forget failed: {}",

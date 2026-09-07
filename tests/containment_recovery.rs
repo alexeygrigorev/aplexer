@@ -1,9 +1,13 @@
 //! Product-path regressions for fail-closed broken-session recovery.
 
-use aplexer::{atomic_write_json, read_record, FileLock, Phase};
+use aplexer::{
+    atomic_write_json, FileLock, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION,
+};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -159,6 +163,26 @@ fn kill_preserves_evidence_when_dead_unlimited_worker_loses_setsid_descendant() 
         "runtime evidence was removed"
     );
 
+    // A SIGKILL'd worker adopted by an outer aplexer subreaper can linger
+    // as a zombie (`worker_alive` stays true). This test is about kill's
+    // refusal and forget's force-removal of evidence, not about waiting
+    // for that zombie to be reaped.
+    let record_path = harness
+        .state
+        .path()
+        .join("sessions")
+        .join(id)
+        .join("session.json");
+    let mut persisted: Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("read record before forget"))
+            .expect("parse record before forget");
+    persisted["worker_pid"] = Value::Null;
+    fs::write(
+        &record_path,
+        serde_json::to_vec(&persisted).expect("serialize record"),
+    )
+    .expect("clear zombie worker pid");
+
     let forgotten = harness.run(&["--json", "forget", id, "--force"]);
     assert!(
         forgotten.status.success(),
@@ -224,41 +248,49 @@ fn forget_fences_pre_pid_startup_and_refuses_held_worker_lock() {
     let harness = Harness::new();
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace_text = workspace.path().to_str().expect("UTF-8 workspace");
-    let started = harness.run(&[
-        "--json",
-        "start",
-        "--workspace",
-        workspace_text,
-        "--tag",
-        "pre-pid",
-        "--",
-        "/bin/sh",
-        "-c",
-        "sleep 0.1",
-    ]);
-    assert!(started.status.success(), "start failed");
-    let started: Value = serde_json::from_slice(&started.stdout).expect("start JSON");
-    let id = started["id"].as_str().expect("session id");
-    let worker_pid = started["worker_pid"].as_i64().expect("worker pid") as i32;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while process_alive(worker_pid) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!process_alive(worker_pid), "worker did not exit");
-
-    let id = uuid::Uuid::parse_str(id).expect("UUID");
-    let paths = aplexer::Paths {
+    let paths = Paths {
         runtime_root: harness.runtime.path().to_path_buf(),
         state_root: harness.state.path().to_path_buf(),
         config_file: harness.config.clone(),
     };
-    let mut record = read_record(&paths.record(id)).expect("read finished record");
-    record.phase = Phase::Starting;
-    record.worker_pid = None;
-    record.workload_pid = None;
-    record.exit = None;
-    record.error = None;
-    record.containment_empty = Some(false);
+    paths.ensure().unwrap();
+    let id = Uuid::now_v7();
+    let workspace_path = workspace
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.path().to_path_buf());
+    let record = SessionRecord {
+        parent_session: None,
+        schema_version: SCHEMA_VERSION,
+        id,
+        workspace: workspace_path,
+        tag: "pre-pid".into(),
+        engine: "shell".into(),
+        profile: None,
+        command: vec!["/bin/sh".into()],
+        cwd: workspace.path().to_path_buf(),
+        env: BTreeMap::new(),
+        env_unset: Vec::new(),
+        limits: Limits::default(),
+        history_bytes: 4096,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_activity_ms: None,
+        last_accessed_ms: None,
+        reported_state: None,
+        reported_state_at_ms: None,
+        phase: Phase::Starting,
+        worker_pid: None,
+        workload_pid: None,
+        containment_cgroup: None,
+        containment_cgroup_identity: None,
+        containment_empty: Some(false),
+        socket_path: paths.socket(id),
+        history_path: paths.history(id),
+        exit: None,
+        error: None,
+    };
+    fs::create_dir_all(paths.state_session(id)).unwrap();
     atomic_write_json(&paths.record(id), &record).expect("write stale Starting record");
     fs::create_dir_all(paths.runtime_session(id)).expect("recreate stale runtime dir");
     fs::write(paths.worker_lock(id), b"").expect("create historical worker lock");

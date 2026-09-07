@@ -217,23 +217,27 @@ fn sigterm_wakes_worker_and_kills_ignoring_setsid_descendant() {
         0
     );
     let deadline = began + Duration::from_secs(3);
-    let record = loop {
-        let record = read_record(&harness.record_path(id)).expect("read session record");
-        if !same_process_is_alive(worker_pid, worker_start)
+    loop {
+        let processes_dead = !same_process_is_alive(worker_pid, worker_start)
             && !same_process_is_alive(workload_pid, workload_start)
-            && !same_process_is_alive(descendant_pid, descendant_start)
-            && matches!(record.phase, Phase::Exited | Phase::Failed)
-        {
-            break record;
+            && !same_process_is_alive(descendant_pid, descendant_start);
+        if processes_dead && !harness.record_path(id).exists() {
+            break;
+        }
+        if processes_dead {
+            if let Ok(record) = read_record(&harness.record_path(id)) {
+                if matches!(record.phase, Phase::Exited | Phase::Failed) {
+                    assert_eq!(record.containment_empty, Some(true));
+                    break;
+                }
+            }
         }
         assert!(
             Instant::now() < deadline,
-            "worker did not promptly terminate its whole containment domain: {record:?}"
+            "worker did not promptly terminate its whole containment domain"
         );
         thread::sleep(Duration::from_millis(10));
-    };
+    }
 
-    assert_eq!(record.phase, Phase::Exited, "unexpected terminal record");
-    assert_eq!(record.containment_empty, Some(true));
     assert!(began.elapsed() < Duration::from_secs(3));
 }

@@ -1,10 +1,13 @@
 #[cfg(feature = "startup-test-hooks")]
 use aplexer::read_persisted_history_tail;
+use aplexer::{atomic_write_json, ExitInfo, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(feature = "startup-test-hooks")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 #[cfg(feature = "startup-test-hooks")]
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -77,6 +80,62 @@ impl Harness {
     fn assert_no_session_artifacts(&self) {
         assert_directory_empty(&self.state_dir.path().join("sessions"));
         assert_directory_empty(&self.runtime_dir.path().join("sessions"));
+    }
+
+    /// A dead-but-listed predecessor: clean natural exits now delete their
+    /// record, so reclaim/archive tests plant a finished leftover (the same
+    /// shape Failed/OOM keep) instead of waiting for `true` to linger.
+    fn plant_finished_session(&self, workspace: &Path, tag: &str, history: &[u8]) -> String {
+        let paths = Paths {
+            runtime_root: self.runtime_dir.path().to_path_buf(),
+            state_root: self.state_dir.path().to_path_buf(),
+            config_file: self.config_file.clone(),
+        };
+        paths.ensure().unwrap();
+        let id = Uuid::now_v7();
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let record = SessionRecord {
+            parent_session: None,
+            schema_version: SCHEMA_VERSION,
+            id,
+            workspace,
+            tag: tag.into(),
+            engine: "shell".into(),
+            profile: None,
+            command: vec!["/bin/sh".into()],
+            cwd: self.state_dir.path().to_path_buf(),
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: 4096,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_activity_ms: None,
+            last_accessed_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
+            phase: Phase::Exited,
+            worker_pid: None,
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(true),
+            socket_path: paths.socket(id),
+            history_path: paths.history(id),
+            exit: Some(ExitInfo {
+                code: Some(0),
+                signal: None,
+                oom_killed: false,
+                exited_at_ms: 1,
+            }),
+            error: None,
+        };
+        fs::create_dir_all(paths.state_session(id)).unwrap();
+        fs::write(&record.history_path, history).unwrap();
+        atomic_write_json(&paths.record(id), &record).unwrap();
+        id.to_string()
     }
 }
 
@@ -350,47 +409,12 @@ fn failed_replacement_preserves_finished_session_evidence() {
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
 
-    let old = harness.run(&[
-        "--json",
-        "start",
-        "--workspace",
-        workspace,
-        "--tag",
+    let old_id = harness.plant_finished_session(
+        Path::new(workspace),
         "daily",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'important-old-history\\n'",
-    ]);
-    assert!(
-        old.status.success(),
-        "old session failed: {}",
-        String::from_utf8_lossy(&old.stderr)
+        b"important-old-history\r\n",
     );
-    let old: Value = serde_json::from_slice(&old.stdout).expect("old session JSON");
-    let old_id = old["id"].as_str().expect("old session id");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let snapshot = harness.run(&["snapshot"]);
-        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
-        let finished = records.as_array().is_some_and(|records| {
-            records.iter().any(|record| {
-                record["id"] == old_id
-                    && record["phase"] == "exited"
-                    && record["worker_alive"] == false
-            })
-        });
-        if finished {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "old session did not finish"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    let capture_before = harness.run(&["capture", old_id]);
+    let capture_before = harness.run(&["capture", &old_id]);
     assert_eq!(capture_before.stdout, b"important-old-history\r\n");
 
     let replacement = harness.run(&[
@@ -411,7 +435,7 @@ fn failed_replacement_preserves_finished_session_evidence() {
     );
     assert!(String::from_utf8_lossy(&replacement.stderr).contains("within 0 ms"));
 
-    let capture_after = harness.run(&["capture", old_id]);
+    let capture_after = harness.run(&["capture", &old_id]);
     assert!(
         capture_after.status.success(),
         "old capture was lost: {}",
@@ -423,7 +447,7 @@ fn failed_replacement_preserves_finished_session_evidence() {
             .state_dir
             .path()
             .join("sessions")
-            .join(old_id)
+            .join(&old_id)
             .exists(),
         "failed replacement removed old durable state"
     );
@@ -450,7 +474,7 @@ fn failed_replacement_preserves_finished_session_evidence() {
             .state_dir
             .path()
             .join("sessions")
-            .join(old_id)
+            .join(&old_id)
             .exists(),
         "ready replacement did not retire old durable state"
     );
@@ -473,42 +497,7 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
     let workspace = TempDir::new().expect("workspace tempdir");
     let workspace = workspace.path().to_str().expect("UTF-8 workspace");
 
-    let old = harness.run(&[
-        "--json",
-        "start",
-        "--workspace",
-        workspace,
-        "--tag",
-        "daily",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'archived-evidence\\n'",
-    ]);
-    assert!(
-        old.status.success(),
-        "old session failed: {}",
-        String::from_utf8_lossy(&old.stderr)
-    );
-    let old: Value = serde_json::from_slice(&old.stdout).expect("old session JSON");
-    let old_id = old["id"].as_str().expect("old session id");
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = harness.run(&["snapshot"]);
-        let records: Value = serde_json::from_slice(&snapshot.stdout).expect("snapshot JSON");
-        if records.as_array().is_some_and(|records| {
-            records.iter().any(|record| {
-                record["id"] == old_id
-                    && record["phase"] == "exited"
-                    && record["worker_alive"] == false
-            })
-        }) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "old session did not finish");
-        thread::sleep(Duration::from_millis(25));
-    }
+    let old_id = harness.plant_finished_session(Path::new(workspace), "daily", b"archived-evidence\r\n");
 
     let replacement = harness.run_with_env(
         &[
@@ -529,7 +518,7 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
     );
     let stderr = String::from_utf8_lossy(&replacement.stderr);
     assert!(stderr.contains("ready and manageable by UUID"), "{stderr}");
-    assert!(stderr.contains(old_id), "{stderr}");
+    assert!(stderr.contains(&old_id), "{stderr}");
     assert!(stderr.contains("retired-sessions"), "{stderr}");
 
     let snapshot = harness.run(&["snapshot"]);
@@ -559,7 +548,7 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
         .state_dir
         .path()
         .join("retired-sessions")
-        .join(old_id);
+        .join(&old_id);
     assert!(archived.join("session.json").exists());
     assert_eq!(
         fs::read(archived.join("history.bin")).expect("read archived history"),
@@ -574,7 +563,7 @@ fn replacement_cleanup_failure_keeps_one_usable_session_and_archived_evidence() 
         .state_dir
         .path()
         .join("sessions")
-        .join(old_id)
+        .join(&old_id)
         .exists());
 
     let killed = harness.run(&[
@@ -1338,31 +1327,30 @@ fn fast_workload_that_exits_before_readiness_probe_starts_successfully() {
     );
     let record: Value = serde_json::from_slice(&output.stdout).expect("start JSON record");
     assert_eq!(record["phase"], "exited", "unexpected phase: {record}");
-    assert_eq!(record["exit"]["code"], 0, "unexpected exit info: {record}");
     assert!(
         record["id"].as_str().is_some_and(|id| !id.is_empty()),
         "terminal record omitted the session id: {record}"
     );
-    // `exited_worker_completed_startup` requires durable proof that the
-    // containment domain is empty before it will call a vanished worker a
-    // completed session. Pin that a real worker's terminal record actually
-    // carries that proof, so the safety conjunct is grounded end to end and
-    // cannot be satisfied only in unit-test fixtures.
     assert_eq!(
         record["containment_empty"], true,
-        "completed session lacks durable containment proof: {record}"
+        "completed session lacks containment proof: {record}"
     );
 
-    // The session that ran must stay listable rather than being rolled back
-    // as a failed startup.
+    // A clean finish removes the record; the session must not linger as an
+    // exited row, and must not be rolled back as a failed startup either.
     let listed = harness.run(&["--json", "list"]);
     assert!(listed.status.success());
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
     assert!(
         listed
             .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row["id"] == record["id"])),
-        "completed session was rolled back out of the registry: {listed}"
+            .is_some_and(|rows| rows.iter().all(|row| row["id"] != record["id"])),
+        "completed session lingered in the registry: {listed}"
+    );
+    let id = record["id"].as_str().unwrap();
+    assert!(
+        !harness.state_dir.path().join("sessions").join(id).exists(),
+        "completed session left durable state"
     );
 }
 

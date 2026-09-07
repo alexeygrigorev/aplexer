@@ -1231,13 +1231,24 @@ pub fn process_start_time_ticks(pid: u32) -> Result<u64> {
 }
 
 fn linux_boot_id() -> Result<String> {
+    // Cached: the boot id cannot change without a reboot, and every
+    // `worker_alive` probe (i.e. every `a list` row, twice per row in the old
+    // plain rendering) read it from disk. Benchmark PLAN P1.1: `a list` with
+    // dozens of sessions did dozens of redundant reads of this one tiny
+    // file; cache it process-wide after the first successful read.
+    static CACHED_BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(cached) = CACHED_BOOT_ID.get() {
+        return Ok(cached.clone());
+    }
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .context("read Linux boot identity")?;
     let boot_id = boot_id.trim();
     if boot_id.is_empty() {
         bail!("Linux boot identity is empty");
     }
-    Ok(boot_id.to_owned())
+    let owned = boot_id.to_owned();
+    let _ = CACHED_BOOT_ID.set(owned.clone());
+    Ok(owned)
 }
 
 /// Signal the worker recorded for a session only if it is still the exact
