@@ -96,6 +96,9 @@ enum Commands {
     /// Check aplexer's environment/config for problems.
     #[command(visible_alias = "check")]
     Doctor,
+    /// Install agent-state hooks so sessions report working/waiting/idle
+    /// instead of guessing from PTY output (see `a init --help`).
+    Init(InitArgs),
     /// Print the current session's identity (workspace/tag/engine/profile).
     #[command(visible_alias = "current")]
     Whoami,
@@ -371,6 +374,25 @@ impl ReportedState {
     }
 }
 
+#[derive(Args)]
+struct InitArgs {
+    /// Only check whether hooks are installed; print the per-engine status
+    /// and exit 0 when fully initialized, 1 otherwise. No files are
+    /// touched. With `--json` this is the machine contract for automation:
+    /// `a init --check --json` reports `{"initialized": bool, ...}`.
+    #[arg(long)]
+    check: bool,
+    /// Remove aplexer's `state-report` hooks instead of installing them.
+    /// Only hook entries containing `state-report` and our generated files
+    /// are removed; everything else is left alone.
+    #[arg(long)]
+    uninstall: bool,
+    /// Only act on one engine: claude, codex, zcodex (shares codex's
+    /// CODEX_HOME config), grok, gemini, or opencode. Default: all engines.
+    #[arg(long, value_name = "ENGINE")]
+    engine: Option<String>,
+}
+
 // -- Inter-agent messaging (docs/inter-agent-messaging-design.md, section 7) --
 
 #[derive(Args)]
@@ -580,6 +602,7 @@ fn run() -> Result<()> {
         Commands::Whoami => cmd_whoami(&paths, cli.json),
         Commands::StateReport(args) => cmd_state_report(&paths, args.state),
         Commands::Doctor => cmd_doctor(&paths, cli.json),
+        Commands::Init(args) => cmd_init(&paths, args, cli.json),
         Commands::Message(args) => cmd_message(&paths, args, cli.json),
         Commands::Watch(args) => cmd_watch(&paths, args),
         Commands::Transcript(args) => cmd_transcript(&paths, args, cli.json),
@@ -2700,17 +2723,13 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
 /// state rejected by the worker) propagates through `?` to `main`'s
 /// generic `a: {error}` / exit(1) handler, same as every other subcommand.
 ///
-/// What this repo does NOT do (deliberately out of scope -- see
-/// docs/pocketshell-integration-plan.md's Open question #2 and section
-/// "0.2"/A3): install a Claude Stop/Notification hook, a Codex `notify`
-/// program, or an OpenCode plugin that actually CALLS this command at the
-/// right moments. Whether hook installation moves into aplexer's own
-/// workspace preparation (alongside `a start`/`a launch-exec`) or stays a
-/// PocketShell-side concern (pocketshell's own `hooks.py`, pointed at this
-/// command instead of/in addition to `tmux set-option @ps_agent_state`) is
-/// an open product decision the integration plan explicitly flags as
-/// undesigned; this command is the aplexer-side primitive that decision
-/// can build on either way.
+/// What this repo does NOT do here (deliberately): install the hooks that
+/// call this command. That wiring lives in `a init` (`aplexer::hooks`),
+/// which merges a `state-report` hook into every configured engine
+/// (Claude Stop/Notification, Codex hooks/notify, OpenCode plugin, Grok
+/// and Gemini hooks) — this command is the ingestion primitive it builds
+/// on. `a init --check --json` is the machine-readable way to verify the
+/// wiring is present.
 fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
     let Some(id) = discover_session_id() else {
         eprintln!("a state-report: not inside an aplexer session (APLEXER_SESSION_ID not set)");
@@ -2726,6 +2745,120 @@ fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
         },
         None,
     )?;
+    Ok(())
+}
+
+/// `a init [--check] [--uninstall] [--engine NAME]`
+///
+/// Machine-wide agent-state hook installation: merges an `a state-report`
+/// hook into every agent engine aplexer knows how to launch (claude, codex
+/// — which also covers the zcodex variant via shared `CODEX_HOME` — grok,
+/// gemini, opencode), including each configured profile's config dir, so a
+/// session reports `working`/`waiting`/`idle` instead of leaving every
+/// consumer to guess from PTY-output recency. See `aplexer::hooks` for the
+/// per-engine mechanisms and the merge-never-clobber rules.
+///
+/// Modes (exactly one):
+///
+/// - default: install (idempotent; only writes files that change).
+/// - `--check`: touch nothing; print per-engine status and exit 0 when
+///   fully initialized, 1 otherwise. With `--json` this prints
+///   `{"initialized": bool, "engines": [...]}` — the machine contract the
+///   PocketShell host CLI automates against (run `a init --check --json`;
+///   when it reports `initialized: false`, run `a init`).
+/// - `--uninstall`: remove our hooks again.
+///
+/// `--engine` limits any mode to one engine (`zcodex` maps onto `codex`).
+fn cmd_init(paths: &Paths, args: InitArgs, json_output: bool) -> Result<()> {
+    if args.check && args.uninstall {
+        bail!("`a init --check` and `a init --uninstall` cannot be combined");
+    }
+    let filter = args
+        .engine
+        .as_deref()
+        .map(aplexer::hooks::normalize_engine_filter)
+        .transpose()?;
+    // Profile config dirs (CLAUDE_CONFIG_DIR / CODEX_HOME) extend the
+    // install targets past the default homes, so a profile session reports
+    // state just like a default one. A broken user config fails here the
+    // same way it fails every other command.
+    let config = Config::load(paths)?;
+    let profile_envs: Vec<BTreeMap<String, String>> = config
+        .profiles
+        .values()
+        .map(|profile| profile.env.clone())
+        .collect();
+    let targets = aplexer::hooks::resolve_targets_from_env(&profile_envs)?;
+    let a_bin = aplexer::hooks::resolve_a_bin();
+
+    if args.check {
+        let statuses = aplexer::hooks::check(&targets, filter);
+        let initialized = statuses.iter().all(|status| status.installed);
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "initialized": initialized,
+                    "engines": statuses,
+                }))?
+            );
+        } else {
+            for status in &statuses {
+                println!(
+                    "{} {:<9} {}",
+                    if status.installed { "OK  " } else { "MISS" },
+                    status.engine,
+                    status.message
+                );
+            }
+            if initialized {
+                println!("hooks initialized for all engines");
+            } else {
+                println!("hooks missing for some engines; run `a init` to install");
+            }
+        }
+        if !initialized {
+            bail!("agent-state hooks are not fully installed");
+        }
+        return Ok(());
+    }
+
+    if args.uninstall {
+        let statuses = aplexer::hooks::uninstall(&targets, filter);
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "engines": statuses,
+                }))?
+            );
+        } else {
+            for status in &statuses {
+                println!("{}: {} — {}", status.engine, status.action, status.message);
+            }
+        }
+        return Ok(());
+    }
+
+    let statuses = aplexer::hooks::install(&targets, &a_bin, filter);
+    let ok = statuses.iter().all(|status| status.action != "error");
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": ok,
+                "engines": statuses,
+            }))?
+        );
+    } else {
+        for status in &statuses {
+            println!("{}: {} — {}", status.engine, status.action, status.message);
+        }
+    }
+    if !ok {
+        bail!("agent-state hook installation hit errors");
+    }
     Ok(())
 }
 
@@ -5955,6 +6088,7 @@ mod switching_tests {
             Commands::LaunchSpec(_) => "launch-spec",
             Commands::LaunchExec(_) => "launch-exec",
             Commands::Doctor => "doctor",
+            Commands::Init(_) => "init",
             Commands::Whoami => "whoami",
             Commands::StateReport(_) => "state-report",
             Commands::Message(_) => "message",
