@@ -1,5 +1,7 @@
+import fcntl
 import json
 import os
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -457,3 +459,98 @@ def test_native_kill_stops_live_session():
             client.kill(session.id, grace_ms=30_001)
         assert client.kill(session.id, signal=15, grace_ms=200) is None
         _wait_until_gone(client, session.id)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_native_forget_matches_cli_contract(capfd):
+    """The Python binding is `a forget`: same gate, warning, and fence.
+
+    `a forget` and `client.forget` used to be two independent destructive
+    bodies (issue #11) and only the CLI one was covered. This pins the
+    previously-untested path against the CLI's contract, so a mutation in the
+    shared `api::forget_session` reddens both suites.
+    """
+    with tempfile.TemporaryDirectory(prefix="apx-py-forget-") as directory:
+        root = Path(directory)
+        state = root / "state"
+        runtime = root / "run"
+        client = Client(
+            state_dir=state,
+            runtime_dir=runtime,
+            config=root / "config.toml",
+        )
+
+        with pytest.raises(AplexerError, match="no matching session"):
+            client.forget("definitely-missing-session", force=True)
+
+        session = client.start(
+            workspace=root,
+            tag="forget-cli",
+            command=["/bin/sleep", "30"],
+        )
+        worker_pid = session.worker_pid
+        assert worker_pid is not None
+        try:
+            with pytest.raises(AplexerError, match="force"):
+                client.forget(session.id)
+            with pytest.raises(AplexerError, match="live worker"):
+                client.forget(session.id, force=True)
+
+            # A worker killed without warning leaves the record behind: there
+            # is no one left to remove it, which is exactly the wreckage
+            # `forget` exists for.
+            os.kill(worker_pid, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while _pid_alive(worker_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not _pid_alive(worker_pid), "worker did not die"
+
+            record_path = state / "sessions" / session.id / "session.json"
+            assert record_path.exists(), "SIGKILL removed the diagnostic record"
+
+            # Rewind the record into the pre-PID startup window, the only
+            # shape where `worker_alive()` is false but a worker may still be
+            # coming up. That is what the worker-lock fence guards.
+            record = json.loads(record_path.read_text())
+            record["phase"] = "starting"
+            record["worker_pid"] = None
+            record["workload_pid"] = None
+            record["exit"] = None
+            record["error"] = None
+            record["containment_empty"] = False
+            record_path.write_text(json.dumps(record))
+
+            runtime_session = runtime / "sessions" / session.id
+            runtime_session.mkdir(parents=True, exist_ok=True)
+            lock_path = runtime_session / "worker.lock"
+            lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with pytest.raises(AplexerError, match="still has a worker holding"):
+                    client.forget(session.id, force=True)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                os.remove(lock_path)
+
+            capfd.readouterr()
+            forgotten = client.forget(session.id, force=True)
+            err = capfd.readouterr().err
+            assert forgotten.forgotten
+            assert not forgotten.signalled
+            assert not forgotten.containment_proven_empty
+            assert forgotten.workload_may_survive
+            # The CLI's warning, on the CLI's stream. Once the record is gone
+            # this line is the only trace that workload processes may survive.
+            assert "workload processes may survive" in err
+            assert all(item.id != session.id for item in client.list())
+        finally:
+            if _pid_alive(worker_pid):
+                os.kill(worker_pid, signal.SIGKILL)

@@ -1491,14 +1491,25 @@ fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Result<PrePidF
     }
 }
 
-/// Forget a session record without signalling any process. This preserves the
-/// CLI's registry/startup locking and refuses a worker that may still be live.
+/// Forget a session record without signalling any process.
+///
+/// The one implementation of `a forget`: the force gate, the live-worker
+/// refusal, the pre-PID worker fence, both directory removals, and the
+/// "workload processes may survive" warning live only here. `a forget`'s
+/// `cmd_forget` resolves the CLI's target spellings and then calls this, so
+/// the Python binding cannot diverge from the CLI on the operation with the
+/// least recoverable outcome (issue #11).
 pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Value> {
     if !force {
-        bail!("forget requires force=True");
+        // Names both spellings because both callers land here: `--force` on
+        // the CLI, `force=True` from the Python binding.
+        bail!("forget requires --force (force=True from the Python binding)");
     }
     let selected = selected_record(paths, selector)?;
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
+    // Resolve happened before taking the registry lock. Re-read under the
+    // lock so a concurrent rename or lifecycle update cannot make a stale
+    // liveness decision destructive.
     let current = read_record(&paths.record(selected.id))
         .with_context(|| format!("re-read session {} before forgetting", selected.id))?;
     if current.worker_alive() {
@@ -1529,12 +1540,30 @@ pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Valu
     }
     fs::remove_dir_all(paths.state_session(current.id))
         .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
+
+    // The record is gone, so this warning is the only remaining trace that
+    // uncontained workload processes may still be running. It goes to stderr
+    // rather than into the JSON alone so a CLI user cannot miss it; the
+    // `workload_may_survive` key carries the same fact for programmatic
+    // callers.
+    let workload_may_survive = !containment_proven_empty;
+    if workload_may_survive {
+        eprintln!(
+            "a: forgot session {} without signalling any process; containment was not proven empty, so workload processes may survive",
+            current.id
+        );
+    } else {
+        eprintln!(
+            "a: forgot session {} without signalling any process (containment was proven empty)",
+            current.id
+        );
+    }
     Ok(json!({
         "id": current.id,
         "forgotten": true,
         "signalled": false,
         "containment_proven_empty": containment_proven_empty,
-        "workload_may_survive": !containment_proven_empty,
+        "workload_may_survive": workload_may_survive,
     }))
 }
 

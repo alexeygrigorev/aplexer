@@ -2150,89 +2150,18 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
 }
 
 fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> {
-    if !args.force {
-        bail!("forget requires --force");
-    }
+    // Only the CLI's target spellings (quick index, tag, `workspace:tag`) and
+    // its presentation live here. The destructive body -- force gate,
+    // live-worker refusal, pre-PID fence, both removals, and the survival
+    // warning -- is `api::forget_session`, shared with the Python binding so
+    // the two cannot diverge (issue #11). Re-resolving by id there is cheap
+    // and keeps the record re-read under the registry lock where it belongs.
     let selected = resolve(paths, &args.target)?;
-    let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
-    // Resolve happened before taking the registry lock. Re-read under the
-    // lock so a concurrent rename or lifecycle update cannot make a stale
-    // liveness decision destructive.
-    let current = read_record(&paths.record(selected.id))
-        .with_context(|| format!("re-read session {} before forgetting", selected.id))?;
-    if current.worker_alive() {
-        bail!(
-            "session {} still has a live worker; refusing to forget it",
-            current.id
-        );
-    }
-    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
-        let lock_path = paths.worker_lock(current.id);
-        // This lock is also a fence against the spawn-to-worker-lock gap. If
-        // a worker was spawned but has not reached its first required lock
-        // yet, it will fail that acquisition and cannot proceed after we
-        // remove the record. Keep our lock through both directory removals.
-        match FileLock::exclusive(&lock_path, true) {
-            Ok(lock) => Some(lock),
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .and_then(io::Error::raw_os_error)
-                    .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
-            {
-                bail!(
-                    "session {} still has a worker holding {}; refusing to forget it",
-                    current.id,
-                    lock_path.display()
-                )
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "cannot fence session {}'s pre-PID worker; refusing to forget it",
-                        current.id
-                    )
-                })
-            }
-        }
-    } else {
-        None
-    };
-
-    let containment_proven_empty = current.containment_proven_empty();
-    match fs::remove_dir_all(paths.runtime_session(current.id)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("remove forgotten session runtime state"),
-    }
-    fs::remove_dir_all(paths.state_session(current.id))
-        .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
-
-    let workload_may_survive = !containment_proven_empty;
-    if workload_may_survive {
-        eprintln!(
-            "a: forgot session {} without signalling any process; containment was not proven empty, so workload processes may survive",
-            current.id
-        );
-    } else {
-        eprintln!(
-            "a: forgot session {} without signalling any process (containment was proven empty)",
-            current.id
-        );
-    }
+    let value = aplexer::api::forget_session(paths, &selected.id.to_string(), args.force)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "id": current.id,
-                "forgotten": true,
-                "signalled": false,
-                "containment_proven_empty": containment_proven_empty,
-                "workload_may_survive": workload_may_survive,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
-        println!("forgotten {}", current.id);
+        println!("forgotten {}", selected.id);
     }
     Ok(())
 }
