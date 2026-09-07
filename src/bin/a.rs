@@ -1078,7 +1078,21 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
                             env::var_os("HOME").as_deref().map(Path::new)
                         )
                     ),
-                    _ => bail!("tag '{selector}' is ambiguous in this workspace"),
+                    // A pair can transiently be held by a corpse next to the
+                    // live session that took its name (`a rename`, issue
+                    // #13); the tag still means the live session until prune
+                    // clears the corpse. Same rule as `resolve_record`.
+                    _ => {
+                        let live: Vec<SessionRecord> = matches
+                            .iter()
+                            .filter(|r| aplexer::reap_verdict(r).is_none())
+                            .cloned()
+                            .collect();
+                        if live.len() == 1 {
+                            return Ok(live.into_iter().next().expect("exactly one live match"));
+                        }
+                        bail!("tag '{selector}' is ambiguous in this workspace")
+                    }
                 }
             }
         }

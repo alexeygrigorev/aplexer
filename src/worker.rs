@@ -1,3 +1,4 @@
+use crate::api::{fence_pre_pid_worker, PrePidFence};
 use crate::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
@@ -1840,17 +1841,76 @@ impl WorkerRuntime {
         }
         Ok(!descendant_pids(std::process::id())?.is_empty())
     }
+    /// Rename this session within its workspace (or into a new one).
+    ///
+    /// The `workspace+tag` claim check answers the same question
+    /// `start_session`'s supersede check answers -- "does any record still
+    /// own this pair?" -- so it applies the same predicate, `reap_verdict`,
+    /// and no third copy (issue #13). `rename` used to refuse on *any*
+    /// conflicting record, dead or not, while `a start` reclaimed a pair
+    /// held by a dead one: on the same box, the same dead record made one
+    /// command succeed and the other fail with "already belongs to session
+    /// <uuid>", naming a session `a list` showed as broken and nothing
+    /// could attach to.
+    ///
+    /// What a dead conflict gets from rename is deliberately *not* what
+    /// `a start` does to it: reclaiming archives and then deletes the
+    /// holder's durable state, and rename is a metadata edit that must
+    /// destroy nothing. So rename skips the dead holder and leaves its
+    /// record for `a prune`, the routine cleaner of exactly this class.
+    /// A live holder keeps its claim, and the refusal names its derived
+    /// state and a next step, in `a start`'s own words.
+    ///
+    /// A pre-PID `Starting` holder is the one "dead"-looking shape that
+    /// must still refuse (issue #9): a stub in the spawn-to-worker-lock gap
+    /// is a healthy session coming up. Its worker lock is both the detector
+    /// and the fence -- held means the session is very much coming up
+    /// (refuse), acquired means nothing is behind the stub, and holding the
+    /// fence across the update below keeps a worker that has not reached
+    /// its acquisition yet from coming up on top of the pair this rename
+    /// just handed out.
     fn rename(&self, workspace: std::path::PathBuf, tag: String) -> Result<SessionRecord> {
         validate_tag(&tag)?;
         let workspace = canonical_workspace(&workspace)?;
         let id = lock(&self.record)?.id;
         let _registry = FileLock::exclusive(&self.paths.registry_lock(), false)?;
-        if let Some(conflict) = list_records(&self.paths)?
+        let conflicts: Vec<SessionRecord> = list_records(&self.paths)?
             .into_iter()
-            .find(|record| record.id != id && record.workspace == workspace && record.tag == tag)
+            .filter(|record| record.id != id && record.workspace == workspace && record.tag == tag)
+            .collect();
+        // Every conflict must be reclaimable-dead, or the rename refuses:
+        // a live holder -- live worker, live workload leader, or a
+        // containment domain that still holds something -- owns its pair,
+        // exactly as against `a start`.
+        if let Some(live) = conflicts
+            .iter()
+            .find(|record| reap_verdict(record).is_none())
         {
-            bail!("workspace+tag already belongs to session {}", conflict.id);
+            bail!(
+                "workspace+tag already belongs to session {} (state: {}); rename it or choose a different tag",
+                live.id,
+                live.observed_state()
+            );
         }
+        // All conflicts are dead by the same verdict `a start` reclaims on.
+        // Fence each pre-PID stub before skipping it, and hold the fences
+        // across the update: the skip is only safe while nothing can come
+        // up behind the stub.
+        let _fences = conflicts
+            .iter()
+            .map(|record| {
+                match fence_pre_pid_worker(&self.paths, record).with_context(|| {
+                    format!("cannot fence session {}'s pre-PID worker", record.id)
+                })? {
+                    PrePidFence::Fenced(lock) => Ok(lock),
+                    PrePidFence::WorkerHoldsLock(lock_path) => bail!(
+                        "workspace+tag already belongs to session {}, whose worker still holds {}; rename it or choose a different tag",
+                        record.id,
+                        lock_path.display()
+                    ),
+                }
+            })
+            .collect::<Result<Vec<Option<FileLock>>>>()?;
         self.update_record(|r| {
             r.workspace = workspace;
             r.tag = tag;

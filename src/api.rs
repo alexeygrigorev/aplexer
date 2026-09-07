@@ -1445,7 +1445,7 @@ pub fn kill_session(paths: &Paths, selector: &str, signal: i32, grace_ms: u64) -
 }
 
 /// Result of fencing the spawn-to-worker-lock gap for one record.
-enum PrePidFence {
+pub(crate) enum PrePidFence {
     /// Nothing can come up under this record while the guard (if any) lives.
     /// `None` means no fence was needed: the record is past the gap, so its
     /// `worker_pid` is the authority and `worker_alive()` already answered.
@@ -1471,8 +1471,13 @@ enum PrePidFence {
 /// cannot proceed after we have destroyed the record).
 ///
 /// Callers must keep the returned guard alive across every removal, exactly
-/// as `a forget` does.
-fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Result<PrePidFence> {
+/// as `a forget` does. `rename`'s claim check (issue #13) uses the same
+/// fence for the same reason, holding it across its record update: its
+/// verdict must not read a coming-up session as free either, and while
+/// rename destroys nothing, holding the lock keeps a worker that has not
+/// reached its acquisition yet from coming up on top of the pair the
+/// rename just handed out.
+pub(crate) fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Result<PrePidFence> {
     if !record.worker_phase_active() || record.worker_pid.is_some() {
         return Ok(PrePidFence::Fenced(None));
     }
@@ -1977,18 +1982,21 @@ fn resolve_parent_session(paths: &Paths) -> Option<Uuid> {
 /// candidate fits `validate_tag` any more, which for a valid base can only
 /// be the 64-byte length cap.
 pub fn pick_fresh_tag(records: &[SessionRecord], workspace: &Path, base: &str) -> Option<String> {
+    // Any live holder counts, not just the first record with the pair: a
+    // rename that took a dead holder's name leaves the corpse next to the
+    // live session (issue #13), and `--fresh` must read that pair as taken.
     let live_holder = |tag: &str| {
         records
             .iter()
-            .find(|r| r.workspace == workspace && r.tag == tag)
-            .filter(|r| crate::reap_verdict(r).is_none())
+            .filter(|r| r.workspace == workspace && r.tag == tag)
+            .any(|r| crate::reap_verdict(r).is_none())
     };
     // Suffixes start at 2: a bare `main` plus `main-2` reads as "the main
     // one and its first sibling", not as an off-by-one list. A base that
     // already ends in `-<number>` (or cannot be suffixed numerically at all)
     // simply continues from the next integer.
     let mut candidate = base.to_string();
-    while live_holder(&candidate).is_some() {
+    while live_holder(&candidate) {
         candidate = match candidate
             .rsplit_once('-')
             .and_then(|(stem, n)| n.parse::<u64>().ok().map(|n| format!("{stem}-{}", n + 1)))
@@ -2046,10 +2054,23 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     // the whole spawn: this read IS the locked read, and no other aplexer
     // command can modify the registry until this call returns.
     let registry = list_records(paths)?;
+    // The pair can be held by more than one record: `a rename` takes a pair
+    // from a dead holder but leaves the corpse in place for `a prune`
+    // (issue #13), so "the holder" must not be whoever `read_dir` lists
+    // first. A live holder always wins -- it is who the supersede check
+    // below refuses to displace -- and only when every holder is reclaimable
+    // does the first dead one become the predecessor this start archives.
     let holder_of = |tag: &str| {
-        registry
+        let mut holders = registry
             .iter()
-            .find(|r| r.workspace == workspace && r.tag == tag)
+            .filter(|r| r.workspace == workspace && r.tag == tag);
+        holders
+            .find(|r| crate::reap_verdict(r).is_none())
+            .or_else(|| {
+                registry
+                    .iter()
+                    .find(|r| r.workspace == workspace && r.tag == tag)
+            })
     };
     let mut tag = req.tag.clone();
     // Held for the rest of the call when the predecessor is a pre-PID stub,

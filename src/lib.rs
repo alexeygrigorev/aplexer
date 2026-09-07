@@ -1566,7 +1566,24 @@ pub fn resolve_record(
     match matches.len() {
         0 => bail!("no matching session"),
         1 => Ok(matches.remove(0)),
-        _ => bail!("selector is ambiguous; use a longer UUID"),
+        // A pair can transiently be held by two records: `a rename` takes a
+        // dead holder's name but leaves the corpse for `a prune` (issue
+        // #13), and the pair is only clean again once prune runs. In that
+        // window the selector still means the live session -- a corpse must
+        // not shadow it, or the rename that fixed the invisible-corpse
+        // error would make the name unusable instead. Only when no live
+        // holder disambiguates the matches does the ambiguity error apply.
+        _ => {
+            let live: Vec<SessionRecord> = matches
+                .iter()
+                .filter(|r| reap_verdict(r).is_none())
+                .cloned()
+                .collect();
+            match live.len() {
+                1 => Ok(live.into_iter().next().expect("exactly one live match")),
+                _ => bail!("selector is ambiguous; use a longer UUID"),
+            }
+        }
     }
 }
 
