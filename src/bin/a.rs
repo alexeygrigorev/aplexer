@@ -129,7 +129,7 @@ enum Commands {
 
 #[derive(Args)]
 struct QuickAttachArgs {
-    /// 1-based index into the workspaces as shown by `a list` (alphabetical).
+    /// 1-based index into the workspaces as shown by `a list`.
     workspace_index: usize,
     /// 1-based index into that workspace's sessions (list order), or a
     /// literal tag. Defaults to that workspace's first session.
@@ -222,10 +222,50 @@ struct TargetArgs {
     tag: Option<String>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct ListArgs {
     #[arg(long)]
     running: bool,
+    /// Order workspaces in `a list` (and the `a N` numbers). Remembered
+    /// until you pick another. Time sorts are newest-first.
+    #[arg(long, value_enum, value_name = "KEY")]
+    sort: Option<ListSort>,
+}
+
+/// How `a list` orders workspace groups. Session order *inside* a group
+/// stays newest-created-first (`list_records`), matching `Ctrl-b 1-9`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ListSort {
+    /// Alphabetical workspace path.
+    #[default]
+    Name,
+    /// When the newest session in the workspace was created.
+    Created,
+    /// When a session in the workspace was last attached.
+    Accessed,
+    /// Most recent agent/PTY activity in the workspace.
+    Activity,
+}
+
+impl ListSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            ListSort::Name => "name",
+            ListSort::Created => "created",
+            ListSort::Accessed => "accessed",
+            ListSort::Activity => "activity",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "name" => Some(ListSort::Name),
+            "created" => Some(ListSort::Created),
+            "accessed" => Some(ListSort::Accessed),
+            "activity" => Some(ListSort::Activity),
+            _ => None,
+        }
+    }
 }
 #[derive(Args)]
 struct AttachArgs {
@@ -560,9 +600,7 @@ fn run() -> Result<()> {
     let paths = Paths::discover()?;
     // Bare `a` with no subcommand defaults to `a list`, matching how tmux
     // and similar tools default to a listing rather than printing usage.
-    let command = cli
-        .command
-        .unwrap_or(Commands::List(ListArgs { running: false }));
+    let command = cli.command.unwrap_or(Commands::List(ListArgs::default()));
     match command {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
         Commands::New(mut args) => {
@@ -824,6 +862,12 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
 }
 
 fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
+    // `--sort` remembers even on the JSON path, so a later human `a list` /
+    // `a N` uses the same workspace order. JSON row order itself stays
+    // newest-created-first (spec.md §18).
+    if args.sort.is_some() {
+        resolve_list_sort(paths, args.sort)?;
+    }
     if json_output {
         println!(
             "{}",
@@ -883,7 +927,8 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             })
             .collect()
     };
-    let groups = group_by_workspace(records);
+    let sort = load_list_sort(paths);
+    let groups = group_by_workspace(records, sort);
     let home = env::var_os("HOME").map(PathBuf::from);
     let current_workspace = resolve_message_workspace(None).ok();
     let color = color_enabled();
@@ -930,9 +975,15 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         } else {
             String::new()
         };
+        let recency = workspace_recency_label(sort, sessions, now);
+        let recency = if recency.is_empty() {
+            String::new()
+        } else {
+            format!(" · {recency}")
+        };
         println!(
             "{badge} {name}{marker}  {}",
-            paint(color, ANSI_DIM, &summary)
+            paint(color, ANSI_DIM, &format!("{summary}{recency}"))
         );
 
         // Column widths adapt to the widest tag/engine actually present, so
@@ -971,7 +1022,7 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             let age = paint(
                 color,
                 ANSI_DIM,
-                &format!("{:>4}", compact_elapsed(now.saturating_sub(timestamp))),
+                &format!("{:>12}", human_age_phrase(now.saturating_sub(timestamp))),
             );
             let attention_mark = if attention {
                 paint(color, ANSI_YELLOW, " !")
@@ -1005,6 +1056,17 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             "Attach: a <workspace#> [session#|tag] · Here: a here [engine] [tag] · Another: a new · Help: a help"
         )
     );
+    println!(
+        "{}",
+        paint(
+            color,
+            ANSI_DIM,
+            &format!(
+                "Sort: {} · a list --sort name|created|accessed|activity",
+                sort.as_str()
+            )
+        )
+    );
     Ok(())
 }
 
@@ -1022,7 +1084,8 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     // workspaces and sessions using this exact same grouping, so the
     // `[N]`/session-index prefixes printed below are not decoration -- they
     // are the literal numbers `a <N>` and `a <N> <M>` resolve against.
-    let by_workspace = group_by_workspace(records);
+    let sort = load_list_sort(paths);
+    let by_workspace = group_by_workspace(records, sort);
     let home = env::var_os("HOME").map(PathBuf::from);
     let color = color_enabled();
     for (workspace_index, (workspace, group)) in by_workspace.iter().enumerate() {
@@ -1229,19 +1292,33 @@ fn state_timestamp(record: &SessionRecord, state: &str, now: u64) -> u64 {
         .unwrap_or(record.updated_at_ms)
 }
 
-/// Compact age for dense lists: `now`, `30s`, `2m`, `3h`, `5d`.
+/// Compact age: `now`, `30s`, `5m`, `5h 1m`, `5d 5h`. Two units once the
+/// span is at least an hour, so a week-old session is not just `5d`.
 fn compact_elapsed(ms: u64) -> String {
     let seconds = ms / 1_000;
     if seconds < 5 {
-        "now".to_string()
-    } else if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3_600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h", seconds / 3_600)
+        return "now".to_string();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m")
     } else {
-        format!("{}d", seconds / 86_400)
+        format!("{secs}s")
     }
 }
 
@@ -1336,7 +1413,10 @@ fn running_summary(group: &[SessionRecord]) -> String {
     }
 }
 
-fn group_by_workspace(records: Vec<SessionRecord>) -> Vec<(PathBuf, Vec<SessionRecord>)> {
+fn group_by_workspace(
+    records: Vec<SessionRecord>,
+    sort: ListSort,
+) -> Vec<(PathBuf, Vec<SessionRecord>)> {
     let mut groups: Vec<(PathBuf, Vec<SessionRecord>)> = Vec::new();
     for r in records {
         match groups.iter_mut().find(|(ws, _)| *ws == r.workspace) {
@@ -1344,8 +1424,104 @@ fn group_by_workspace(records: Vec<SessionRecord>) -> Vec<(PathBuf, Vec<SessionR
             None => groups.push((r.workspace.clone(), vec![r])),
         }
     }
-    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    groups.sort_by(|a, b| compare_workspaces(a, b, sort));
     groups
+}
+
+fn compare_workspaces(
+    left: &(PathBuf, Vec<SessionRecord>),
+    right: &(PathBuf, Vec<SessionRecord>),
+    sort: ListSort,
+) -> std::cmp::Ordering {
+    let time_order =
+        |left_ms: u64, right_ms: u64| right_ms.cmp(&left_ms).then_with(|| left.0.cmp(&right.0));
+    match sort {
+        ListSort::Name => left.0.cmp(&right.0),
+        ListSort::Created => time_order(
+            workspace_created_ms(&left.1),
+            workspace_created_ms(&right.1),
+        ),
+        ListSort::Accessed => time_order(
+            workspace_accessed_ms(&left.1),
+            workspace_accessed_ms(&right.1),
+        ),
+        ListSort::Activity => time_order(
+            workspace_activity_ms(&left.1),
+            workspace_activity_ms(&right.1),
+        ),
+    }
+}
+
+fn workspace_created_ms(sessions: &[SessionRecord]) -> u64 {
+    sessions.iter().map(|s| s.created_at_ms).max().unwrap_or(0)
+}
+
+/// Recency of human access: last attach, falling back to created so
+/// never-attached records (including those from before `last_accessed_ms`
+/// existed) still have a stable place in the order.
+fn workspace_accessed_ms(sessions: &[SessionRecord]) -> u64 {
+    sessions
+        .iter()
+        .map(|s| s.last_accessed_ms.unwrap_or(s.created_at_ms))
+        .max()
+        .unwrap_or(0)
+}
+
+fn last_agent_activity_ms(record: &SessionRecord) -> Option<u64> {
+    match (record.last_activity_ms, record.reported_state_at_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn workspace_activity_ms(sessions: &[SessionRecord]) -> u64 {
+    sessions
+        .iter()
+        .filter_map(last_agent_activity_ms)
+        .max()
+        .unwrap_or(0)
+}
+
+fn workspace_recency_label(sort: ListSort, sessions: &[SessionRecord], now: u64) -> String {
+    let ago = |at: u64| human_age_phrase(now.saturating_sub(at));
+    match sort {
+        ListSort::Name => String::new(),
+        ListSort::Created => format!("created {}", ago(workspace_created_ms(sessions))),
+        ListSort::Accessed => match sessions.iter().filter_map(|s| s.last_accessed_ms).max() {
+            Some(at) => format!("opened {}", ago(at)),
+            None => "never opened".to_string(),
+        },
+        ListSort::Activity => match workspace_activity_ms(sessions) {
+            0 => "no activity".to_string(),
+            at => format!("active {}", ago(at)),
+        },
+    }
+}
+
+fn list_sort_path(paths: &Paths) -> PathBuf {
+    paths.state_root.join("list-sort")
+}
+
+fn load_list_sort(paths: &Paths) -> ListSort {
+    fs::read_to_string(list_sort_path(paths))
+        .ok()
+        .and_then(|text| ListSort::parse(text.trim()))
+        .unwrap_or(ListSort::Name)
+}
+
+fn save_list_sort(paths: &Paths, sort: ListSort) -> Result<()> {
+    fs::write(list_sort_path(paths), format!("{}\n", sort.as_str()))
+        .with_context(|| format!("write {}", list_sort_path(paths).display()))
+}
+
+/// `--sort KEY` both applies and remembers; a bare `a list` (and `a N`)
+/// reuse the last choice so the numbers on the tree stay stable.
+fn resolve_list_sort(paths: &Paths, requested: Option<ListSort>) -> Result<ListSort> {
+    if let Some(sort) = requested {
+        save_list_sort(paths, sort)?;
+        return Ok(sort);
+    }
+    Ok(load_list_sort(paths))
 }
 
 /// `a <N>` / `a <N> <M>` / `a <N> <tag>` -- attach by position in the same
@@ -1751,7 +1927,7 @@ fn resolve_quick_index(
     workspace_index: usize,
     session: Option<&str>,
 ) -> Result<SessionRecord> {
-    let groups = group_by_workspace(list_records(paths)?);
+    let groups = group_by_workspace(list_records(paths)?, load_list_sort(paths));
     if groups.is_empty() {
         bail!("no sessions found (see `a start`)");
     }
@@ -4211,8 +4387,8 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): the
     // attach client holds the host on the alternate screen for the whole
     // session (see `ATTACH_ALT_SCREEN_ENTER`) so the pre-attach primary
-    // scrollback -- typically the `a` list -- cannot mix into the live view.
-    // Detach must return the host to that primary screen.
+    // scrollback -- typically the `a` session list -- cannot mix into the
+    // live view. Detach must return the host to that primary screen.
     // Workload-originated 1049l is stripped from the relay and never
     // reaches the host; this write is the one exit that does.
     //
@@ -4935,8 +5111,8 @@ fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<S
 ///   group; skips dead sessions; wraps; errors if nothing else is
 ///   attachable there.
 /// - `NextGlobal`/`PrevGlobal`: candidates are every group flattened in
-///   group order (alphabetical workspace, then list order) -- exactly the
-///   top-to-bottom order of `a list`'s tree.
+///   `a list` workspace order (the remembered `--sort`), then list order
+///   inside each group -- exactly the top-to-bottom order of `a list`.
 /// - `Index(n)`: 1-based, into the current workspace group only, **no**
 ///   skipping of dead sessions -- the number must mean exactly what the
 ///   status bar shows (`workspace_summary`); an unattachable target is
@@ -4997,7 +5173,7 @@ fn resolve_switch_target(
     target: SwitchTarget,
     last: Option<Uuid>,
 ) -> Result<SessionRecord> {
-    let groups = group_by_workspace(list_records(paths)?);
+    let groups = group_by_workspace(list_records(paths)?, load_list_sort(paths));
     pick_switch_target(&groups, &current.workspace, current.id, target, last)
 }
 
@@ -6193,6 +6369,12 @@ mod switching_tests {
             Some(Commands::Start(start)) => assert_eq!(start.tag, DEFAULT_HUMAN_TAG),
             _ => panic!("expected start command"),
         }
+
+        let args = args_of(&["list", "--sort", "activity"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::List(list)) => assert_eq!(list.sort, Some(ListSort::Activity)),
+            _ => panic!("expected list --sort activity"),
+        }
     }
 
     fn args_of(argv: &[&str]) -> Vec<String> {
@@ -6256,13 +6438,76 @@ mod switching_tests {
         assert_eq!(compact_elapsed(59_000), "59s");
         assert_eq!(compact_elapsed(120_000), "2m");
         assert_eq!(compact_elapsed(7_200_000), "2h");
+        assert_eq!(compact_elapsed(7_260_000), "2h 1m");
         assert_eq!(compact_elapsed(172_800_000), "2d");
+        assert_eq!(compact_elapsed(190_800_000), "2d 5h");
+        assert_eq!(human_age_phrase(7_260_000), "2h 1m ago");
+        assert_eq!(human_age_phrase(0), "just now");
 
         assert_eq!(fit_column("abcdefgh", 5), "abcd…");
         // Wide glyphs count display cells, not chars: two CJK glyphs fit a
         // 5-cell column exactly with padding, three must truncate.
         assert_eq!(terminal_display_width(&fit_column("界界界", 5)), 5);
         assert_eq!(fit_column("界界", 5), "界界 ");
+    }
+
+    #[test]
+    fn group_by_workspace_sorts_by_name_created_accessed_and_activity() {
+        let mut zebra = mk_record("/ws/zebra", "main", Phase::Running);
+        zebra.created_at_ms = 10;
+        zebra.last_accessed_ms = Some(100);
+        zebra.last_activity_ms = Some(1);
+
+        let mut apple = mk_record("/ws/apple", "main", Phase::Running);
+        apple.created_at_ms = 30;
+        apple.last_accessed_ms = Some(50);
+        apple.last_activity_ms = Some(200);
+
+        let mut mango = mk_record("/ws/mango", "review", Phase::Running);
+        mango.created_at_ms = 20;
+        mango.last_accessed_ms = None;
+        mango.last_activity_ms = None;
+
+        let records = vec![zebra, apple, mango];
+        let names = |sort: ListSort, records: &[SessionRecord]| -> Vec<PathBuf> {
+            group_by_workspace(records.to_vec(), sort)
+                .into_iter()
+                .map(|(ws, _)| ws)
+                .collect()
+        };
+
+        assert_eq!(
+            names(ListSort::Name, &records),
+            vec![
+                PathBuf::from("/ws/apple"),
+                PathBuf::from("/ws/mango"),
+                PathBuf::from("/ws/zebra")
+            ]
+        );
+        assert_eq!(
+            names(ListSort::Created, &records),
+            vec![
+                PathBuf::from("/ws/apple"),
+                PathBuf::from("/ws/mango"),
+                PathBuf::from("/ws/zebra")
+            ]
+        );
+        assert_eq!(
+            names(ListSort::Accessed, &records),
+            vec![
+                PathBuf::from("/ws/zebra"),
+                PathBuf::from("/ws/apple"),
+                PathBuf::from("/ws/mango")
+            ]
+        );
+        assert_eq!(
+            names(ListSort::Activity, &records),
+            vec![
+                PathBuf::from("/ws/apple"),
+                PathBuf::from("/ws/zebra"),
+                PathBuf::from("/ws/mango")
+            ]
+        );
     }
 
     #[test]

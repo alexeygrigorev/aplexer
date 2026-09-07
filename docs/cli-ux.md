@@ -157,7 +157,8 @@ PR #4 implements the highest-frequency, lowest-contract-risk improvements.
 - bare `a` on a TTY renders an empty state or an attention-first workspace tree;
 - the current workspace is marked `here`;
 - rows show semantic state when fresh and honest activity labels otherwise;
-- relative recency is compact (`now`, `12s`, `4m`, `2h`);
+- relative recency is compact (`now`, `12s`, `5h 1m ago`, `5d 5h ago`);
+- `a list --sort name|created|accessed|activity` reorders workspaces (remembered so `a N` matches the tree);
 - long tags and engine/profile names are width-safe and use an ellipsis;
 - the footer teaches attach, create-or-attach here, and help;
 - `a status` on a TTY becomes a task-first summary with a suggested next action;
