@@ -2365,7 +2365,10 @@ fn read_counter(path: &Path, key: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::env;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use crate::paths::{absolute_override_path, absolute_xdg_path};
 
     fn load_config_text(text: &str) -> Result<Config> {
         let root = tempfile::tempdir().unwrap();
