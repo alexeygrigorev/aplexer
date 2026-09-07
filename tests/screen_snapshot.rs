@@ -1605,6 +1605,20 @@ fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
         escape(transition)
     );
 
+    // Session B asks the terminal for no mouse of its own, so once B's
+    // snapshot is on the wire the attach client borrows mouse reporting for
+    // itself -- that is the only way a wheel event can reach `a` at all, and
+    // it is what makes the wheel open the scrollback pager (`sync_client_mouse`
+    // in src/bin/a.rs; the workload wins whenever it wants the mouse, which
+    // is exactly why A's modes had to be neutralized above). Wait for the
+    // hand-over rather than racing it.
+    let borrowed_at = client.wait_for_offset(
+        b"\x1b[?1006h",
+        target_at,
+        "the client borrowing mouse reporting for the scrollback wheel",
+    );
+    assert!(borrowed_at >= target_at);
+    let out = client.output();
     let host_after = host_terminal(&out, 24, 80);
     assert!(
         host_after.screen().alternate_screen(),
@@ -1612,11 +1626,13 @@ fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
     );
     assert_eq!(
         host_after.screen().mouse_protocol_mode(),
-        vt100::MouseProtocolMode::None
+        vt100::MouseProtocolMode::PressRelease,
+        "with the workload asking for no mouse, the client holds press/release \
+         reporting so the wheel reaches the scrollback pager"
     );
     assert_eq!(
         host_after.screen().mouse_protocol_encoding(),
-        vt100::MouseProtocolEncoding::Default
+        vt100::MouseProtocolEncoding::Sgr
     );
 
     client.detach();
@@ -1763,6 +1779,161 @@ fn growing_the_terminal_grows_a_bottom_anchored_workload_region() {
     assert!(
         worker.contains(&format!("{marker}-80")),
         "the worker's screen never showed the scrolled output:\n{worker}"
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// The end-to-end shape of the feature the whole scroll-mode change exists
+/// for: attach to a session whose output has already scrolled past the top
+/// of the screen, and be able to read it.
+///
+/// Three things are asserted, in the order a user meets them:
+///
+/// 1. **Depth from the first second of the attach.** The lines under test
+///    were printed *before* this client existed, so they can only be visible
+///    because the client's model was primed from the worker's retained
+///    history (`seed_client_scrollback`). A pager over only the current
+///    screen would fail here, and "history" that starts empty on every
+///    attach is not history.
+/// 2. **Keystrokes do not reach the workload.** The keys typed while the
+///    pager is up are checked against the *session's own* screen afterwards.
+///    This is the actual bug: with the host on the alternate screen and
+///    `alternateScroll` on, scrolling to read used to type cursor keys into
+///    the user's agent.
+/// 3. **The live screen comes back.** Leaving the pager repaints from the
+///    model, including everything that arrived while the user was reading.
+#[test]
+fn scroll_mode_reads_back_history_the_screen_has_already_lost() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("scrollback");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "history");
+    // Comfortably more than a 24-row screen holds, so the early lines are
+    // off the top before anyone attaches.
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "for i in $(seq -w 1 80); do printf 'HISTLINE-%s\\n' \"$i\"; done",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "HISTLINE-80");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"HISTLINE-80", 0, "the newest line on the attach snapshot");
+
+    // The old lines really are off the screen: this is the state the user
+    // reported having no way out of.
+    let live = host_terminal(&client.output(), 24, 80);
+    let live_text = live.screen().contents();
+    assert!(
+        !live_text.contains("HISTLINE-05"),
+        "the early output must already be off the visible screen:\n{live_text}"
+    );
+
+    // Ctrl-b [ , then Home: all the way back through the retained history.
+    let opened_at = client.mark();
+    client.send(&[0x02, b'[']);
+    client.wait_for_offset(b"SCROLL", opened_at, "the scroll-mode status bar");
+    let paged_at = client.mark();
+    client.send(b"\x1b[H");
+    client.wait_for_offset(b"HISTLINE-05", paged_at, "output paged back from history");
+
+    let scrolled = host_terminal(&client.output(), 24, 80);
+    let scrolled_text = scrolled.screen().contents();
+    assert!(
+        scrolled_text.contains("HISTLINE-05"),
+        "the pager must be showing output that scrolled off before the attach:\n{scrolled_text}"
+    );
+    assert!(
+        scrolled_text.contains("SCROLL"),
+        "the status bar must say plainly that keys are going to the pager:\n{scrolled_text}"
+    );
+    assert!(
+        scrolled.screen().alternate_screen(),
+        "the host stays on the alternate screen throughout (that is what keeps the \
+         pre-attach `a` list out of the view)"
+    );
+
+    // Keys typed at the pager must not reach the workload. None of these are
+    // bound to a navigation command, so they are swallowed outright.
+    client.send(b"XXNOTINPUTXX");
+    // Leave the pager and check the live screen came back.
+    let left_at = client.mark();
+    client.send(b"q");
+    client.wait_for_offset(b"HISTLINE-80", left_at, "the live screen repainted on exit");
+
+    let back = host_terminal(&client.output(), 24, 80);
+    let back_text = back.screen().contents();
+    assert!(
+        back_text.contains("HISTLINE-80"),
+        "leaving the pager must repaint the live screen:\n{back_text}"
+    );
+    assert!(
+        !back_text.contains("SCROLL "),
+        "the scroll-mode bar must be gone once the session has the keyboard back:\n{back_text}"
+    );
+
+    let session_screen = harness.run_ok(
+        &["capture", &id, "--screen", "--plain"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !session_screen.contains("XXNOTINPUTXX"),
+        "keys typed while the pager was up reached the workload -- this is the bug \
+         scroll mode exists to fix; session screen:\n{session_screen}"
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+/// The wheel alone, with no prefix -- the gesture the user actually has in
+/// their fingers from tmux, and the one they reported as broken. The client
+/// borrows mouse reporting whenever the workload wants none, so a wheel-up
+/// report from the terminal opens the pager directly.
+#[test]
+fn a_wheel_roll_opens_scroll_mode_with_no_prefix_key() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("wheel");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "wheel");
+    harness.run_ok(
+        &[
+            "send",
+            &id,
+            "for i in $(seq -w 1 60); do printf 'WHEELLINE-%s\\n' \"$i\"; done",
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id, "WHEELLINE-60");
+
+    let mut client = PtyClient::spawn(&harness, &id, 24, 80);
+    client.wait_for(b"WHEELLINE-60", 0, "the newest line on the attach snapshot");
+    // The client asks the terminal for the mouse only because the workload
+    // (a bare shell) wants none; without this there is no wheel report to
+    // send it in the first place.
+    client.wait_for(b"\x1b[?1006h", 0, "the client borrowing mouse reporting");
+
+    let rolled_at = client.mark();
+    // One notch up, in SGR encoding: button 64, press.
+    client.send(b"\x1b[<64;40;12M");
+    client.wait_for_offset(b"SCROLL", rolled_at, "the wheel opening scroll mode");
+
+    let scrolled = host_terminal(&client.output(), 24, 80);
+    assert!(
+        scrolled.screen().contents().contains("SCROLL"),
+        "a wheel roll with no prefix must open the pager:\n{}",
+        scrolled.screen().contents()
     );
 
     client.detach();

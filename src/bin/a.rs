@@ -3662,6 +3662,7 @@ fn cmd_hotkeys() -> Result<()> {
     println!("Attach-mode keys (press Ctrl-b, then one of these):");
     println!();
     println!("  ?        show this reference in the status bar");
+    println!("  [        scroll back through this session's output (q or Esc to leave)");
     println!("  d        detach (the workload keeps running)");
     println!("  r        redraw the live screen (recover a garbled display)");
     println!("  n / p    next / previous session in this workspace");
@@ -3670,6 +3671,24 @@ fn cmd_hotkeys() -> Result<()> {
     println!("  l        return to the previously attached session");
     println!();
     println!("Any other key after Ctrl-b is forwarded through untouched.");
+    println!();
+    println!("Scrolling back (aplexer's copy-mode, like tmux's Ctrl-b [):");
+    println!();
+    println!("  the mouse wheel enters it on its own, with no prefix -- unless the");
+    println!("  workload has asked the terminal for the mouse itself, in which case");
+    println!("  the wheel belongs to the workload and Ctrl-b [ is the way in.");
+    println!();
+    println!("  PgUp/PgDn  a screen at a time      Up/Down, k/j   a line at a time");
+    println!("  Home / End top / back to live      g / G          the same");
+    println!("  Space / b  a screen at a time      u / d          half a screen");
+    println!("  q, Esc     back to the live screen");
+    println!();
+    println!("  While scrolling, keys go to the pager and never to the session.");
+    println!(
+        "  History is {} lines by default (APLEXER_HISTORY_LIMIT);",
+        aplexer::screen::DEFAULT_SCROLLBACK_LINES
+    );
+    println!("  APLEXER_MOUSE=off leaves the mouse to the terminal for selection.");
     Ok(())
 }
 
@@ -4603,6 +4622,28 @@ enum BoundaryPolicy {
     /// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`
     /// fails if a second one appears.
     PastDeadline,
+    /// Write anyway, because **there is no relayed stream to splice into**.
+    ///
+    /// Not a second exemption from the gate so much as a case the gate does
+    /// not apply to. While scroll mode is active (`Ctrl-b [`, or a wheel
+    /// roll) the client has taken the host terminal away from the relay
+    /// entirely: `relay_to_terminal` still feeds every workload byte to the
+    /// model -- that is what keeps the history growing and makes the exit
+    /// repaint correct -- but writes none of them, so the host is not
+    /// part-way through anything the workload emitted. `at_escape_boundary`
+    /// would still be answering for the *model*, which by then is many
+    /// chunks ahead of the host, so consulting it here would be consulting
+    /// the wrong stream: it can sit false indefinitely on a workload that
+    /// stopped mid-sequence, and deferring on that would freeze the pager
+    /// the user is actively driving.
+    ///
+    /// What the host may genuinely be part-way through is the *last* chunk
+    /// written before the relay was suspended. `SCROLL_CANCEL` (`CAN`, the
+    /// control every VT parser treats as "abandon the sequence in flight")
+    /// leads every write made under this policy, which is what makes it
+    /// safe; the sites are pinned by
+    /// `scroll_mode_writes_are_the_only_stream_suspended_ones`.
+    StreamSuspended,
 }
 
 /// **The single funnel for client-originated bytes**, and therefore the one
@@ -4840,12 +4881,23 @@ fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) -> bool {
 fn relay_to_terminal(
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     stdout: &Arc<Mutex<io::Stdout>>,
+    scroll: &Arc<ScrollMode>,
     data: &[u8],
 ) -> io::Result<()> {
     let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
     {
         let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
         let rewritten = s.relay(data);
+        // Scroll mode: the model still consumes every byte -- that is what
+        // grows the retained history the user is reading and what makes the
+        // repaint on the way out show everything that arrived meanwhile --
+        // but nothing reaches the host, because the pager owns the screen.
+        // Checked here, under the same stdout lock `enter_scroll_mode` flips
+        // the flag under, so a chunk can never be half-written across the
+        // pager's first frame.
+        if scroll.is_active() {
+            return Ok(());
+        }
         let src = rewritten.as_deref().unwrap_or(data);
         if let Some(filtered) = s.filter_host(src) {
             out.write_all(&filtered)?;
@@ -5186,6 +5238,16 @@ struct StatusBarCtx {
     /// When the current synchronized-output deferral started, so
     /// `STATUS_BAR_SYNC_DEFER_LIMIT` can bound it.
     sync_deferred_since: Arc<Mutex<Option<Instant>>>,
+    /// Scroll mode (`Ctrl-b [`, or a wheel roll): whether the pager is up
+    /// and where in the retained history it is looking. Read by the relay on
+    /// every chunk to decide whether the host may be written to at all.
+    scroll: Arc<ScrollMode>,
+    /// Who currently owns mouse reporting on the host: `Some(true)` this
+    /// client (so the wheel reaches `a`), `Some(false)` the workload,
+    /// `None` nothing asserted yet. See `sync_client_mouse`.
+    mouse_owned: Arc<Mutex<Option<bool>>>,
+    /// Whether borrowing the mouse is permitted at all (`APLEXER_MOUSE`).
+    mouse_capture: bool,
 }
 
 type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
@@ -5200,7 +5262,7 @@ const FLASH_DURATION: Duration = Duration::from_secs(3);
 /// the same chords `a keys`/`a hotkeys` print, compressed to what fits a
 /// terminal line. Consumed locally: no byte reaches the workload.
 const ATTACH_KEY_HELP: &str =
-    "Ctrl-b: d detach · r redraw · n/p switch · N/P global · 1-9 jump · l last · ? help";
+    "Ctrl-b: [ scroll · d detach · r redraw · n/p switch · N/P global · 1-9 jump · l last · ? help";
 
 /// Shows a transient message on the status bar and redraws immediately --
 /// the single channel for attach hints, help, and switch failures, so
@@ -5609,6 +5671,745 @@ fn status_bar_sequence(
     seq.extend_from_slice(b"\x1b[0m");
     seq.extend_from_slice(restore);
     seq
+}
+
+// ---------------------------------------------------------------------------
+// Scroll mode (`Ctrl-b [`, or the wheel) -- aplexer's copy-mode
+// ---------------------------------------------------------------------------
+//
+// The problem it solves. `a attach` holds the host terminal on the alternate
+// screen for the whole attach (`ATTACH_ALT_SCREEN_ENTER`) so the pre-attach
+// `a` session list cannot bleed into the live view. The alternate screen has
+// no scrollback, so from the host terminal there is nothing to scroll back
+// *to* -- and worse, a terminal with xterm's `alternateScroll` answers a
+// wheel event there by synthesizing cursor-up/down key presses and sending
+// them to the workload, i.e. scrolling to read types into the user's agent.
+// That translation is now off (`?1007l`), which stopped the harm and left the
+// user with no way to read earlier output at all.
+//
+// The shape of the fix is tmux's, not a terminal's. A tmux pane's virtual
+// terminal retains a scrollback grid above the visible screen, and copy-mode
+// pages through that grid; tmux never asks the host for scrollback and never
+// re-parses a byte log. aplexer's equivalent emulator is `ScreenTracker`,
+// which the attach client already runs over every relayed byte -- it was just
+// built with a scrollback length of zero. Giving the *client's* model a real
+// scrollback length (`ClientScreen::try_new_with_scrollback`) makes the
+// history accumulate as a side effect of the parse that was happening anyway,
+// and `Screen::set_scrollback` pages it.
+//
+// Why the client's model and not the worker's. The worker is the tmux-faithful
+// home for it -- one parse, survives detach -- but it would need a protocol
+// addition to serve scrolled-back rows, and the worker parses every session
+// whether or not anyone is attached, so the memory would be spent on sessions
+// nobody is reading. The client pays only while attached, is already at the
+// exact geometry the pager has to render at, and reaches the same "scroll
+// back through what happened while I was away" outcome by priming its grid
+// once from the worker's retained raw history at attach
+// (`ClientScreen::seed_history`, over the `capture` RPC that already exists).
+// Only the priming replay reads bytes; from then on the live model *is* the
+// history.
+
+/// Retained history depth, in lines, for an attach client's model --
+/// `history-limit` in tmux, whose default this deliberately matches.
+///
+/// Overridable with `APLEXER_HISTORY_LIMIT`; `0` disables scroll mode's
+/// history entirely (the pager then has only the current screen, and the
+/// model costs exactly what it did before this feature). The value is
+/// clamped against `MAX_SCROLLBACK_CELLS` at the terminal's width, so a
+/// large number cannot turn into a large allocation.
+fn history_limit() -> usize {
+    match env::var("APLEXER_HISTORY_LIMIT") {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(aplexer::screen::DEFAULT_SCROLLBACK_LINES),
+        Err(_) => aplexer::screen::DEFAULT_SCROLLBACK_LINES,
+    }
+}
+
+/// How much of the worker's retained raw history is replayed into a fresh
+/// client model to give it a past (`ClientScreen::seed_history`).
+///
+/// Sized from the line limit rather than fixed: roughly half a kilobyte of
+/// raw PTY bytes per rendered line is a fair rate for colorized agent output,
+/// so the default 2000-line grid asks for ~1 MiB -- enough to fill it, small
+/// enough that the parse is tens of milliseconds on the attach path, and
+/// capped at the worker's own `DEFAULT_HISTORY_BYTES` because there is never
+/// more than that to fetch.
+fn scrollback_seed_bytes() -> usize {
+    history_limit()
+        .saturating_mul(512)
+        .clamp(64 * 1024, aplexer::DEFAULT_HISTORY_BYTES)
+}
+
+/// Whether the client may borrow mouse reporting from the host terminal.
+///
+/// It has to, to see a wheel event at all: the host reports the wheel only
+/// while some mouse protocol is enabled, and with `?1007l` in force nothing
+/// else turns a wheel roll into anything. The cost is tmux's cost with
+/// `mouse on` -- while the client owns the mouse, drag-to-select needs the
+/// terminal's usual Shift override -- so `APLEXER_MOUSE=off` turns the
+/// borrowing off and leaves `Ctrl-b [` as the way in.
+fn mouse_capture_enabled() -> bool {
+    !matches!(
+        env::var("APLEXER_MOUSE").as_deref(),
+        Ok("off") | Ok("0") | Ok("no") | Ok("false")
+    )
+}
+
+/// The client's own mouse reporting: every protocol and encoding this client
+/// knows about turned off, then button press/release (`?1000h`) in SGR
+/// encoding (`?1006h`).
+///
+/// `?1000h` rather than `?1002h`/`?1003h` deliberately: press/release is all
+/// a wheel needs, and not asking for motion reports keeps the terminal from
+/// streaming a report per cell of mouse movement across the socket.
+const CLIENT_MOUSE_ENABLE: &[u8] =
+    b"\x1b[?9l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1000h\x1b[?1006h";
+
+/// `CAN` -- "abandon any control sequence in flight". Leads every write made
+/// under `BoundaryPolicy::StreamSuspended`; see that variant's doc comment
+/// for why that is what makes those writes safe without the boundary gate.
+const SCROLL_CANCEL: &[u8] = b"\x18";
+
+/// Lines a wheel notch moves, matching tmux's own three.
+const WHEEL_LINES: usize = 3;
+
+/// SGR mouse button numbers for the wheel (xterm: 64 + button index).
+const MOUSE_WHEEL_UP: u32 = 64;
+const MOUSE_WHEEL_DOWN: u32 = 65;
+
+/// Shared scroll-mode state.
+///
+/// `active` is an atomic rather than part of the mutex because the relay
+/// reads it on every chunk, under the stdout lock, purely to decide whether
+/// to write. Lock order is `stdout` -> `view` -> `screen`, which extends the
+/// existing `stdout` -> `term` -> `screen` order rather than crossing it:
+/// nothing takes `stdout` while holding `view`.
+struct ScrollMode {
+    active: AtomicBool,
+    view: Mutex<ScrollView>,
+}
+
+impl ScrollMode {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            view: Mutex::new(ScrollView::default()),
+        }
+    }
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
+/// Where the pager is looking: `offset` lines above the live screen, out of
+/// `available` retained.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollView {
+    offset: usize,
+    available: usize,
+}
+
+/// One navigation step, resolved against the viewport height by
+/// `apply_scroll_command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollCommand {
+    /// Enter the pager without moving (`Ctrl-b [`).
+    Stay,
+    Up(usize),
+    Down(usize),
+    PageUp,
+    PageDown,
+    HalfUp,
+    HalfDown,
+    Top,
+    Bottom,
+    /// `q`, `Esc` or `Ctrl-C`: back to the live screen.
+    Exit,
+}
+
+/// What `scroll_keys` made of the bytes at the front of the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollKey {
+    /// A navigation command, and how many bytes it consumed.
+    Command(ScrollCommand, usize),
+    /// Recognized and deliberately swallowed (a non-wheel mouse report, an
+    /// unbound key). **Consumed, never forwarded** -- that is the whole
+    /// point of the mode: while the pager is up, no keystroke reaches the
+    /// workload.
+    Ignored(usize),
+    /// A sequence that has begun but not finished in this buffer. The caller
+    /// keeps the bytes and retries when more arrive.
+    Incomplete,
+}
+
+/// Keyboard and mouse decoding for scroll mode. Pure, so the split-sequence
+/// and modifier cases are unit-testable without a terminal.
+///
+/// Bindings follow tmux copy-mode where tmux has one and `less` elsewhere,
+/// because those are the two muscle memories a user arrives with:
+/// arrows/`j`/`k` by the line, PageUp/PageDown and Space/`b` by the screen,
+/// `Ctrl-U`/`Ctrl-D`/`u`/`d` by the half screen, Home/`g` and End/`G` to the
+/// ends, `q`/`Esc`/`Ctrl-C` back to live, and the wheel by
+/// `WHEEL_LINES`.
+///
+/// A lone `ESC` that is the *entire* remaining buffer is read as the Escape
+/// key, not as the start of a sequence that has not arrived yet. Real
+/// terminals emit `ESC [ A` for an arrow key in one write, so the ambiguity
+/// is only theoretically reachable, and resolving it the other way would
+/// mean Escape did nothing until the user pressed another key -- much worse
+/// than the rare case of a split arrow key exiting the pager.
+fn scroll_keys(buf: &[u8]) -> ScrollKey {
+    use ScrollCommand::*;
+    let Some(&first) = buf.first() else {
+        return ScrollKey::Incomplete;
+    };
+    if first != 0x1b {
+        let command = match first {
+            b'q' | b'Q' | 0x03 => Some(Exit),
+            b'k' | b'y' => Some(Up(1)),
+            b'j' | b'e' => Some(Down(1)),
+            b' ' | b'f' | 0x06 => Some(PageDown),
+            b'b' | 0x02 => Some(PageUp),
+            b'u' | 0x15 => Some(HalfUp),
+            b'd' | 0x04 => Some(HalfDown),
+            b'g' => Some(Top),
+            b'G' => Some(Bottom),
+            _ => None,
+        };
+        return match command {
+            Some(c) => ScrollKey::Command(c, 1),
+            None => ScrollKey::Ignored(1),
+        };
+    }
+    if buf.len() == 1 {
+        return ScrollKey::Command(Exit, 1);
+    }
+    match buf[1] {
+        b'[' => {
+            if buf.len() == 2 {
+                return ScrollKey::Incomplete;
+            }
+            if buf[2] == b'<' {
+                return match parse_sgr_mouse(buf) {
+                    MouseParse::Complete(report, consumed) => {
+                        // Wheel reports repeat on press only; the release
+                        // report a terminal may pair with them is swallowed
+                        // by the `Ignored` arm below, so one notch moves
+                        // WHEEL_LINES exactly once.
+                        match (report.button, report.press) {
+                            (MOUSE_WHEEL_UP, true) => ScrollKey::Command(Up(WHEEL_LINES), consumed),
+                            (MOUSE_WHEEL_DOWN, true) => {
+                                ScrollKey::Command(Down(WHEEL_LINES), consumed)
+                            }
+                            _ => ScrollKey::Ignored(consumed),
+                        }
+                    }
+                    MouseParse::Incomplete => ScrollKey::Incomplete,
+                    MouseParse::NotMouse => ScrollKey::Ignored(1),
+                };
+            }
+            // A generic CSI: scan to the final byte, so `\x1b[5;2~`
+            // (shifted PageUp) resolves the same as `\x1b[5~`.
+            let Some(end) = buf[2..]
+                .iter()
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map(|i| i + 2)
+            else {
+                // Bounded, so a stray `ESC [` followed by a stream of digits
+                // cannot buffer forever.
+                return if buf.len() > 32 {
+                    ScrollKey::Ignored(buf.len())
+                } else {
+                    ScrollKey::Incomplete
+                };
+            };
+            let consumed = end + 1;
+            let params = &buf[2..end];
+            let leading: u32 = params
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .fold(0u32, |acc, b| {
+                    acc.saturating_mul(10).saturating_add(u32::from(b - b'0'))
+                });
+            let command = match (buf[end], leading) {
+                (b'A', _) => Some(Up(1)),
+                (b'B', _) => Some(Down(1)),
+                (b'H', _) => Some(Top),
+                (b'F', _) => Some(Bottom),
+                (b'~', 1 | 7) => Some(Top),
+                (b'~', 4 | 8) => Some(Bottom),
+                (b'~', 5) => Some(PageUp),
+                (b'~', 6) => Some(PageDown),
+                _ => None,
+            };
+            match command {
+                Some(c) => ScrollKey::Command(c, consumed),
+                None => ScrollKey::Ignored(consumed),
+            }
+        }
+        b'O' => {
+            if buf.len() == 2 {
+                return ScrollKey::Incomplete;
+            }
+            let command = match buf[2] {
+                b'A' => Some(Up(1)),
+                b'B' => Some(Down(1)),
+                b'H' => Some(Top),
+                b'F' => Some(Bottom),
+                _ => None,
+            };
+            match command {
+                Some(c) => ScrollKey::Command(c, 3),
+                None => ScrollKey::Ignored(3),
+            }
+        }
+        _ => ScrollKey::Ignored(2),
+    }
+}
+
+/// The scroll-mode status bar: what mode the user is in, how far back they
+/// are, and how to get out.
+///
+/// The position readout is tmux copy-mode's `[n/total]` in words rather than
+/// brackets, because this bar is the *only* thing telling the user their
+/// keystrokes are going to the pager instead of to their agent -- the single
+/// question the mode has to answer at a glance. Trimmed from the right as
+/// the terminal narrows, down to a minimum that keeps the word SCROLL and
+/// the way out.
+fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
+    let position = format!("SCROLL {}/{}", view.offset, view.available);
+    let note = if view.available == 0 && alt_screen {
+        " · no history: the workload owns the screen"
+    } else {
+        ""
+    };
+    let full = format!(
+        "{position}{note} · PgUp/PgDn ↑↓ Home/End · q live · keys go here, not to the session"
+    );
+    let medium = format!("{position}{note} · PgUp/PgDn ↑↓ Home/End · q live");
+    let compact = format!("{position} · q live");
+    for candidate in [full, medium, compact, position.clone()] {
+        if terminal_display_width(&candidate) <= cols {
+            return pad_or_truncate(&sanitize_terminal_text(&candidate), cols);
+        }
+    }
+    pad_or_truncate(&sanitize_terminal_text("SCROLL · q"), cols)
+}
+
+/// The bar row, drawn for scroll mode: no workload cursor restore (the
+/// workload's cursor is not on screen -- the pager is), and the cursor left
+/// hidden.
+fn scroll_bar_sequence(geom: TermGeom, text: &str) -> Vec<u8> {
+    let mut seq = Vec::new();
+    seq.extend_from_slice(b"\x1b[?25l");
+    seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
+    seq.extend_from_slice(b"\x1b[2K\x1b[7m");
+    seq.extend_from_slice(text.as_bytes());
+    seq.extend_from_slice(b"\x1b[0m\x1b[?25l");
+    seq
+}
+
+/// Paint the pager: the model's screen as it looked `offset` lines back,
+/// plus the scroll-mode bar.
+///
+/// Three things this does not do, each deliberate:
+///
+/// - It does not consult the escape boundary (`BoundaryPolicy::StreamSuspended`).
+///   Nothing of the workload's is being written while the pager is up, so
+///   there is no half-emitted sequence of the workload's to splice into; the
+///   `SCROLL_CANCEL` prefix ends whatever the host had in flight at the
+///   moment the relay was suspended.
+/// - It does not leave the model scrolled. `ClientScreen::scrolled_frame`
+///   applies the offset, renders, and puts the model back at the live
+///   screen, so `relay`, `cursor_restore` and `snapshot` keep describing the
+///   live session throughout.
+/// - It re-asserts the client's own `1;{rows-1}` reservation rather than the
+///   workload's margins. The pager owns the whole screen above the bar; a
+///   workload sub-range is meaningless to it, and would let the frame's own
+///   absolute row addressing fall outside the region.
+fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
+    let geom = match ctx.term.lock() {
+        Ok(g) => *g,
+        Err(_) => return false,
+    };
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut view = ctx
+        .scroll
+        .view
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let (frame, alt_screen) = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let (frame, offset, available) = screen.scrolled_frame(view.offset);
+        view.offset = offset;
+        view.available = available;
+        let frame = screen.filter_host(&frame).unwrap_or(frame);
+        (frame, screen.alternate_screen())
+    };
+    let mut seq = SCROLL_CANCEL.to_vec();
+    if geom.reserved {
+        seq.extend_from_slice(format!("\x1b[1;{}r", geom.rows - 1).as_bytes());
+    }
+    seq.extend_from_slice(&frame);
+    if geom.reserved {
+        let text = scroll_bar_text(*view, geom.cols as usize, alt_screen);
+        seq.extend_from_slice(&scroll_bar_sequence(geom, &text));
+        // Recorded against the same dirty-check `refresh_scroll_bar` reads,
+        // so the status tick right after a navigation does not rewrite a row
+        // this frame just drew.
+        *ctx.last_drawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((text, geom.rows, geom.cols, None));
+    }
+    seq.extend_from_slice(b"\x1b[?25l");
+    drop(view);
+    write_client_locked(
+        &mut *out,
+        &ctx.screen,
+        &seq,
+        BoundaryPolicy::StreamSuspended,
+    )
+}
+
+/// Refresh just the pager's bar row, so the retained-line count stays honest
+/// while the workload keeps producing output behind the pager, without
+/// repainting (and flickering) a whole screen on a timer.
+fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
+    let geom = match ctx.term.lock() {
+        Ok(g) => *g,
+        Err(_) => return false,
+    };
+    if !geom.reserved {
+        return false;
+    }
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut view = ctx
+        .scroll
+        .view
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let (available, alt_screen) = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        (screen.scrollback_available(), screen.alternate_screen())
+    };
+    view.available = available;
+    let text = scroll_bar_text(*view, geom.cols as usize, alt_screen);
+    drop(view);
+    // Dirty-checked against the same `last_drawn` the live bar uses, so this
+    // tick is a no-op in the common case *and* still repairs the row when
+    // something else wrote over it -- a `Ctrl-b ?` help flash, most
+    // obviously, which would otherwise sit on the bar for the rest of the
+    // time the user spends reading.
+    {
+        let mut last = ctx
+            .last_drawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = (text.clone(), geom.rows, geom.cols, None);
+        if last.as_ref() == Some(&key) {
+            return false;
+        }
+        *last = Some(key);
+    }
+    write_client_locked(
+        &mut *out,
+        &ctx.screen,
+        &scroll_bar_sequence(geom, &text),
+        BoundaryPolicy::StreamSuspended,
+    )
+}
+
+/// Enter scroll mode and run the gesture that asked for it.
+///
+/// `active` is flipped under the stdout lock, which is the same lock
+/// `relay_to_terminal` checks it under -- so a chunk cannot be half-written
+/// over the pager's first frame.
+fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
+    {
+        let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+        if ctx.scroll.active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *ctx.scroll
+            .view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = ScrollView::default();
+    }
+    // The bar is about to say something completely different from whatever
+    // the dirty-check last recorded, and will again on the way out.
+    *ctx.last_drawn
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    apply_scroll_command(ctx, first);
+}
+
+/// Leave scroll mode: repaint the host from the live model and let the relay
+/// resume.
+///
+/// The repaint is the same snapshot `Ctrl-b r` writes -- the model has been
+/// fed every byte that arrived while the pager was up, so it is current, and
+/// the frames the relay declined to write are already accounted for in it.
+/// The bar is rewritten in the same sequence because the snapshot's `ED2`
+/// blanks the reserved row.
+fn exit_scroll_mode(ctx: &StatusBarCtx) {
+    if !ctx.scroll.is_active() {
+        return;
+    }
+    // Reads session records off disk; must not happen under the stdout lock.
+    let bar = status_bar_render(ctx);
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let (snapshot, restore, margins) = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = screen.snapshot();
+        let snapshot = screen.filter_host(&snapshot).unwrap_or(snapshot);
+        (snapshot, screen.cursor_restore(), screen.margins())
+    };
+    let mut seq = SCROLL_CANCEL.to_vec();
+    seq.extend_from_slice(&snapshot);
+    if let Some((geom, text)) = bar {
+        seq.extend_from_slice(&status_bar_sequence(geom, &text, margins, &restore));
+    }
+    write_client_locked(
+        &mut *out,
+        &ctx.screen,
+        &seq,
+        BoundaryPolicy::StreamSuspended,
+    );
+    *ctx.last_drawn
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    ctx.scroll.active.store(false, Ordering::SeqCst);
+}
+
+/// Resolve one navigation step against the current viewport and repaint.
+///
+/// `Down` past the live screen leaves scroll mode, the way tmux's copy-mode
+/// does not but every pager the user has ever used does: scrolling back to
+/// the bottom means "I am done reading", and having to also press `q` to get
+/// the keyboard back is exactly the confusion this mode must not create.
+fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
+    let page = {
+        let geom = ctx.term.lock().map(|g| *g).unwrap_or(TermGeom {
+            rows: 0,
+            cols: 0,
+            reserved: false,
+        });
+        usize::from(reserved_rows(geom.rows)).max(1)
+    };
+    if command == ScrollCommand::Exit {
+        exit_scroll_mode(ctx);
+        return;
+    }
+    let exit = {
+        let mut view = ctx
+            .scroll
+            .view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (delta, downward): (isize, bool) = match command {
+            ScrollCommand::Exit => unreachable!("handled above"),
+            ScrollCommand::Stay => (0, false),
+            ScrollCommand::Up(n) => (n as isize, false),
+            ScrollCommand::Down(n) => (-(n as isize), true),
+            ScrollCommand::PageUp => (page as isize, false),
+            ScrollCommand::PageDown => (-(page as isize), true),
+            ScrollCommand::HalfUp => ((page / 2).max(1) as isize, false),
+            ScrollCommand::HalfDown => (-((page / 2).max(1) as isize), true),
+            ScrollCommand::Top => (view.available as isize, false),
+            ScrollCommand::Bottom => (-(view.offset as isize), true),
+        };
+        if downward && view.offset == 0 {
+            true
+        } else {
+            view.offset = (view.offset as isize + delta).max(0) as usize;
+            false
+        }
+    };
+    if exit {
+        exit_scroll_mode(ctx);
+    } else {
+        paint_scroll_view(ctx);
+    }
+}
+
+/// Byte-level routing of stdin while the client owns the mouse, the pager is
+/// up, or both -- the thing that guarantees a keystroke aimed at the pager
+/// can never reach the workload.
+///
+/// Returns the bytes that may still be forwarded. In scroll mode that is
+/// always empty: every byte is consumed, navigation or not.
+///
+/// `pending` exists because a mouse report can be split across two `read()`s
+/// exactly like the `Ctrl-b` prefix can. Outside scroll mode it is only ever
+/// allowed to hold a buffer that has already produced the full three-byte
+/// `\x1b[<` SGR introducer -- no keyboard emits that, so nothing a user
+/// types can be delayed by it. A bare `ESC` or `ESC [` at the end of a chunk
+/// is forwarded immediately rather than held, because holding it would make
+/// the Escape key in the user's editor wait for the next keystroke.
+#[derive(Default)]
+struct ScrollInput {
+    pending: Vec<u8>,
+}
+
+impl ScrollInput {
+    fn route(&mut self, ctx: &StatusBarCtx, bytes: &[u8]) -> Vec<u8> {
+        let client_mouse = matches!(
+            *ctx.mouse_owned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(true)
+        );
+        if !ctx.scroll.is_active() && !client_mouse {
+            // Neither the pager nor the wheel is in play: the workload's
+            // input path is exactly what it always was.
+            let mut out = std::mem::take(&mut self.pending);
+            out.extend_from_slice(bytes);
+            return out;
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut out: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if ctx.scroll.is_active() {
+                match scroll_keys(&self.pending[i..]) {
+                    ScrollKey::Command(command, n) => {
+                        i += n;
+                        // The buffer is advanced *before* the command runs,
+                        // so an Exit landing mid-buffer leaves the bytes
+                        // after it to be forwarded normally on the next turn
+                        // of this loop rather than being swallowed with it.
+                        self.pending.drain(..i);
+                        i = 0;
+                        apply_scroll_command(ctx, command);
+                        if !ctx.scroll.is_active() {
+                            // The command closed the pager. Everything left
+                            // in this buffer was typed while the pager still
+                            // had the keyboard, so it is discarded rather
+                            // than forwarded: the user meant it for the
+                            // pager, and "the rest of the keystroke you were
+                            // reading with lands in your agent's prompt" is
+                            // the exact failure this mode exists to prevent.
+                            // Bytes from the next read() go to the workload
+                            // normally.
+                            self.pending.clear();
+                            return out;
+                        }
+                    }
+                    ScrollKey::Ignored(n) => i += n,
+                    ScrollKey::Incomplete => break,
+                }
+                continue;
+            }
+            // Live, with the client holding the mouse: swallow mouse
+            // reports (the workload never asked for them, so forwarding
+            // would type escape sequences into it) and let a wheel roll up
+            // open the pager, which is the gesture the user already has in
+            // their fingers from tmux.
+            let rest = &self.pending[i..];
+            if rest.len() >= 3 && &rest[..3] == b"\x1b[<" {
+                match parse_sgr_mouse(rest) {
+                    MouseParse::Complete(report, consumed) => {
+                        i += consumed;
+                        if report.button == MOUSE_WHEEL_UP && report.press {
+                            self.pending.drain(..i);
+                            i = 0;
+                            enter_scroll_mode(ctx, ScrollCommand::Up(WHEEL_LINES));
+                        }
+                    }
+                    MouseParse::Incomplete => break,
+                    MouseParse::NotMouse => {
+                        out.push(self.pending[i]);
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            out.push(self.pending[i]);
+            i += 1;
+        }
+        self.pending.drain(..i);
+        out
+    }
+}
+
+/// Borrow the host's mouse reporting for the client, or hand it back to the
+/// workload -- whichever the workload's own state currently calls for.
+///
+/// **Precedence, stated deliberately: the workload wins.** A TUI that has
+/// asked for mouse reporting is a TUI with panes of its own to scroll, and
+/// tmux's answer -- the pane's application gets the mouse when it requested
+/// it -- is the right one. So the client borrows the mouse only while the
+/// workload wants none, and gives it back the moment the workload asks,
+/// re-asserting the workload's exact modes with
+/// `ClientScreen::workload_mouse_sequence` so the handover cannot leave the
+/// terminal in a state neither side chose. While the workload holds the
+/// mouse the wheel goes to it and `Ctrl-b [` is the way into the pager.
+///
+/// Boundary-gated like every other client injection: this is a live splice
+/// into a relayed stream (the workload can flip mouse modes at any byte),
+/// so it waits for a real boundary and simply tries again on the next status
+/// tick if it does not get one.
+fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
+    if !ctx.mouse_capture {
+        return false;
+    }
+    let (want, seq) = {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        if screen.workload_wants_mouse() {
+            (false, screen.workload_mouse_sequence())
+        } else {
+            (true, CLIENT_MOUSE_ENABLE.to_vec())
+        }
+    };
+    {
+        let owned = ctx
+            .mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *owned == Some(want) {
+            return false;
+        }
+    }
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    let policy = if ctx.scroll.is_active() {
+        BoundaryPolicy::StreamSuspended
+    } else {
+        BoundaryPolicy::Defer
+    };
+    if write_client_locked(&mut *out, &ctx.screen, &seq, policy) {
+        *ctx.mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(want);
+        true
+    } else {
+        false
+    }
+}
+
+/// Prime a freshly built client model with a tail of the worker's retained
+/// raw history, so `Ctrl-b [` has a past to page through from the first
+/// second of the attach rather than only what arrives afterwards.
+///
+/// Failure is not an error the user should see: a worker too old to answer,
+/// a session that just exited, or a history file that has been rotated all
+/// mean "no history to seed", and the attach continues with an empty grid
+/// that fills from the live stream.
+fn seed_client_scrollback(
+    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
+    record: &SessionRecord,
+) {
+    if history_limit() == 0 {
+        return;
+    }
+    let Ok(tail) = rpc_capture(record, Some(scrollback_seed_bytes())) else {
+        return;
+    };
+    screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .seed_history(&tail);
 }
 
 /// Which session a `Ctrl-b` switch chord asks for
@@ -6030,6 +6831,10 @@ enum InputAction {
     /// Local, like Help -- the garbled cells are on this terminal, not in
     /// the session.
     Redraw,
+    /// `Ctrl-b [`: open the scrollback pager (tmux's copy-mode chord). Local
+    /// and, crucially, *consumed*: from here until the user leaves the mode,
+    /// no keystroke reaches the workload.
+    Scroll,
 }
 
 /// Byte-scanning state for the `Ctrl-b` prefix state machine, split out of
@@ -6047,7 +6852,8 @@ struct InputScanner {
 impl InputScanner {
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
     /// `Ctrl-b d` detaches; `?` flashes the key reference; `r` redraws the
-    /// live screen; `n p N P l 1-9` switch. Anything else pending is "not a
+    /// live screen; `[` opens the scrollback pager; `n p N P l 1-9` switch.
+    /// Anything else pending is "not a
     /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
     /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
     /// still pass through to the workload untouched.
@@ -6069,6 +6875,7 @@ impl InputScanner {
                     }
                     b'?' => Some(InputAction::Help),
                     b'r' => Some(InputAction::Redraw),
+                    b'[' => Some(InputAction::Scroll),
                     b'n' => Some(InputAction::Switch(SwitchTarget::Next)),
                     b'p' => Some(InputAction::Switch(SwitchTarget::Prev)),
                     b'N' => Some(InputAction::Switch(SwitchTarget::NextGlobal)),
@@ -6301,10 +7108,23 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         aplexer::screen::DEFAULT_TERMINAL_ROWS,
         aplexer::screen::DEFAULT_TERMINAL_COLS,
     ));
-    let workload_screen = Arc::new(Mutex::new(aplexer::screen::ClientScreen::try_new(
-        screen_rows,
+    // The client's model, unlike the worker's, retains scrollback: this is
+    // the grid `Ctrl-b [` pages through, and giving it a real depth is what
+    // makes an attached session's history readable at all (see the scroll
+    // mode section above `history_limit`). The requested line count is
+    // clamped against `MAX_SCROLLBACK_CELLS` at this terminal's width.
+    let scrollback_lines = aplexer::screen::scrollback_lines_for(
         screen_cols,
-    )?));
+        if display_tty { history_limit() } else { 0 },
+    );
+    let workload_screen = Arc::new(Mutex::new(
+        aplexer::screen::ClientScreen::try_new_with_scrollback(
+            screen_rows,
+            screen_cols,
+            scrollback_lines,
+        )?,
+    ));
+    let scroll_mode = Arc::new(ScrollMode::new());
     let status_ctx = StatusBarCtx {
         stdout: stdout.clone(),
         term: term.clone(),
@@ -6317,6 +7137,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         pending_refresh: Arc::new(AtomicBool::new(false)),
         pending_layout: Arc::new(Mutex::new(None)),
         sync_deferred_since: Arc::new(Mutex::new(None)),
+        scroll: scroll_mode.clone(),
+        mouse_owned: Arc::new(Mutex::new(None)),
+        mouse_capture: display_tty && input_tty && mouse_capture_enabled(),
     };
 
     // Hold the host on the alternate screen for the whole attach, *before*
@@ -6341,7 +7164,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // DECSTBM sub-range as its last bytes (design doc section 6.2 step 3), so
     // scanning it here is what lets the immediately-following `draw_status_bar`
     // re-assert that region instead of overwriting it with the bar's own.
+    // Prime the retained history *before* the reattach snapshot, so its rows
+    // sit above the screen the snapshot paints rather than after it. Model
+    // only: not one byte of the seed reaches the terminal.
+    if scrollback_lines > 0 {
+        seed_client_scrollback(&workload_screen, record);
+    }
     feed_and_write(&stdout, &workload_screen, b"", &handshake.initial, None)?;
+    // After the snapshot, because the snapshot is what tells the model which
+    // mouse modes the workload itself wants -- and the workload's wishes
+    // decide whether the client may borrow the mouse at all.
+    sync_client_mouse(&status_ctx);
     if display_tty {
         // The attach hint goes through the status-bar flash channel, not an
         // eprintln'd banner: a banner written before/around the snapshot is
@@ -6406,6 +7239,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // ordinary input, so a program that wants a literal Ctrl-b (some
         // editors and REPLs use it) isn't broken by this feature.
         let mut scanner = InputScanner::default();
+        // Sits between the chord scanner and the socket: while the pager is
+        // up it consumes every byte (no keystroke reaches the workload --
+        // the whole point of the mode), and while the client holds the
+        // mouse it consumes mouse reports the workload never asked for and
+        // turns a wheel roll up into the pager.
+        let mut scroll_input = ScrollInput::default();
         'outer: while input_active.load(Ordering::Relaxed) {
             let n = match input.read(&mut buffer) {
                 Ok(0) => {
@@ -6436,12 +7275,20 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // chord); a Forward after it goes to the new one,
                         // automatically, because perform_switch swapped the
                         // stream inside input_writer's mutex.
+                        let bytes = scroll_input.route(&input_status_ctx, &bytes);
+                        if bytes.is_empty() {
+                            continue;
+                        }
                         if send_data(&input_writer, &bytes).is_err() {
                             detach_attached_client(&input_writer, &input_active);
                             break 'outer;
                         }
                     }
                     InputAction::Detach => {
+                        // Leave the pager first: detach restores the host
+                        // from the *live* model, and the reset sequence it
+                        // writes assumes the relay owns the screen again.
+                        exit_scroll_mode(&input_status_ctx);
                         input_detached.store(true, Ordering::Relaxed);
                         detach_attached_client(&input_writer, &input_active);
                         break 'outer;
@@ -6450,9 +7297,25 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         flash_status(&input_status_ctx, ATTACH_KEY_HELP);
                     }
                     InputAction::Redraw => {
-                        redraw_live_screen(&input_status_ctx);
+                        // `Ctrl-b r` means "this display is garbled, redraw
+                        // what I am looking at". While the pager is up that
+                        // is the pager, not the live screen -- painting the
+                        // live screen here would silently swap the user's
+                        // view without giving them the keyboard back.
+                        if input_status_ctx.scroll.is_active() {
+                            paint_scroll_view(&input_status_ctx);
+                        } else {
+                            redraw_live_screen(&input_status_ctx);
+                        }
+                    }
+                    InputAction::Scroll => {
+                        enter_scroll_mode(&input_status_ctx, ScrollCommand::Stay);
                     }
                     InputAction::Switch(target) => {
+                        // A switch replaces the model wholesale; the pager
+                        // is looking at the outgoing session's history, so
+                        // it has to close before the swap.
+                        exit_scroll_mode(&input_status_ctx);
                         let result = perform_switch(
                             &input_paths,
                             target,
@@ -6514,6 +7377,12 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // the client's own row reservation waits, and only
                         // for as long as `LAYOUT_DEFER_LIMIT`.
                         apply_terminal_layout(&resize_ctx, rows, cols);
+                        // The pager renders at the reserved geometry, so a
+                        // resize has to redraw it -- nothing else will,
+                        // because the relay is suspended.
+                        if resize_ctx.scroll.is_active() {
+                            paint_scroll_view(&resize_ctx);
+                        }
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
                         // perform_switch); if a real terminal resize races
@@ -6577,6 +7446,18 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 // expire on a workload that stopped mid-escape-sequence.
                 // Cheap: one uncontended mutex peek that returns immediately
                 // when nothing is deferred, which is the overwhelming case.
+                // Cheap and idempotent: returns immediately unless the
+                // workload's own mouse wishes changed since the last tick.
+                sync_client_mouse(&thread_status_ctx);
+                if thread_status_ctx.scroll.is_active() {
+                    // The pager owns the terminal. Its position readout is
+                    // the only thing that needs to keep moving while the
+                    // workload produces output behind it; a deferred resize
+                    // or bar redraw stays deferred until the user comes back
+                    // to the live screen.
+                    refresh_scroll_bar(&thread_status_ctx);
+                    continue;
+                }
                 flush_pending_layout(&thread_status_ctx);
                 let idle_for = activity.elapsed();
                 let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
@@ -6634,9 +7515,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             };
             match frame.kind {
                 FrameKind::Data => {
-                    relay_to_terminal(&workload_screen, &stdout, &frame.payload)?;
+                    relay_to_terminal(&workload_screen, &stdout, &scroll_mode, &frame.payload)?;
                     if let Ok(mut t) = last_activity.lock() {
                         *t = Instant::now();
+                    }
+                    // While the pager is up nothing may paint over it: the
+                    // deferred resize, the deferred bar and the deferred
+                    // `Ctrl-b r` all keep waiting, and are delivered by the
+                    // repaint `exit_scroll_mode` performs (or by the first
+                    // chunk after it).
+                    if scroll_mode.is_active() {
+                        continue;
                     }
                     // A redraw the status thread wanted while the stream was
                     // mid-sequence (or mid-frame) waits here rather than being
@@ -6698,6 +7587,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let outcome = take_pending_switch(&pending_switch, &switch_in_progress);
         let Some(outcome) = outcome else { break };
 
+        let switched_to = outcome.record.clone();
         *shared_record.lock().unwrap_or_else(PoisonError::into_inner) = outcome.record;
         reader = outcome.reader; // old stream dropped (closed) here
 
@@ -6729,13 +7619,35 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 aplexer::screen::DEFAULT_TERMINAL_COLS,
             )
         };
+        // The reset and the seed are done here rather than through
+        // `feed_and_write`'s `reset_to`, because the retained history has to
+        // be primed *between* them: reset (drop A's model and its history),
+        // seed (give B's model B's past), then paint B's screen on top. Done
+        // the other way round the seed's rows would land above nothing, or
+        // below B's current screen.
+        {
+            let mut screen = workload_screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            screen.reset(screen_rows, screen_cols);
+        }
+        if scrollback_lines > 0 {
+            seed_client_scrollback(&workload_screen, &switched_to);
+        }
         let _ = feed_and_write(
             &stdout,
             &workload_screen,
             TERMINAL_RESET_SEQUENCE,
             &outcome.history,
-            Some((screen_rows, screen_cols)),
+            None,
         );
+        // TERMINAL_RESET_SEQUENCE turned every mouse mode off, so whoever
+        // owned the mouse before the switch owns nothing now.
+        *status_ctx
+            .mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        sync_client_mouse(&status_ctx);
         if let Ok(mut t) = last_activity.lock() {
             *t = Instant::now();
         }
@@ -7271,6 +8183,289 @@ mod switching_tests {
         let mut s = InputScanner::default();
         let actions = s.scan(&[0x02, b'0']);
         assert_eq!(bytes(&actions), vec![0x02, b'0']);
+    }
+
+    // -- scroll mode: key decoding and offset arithmetic -------------------
+
+    /// The property the whole mode rests on: in scroll mode `scroll_keys`
+    /// classifies every byte as either a command or `Ignored`, and both are
+    /// *consumed*. There is no third answer that could let a keystroke reach
+    /// the workload.
+    #[test]
+    fn scroll_mode_consumes_every_byte_it_is_given() {
+        // Ordinary typing, control characters, a paste, an unknown CSI, a
+        // non-wheel mouse report, UTF-8.
+        for chunk in [
+            b"hello world".as_slice(),
+            b"\x7f\x0d\x0a\x09".as_slice(),
+            b"\x1b[200~pasted text\x1b[201~".as_slice(),
+            b"\x1b[1;2R".as_slice(),
+            b"\x1b[<0;10;5M".as_slice(),
+            "naïve — ünïcode".as_bytes(),
+            b"\x1b[Z\x1bOP\x1b[15~".as_slice(),
+        ] {
+            let mut i = 0;
+            let mut guard = 0;
+            while i < chunk.len() {
+                guard += 1;
+                assert!(guard < 1000, "scroll_keys made no progress on {chunk:?}");
+                match scroll_keys(&chunk[i..]) {
+                    ScrollKey::Command(_, n) | ScrollKey::Ignored(n) => {
+                        assert!(n > 0, "a zero-length consume would spin forever");
+                        i += n;
+                    }
+                    ScrollKey::Incomplete => panic!(
+                        "a complete chunk must never be Incomplete: {:?} at {i}",
+                        String::from_utf8_lossy(chunk)
+                    ),
+                }
+            }
+            assert_eq!(i, chunk.len(), "consumed past the end of {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn scroll_keys_navigation_bindings() {
+        use ScrollCommand::*;
+        for (bytes, expected) in [
+            (b"\x1b[5~".as_slice(), PageUp),
+            (b"\x1b[6~".as_slice(), PageDown),
+            (b"\x1b[5;2~".as_slice(), PageUp), // shifted PageUp
+            (b"\x1b[A".as_slice(), Up(1)),
+            (b"\x1b[B".as_slice(), Down(1)),
+            (b"\x1bOA".as_slice(), Up(1)),
+            (b"\x1bOB".as_slice(), Down(1)),
+            (b"\x1b[H".as_slice(), Top),
+            (b"\x1b[F".as_slice(), Bottom),
+            (b"\x1b[1~".as_slice(), Top),
+            (b"\x1b[4~".as_slice(), Bottom),
+            (b"k".as_slice(), Up(1)),
+            (b"j".as_slice(), Down(1)),
+            (b" ".as_slice(), PageDown),
+            (b"b".as_slice(), PageUp),
+            (b"u".as_slice(), HalfUp),
+            (b"d".as_slice(), HalfDown),
+            (b"g".as_slice(), Top),
+            (b"G".as_slice(), Bottom),
+            (b"q".as_slice(), Exit),
+            (b"\x03".as_slice(), Exit),
+            (b"\x1b".as_slice(), Exit),
+            (b"\x1b[<64;10;5M".as_slice(), Up(WHEEL_LINES)),
+            (b"\x1b[<65;10;5M".as_slice(), Down(WHEEL_LINES)),
+        ] {
+            match scroll_keys(bytes) {
+                ScrollKey::Command(command, consumed) => {
+                    assert_eq!(
+                        command,
+                        expected,
+                        "for {:?}",
+                        String::from_utf8_lossy(bytes)
+                    );
+                    assert_eq!(
+                        consumed,
+                        bytes.len(),
+                        "for {:?}",
+                        String::from_utf8_lossy(bytes)
+                    );
+                }
+                other => panic!("{:?} gave {other:?}", String::from_utf8_lossy(bytes)),
+            }
+        }
+    }
+
+    /// A wheel *release* report (`m`) must not move the view a second time,
+    /// or one notch would scroll twice as far as tmux's.
+    #[test]
+    fn scroll_keys_wheel_release_is_swallowed_not_repeated() {
+        assert_eq!(
+            scroll_keys(b"\x1b[<64;10;5m"),
+            ScrollKey::Ignored(b"\x1b[<64;10;5m".len())
+        );
+    }
+
+    /// An arrow key or mouse report arriving in two `read()`s is held, not
+    /// mistaken for something else.
+    #[test]
+    fn scroll_keys_split_sequences_are_incomplete_not_misread() {
+        assert_eq!(scroll_keys(b"\x1b["), ScrollKey::Incomplete);
+        assert_eq!(scroll_keys(b"\x1bO"), ScrollKey::Incomplete);
+        assert_eq!(scroll_keys(b"\x1b[<64;10"), ScrollKey::Incomplete);
+        // ...but not forever: a stray `ESC [` followed by junk is bounded.
+        let long = [b"\x1b[".as_slice(), &[b'1'; 40]].concat();
+        assert_eq!(scroll_keys(&long), ScrollKey::Ignored(long.len()));
+    }
+
+    /// The bar has to name the mode and the position at every width, because
+    /// it is the only thing telling the user where their keystrokes go.
+    #[test]
+    fn scroll_bar_text_keeps_the_mode_and_position_at_every_width() {
+        let view = ScrollView {
+            offset: 12,
+            available: 2000,
+        };
+        for cols in [10usize, 20, 40, 80, 200] {
+            let text = scroll_bar_text(view, cols, false);
+            assert_eq!(
+                terminal_display_width(&text),
+                cols,
+                "the bar must fill exactly its row at {cols} columns"
+            );
+            assert!(
+                text.contains("SCROLL"),
+                "the mode must be named at {cols} columns, got {text:?}"
+            );
+            if cols >= 20 {
+                assert!(
+                    text.contains("12/2000"),
+                    "the position must survive at {cols} columns, got {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A pager whose "back to live" gesture needs a second keystroke to
+    /// actually hand the keyboard back is the confusion this mode exists to
+    /// avoid, so scrolling down past the live screen leaves the mode.
+    #[test]
+    fn scrolling_down_past_the_live_screen_leaves_scroll_mode() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        ctx.scroll.active.store(true, Ordering::SeqCst);
+        *ctx.scroll
+            .view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = ScrollView {
+            offset: 2,
+            available: 100,
+        };
+        apply_scroll_command(&ctx, ScrollCommand::Down(1));
+        assert!(
+            ctx.scroll.is_active(),
+            "one line up from the bottom is still the pager"
+        );
+        apply_scroll_command(&ctx, ScrollCommand::Down(5));
+        assert!(
+            !ctx.scroll.is_active(),
+            "hitting the bottom hands the keyboard back to the session"
+        );
+    }
+
+    /// `Ctrl-b [` opens the pager without moving it, and without immediately
+    /// closing it again -- the `Stay` command exists for exactly that.
+    #[test]
+    fn ctrl_b_bracket_opens_the_pager_at_the_live_screen() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        enter_scroll_mode(&ctx, ScrollCommand::Stay);
+        assert!(ctx.scroll.is_active());
+        assert_eq!(
+            ctx.scroll
+                .view
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .offset,
+            0
+        );
+        apply_scroll_command(&ctx, ScrollCommand::Exit);
+        assert!(!ctx.scroll.is_active());
+    }
+
+    #[test]
+    fn scan_ctrl_b_bracket_opens_scroll_mode() {
+        let mut s = InputScanner::default();
+        let actions = s.scan(&[0x02, b'[']);
+        assert!(matches!(actions.as_slice(), [InputAction::Scroll]));
+    }
+
+    /// The routing layer, not just the decoder: with the pager up, a chunk
+    /// of ordinary typing comes back empty -- nothing to send to the
+    /// workload.
+    #[test]
+    fn scroll_input_forwards_nothing_while_the_pager_is_up() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        let mut input = ScrollInput::default();
+        assert_eq!(
+            input.route(&ctx, b"ls -la\r"),
+            b"ls -la\r".to_vec(),
+            "with the pager down and no mouse borrowed, input is untouched"
+        );
+        enter_scroll_mode(&ctx, ScrollCommand::Stay);
+        for chunk in [
+            b"ls -la\r".as_slice(),
+            b"\x1b[A".as_slice(),
+            b"XXNOTINPUTXX".as_slice(),
+            b"\x1b[<0;3;4M".as_slice(),
+            b"rm -rf /\r".as_slice(),
+        ] {
+            assert!(
+                input.route(&ctx, chunk).is_empty(),
+                "{:?} must not reach the workload",
+                String::from_utf8_lossy(chunk)
+            );
+            if !ctx.scroll.is_active() {
+                // A chunk containing a downward move at the live screen
+                // (Space is PageDown) legitimately closes the pager -- and
+                // the assertion above is the important half: the *rest* of
+                // that chunk is discarded rather than typed into the
+                // session. Reopen for the next case.
+                enter_scroll_mode(&ctx, ScrollCommand::Stay);
+            }
+        }
+    }
+
+    /// While the client holds the mouse and the pager is *down*, mouse
+    /// reports are swallowed (the workload never asked for them) and a wheel
+    /// roll up opens the pager -- with no `Ctrl-b` first, which is the
+    /// gesture the user actually reported as broken. Ordinary typing in the
+    /// same chunk still gets through.
+    #[test]
+    fn wheel_up_opens_the_pager_with_no_prefix_and_typing_still_passes() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        *ctx.mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(true);
+        let mut input = ScrollInput::default();
+        assert_eq!(input.route(&ctx, b"ab"), b"ab".to_vec());
+        assert!(!ctx.scroll.is_active());
+        // A left click: swallowed, never typed into the workload.
+        assert!(input.route(&ctx, b"\x1b[<0;5;5M").is_empty());
+        assert!(!ctx.scroll.is_active());
+        // The wheel: straight into the pager.
+        assert!(input.route(&ctx, b"\x1b[<64;5;5M").is_empty());
+        assert!(ctx.scroll.is_active());
+    }
+
+    /// A mouse report split across two reads is reassembled rather than
+    /// leaking its tail into the workload as text.
+    #[test]
+    fn a_split_mouse_report_is_buffered_not_leaked_to_the_workload() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        *ctx.mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(true);
+        let mut input = ScrollInput::default();
+        assert!(input.route(&ctx, b"\x1b[<64;5").is_empty());
+        assert!(!ctx.scroll.is_active());
+        assert!(input.route(&ctx, b";5M").is_empty());
+        assert!(ctx.scroll.is_active());
+    }
+
+    /// The counterpart guarantee: a bare `ESC` at the end of a chunk is
+    /// forwarded immediately while the pager is down, so pressing Escape in
+    /// an editor inside the session does not wait for the next keystroke.
+    #[test]
+    fn a_bare_escape_is_never_held_back_from_the_workload() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        *ctx.mouse_owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(true);
+        let mut input = ScrollInput::default();
+        assert_eq!(input.route(&ctx, b"\x1b"), b"\x1b".to_vec());
+        assert_eq!(input.route(&ctx, b"\x1b["), b"\x1b[".to_vec());
     }
 
     // -- parse_sgr_mouse (docs/clickable-status-bar-design.md section 2) --
@@ -8169,6 +9364,9 @@ mod switching_tests {
             pending_refresh: Arc::new(AtomicBool::new(false)),
             pending_layout: Arc::new(Mutex::new(None)),
             sync_deferred_since: Arc::new(Mutex::new(None)),
+            scroll: Arc::new(ScrollMode::new()),
+            mouse_owned: Arc::new(Mutex::new(None)),
+            mouse_capture: false,
         }
     }
 
@@ -9265,6 +10463,10 @@ mod switching_tests {
         "apply_terminal_layout_to",
         "draw_status_bar",
         "redraw_live_screen",
+        "paint_scroll_view",
+        "refresh_scroll_bar",
+        "exit_scroll_mode",
+        "sync_client_mouse",
     ];
 
     /// `write_locked` writes unconditionally, so it is a second route to the
@@ -9442,6 +10644,64 @@ mod switching_tests {
             past_deadline[0].0, "apply_terminal_layout_to",
             "the deadline exemption belongs to the resize path and nothing else"
         );
+    }
+
+    /// `BoundaryPolicy::StreamSuspended` says "the relay is not writing to
+    /// the host at all right now", which is true of exactly one thing: scroll
+    /// mode. Pinned the same way the deadline exemption is, so it cannot
+    /// quietly become a general-purpose way around the gate.
+    ///
+    /// Two properties, both of which the variant's correctness rests on:
+    /// only scroll-mode writers may pass it, and every write that does must
+    /// lead with `SCROLL_CANCEL` -- the `CAN` that ends whatever sequence the
+    /// host was part-way through when the relay was suspended.
+    #[test]
+    fn scroll_mode_writes_are_the_only_stream_suspended_ones() {
+        use std::collections::BTreeSet;
+
+        /// Every function allowed to write while the relay is suspended, and
+        /// where its `SCROLL_CANCEL` prefix comes from.
+        const SUSPENDED_WRITERS: &[(&str, bool)] = &[
+            // (name, must build its own SCROLL_CANCEL-led sequence)
+            ("paint_scroll_view", true),
+            ("exit_scroll_mode", true),
+            // The bar row is drawn *into* a screen the pager already owns
+            // and already cancelled; it is not the first write after the
+            // suspension, so it needs no CAN of its own.
+            ("refresh_scroll_bar", false),
+            // Hands the mouse over while the pager is up; same reasoning.
+            ("sync_client_mouse", false),
+        ];
+
+        let lines = production_source_lines();
+        let found: BTreeSet<String> = enclosing_fns_of(&lines, "BoundaryPolicy::StreamSuspended")
+            .into_iter()
+            .map(|(f, _)| f)
+            .filter(|f| f != "write_client_locked")
+            .collect();
+        let declared: BTreeSet<String> = SUSPENDED_WRITERS
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        assert_eq!(
+            found, declared,
+            "`BoundaryPolicy::StreamSuspended` bypasses the escape-boundary gate on the \
+             grounds that scroll mode has suspended the relay entirely. Only scroll mode may \
+             claim that. If a new writer genuinely runs with the relay suspended, add it here \
+             with whether it must lead with SCROLL_CANCEL; otherwise use BoundaryPolicy::Defer."
+        );
+        for (name, needs_cancel) in SUSPENDED_WRITERS {
+            if !needs_cancel {
+                continue;
+            }
+            let body = top_level_fn_body(&lines, name);
+            assert!(
+                body.contains("SCROLL_CANCEL"),
+                "`{name}` writes the first bytes after the relay is suspended, so it must lead \
+                 with SCROLL_CANCEL (CAN) to end whatever escape sequence the host was \
+                 part-way through -- that prefix is what makes skipping the boundary gate safe"
+            );
+        }
     }
 }
 

@@ -18,6 +18,35 @@ use anyhow::{bail, Result};
 /// keeping each session's model within a defensible fixed bound.
 pub const MAX_SCREEN_CELLS: usize = 256 * 1024;
 
+/// Ceiling on the *scrollback* cells a client-side model may retain, on top
+/// of the visible grid `MAX_SCREEN_CELLS` bounds.
+///
+/// Scrollback is the one part of the model whose size the user configures
+/// (`APLEXER_HISTORY_LIMIT`, tmux's `history-limit`), so it needs its own
+/// bound rather than borrowing the screen's: a `vt100` cell is 32 bytes, so
+/// a naive "100000 lines" on a 200-column terminal would ask for 640 MB.
+/// One million cells is 32 MB at that cell size -- generous next to the
+/// 2000-line default (12.8 MB at 200 columns, 5 MB at 80) and still a hard
+/// ceiling a typo cannot blow past.
+pub const MAX_SCROLLBACK_CELLS: usize = 1024 * 1024;
+
+/// Default retained scrollback, in lines. Deliberately tmux's own
+/// `history-limit` default, because that is the number the user is
+/// measuring aplexer against.
+pub const DEFAULT_SCROLLBACK_LINES: usize = 2000;
+
+/// The scrollback line count actually usable at `cols` columns: the request,
+/// clamped so `lines * cols` stays inside `MAX_SCROLLBACK_CELLS`. Returns 0
+/// for a request of 0 (the worker's model, which retains no history -- see
+/// `ScreenTracker::try_new`).
+pub fn scrollback_lines_for(cols: u16, lines: usize) -> usize {
+    if lines == 0 {
+        return 0;
+    }
+    let cols = usize::from(cols.max(1));
+    lines.min(MAX_SCROLLBACK_CELLS / cols).max(1)
+}
+
 /// Conventional geometry used when a PTY exists but its kernel winsize has
 /// not been initialized. Linux reports that state as `0x0`; feeding the
 /// zeros (or a `1x1` clamp) to vt100 leaves several parser operations with a
@@ -455,25 +484,145 @@ pub struct ScreenTracker {
     margins: MarginTracker,
     /// Last-observed `alternate_screen()` value, for flip detection.
     alt_screen: bool,
+    /// Retained scrollback lines this tracker was built with, so a rebuild
+    /// (`ClientScreen::reset` on a session switch) keeps the same depth.
+    /// `0` for the worker's own model -- see `try_new`.
+    scrollback: usize,
 }
 
 impl ScreenTracker {
-    /// `Parser::new(rows, cols, 0)` -- zero model scrollback; scrolling is
-    /// the host terminal's job (docs/scrollback-design.md), and this caps
-    /// the model's memory at the two-grid cost (design doc section 5.2).
+    /// The **worker's** tracker: `Parser::new(rows, cols, 0)`, no retained
+    /// scrollback. The worker parses every byte of every session whether or
+    /// not anyone is attached, so its per-session cost has to stay at the
+    /// two-grid minimum (design doc section 5.2); the raw history file is
+    /// what carries a session's past there.
+    ///
+    /// The *client's* model is built with
+    /// [`try_new_with_scrollback`](Self::try_new_with_scrollback) instead,
+    /// which is what `Ctrl-b [` pages through.
     pub fn try_new(rows: u16, cols: u16) -> Result<Self> {
+        Self::try_new_with_scrollback(rows, cols, 0)
+    }
+
+    /// A tracker that retains `scrollback` lines of history above the
+    /// visible grid -- aplexer's equivalent of a tmux pane's history, and
+    /// the thing `Ctrl-b [` pages through with `Screen::set_scrollback`.
+    ///
+    /// The emulator that is *already* parsing every byte accumulates the
+    /// history as a side effect, exactly the way tmux's per-pane virtual
+    /// terminal does; nothing re-parses a raw byte log to reconstruct the
+    /// past, so the pager can never disagree with the live screen.
+    ///
+    /// Two properties inherited from `vt100` and deliberately kept, because
+    /// they are also tmux's:
+    ///
+    /// - Lines enter the scrollback only when the *primary* grid scrolls
+    ///   with no DECSTBM sub-range in force. A full-screen alternate-screen
+    ///   application (vim, htop, a TUI agent) therefore has no history while
+    ///   it owns the screen, which is what tmux's copy-mode shows too.
+    /// - History is **not** reflowed on resize. Retained rows keep the width
+    ///   they were written at; a later resize changes the visible grid only.
+    ///   Reflowing retained history is the class of bug that garbles tmux
+    ///   scrollback (docs/scrollback-design.md sections 2-3), so it is not
+    ///   attempted here either.
+    ///
+    /// `scrollback` is taken as given; callers clamp it with
+    /// `scrollback_lines_for` so `lines * cols` respects
+    /// `MAX_SCROLLBACK_CELLS`.
+    pub fn try_new_with_scrollback(rows: u16, cols: u16, scrollback: usize) -> Result<Self> {
         let (rows, cols) = validate_size(rows, cols)?;
         Ok(Self {
-            // Invariant: the third argument (scrollback rows) must stay 0.
-            // `ScreenTracker` is a current-screen-only cache, never a
-            // retained history buffer -- retaining scrollback here would
-            // expose it to resize-time reflow of that history, which is
-            // exactly the class of bug that garbles tmux scrollback (see
-            // module doc above and docs/scrollback-design.md sections 2-3).
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, scrollback),
             margins: MarginTracker::new(rows),
             alt_screen: false,
+            scrollback,
         })
+    }
+
+    /// How many lines of history this tracker retains at most.
+    pub fn scrollback_capacity(&self) -> usize {
+        self.scrollback
+    }
+
+    /// How many lines of history are available above the *active* grid right
+    /// now, and therefore how far `scrolled_frame` can go back.
+    ///
+    /// `vt100` exposes the retained-row count only through the clamp inside
+    /// `set_scrollback`, so this asks for an impossible offset, reads back
+    /// what it was clamped to, and restores the offset to 0. The tracker's
+    /// resting offset is always 0 (see `scrolled_frame`), which is what
+    /// keeps `cursor_restore`/`snapshot`/`relay` describing the live screen
+    /// no matter what the pager is showing.
+    pub fn scrollback_available(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let available = screen.scrollback();
+        screen.set_scrollback(0);
+        available
+    }
+
+    /// Render the screen as it looks `offset` lines back in the history, as
+    /// escape codes suitable for painting a host terminal, and return
+    /// `(bytes, clamped offset, lines available)`.
+    ///
+    /// The offset is applied, read back (`vt100` clamps it), rendered, and
+    /// **reset to 0** before returning: the model's steady state is always
+    /// the live screen, so a scrolled-back pager never changes what
+    /// `snapshot`, `cursor_restore` or `ClientScreen::relay` see.
+    pub fn scrolled_frame(&mut self, offset: usize) -> (Vec<u8>, usize, usize) {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let available = screen.scrollback();
+        screen.set_scrollback(offset);
+        let clamped = screen.scrollback();
+        let bytes = screen.contents_formatted();
+        screen.set_scrollback(0);
+        (bytes, clamped, available)
+    }
+
+    /// The mouse reporting the *workload* has asked the terminal for, as a
+    /// self-contained assertion: every protocol and encoding this client
+    /// knows how to turn on is turned off first, then whatever the workload
+    /// actually wants is turned back on.
+    ///
+    /// Written down as an absolute rather than a diff because it is used to
+    /// hand the mouse *back*: the attach client turns SGR mouse reporting on
+    /// for itself while the workload wants none (that is the only way a
+    /// wheel event can reach `a` at all -- see `sync_client_mouse` in
+    /// `src/bin/a.rs`), and the moment the workload asks for the mouse the
+    /// client must undo exactly its own modes and leave the workload's in
+    /// force, in one write that cannot half-apply.
+    pub fn workload_mouse_sequence(&self) -> Vec<u8> {
+        let screen = self.parser.screen();
+        let mut out: Vec<u8> =
+            b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l".to_vec();
+        out.extend_from_slice(match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => b"".as_slice(),
+            vt100::MouseProtocolMode::Press => b"\x1b[?9h".as_slice(),
+            vt100::MouseProtocolMode::PressRelease => b"\x1b[?1000h".as_slice(),
+            vt100::MouseProtocolMode::ButtonMotion => b"\x1b[?1002h".as_slice(),
+            vt100::MouseProtocolMode::AnyMotion => b"\x1b[?1003h".as_slice(),
+        });
+        out.extend_from_slice(match screen.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => b"".as_slice(),
+            vt100::MouseProtocolEncoding::Utf8 => b"\x1b[?1005h".as_slice(),
+            vt100::MouseProtocolEncoding::Sgr => b"\x1b[?1006h".as_slice(),
+        });
+        out
+    }
+
+    /// True while the workload has asked for mouse reporting of its own. The
+    /// wheel belongs to it then, exactly as a tmux pane's application owns
+    /// the mouse when it requested it.
+    pub fn workload_wants_mouse(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    /// True while the alternate screen is the active grid. `vt100` gives the
+    /// alternate grid no scrollback (nor does any real terminal), so this is
+    /// also "there is no history to page through right now".
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
     }
 
     #[cfg(test)]
@@ -556,6 +705,13 @@ impl ScreenTracker {
     /// the same emission-facing view `MarginTracker::margins` documents.
     pub fn margins(&self) -> Option<(u16, u16)> {
         self.margins.margins()
+    }
+
+    /// Forget any tracked DECSTBM sub-range and any half-parsed sequence,
+    /// without touching the grid. Used after `ClientScreen::seed_history`
+    /// replays a raw tail, whose trailing state was never this client's.
+    pub fn reset_margins(&mut self) {
+        self.margins.reset();
     }
 
     /// Where the *workload* believes its cursor is, 0-based `(row, col)`.
@@ -994,11 +1150,82 @@ pub struct ClientScreen {
 
 impl ClientScreen {
     pub fn try_new(rows: u16, cols: u16) -> Result<Self> {
+        Self::try_new_with_scrollback(rows, cols, 0)
+    }
+
+    /// A client model that retains `scrollback` lines of history above the
+    /// visible screen -- what `Ctrl-b [` pages through. See
+    /// `ScreenTracker::try_new_with_scrollback` for the semantics inherited
+    /// from `vt100` (alt-screen applications have no history; retained rows
+    /// are never reflowed on resize).
+    pub fn try_new_with_scrollback(rows: u16, cols: u16, scrollback: usize) -> Result<Self> {
         Ok(Self {
-            screen: ScreenTracker::try_new(rows, cols)?,
+            screen: ScreenTracker::try_new_with_scrollback(rows, cols, scrollback)?,
             boundary: StreamBoundary::new(),
             host_alt: None,
         })
+    }
+
+    /// Prime the scrollback grid from a tail of the worker's retained raw
+    /// history, before the first live byte and before the reattach snapshot.
+    ///
+    /// The model itself is the history (that is the whole tmux-shaped
+    /// design), but a *freshly attached* client's model is empty: it has
+    /// been parsing this session for zero seconds. Without this, "attach and
+    /// scroll up" -- the exact gesture being fixed -- would show nothing at
+    /// all until the workload produced a screenful under the new client.
+    /// Replaying the worker's byte log once, into the model only, is what
+    /// gives the grid a past to page through; from that point on the live
+    /// relay maintains it and nothing re-parses anything.
+    ///
+    /// Deliberately **not** written to the terminal, and deliberately not
+    /// allowed to leave state behind:
+    ///
+    /// - The tail can begin mid-escape-sequence (it is a byte-count slice of
+    ///   a log), so `StreamBoundary` is reset afterwards rather than being
+    ///   left holding a half-sequence that was never the workload's.
+    /// - The epilogue leaves the primary grid selected, full-screen margins,
+    ///   and a default pen, and `MarginTracker` is reset to match, so a
+    ///   DECSTBM or `?1049h` that happened to be in force at the end of the
+    ///   tail cannot outlive the seed and contradict the snapshot that is
+    ///   fed next.
+    pub fn seed_history(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.screen.process(data);
+        self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
+        self.screen.reset_margins();
+        self.boundary.reset();
+    }
+
+    /// `ScreenTracker::scrolled_frame` -- the pager's view of the history,
+    /// with the model left resting at offset 0.
+    pub fn scrolled_frame(&mut self, offset: usize) -> (Vec<u8>, usize, usize) {
+        self.screen.scrolled_frame(offset)
+    }
+
+    /// How many lines of history are available to page back through.
+    pub fn scrollback_available(&mut self) -> usize {
+        self.screen.scrollback_available()
+    }
+
+    /// True while the workload has asked for mouse reporting of its own.
+    pub fn workload_wants_mouse(&self) -> bool {
+        self.screen.workload_wants_mouse()
+    }
+
+    /// True while the workload is on the alternate screen -- where, exactly
+    /// as in tmux, there is no retained history to page through because the
+    /// application owns the whole screen.
+    pub fn alternate_screen(&self) -> bool {
+        self.screen.alternate_screen()
+    }
+
+    /// An absolute re-assertion of the workload's own mouse modes, used to
+    /// hand the mouse back after the client borrowed it for the wheel.
+    pub fn workload_mouse_sequence(&self) -> Vec<u8> {
+        self.screen.workload_mouse_sequence()
     }
 
     /// Keep the host terminal on the alternate screen for the rest of this
@@ -1297,7 +1524,12 @@ impl ClientScreen {
     /// Start over for a different session (`Ctrl-b n`): a new workload has
     /// its own screen, its own margins and its own half-parsed sequences.
     pub fn reset(&mut self, rows: u16, cols: u16) {
-        if let Ok(fresh) = ScreenTracker::try_new(rows, cols) {
+        // The retained-history depth belongs to the *client*, not to the
+        // session it happens to be showing, so a switch rebuilds an equally
+        // deep (and equally empty) grid rather than silently dropping to the
+        // worker's zero-scrollback shape.
+        let scrollback = self.screen.scrollback_capacity();
+        if let Ok(fresh) = ScreenTracker::try_new_with_scrollback(rows, cols, scrollback) {
             self.screen = fresh;
         }
         self.boundary.reset();
@@ -2204,6 +2436,223 @@ mod tests {
         let mut tracker = ScreenTracker::new(24, 80);
         tracker.process(b"hello there\r\n");
         assert!(tracker.contents().contains("hello there"));
+    }
+
+    // -- retained history (the grid `Ctrl-b [` pages through) --------------
+
+    /// Rows scrolled off the top are kept and can be paged back to, and the
+    /// rendered frame is what a real host terminal would show -- measured by
+    /// feeding it to an actual `vt100` parser rather than by asserting on
+    /// escape codes.
+    #[test]
+    fn client_screen_retains_scrolled_off_rows_and_pages_back_to_them() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("LINE-{i:02}\r\n").as_bytes());
+        }
+        let available = client.scrollback_available();
+        assert!(
+            available >= 25,
+            "30 lines through a 5-row screen must leave ~26 in history, got {available}"
+        );
+
+        // Live view: only the last few lines are on screen.
+        let live = {
+            let mut host = vt100::Parser::new(5, 20, 0);
+            host.process(&client.scrolled_frame(0).0);
+            host.screen().contents()
+        };
+        assert!(
+            live.contains("LINE-29"),
+            "live view lost the newest lines:\n{live}"
+        );
+        assert!(
+            !live.contains("LINE-05"),
+            "live view should not reach back:\n{live}"
+        );
+
+        // Paged back: the older lines are there, in order.
+        let scrolled = {
+            let (frame, offset, _) = client.scrolled_frame(20);
+            assert_eq!(offset, 20, "the requested offset was reachable");
+            let mut host = vt100::Parser::new(5, 20, 0);
+            host.process(&frame);
+            host.screen().contents()
+        };
+        assert!(
+            scrolled.contains("LINE-07"),
+            "paging back 20 lines must reach the LINE-07 window:\n{scrolled}"
+        );
+        assert!(
+            !scrolled.contains("LINE-29"),
+            "paging back must actually move the window:\n{scrolled}"
+        );
+
+        // An offset past the end is clamped, not an error.
+        let (_, clamped, total) = client.scrolled_frame(usize::MAX);
+        assert_eq!(clamped, total);
+    }
+
+    /// The pager must be a *view*: after rendering a scrolled-back frame the
+    /// model still describes the live screen, or the status bar's cursor
+    /// restore and `ClientScreen::relay`'s row arithmetic would both be
+    /// answering about a screen the workload is not on.
+    #[test]
+    fn rendering_a_scrolled_frame_leaves_the_model_on_the_live_screen() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("LINE-{i:02}\r\n").as_bytes());
+        }
+        let before = (
+            client.snapshot(),
+            client.cursor_position(),
+            client.margins(),
+        );
+        let _ = client.scrolled_frame(15);
+        let after = (
+            client.snapshot(),
+            client.cursor_position(),
+            client.margins(),
+        );
+        assert_eq!(before, after, "the pager left the model scrolled back");
+    }
+
+    /// Retained history is capped by the configured line count, the oldest
+    /// rows falling off the front -- tmux's `history-limit`, not an
+    /// unbounded buffer.
+    #[test]
+    fn retained_history_is_bounded_by_the_configured_line_limit() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 10).unwrap();
+        for i in 1..=100 {
+            client.feed(format!("LINE-{i:03}\r\n").as_bytes());
+        }
+        assert_eq!(client.scrollback_available(), 10);
+        let oldest = {
+            let (frame, _, _) = client.scrolled_frame(10);
+            let mut host = vt100::Parser::new(5, 20, 0);
+            host.process(&frame);
+            host.screen().contents()
+        };
+        assert!(
+            !oldest.contains("LINE-001"),
+            "a 10-line limit must have dropped the first lines:\n{oldest}"
+        );
+    }
+
+    #[test]
+    fn scrollback_lines_are_clamped_against_the_cell_budget() {
+        assert_eq!(scrollback_lines_for(80, 0), 0);
+        assert_eq!(scrollback_lines_for(80, 2000), 2000);
+        // A wild request is clamped rather than allocated.
+        let clamped = scrollback_lines_for(200, 10_000_000);
+        assert!(
+            clamped * 200 <= MAX_SCROLLBACK_CELLS,
+            "clamp exceeded the budget"
+        );
+        assert!(clamped > 0);
+    }
+
+    /// A full-screen alternate-screen application owns the whole screen and
+    /// has no history behind it -- the same thing tmux's copy-mode shows in
+    /// an alt-screen pane. Pinned so the scroll-mode status bar's "no
+    /// history" note stays truthful.
+    #[test]
+    fn an_alt_screen_workload_has_no_history_to_page_through() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("LINE-{i:02}\r\n").as_bytes());
+        }
+        assert!(client.scrollback_available() > 0);
+        client.feed(b"\x1b[?1049h");
+        assert!(client.alternate_screen());
+        for i in 1..=30 {
+            client.feed(format!("ALT-{i:02}\r\n").as_bytes());
+        }
+        assert_eq!(
+            client.scrollback_available(),
+            0,
+            "the alternate grid has no scrollback, in vt100 as in every real terminal"
+        );
+        // ...and leaving it gives the primary screen's history back.
+        client.feed(b"\x1b[?1049l");
+        assert!(client.scrollback_available() > 0);
+    }
+
+    /// Priming from a raw tail gives a freshly attached client a past to
+    /// page through, and leaves nothing of that tail's terminal state behind
+    /// to contradict the snapshot fed next.
+    #[test]
+    fn seeding_history_fills_the_grid_without_leaking_the_tails_state() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        let mut tail = Vec::new();
+        for i in 1..=30 {
+            tail.extend_from_slice(format!("SEED-{i:02}\r\n").as_bytes());
+        }
+        // The tail ends inside an alt-screen TUI with a scroll region set
+        // and a half-emitted escape sequence, exactly as a byte-count slice
+        // of a live log can.
+        tail.extend_from_slice(b"\x1b[?1049h\x1b[2;4r\x1b[38;5;");
+        client.seed_history(&tail);
+
+        assert!(
+            client.scrollback_available() > 0,
+            "seeding must leave history to page through"
+        );
+        assert!(
+            !client.alternate_screen(),
+            "the tail's alt-screen state must not outlive the seed"
+        );
+        assert_eq!(
+            client.margins(),
+            None,
+            "the tail's DECSTBM must not outlive the seed"
+        );
+        assert!(
+            client.at_escape_boundary(),
+            "the tail's half-emitted sequence must not leave the stream mid-sequence"
+        );
+    }
+
+    /// Handing the mouse back to the workload has to be expressible as one
+    /// self-contained write, whatever the client turned on for itself.
+    #[test]
+    fn workload_mouse_sequence_restores_exactly_what_the_workload_asked_for() {
+        for (workload, mode, encoding) in [
+            (
+                b"".as_slice(),
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1006h".as_slice(),
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Sgr,
+            ),
+            (
+                b"\x1b[?1003h".as_slice(),
+                vt100::MouseProtocolMode::AnyMotion,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            (
+                b"\x1b[?1002h\x1b[?1005h".as_slice(),
+                vt100::MouseProtocolMode::ButtonMotion,
+                vt100::MouseProtocolEncoding::Utf8,
+            ),
+        ] {
+            let mut client = ClientScreen::try_new(5, 20).unwrap();
+            client.feed(workload);
+            assert_eq!(
+                client.workload_wants_mouse(),
+                mode != vt100::MouseProtocolMode::None
+            );
+
+            // A host that the client had already borrowed the mouse on.
+            let mut host = vt100::Parser::new(5, 20, 0);
+            host.process(b"\x1b[?1000h\x1b[?1006h");
+            host.process(&client.workload_mouse_sequence());
+            assert_eq!(host.screen().mouse_protocol_mode(), mode);
+            assert_eq!(host.screen().mouse_protocol_encoding(), encoding);
+        }
     }
 
     #[test]
