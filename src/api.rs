@@ -1244,6 +1244,9 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         records.retain(|r| r.worker_phase_active() && r.worker_alive());
     }
     let mut enriched = Vec::with_capacity(records.len());
+    // One clock for the whole snapshot, so two rows created in the same
+    // instant cannot land on opposite sides of the startup window.
+    let now = crate::now_ms();
     for record in &records {
         let mut value = serde_json::to_value(public_session_record(record))?;
         let worker_alive = record.worker_alive();
@@ -1253,7 +1256,12 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         // handed only the persisted `phase`, which a killed worker leaves
         // at "running" forever, so a zombie record was indistinguishable
         // from a live session on the wire.
-        value["state"] = json!(crate::observed_state(&record.phase, worker_alive));
+        value["state"] = json!(crate::observed_state(
+            &record.phase,
+            worker_alive,
+            record.created_at_ms,
+            now
+        ));
         // Which agent is live inside the session right now, detected from the
         // workload's process tree at query time (`record_agent`). Always
         // present, `null` when no agent is detectable -- every pocketshell

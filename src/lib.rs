@@ -48,6 +48,17 @@ const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 /// Long enough for graceful shutdown, but bounded so an authenticated local
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
+/// The default `--startup-timeout-ms` for `a start` / `a here`, and the same
+/// bound query-time code uses to decide whether a `Starting` record that has
+/// not registered a worker pid is still coming up or is a crashed start.
+///
+/// One constant on purpose: the startup contract and the rule that reads it
+/// cannot drift apart, and no consumer has to invent an age bound of its own
+/// (issue #9). `--startup-timeout-ms` is per-invocation and not persisted, so
+/// a query-time reader can only use the default; a start given a longer
+/// timeout than this simply reads `broken` for the remainder of its own
+/// window, which is the conservative direction.
+pub const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 10_000;
 
 pub fn validate_history_bytes(value: usize) -> Result<usize> {
     if value > MAX_HISTORY_BYTES {
@@ -483,16 +494,56 @@ impl Phase {
 /// one from both instead of rewriting either: the persisted `phase` stays
 /// exactly what the worker wrote, and `worker_alive` stays the live probe.
 ///
+/// `start_session` persists a `Starting` record with `worker_pid: None`
+/// before the worker can register its pid, so `worker_alive` is false for the
+/// first tens of milliseconds of every healthy `a start`. Reporting that as
+/// `broken` conflated two opposite situations that are byte-identical in the
+/// record: **starting** (no worker *yet*, transient, resolves in
+/// milliseconds) and **broken** (the worker died, permanent, needs
+/// `a prune`). A consumer mapping `broken -> dead` therefore treated every
+/// session as reclaimable for the first instants of its life (issue #9).
+///
+/// Age is what separates them, and `DEFAULT_STARTUP_TIMEOUT_MS` -- aplexer's
+/// own startup contract, not a fresh magic number -- is the bound: a
+/// `Starting` record younger than that is `starting`; older, it is the
+/// crashed-start record `a prune` can reap, so it is `broken`.
+/// `Running`/`Exiting` get no such grace: those phases are only ever written
+/// by a worker that had already registered.
+///
 /// Both `a status`'s `state:` line and every `a list --json`/`a snapshot`
 /// row's `state` field come from here, so the two commands cannot disagree
 /// about whether a session is broken -- the disagreement that let a machine
 /// consumer read a zombie record as an ordinary running session.
-pub fn observed_state(phase: &Phase, worker_alive: bool) -> &'static str {
+pub fn observed_state(
+    phase: &Phase,
+    worker_alive: bool,
+    created_at_ms: u64,
+    now_ms: u64,
+) -> &'static str {
     if matches!(phase, Phase::Starting | Phase::Running | Phase::Exiting) && !worker_alive {
-        "broken"
+        if within_startup_window(phase, created_at_ms, now_ms) {
+            phase.name()
+        } else {
+            "broken"
+        }
     } else {
         phase.name()
     }
+}
+
+/// Whether a record is still inside `a start`'s own startup budget, i.e. a
+/// worker may legitimately not have finished coming up yet.
+///
+/// The single expression of that rule: `observed_state` uses it to keep a
+/// mid-create record out of `broken`, and `a attach`'s `check_attachable`
+/// uses it to keep the "your runtime directory was destroyed, run `a kill`"
+/// diagnosis off a session that is merely still binding its control socket.
+/// Note that this is true for a live worker too -- `Starting` means the
+/// worker has not published `phase: running` yet, whatever its pid says --
+/// so a caller that cares about liveness must test that separately.
+pub fn within_startup_window(phase: &Phase, created_at_ms: u64, now_ms: u64) -> bool {
+    matches!(phase, Phase::Starting)
+        && now_ms.saturating_sub(created_at_ms) < DEFAULT_STARTUP_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,7 +777,14 @@ impl SessionRecord {
 
     /// The derived liveness state, identical to `a status`'s `state:` line.
     pub fn observed_state(&self) -> &'static str {
-        observed_state(&self.phase, self.worker_alive())
+        self.observed_state_at(now_ms())
+    }
+
+    /// `observed_state` with an injected clock, so a test can pin the
+    /// startup-window boundary without sleeping out
+    /// `DEFAULT_STARTUP_TIMEOUT_MS`.
+    pub fn observed_state_at(&self, now_ms: u64) -> &'static str {
+        observed_state(&self.phase, self.worker_alive(), self.created_at_ms, now_ms)
     }
 }
 
@@ -884,6 +942,17 @@ fn recorded_cgroup_observed_empty(
 ///
 /// `Some(verdict)` means removable, carrying whether containment was proven
 /// empty or merely holds no remaining handle; `None` means retain.
+///
+/// Deliberately NOT startup-window aware, unlike `observed_state` (issue
+/// #9). A pre-PID `Starting` stub has no live worker, no live leader and no
+/// containment domain, so it is reapable here -- and it must be, or a
+/// crashed start would be unprunable until its budget expired. What keeps
+/// prune off a *healthy* start is not this predicate but a lock: the
+/// destroying callers (`reap_session_state`, `a forget`, `start_session`'s
+/// reclaim) take the worker lock for a pre-PID record via
+/// `fence_pre_pid_worker`, and a worker already holding it is retained.
+/// Pinned by `prune_fences_a_pre_pid_starting_record_against_its_worker_lock`
+/// and `a_pre_pid_record_is_fenced_by_its_worker_lock`.
 pub fn reap_verdict(record: &SessionRecord) -> Option<ContainmentReap> {
     if record.worker_alive() || record.workload_leader_alive() {
         return None;
@@ -5345,13 +5414,52 @@ mod tests {
     /// `state` is derived from both facts and rewrites neither.
     #[test]
     fn observed_state_reports_broken_only_for_a_contradicted_phase() {
-        for phase in [Phase::Starting, Phase::Running, Phase::Exiting] {
-            assert_eq!(observed_state(&phase, false), "broken");
-            assert_eq!(observed_state(&phase, true), phase.name());
+        let now = DEFAULT_STARTUP_TIMEOUT_MS * 2;
+        let aged = |age: u64| now - age;
+        // A `Starting` record with no live worker is the shape
+        // `start_session` persists before the worker registers its pid, and
+        // also the shape a crashed start leaves behind. Only age tells them
+        // apart, and the boundary is exactly the startup budget.
+        assert_eq!(
+            observed_state(&Phase::Starting, false, aged(0), now),
+            "starting"
+        );
+        assert_eq!(
+            observed_state(
+                &Phase::Starting,
+                false,
+                aged(DEFAULT_STARTUP_TIMEOUT_MS - 1),
+                now
+            ),
+            "starting"
+        );
+        assert_eq!(
+            observed_state(
+                &Phase::Starting,
+                false,
+                aged(DEFAULT_STARTUP_TIMEOUT_MS),
+                now
+            ),
+            "broken",
+            "past the startup budget a pre-PID record is a crashed start"
+        );
+        // A record whose clock ran backwards (or was written by a machine
+        // with a different clock) must not become permanently `starting`.
+        assert_eq!(
+            observed_state(&Phase::Starting, false, now + 1_000, now),
+            "starting"
+        );
+        assert_eq!(observed_state(&Phase::Starting, true, 0, now), "starting");
+        // Running/Exiting are only ever written by a worker that already
+        // registered, so a dead worker there is broken at any age.
+        for phase in [Phase::Running, Phase::Exiting] {
+            assert_eq!(observed_state(&phase, false, aged(0), now), "broken");
+            assert_eq!(observed_state(&phase, false, aged(1), now), "broken");
+            assert_eq!(observed_state(&phase, true, aged(0), now), phase.name());
         }
         for phase in [Phase::Exited, Phase::Failed] {
-            assert_eq!(observed_state(&phase, false), phase.name());
-            assert_eq!(observed_state(&phase, true), phase.name());
+            assert_eq!(observed_state(&phase, false, aged(0), now), phase.name());
+            assert_eq!(observed_state(&phase, true, aged(0), now), phase.name());
         }
     }
 

@@ -1088,6 +1088,18 @@ otherwise. A machine consumer deciding whether a session is attachable must
 read `state` (or `phase` together with `worker_alive`), because a worker
 killed without recording an exit leaves `phase` at `running` forever.
 
+One exception, and the reason `state` can be trusted where `phase` +
+`worker_alive` cannot: a session's record is persisted with `worker_pid:
+null` before its worker registers, so a healthy `a start` has a dead-looking
+worker for its first tens of milliseconds. A `Starting` record younger than
+`--startup-timeout-ms` (default 10000, `DEFAULT_STARTUP_TIMEOUT_MS`) is
+therefore `starting`, not `broken`; older than that, it is the crashed-start
+record `a prune` can reap and becomes `broken`. Age is the only difference
+between those two records, so a consumer must not re-derive this rule from
+`phase` and `worker_alive` -- that is what `state` is for. `a doctor` uses
+the same bound and does not report a session still inside the startup window
+as broken or stale.
+
 `agent` names the coding agent aplexer can see running inside the session
 right now: `claude`, `codex`, `opencode`, `grok`, or `null`. Like `state` it
 is derived rather than persisted, and it is present on every `a list --json`

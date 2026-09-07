@@ -1,4 +1,7 @@
-use aplexer::{atomic_write_json, Limits, Paths, Phase, SessionRecord, SCHEMA_VERSION};
+use aplexer::{
+    atomic_write_json, now_ms, Limits, Paths, Phase, SessionRecord, DEFAULT_STARTUP_TIMEOUT_MS,
+    SCHEMA_VERSION,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -263,6 +266,78 @@ fn doctor_does_not_advise_prune_for_a_live_worker_whose_leader_is_gone() {
         broken["recovery"]["prune"], "a prune",
         "a worker that has since died must be advised as reapable: {broken}"
     );
+}
+
+fn doctor_sessions_check(paths: &Paths) -> (std::process::Output, Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_a"))
+        .args(["--json", "doctor"])
+        .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
+        .env("APLEXER_STATE_DIR", &paths.state_root)
+        .env("APLEXER_CONFIG", &paths.config_file)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sessions")
+        .cloned()
+        .unwrap();
+    (output, sessions)
+}
+
+/// `phase: starting` with no worker pid is what `a start` persists before
+/// its worker registers. Inside `--startup-timeout-ms` that is a healthy
+/// create, and doctor must not offer it up as a broken record to reclaim --
+/// nothing about it is wrong, and the advice would race a session that is
+/// about to come up (issue #9).
+#[test]
+fn doctor_does_not_report_a_session_still_inside_the_startup_window() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut record = stale_running_record(&paths);
+    record.phase = Phase::Starting;
+    record.tag = "creating".into();
+    record.created_at_ms = now_ms();
+    record.updated_at_ms = record.created_at_ms;
+    std::fs::create_dir_all(paths.state_session(record.id)).unwrap();
+    atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+    let (output, sessions) = doctor_sessions_check(&paths);
+    assert!(
+        output.status.success(),
+        "doctor treated a mid-create session as broken: {sessions}"
+    );
+    assert_eq!(sessions["ok"], true, "{sessions}");
+    assert!(
+        sessions["broken_sessions"]
+            .as_array()
+            .is_some_and(|rows| rows.is_empty()),
+        "doctor listed a mid-create session as broken: {sessions}"
+    );
+}
+
+/// The same record, differing only in age, is the crashed start `a prune`
+/// exists to reap -- so doctor must still report it. This is the other half
+/// of the pair: without it, the fix above would just hide broken records.
+#[test]
+fn doctor_reports_a_starting_record_past_the_startup_budget_as_broken() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut record = stale_running_record(&paths);
+    record.phase = Phase::Starting;
+    record.tag = "stuck".into();
+    record.created_at_ms = now_ms().saturating_sub(DEFAULT_STARTUP_TIMEOUT_MS + 1);
+    record.updated_at_ms = record.created_at_ms;
+    std::fs::create_dir_all(paths.state_session(record.id)).unwrap();
+    atomic_write_json(&paths.record(record.id), &record).unwrap();
+
+    let (output, sessions) = doctor_sessions_check(&paths);
+    assert!(!output.status.success(), "{sessions}");
+    assert_eq!(sessions["ok"], false, "{sessions}");
+    assert_eq!(sessions["broken_sessions"][0]["id"], record.id.to_string());
+    assert_eq!(sessions["broken_sessions"][0]["state"], "broken");
 }
 
 #[test]

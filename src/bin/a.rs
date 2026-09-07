@@ -424,7 +424,7 @@ struct StartArgs {
     #[arg(long)]
     attach: bool,
     /// Give up if the workload has not started after this long
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = DEFAULT_STARTUP_TIMEOUT_MS)]
     startup_timeout_ms: u64,
     /// Keep the engine's confirmation/sandbox prompts. Default is to append
     /// the engine's skip-permissions argv (`--dangerously-bypass-approvals-
@@ -1424,7 +1424,7 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
                 None => r.engine.clone(),
             };
             let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
-            let state = observed_state(&r.phase, alive_of(r));
+            let state = derived_liveness(&r.phase, alive_of(r), r.created_at_ms);
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));
             println!("{connector} {idx}  {tag} {ep} {state}");
@@ -1506,11 +1506,24 @@ fn state_glyph(state: &str) -> (&'static str, &'static str) {
 /// Returns `(state, source)` where source is `reported`, `activity`, or
 /// `lifecycle`, so callers can qualify inferred states instead of faking
 /// certainty.
+/// `observed_state` against the wall clock, for the query-time commands that
+/// have no injected clock of their own. Every derived `state` a CLI command
+/// prints goes through here or through `observed_state` directly, so none of
+/// them can disagree about the startup window (issue #9).
+fn derived_liveness(phase: &Phase, worker_alive: bool, created_at_ms: u64) -> &'static str {
+    observed_state(phase, worker_alive, created_at_ms, now_ms())
+}
+
 fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static str) {
-    if matches!(
-        record.phase,
-        Phase::Starting | Phase::Running | Phase::Exiting
-    ) && !record.worker_alive()
+    // Deferred to `observed_state` rather than repeating its predicate, so
+    // the TTY UI cannot go on painting a mid-create session `broken` after
+    // the derived state stopped saying so.
+    if observed_state(
+        &record.phase,
+        record.worker_alive(),
+        record.created_at_ms,
+        now,
+    ) == "broken"
     {
         return ("broken", "lifecycle");
     }
@@ -1697,7 +1710,11 @@ fn running_count(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> (usiz
     let running = group
         .iter()
         .filter(|r| {
-            observed_state(&r.phase, alive.get(&r.id).copied().unwrap_or(false)) == "running"
+            derived_liveness(
+                &r.phase,
+                alive.get(&r.id).copied().unwrap_or(false),
+                r.created_at_ms,
+            ) == "running"
         })
         .count();
     (running, group.len())
@@ -1965,7 +1982,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             cpu_period_us: 100_000,
             history_bytes: None,
             attach: true,
-            startup_timeout_ms: 10_000,
+            startup_timeout_ms: DEFAULT_STARTUP_TIMEOUT_MS,
             no_skip_permissions: false,
             fresh: false,
             command,
@@ -2325,7 +2342,11 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         // `status` reading `phase` alone could not tell a zombie record
         // from a live session -- while the same command was telling a
         // human "broken".
-        value["state"] = json!(observed_state(&current.phase, worker_alive));
+        value["state"] = json!(derived_liveness(
+            &current.phase,
+            worker_alive,
+            current.created_at_ms
+        ));
         // Which agent is running inside the session's workload tree right
         // now, from the same query-time detection every `a list --json` row
         // carries (`api::record_agent`). Always present; `null` when no
@@ -2349,7 +2370,10 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
     } else {
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
-        println!("state: {}", observed_state(&current.phase, worker_alive));
+        println!(
+            "state: {}",
+            derived_liveness(&current.phase, worker_alive, current.created_at_ms)
+        );
         let ep = match &current.profile {
             Some(p) => format!("{}/{p}", current.engine),
             None => current.engine.clone(),
@@ -2456,7 +2480,11 @@ fn cmd_status_tty(
     if !suffix.is_empty() {
         println!("  {}", paint(color, ANSI_DIM, suffix.trim()));
     }
-    let lifecycle = observed_state(&current.phase, current.worker_alive());
+    let lifecycle = derived_liveness(
+        &current.phase,
+        current.worker_alive(),
+        current.created_at_ms,
+    );
     if lifecycle != state {
         println!(
             "  {}",
@@ -3194,7 +3222,8 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
         if io::stdout().is_terminal() {
             let (state, source) = session_ui_state(&record, now_ms());
             println!("state: {state}{}", state_source_suffix(source));
-            let lifecycle = observed_state(&record.phase, record.worker_alive());
+            let lifecycle =
+                derived_liveness(&record.phase, record.worker_alive(), record.created_at_ms);
             if lifecycle != state {
                 println!("lifecycle: {lifecycle}");
             }
@@ -3544,6 +3573,15 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
                     if worker_alive && worker_reachable {
                         return None;
                     }
+                    let state = derived_liveness(&record.phase, worker_alive, record.created_at_ms);
+                    // A `Starting` record inside the startup window has no
+                    // worker pid yet and no socket to answer an RPC: that is
+                    // `a start` in flight, not wreckage. Reporting it here
+                    // sent the user at `a prune` / `a kill` for a session
+                    // that was about to come up on its own (issue #9).
+                    if state == "starting" {
+                        return None;
+                    }
                     // Recovery advice has to follow the same predicate prune
                     // actually uses, or doctor sends the user at a command
                     // that hard-fails. `a kill` on a broken unlimited record
@@ -3564,7 +3602,7 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
                         "id": record.id,
                         "selector": record.selector(),
                         "phase": record.phase.name(),
-                        "state": record.observed_state(),
+                        "state": state,
                         "worker_alive": worker_alive,
                         "worker_reachable": worker_reachable,
                         "rpc_error": rpc_error,
@@ -3778,15 +3816,24 @@ fn path_check(name: &str, path: &Path) -> Value {
 /// A third, rarer case: `phase` is non-terminal and `worker_pid` is alive,
 /// but `socket_path` doesn't exist on disk. This happens when the worker's
 /// runtime directory (which holds `control.sock`) got removed out from under
-/// it -- observed in practice as a race during worker startup under heavy
-/// concurrent load. The worker process is technically still running, but
-/// it's unreachable, so treating it as attachable would just trade the
-/// clear checks above for the same bare `UnixStream::connect` OS error this
+/// it. The worker process is technically still running, but it's
+/// unreachable, so treating it as attachable would just trade the clear
+/// checks above for the same bare `UnixStream::connect` OS error this
 /// function exists to avoid. `a kill` again has a real action to take here
 /// (see cmd_kill's socket-missing force-clean path), so it's not exempted
 /// from this check the way the other two cases exempt it -- `a kill` relies
 /// on `rpc_simple` failing and inspects the socket itself rather than going
 /// through `check_attachable`.
+///
+/// That third case used to swallow a fourth that is not a fault at all: the
+/// worker binds `control.sock` some milliseconds after it registers its pid,
+/// so a client racing a healthy `a start` saw the same missing socket and
+/// was told the runtime directory had been destroyed and to run `a kill` --
+/// on a session that was about to come up. Both that and the missing-pid
+/// window before it are now answered by `state == "starting"` (issue #9),
+/// which is bounded by `DEFAULT_STARTUP_TIMEOUT_MS`: past the startup
+/// budget the record really is a crashed start and the advice above applies
+/// again.
 fn check_attachable(record: &SessionRecord) -> Result<()> {
     if matches!(record.phase, Phase::Exited | Phase::Failed) {
         bail!(
@@ -3797,14 +3844,38 @@ fn check_attachable(record: &SessionRecord) -> Result<()> {
         );
     }
     let worker_alive = record.worker_alive();
+    let state = derived_liveness(&record.phase, worker_alive, record.created_at_ms);
+    let socket_missing = !record.socket_path.exists();
+    // A session still inside its startup budget is coming up, not wreckage.
+    // The worker writes the record, then its pid, then binds the socket, and
+    // only then sets `phase: running` -- so `Starting` plus a missing pid or
+    // a missing socket is exactly `a start` in flight. Both bails below used
+    // to send the user at `a kill` for a perfectly healthy start that had
+    // simply been raced (issue #9); the socket bail's own doc comment names
+    // that race and then advised killing it anyway. Past the budget the
+    // record is a crashed start and the original advice is right again.
+    //
+    // The liveness conjunct matters: `Starting` is still `Starting` after
+    // the worker is up and listening, and that session is perfectly
+    // attachable -- only a missing pid or a missing socket is a reason to
+    // refuse at all.
+    let still_starting = within_startup_window(&record.phase, record.created_at_ms, now_ms());
+    if still_starting && (!worker_alive || socket_missing) {
+        bail!(
+            "session {} is still starting (its worker has not finished coming up); \
+             retry in a moment, or run `a status {}` if it never does",
+            record.id,
+            record.id
+        );
+    }
     if !worker_alive {
         bail!(
             "session {}'s worker is not running (state: {}); run `a status` for details, `a kill` to reclaim it",
             record.id,
-            observed_state(&record.phase, worker_alive)
+            state
         );
     }
-    if !record.socket_path.exists() {
+    if socket_missing {
         bail!(
             "session {} looks alive (worker pid {} running) but its control socket is gone \
              ({}); this usually means the worker's runtime directory was removed out from \
@@ -8968,6 +9039,77 @@ mod switching_tests {
         corpse.reported_state_at_ms = Some(now);
         assert_eq!(session_ui_state(&corpse, now), ("broken", "lifecycle"));
         assert!(ui_state_needs_attention("broken"));
+
+        // ... but a Starting record with no worker pid yet is the shape
+        // every healthy `a start` persists first, and the TTY UI must not
+        // paint that as a corpse (issue #9). Age is the only thing that
+        // turns it into one.
+        let mut creating = mk_record("/ws/state", "creating", Phase::Starting);
+        creating.worker_pid = None;
+        creating.created_at_ms = now;
+        assert_eq!(
+            session_ui_state(&creating, now + 1),
+            ("starting", "lifecycle")
+        );
+        assert_eq!(
+            session_ui_state(&creating, now + DEFAULT_STARTUP_TIMEOUT_MS - 1),
+            ("starting", "lifecycle")
+        );
+        assert_eq!(
+            session_ui_state(&creating, now + DEFAULT_STARTUP_TIMEOUT_MS),
+            ("broken", "lifecycle")
+        );
+    }
+
+    /// Issue #9's second half. The worker persists the record, then its pid,
+    /// then binds the control socket -- so a client racing a healthy start
+    /// finds either no pid or no socket. Both used to be reported as
+    /// destroyed state with `a kill` as the remedy.
+    #[test]
+    fn check_attachable_does_not_advise_killing_a_still_starting_session() {
+        let now = now_ms();
+
+        // Before the worker registers a pid.
+        let mut pre_pid = mk_record("/ws/a", "main", Phase::Starting);
+        pre_pid.worker_pid = None;
+        pre_pid.created_at_ms = now;
+        let err = check_attachable(&pre_pid).unwrap_err().to_string();
+        assert!(err.contains("still starting"), "{err}");
+        assert!(!err.contains("a kill"), "{err}");
+
+        // Pid registered, socket not bound yet.
+        let mut pre_socket = mk_record("/ws/a", "main", Phase::Starting);
+        pre_socket.created_at_ms = now;
+        pre_socket.socket_path = PathBuf::from("/definitely/does/not/exist/control.sock");
+        let err = check_attachable(&pre_socket).unwrap_err().to_string();
+        assert!(err.contains("still starting"), "{err}");
+        assert!(!err.contains("removed out from under it"), "{err}");
+        assert!(!err.contains("a kill"), "{err}");
+
+        // Past the startup budget these really are wreckage, and the
+        // original advice is the right advice again.
+        let mut expired_pre_pid = pre_pid.clone();
+        expired_pre_pid.created_at_ms = now.saturating_sub(DEFAULT_STARTUP_TIMEOUT_MS);
+        let err = check_attachable(&expired_pre_pid).unwrap_err().to_string();
+        assert!(err.contains("worker is not running"), "{err}");
+        assert!(err.contains("state: broken"), "{err}");
+
+        let mut expired_pre_socket = pre_socket.clone();
+        expired_pre_socket.created_at_ms = now.saturating_sub(DEFAULT_STARTUP_TIMEOUT_MS);
+        let err = check_attachable(&expired_pre_socket)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control socket is gone"), "{err}");
+        assert!(
+            err.contains(&format!("a kill {}", expired_pre_socket.id)),
+            "{err}"
+        );
+
+        // The guard must not stand in the way of the ordinary path: a
+        // Starting session whose worker is up and listening is attachable.
+        let mut ready = mk_record("/ws/a", "main", Phase::Starting);
+        ready.created_at_ms = now;
+        assert!(check_attachable(&ready).is_ok());
     }
 
     #[test]
