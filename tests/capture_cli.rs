@@ -71,6 +71,8 @@ impl Harness {
             phase,
             worker_pid,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: None,

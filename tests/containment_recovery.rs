@@ -280,6 +280,8 @@ fn forget_fences_pre_pid_startup_and_refuses_held_worker_lock() {
         phase: Phase::Starting,
         worker_pid: None,
         workload_pid: None,
+        worker_cgroup: None,
+        workload_cgroup: None,
         containment_cgroup: None,
         containment_cgroup_identity: None,
         containment_empty: Some(false),

@@ -2295,6 +2295,14 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         // carries (`api::record_agent`). Always present; `null` when no
         // agent is detectable.
         value["agent"] = json!(aplexer::api::record_agent(&current));
+        // Same derived placement facts every `a list --json`/`a snapshot`
+        // row carries, from the same helper so no two commands can
+        // disagree about whether a session shares the per-user manager's
+        // failure domain (issue #1).
+        value["worker_placement"] =
+            aplexer::placement::placement_summary(current.worker_cgroup.as_deref());
+        value["workload_placement"] =
+            aplexer::placement::placement_summary(current.workload_cgroup.as_deref());
         value["worker_reachable"] = json!(worker_reachable);
         if let Some(error) = &rpc_error {
             value["rpc_error"] = json!(error);
@@ -3489,6 +3497,91 @@ fn doctor_checks_ok(checks: &[Value]) -> bool {
         .all(|check| check["ok"].as_bool().unwrap_or(false) || check["severity"] == "warning")
 }
 
+/// The `launch_placement` doctor check (issue #1). Two questions in one:
+/// (1) which service manager owns the cgroup this process is running in --
+/// the placement every `a start` launched from this context hands its
+/// worker, since setsid() changes session, not cgroup -- and (2) how many
+/// active recorded sessions sit in the per-user manager's exit.target
+/// failure domain, from the `worker_cgroup` evidence the worker now records
+/// at launch. Warning-severity by design: the issue asks aplexer to warn
+/// clearly, and a vulnerable placement has actionable workarounds (launch
+/// context, or the opt-in system scope), so it must not fail the host.
+fn launch_placement_check(paths: &Paths) -> Value {
+    let own_cgroup = aplexer::placement::read_process_cgroup(std::process::id());
+    let own_placement = own_cgroup
+        .as_deref()
+        .map(aplexer::placement::classify_cgroup_path);
+    let vulnerable = own_placement
+        .map(|placement| placement.vulnerable_to_user_manager_exit())
+        .unwrap_or(false);
+    let mut vulnerable_sessions: Vec<Value> = Vec::new();
+    if let Ok(records) = list_records(paths) {
+        for record in records {
+            if !record.worker_phase_active() {
+                continue;
+            }
+            let session_vulnerable = record
+                .worker_cgroup
+                .as_deref()
+                .map(|cgroup| {
+                    aplexer::placement::classify_cgroup_path(cgroup)
+                        .vulnerable_to_user_manager_exit()
+                })
+                .unwrap_or(false);
+            if session_vulnerable {
+                vulnerable_sessions.push(json!({
+                    "id": record.id.to_string(),
+                    "selector": record.selector(),
+                    "worker_cgroup": record.worker_cgroup,
+                }));
+            }
+        }
+    }
+    let placement_name = own_placement.map(|placement| placement.name());
+    let advice = own_placement.and_then(|placement| placement.advice());
+    let mut detail = format!(
+        "aplexer commands launched here run in cgroup {} ({})",
+        own_cgroup.as_deref().unwrap_or("<unknown>"),
+        placement_name.unwrap_or("unknown"),
+    );
+    if vulnerable {
+        if let Some(advice) = advice {
+            detail.push_str(&format!(
+                "; sessions started here will die at `systemctl --user exit`; {advice}"
+            ));
+        }
+    } else if let Some(advice) = advice {
+        detail.push_str(&format!("; note: {advice}"));
+    }
+    if !vulnerable_sessions.is_empty() {
+        detail.push_str(&format!(
+            "; {} active session(s) recorded inside the per-user manager failure domain",
+            vulnerable_sessions.len()
+        ));
+    }
+    json!({
+        "name": "launch_placement",
+        "ok": !vulnerable,
+        "severity": if vulnerable { "warning" } else { "ok" },
+        "required": false,
+        "detail": detail,
+        "own_cgroup": own_cgroup,
+        "own_placement": placement_name,
+        "vulnerable_to_user_manager_exit": vulnerable,
+        "vulnerable_sessions": vulnerable_sessions,
+        "advice": advice,
+        // Doctor only reads /proc and session records; it never probes the
+        // system-scope backend (that would create a transient scope just by
+        // asking for a checkup). The escape is documented here, and its
+        // availability is proven at the opted-in `a start` that uses it.
+        "escape": {
+            "env": aplexer::placement::LAUNCH_SYSTEM_SCOPE_ENV,
+            "value": aplexer::placement::LAUNCH_SYSTEM_SCOPE_VALUE,
+            "requested": aplexer::placement::system_scope_requested(),
+        },
+    })
+}
+
 fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let mut checks = Vec::<Value>::new();
     checks.push(json!({"name":"linux","ok":true,"detail":std::env::consts::OS}));
@@ -3497,6 +3590,7 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let sample = paths.socket(Uuid::nil());
     checks.push(json!({"name":"unix_socket_path","ok":sample.as_os_str().len()<108,"detail":sample.display().to_string()}));
     checks.push(cgroup_limits_check(probe_cgroup_limits()));
+    checks.push(launch_placement_check(paths));
     match Config::load(paths){Ok(config)=>checks.push(json!({"name":"config","ok":true,"detail":format!("{} engines, {} profiles",config.engines.len(),config.profiles.len())})),Err(e)=>checks.push(json!({"name":"config","ok":false,"detail":format!("{e:#}")}))}
     match list_records(paths) {
         Ok(records) => {
@@ -10242,6 +10336,8 @@ mod switching_tests {
             phase,
             worker_pid: Some(std::process::id()), // our own pid: always "alive"
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),

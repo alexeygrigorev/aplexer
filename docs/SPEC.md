@@ -338,6 +338,8 @@ parent:
 
 Linux-specific APIs are allowed and encouraged.
 
+`setsid()` in the child sequence above provides terminal/session separation only: it creates a new session and detaches the controlling terminal, but it does not move the process to another cgroup and does not change which service manager owns it. Session separation is not cgroup or manager durability (see section 7.5).
+
 Candidate primitives:
 
 - `openpty` / `posix_openpt`,
@@ -433,6 +435,25 @@ The exact enum may be chosen during implementation.
 The worker should survive long enough to expose useful diagnostics and optionally launch a replacement shell or allow an explicit restart.
 
 The runtime should prefer killing the workload as a group rather than leaving an agent in an unknown partially killed state.
+
+### 7.5 Worker placement and the per-user manager failure domain
+
+On systemd hosts, everything beneath `user@UID.service` shares one failure domain: when the per-user manager enters `exit.target` (for example `systemctl --user exit` during a graphical-session logout), it kills that whole subtree regardless of aplexer's per-session worker isolation. Two launch shapes are exposed:
+
+1. A worker forked by `a start` from a client running beneath a user service or scope (a tmux pane driven by a user unit, a graphical terminal hosted there) inherits that subtree. `setsid()` changes the session, not the cgroup.
+2. Every resource-limited workload is explicitly placed in a transient `systemd-run --user --scope --collect --unit=aplexer-workload-<id>` scope, which lives beneath the same per-user manager even when `a start` itself was launched from a plain SSH session.
+
+Workers launched from a plain login session (SSH/console) live in logind's `session-<n>.scope`, a sibling of `user@.service` under the user slice and owned by the system manager; those survive a user-manager exit. This asymmetry is exactly what the 2026-08-27 incident showed.
+
+Required behavior (implemented):
+
+- **Record.** The worker reads its actual cgroup from `/proc/<pid>/cgroup` (the v2 `0::` path) right after publishing its pid and persists it as `worker_cgroup`; it does the same for the workload leader as `workload_cgroup`. Evidence recorded while the processes are alive keeps the failure domain provable after a manager-wide kill removes every `/proc` trace.
+- **Validate.** At launch the workload leader's real location is compared against the containment scope systemd was asked to create; a mismatch is reported in worker.log instead of silently trusting the persisted locator.
+- **Classify and expose.** The machine API carries `worker_placement` / `workload_placement` per row (cgroup, `placement`: `init_owned` / `login_session` / `user_manager` / `system_slice` / `container` / `unknown`, and `vulnerable_to_user_manager_exit`), classified by the same code `a doctor` uses.
+- **Warn clearly.** `a start` prints a one-line stderr warning when the fresh session's worker is recorded in the user-manager subtree, naming the cgroup, the `systemctl --user exit` kill path, and one actionable next step. `a doctor` carries a warning-severity `launch_placement` check (own placement of the launch context plus a count of active sessions recorded inside the failure domain, with advice). Warn, never fail: a vulnerable session still works until the manager exits.
+- **Opt-in escape.** `APLEXER_LAUNCH_SYSTEM_SCOPE=system` makes the launch path place the worker in a system-manager scope (`systemd-run --system --scope --collect --unit=aplexer-worker-<id>`), and the resource-limited workload scope at the system level too, so neither shares the per-user manager's lifecycle. The backend is probed first (one trivial collected scope); on probe failure the launch degrades to the plain `setsid()` path with the reason on stderr. The escape is never attempted implicitly and never breaks a start. System scopes need root or a polkit authorization (`org.freedesktop.systemd1.manage-units`), so on stock hosts this is for administrators who have arranged that authorization.
+
+Not solved by placement alone: the complete answer for issue #1 is a small system-level, per-user launcher service owning worker and workload placement outside every login/user manager, with delegated aplexer control. That is deliberate future infrastructure work; recording, validation, warning, and the opt-in escape are the honest subset that works without it. Recovery UX after any placement failure is unchanged: `a list` reports broken records, `a doctor` names the recovery command (`a prune` / `a kill` / `a forget --force` by `reap_verdict`).
 
 ---
 
@@ -724,6 +745,10 @@ observed_engine
 containment_cgroup
 containment_cgroup_identity
 containment_empty
+worker_cgroup
+workload_cgroup
+worker_placement (derived at query time)
+workload_placement (derived at query time)
 exit_code
 exit_signal
 exit_reason

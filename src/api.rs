@@ -999,6 +999,8 @@ mod startup_cleanup_tests {
             phase,
             worker_pid: Some(1),
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty,
@@ -1269,6 +1271,15 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         // it, so `engine` cannot answer this and a consumer needs one key it
         // can read unconditionally.
         value["agent"] = json!(record_agent(record));
+        // Placement facts derived from the recorded cgroup paths
+        // (`placement::classify_cgroup_path`), the same classification
+        // `a doctor`'s launch_placement check uses -- so a consumer of this
+        // row and a consumer of doctor can never disagree about whether a
+        // session dies with the per-user manager (issue #1).
+        value["worker_placement"] =
+            crate::placement::placement_summary(record.worker_cgroup.as_deref());
+        value["workload_placement"] =
+            crate::placement::placement_summary(record.workload_cgroup.as_deref());
         enriched.push(value);
     }
     Ok(Value::Array(enriched))
@@ -1353,6 +1364,12 @@ pub fn status_json(paths: &Paths, selector: &str) -> Result<Value> {
     // carries, so the two commands cannot disagree about which agent is in a
     // session.
     value["agent"] = json!(record_agent(&current));
+    // Same derived placement facts every `a list --json`/`a snapshot` row
+    // carries, from the same helper (issue #1).
+    value["worker_placement"] =
+        crate::placement::placement_summary(current.worker_cgroup.as_deref());
+    value["workload_placement"] =
+        crate::placement::placement_summary(current.workload_cgroup.as_deref());
     if let Some(error) = rpc_error {
         value["rpc_error"] = json!(error);
     }
@@ -2011,7 +2028,23 @@ pub fn pick_fresh_tag(records: &[SessionRecord], workspace: &Path, base: &str) -
     Some(candidate)
 }
 
+/// The one public start entry point: the launch itself
+/// (`start_session_launch`) plus the launch-placement advisories. This is
+/// deliberately the choke point -- every start path (`a start`, `a new`,
+/// `a here`'s create arm, fast-session-switch's sibling creation, the
+/// Python binding) answers the same way about the fresh session's
+/// placement (issue #1: warn clearly). Advisories go to stderr so JSON on
+/// stdout stays machine-clean; a warning names the session's recorded
+/// cgroup, the manager exit that kills it, and one actionable next step.
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
+    let record = start_session_launch(paths, req)?;
+    if let Some(warning) = crate::placement::start_placement_warning(&record) {
+        eprintln!("{warning}");
+    }
+    Ok(record)
+}
+
+fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     ensure_sigchld_compatible_for_child_management()?;
     validate_tag(&req.tag)?;
     let workspace = canonical_workspace(&req.workspace)?;
@@ -2178,6 +2211,8 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             phase: Phase::Starting,
             worker_pid: None,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),
@@ -2190,6 +2225,39 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         let worker_log = File::create(paths.state_session(id).join("worker.log"))
             .context("create worker log")?;
         let mut command = worker_command(id, req.python.as_deref())?;
+        // Opt-in placement escape (issue #1): `setsid()` detaches the worker
+        // from the launching terminal but leaves it in the ambient cgroup,
+        // which is beneath user@UID.service whenever this launch is. When
+        // APLEXER_LAUNCH_SYSTEM_SCOPE=system is set AND the system-scope
+        // backend probes as working, spawn the worker inside a system
+        // manager scope so the PTY keeper does not share the per-user
+        // manager's lifecycle. Any probe/wrap failure degrades to the plain
+        // setsid() launch with a printed reason -- the escape must never
+        // turn into a broken start, and the honest placement warning from
+        // `start_session` covers the degraded shape.
+        if crate::placement::system_scope_requested() {
+            match crate::system_scope_escape_decision() {
+                Ok(true) => {
+                    if let Err(error) = crate::wrap_worker_in_system_scope(id, &mut command) {
+                        eprintln!(
+                            "warning: APLEXER_LAUNCH_SYSTEM_SCOPE=system requested, but the \
+                             worker could not be wrapped in a system scope ({error:#}); the \
+                             worker stays in the ambient cgroup"
+                        );
+                    }
+                }
+                // The decision is `false` only when the escape was not
+                // requested, which the branch condition already established.
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "warning: APLEXER_LAUNCH_SYSTEM_SCOPE=system requested, but the \
+                         system-scope backend is unavailable ({error:#}); the worker stays \
+                         in the ambient cgroup"
+                    );
+                }
+            }
+        }
         command
             .env("APLEXER_RUNTIME_DIR", &paths.runtime_root)
             .env("APLEXER_STATE_DIR", &paths.state_root)
@@ -2421,6 +2489,8 @@ mod fresh_tag_tests {
             phase: Phase::Running,
             worker_pid,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),
@@ -2554,6 +2624,8 @@ mod reclaim_tests {
             phase: Phase::Running,
             worker_pid: None,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),

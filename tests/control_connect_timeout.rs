@@ -50,6 +50,8 @@ fn status_cli_bounds_connect_to_a_saturated_control_backlog() {
         phase: Phase::Running,
         worker_pid: None,
         workload_pid: None,
+        worker_cgroup: None,
+        workload_cgroup: None,
         containment_cgroup: None,
         containment_cgroup_identity: None,
         containment_empty: None,

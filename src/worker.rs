@@ -1439,6 +1439,8 @@ mod tests {
             phase: Phase::Running,
             worker_pid: None,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),
@@ -2452,6 +2454,13 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         // Migrate a legacy record before exposing any further worker state,
         // retaining only non-secret roots needed for transcript discovery.
         record.worker_pid = Some(std::process::id());
+        // Placement evidence (issue #1): the fork's pre_exec setsid() gave
+        // this process a new session but left it in the ambient cgroup, so
+        // whatever manager owns that cgroup can still kill this session
+        // wholesale. Record where we actually are while we can still read
+        // it -- after a manager-wide kill the path is gone and the failure
+        // is unprovable, exactly the incident's `yolo` post-mortem problem.
+        record.worker_cgroup = crate::placement::read_process_cgroup(std::process::id());
         record.updated_at_ms = now_ms();
         startup.failure_record = record.clone();
         atomic_write_json(&record_path, &record)?;
@@ -2512,6 +2521,23 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         let child_slot = Arc::new(Mutex::new(Some(child)));
         startup.child = Some(Arc::clone(&child_slot));
         record.workload_pid = Some(pid);
+        // Launch-time cgroup validation (issue #1): read where the workload
+        // leader actually landed and, for a limited session, check that
+        // against the scope systemd was asked to create for it. The
+        // pre_exec cgroup.procs write is supposed to make a mismatch
+        // impossible; if the two sources of truth ever disagree, say so in
+        // worker.log instead of silently trusting the persisted locator.
+        record.workload_cgroup = crate::placement::read_process_cgroup(pid);
+        if let (Some(cgroup), Some(actual)) = (cgroup.as_ref(), record.workload_cgroup.as_deref()) {
+            let expected = cgroup.proc_path();
+            if actual != expected {
+                eprintln!(
+                    "warning: workload pid {pid} is in cgroup {actual}, not the recorded \
+                     containment scope {expected}; resource limits may not apply to the \
+                     workload's real location"
+                );
+            }
+        }
         startup.failure_record = record.clone();
         // Publish the leader and cgroup locator before any injected or real
         // post-spawn failure. The launcher must never have to infer a

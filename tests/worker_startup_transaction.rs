@@ -100,6 +100,8 @@ impl Harness {
             phase: Phase::Starting,
             worker_pid: None,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),

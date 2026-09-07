@@ -158,6 +158,8 @@ fn terminal_legacy_oversized_record_remains_recoverable() {
         phase: Phase::Exited,
         worker_pid: None,
         workload_pid: None,
+        worker_cgroup: None,
+        workload_cgroup: None,
         containment_cgroup: None,
         containment_cgroup_identity: None,
         containment_empty: Some(true),

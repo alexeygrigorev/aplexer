@@ -107,6 +107,20 @@
         "null"
       ]
     },
+    "worker_cgroup": {
+      "description": "Cgroup-v2 path (/proc/<pid>/cgroup `0::` form) the worker process was actually in at launch, read from /proc by the worker itself (issue #1).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workload_cgroup": {
+      "description": "Same evidence for the workload leader process; for limited sessions this is cross-checked at launch against containment_cgroup.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "containment_cgroup": {
       "type": [
         "string",

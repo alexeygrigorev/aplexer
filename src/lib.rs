@@ -5,6 +5,7 @@ pub mod agent_kind;
 pub mod api;
 pub mod hooks;
 pub mod messaging;
+pub mod placement;
 pub mod screen;
 pub mod watch;
 pub mod worker;
@@ -18,7 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -640,6 +641,27 @@ pub struct SessionRecord {
     pub worker_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_pid: Option<u32>,
+    /// The cgroup-v2 path (`/proc/<pid>/cgroup` `0::` form, e.g.
+    /// `/user.slice/user-1000.slice/session-8.scope`) the worker process was
+    /// actually in, read from `/proc` by the worker itself right after it
+    /// published its pid (issue #1). `setsid()` gave the worker a new
+    /// session but did NOT move it out of whichever service manager owns
+    /// this subtree, so this path is the durable evidence of which manager
+    /// can kill the session wholesale -- `a doctor` and the placement
+    /// summary fields classify it via `placement::classify_cgroup_path`.
+    /// `None` on records started before the field existed and when the
+    /// read failed (recording nothing beats recording a guess).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_cgroup: Option<String>,
+    /// Same evidence for the workload's leader process, read right after
+    /// the spawn. For a resource-limited session this is cross-checked at
+    /// launch against `containment_cgroup` (the scope systemd was asked to
+    /// create): disagreement is logged to worker.log because it means the
+    /// limits were not applied where the workload actually runs. An
+    /// unlimited session shares the worker's cgroup, so the two fields
+    /// normally agree there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_cgroup: Option<String>,
     /// Kernel containment domain for resource-limited sessions. Recovery
     /// code must validate this path against the session id before using it;
     /// an absent locator is never equivalent to an empty domain.
@@ -3681,6 +3703,125 @@ fn trusted_system_helper(name: &str) -> Result<PathBuf> {
     )
 }
 
+/// End-to-end probe of the system-manager scope backend behind the
+/// `APLEXER_LAUNCH_SYSTEM_SCOPE=system` escape (issue #1): resolves the same
+/// trusted helpers the real launch path resolves, then creates and collects
+/// one trivial transient scope (`-- true`) on the system manager. This is
+/// the only way to know the backend actually works -- as a regular user it
+/// usually does not (`org.freedesktop.systemd1.manage-units` needs root or
+/// a polkit authorization), and guessing would turn the opt-in escape into
+/// a broken start. Probing creates no lasting state: the scope runs `true`,
+/// exits, and `--collect` garbage-collects it. Never called unless the env
+/// opt-in is set.
+pub fn probe_system_scope_backend() -> Result<()> {
+    let systemd_run = trusted_system_helper("systemd-run")?;
+    let true_binary = trusted_system_helper("true")?;
+    let unit = format!("aplexer-escape-probe-{}", Uuid::new_v4().simple());
+    let mut command = Command::new(systemd_run);
+    command
+        .args([
+            "--system",
+            "--scope",
+            "--collect",
+            "--quiet",
+            &format!("--unit={unit}"),
+            "--",
+        ])
+        .arg(&true_binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut probe = command
+        .spawn()
+        .with_context(|| format!("spawn system-scope probe from {}", true_binary.display()))?;
+    // Same discipline as every other helper child: register the pid so the
+    // worker's descendant reaper cannot consume its status, and always reap
+    // it here before dropping.
+    let probe_pid = probe.id();
+    crate::worker::own_child_pid(probe_pid);
+    let probe_result = (|| -> Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match probe.try_wait()? {
+                Some(status) => return Ok(status),
+                None if Instant::now() >= deadline => {
+                    let _ = probe.kill();
+                    let _ = probe.wait();
+                    bail!("systemd-run system-scope probe timed out after 10s");
+                }
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    })();
+    crate::worker::disown_child_pid(probe_pid);
+    let status = probe_result?;
+    if !status.success() {
+        bail!(
+            "systemd-run --system --scope probe exited with {status}; creating system \
+             manager scopes needs root or polkit authorization \
+             (org.freedesktop.systemd1.manage-units)"
+        );
+    }
+    Ok(())
+}
+
+/// Decide, once per launch, whether the opt-in escape backend is usable.
+/// `Ok(true)`/`Ok(false)` mean "system scope"/"user manager fallback" for
+/// the caller's placement decision; the error is the probe failure, for the
+/// caller to report honestly instead of silently pretending the escape
+/// happened (issue #1: warn or fail clearly).
+pub fn system_scope_escape_decision() -> Result<bool> {
+    if !crate::placement::system_scope_requested() {
+        return Ok(false);
+    }
+    match probe_system_scope_backend() {
+        Ok(()) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Rewrite `worker` (already carrying the worker program and its initial
+/// argv from `worker_command`) so spawning it creates the worker inside a
+/// system-manager scope (`systemd-run --system --scope --collect
+/// --unit=aplexer-worker-<id>`) instead of bare `setsid()` in the ambient
+/// cgroup (issue #1). Everything configured on the command afterwards --
+/// per-session env, `--rows/--cols` -- lands on the systemd-run wrapper and
+/// is passed through to the worker child: systemd-run shares its own
+/// environment with the scope's process, and argv after `--` is the
+/// worker's argv verbatim.
+///
+/// The `pre_exec` closure the caller installs afterwards (setsid + signal
+/// blocking) then applies to systemd-run itself; the worker inherits the
+/// blocked-signal baseline it unblocks at startup and needs no session of
+/// its own (the workload's spawn does its own `setsid` + `TIOCSCTTY`).
+/// The wrapper stays the worker's parent for the worker's whole life --
+/// one extra small process per escaped session -- and `--collect` removes
+/// the scope as soon as the worker exits.
+///
+/// `Ok(())` means the command now spawns into the escape scope; the error
+/// is the reason the escape was not applied, for the caller to surface.
+/// The caller falls back to the plain (setsid-only, ambient-cgroup) spawn
+/// in that case: the issue asks for honest degradation with a warning,
+/// never for a broken start.
+fn wrap_worker_in_system_scope(id: Uuid, worker: &mut Command) -> Result<()> {
+    let systemd_run = trusted_system_helper("systemd-run")?;
+    let program = worker.get_program().to_os_string();
+    let worker_args: Vec<OsString> = worker.get_args().map(|arg| arg.to_os_string()).collect();
+    let mut command = Command::new(systemd_run);
+    command.args([
+        "--system",
+        "--scope",
+        "--collect",
+        "--quiet",
+        &format!("--unit=aplexer-worker-{id}"),
+        "--",
+    ]);
+    command.arg(&program);
+    command.args(&worker_args);
+    *worker = command;
+    Ok(())
+}
+
 fn control_group_locator(id: Uuid, value: &str) -> Result<PathBuf> {
     let value = value.trim();
     let reported = Path::new(value);
@@ -3767,9 +3908,21 @@ impl Cgroup {
     // this project exists to prevent.
     //
     // Instead we ask systemd-run to create a fresh, independently delegated
-    // scope directly under the user's own slice (a sibling, not a nested
-    // child, of the ambient cgroup) and hold it open with a placeholder
-    // process until the real workload can be moved in.
+    // scope (a sibling, not a nested child, of the ambient cgroup) and hold
+    // it open with a placeholder process until the real workload can be
+    // moved in.
+    //
+    // Which manager owns the new scope is a placement decision with a real
+    // failure-domain consequence (issue #1): the default `--user` scope
+    // lives beneath user@UID.service and dies with the per-user manager's
+    // exit.target; the opt-in `--system` scope (APLEXER_LAUNCH_SYSTEM_SCOPE
+    // = system, probed first via `system_scope_escape_decision`) lives under
+    // the system manager and survives it. Probe failure downgrades to the
+    // user manager with a printed warning -- limits still apply either way;
+    // only the survival domain differs. A failure *after* a successful probe
+    // (spawn, scope wait, controller delegation) fails closed exactly as the
+    // `--user` path always has: a validated backend that then breaks is a
+    // real error, not a placement preference to silently swap.
     pub fn create<F>(id: Uuid, limits: &Limits, setup_started: F) -> Result<Option<Self>>
     where
         F: FnOnce(),
@@ -3778,6 +3931,19 @@ impl Cgroup {
         if !limits.requested() {
             return Ok(None);
         }
+        let system_scope = match system_scope_escape_decision() {
+            Ok(system_scope) => system_scope,
+            Err(error) => {
+                eprintln!(
+                    "warning: APLEXER_LAUNCH_SYSTEM_SCOPE=system requested, but the \
+                     system-scope backend is unavailable ({error:#}); the workload scope \
+                     falls back to the per-user manager and inherits its exit.target \
+                     failure domain"
+                );
+                false
+            }
+        };
+        let bus_flag = if system_scope { "--system" } else { "--user" };
         let identity = current_cgroup_identity()?;
         // Resolve every executable before starting the scope. Ambient PATH is
         // intentionally irrelevant: a user-controlled shadow helper must not
@@ -3788,7 +3954,7 @@ impl Cgroup {
         let unit = format!("aplexer-workload-{id}");
         let mut command = Command::new(systemd_run);
         command
-            .arg("--user")
+            .arg(bus_flag)
             .arg("--scope")
             .arg("--collect")
             .arg(format!("--unit={unit}"))
@@ -3830,16 +3996,22 @@ impl Cgroup {
         // procfs descendant tree. Let the caller preserve recovery evidence
         // until an authoritative cgroup path has been recorded.
         setup_started();
-        let path =
-            match wait_for_scope_cgroup(id, &unit, &identity, &systemctl, Duration::from_secs(5)) {
-                Ok(path) => path,
-                Err(error) => {
-                    return Err(cleanup_anchor_after_failure(
-                        &mut anchor,
-                        error.context("limits fail closed"),
-                    ));
-                }
-            };
+        let path = match wait_for_scope_cgroup(
+            id,
+            &unit,
+            &identity,
+            &systemctl,
+            bus_flag,
+            Duration::from_secs(5),
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(cleanup_anchor_after_failure(
+                    &mut anchor,
+                    error.context("limits fail closed"),
+                ));
+            }
+        };
         if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
             return Err(cleanup_anchor_after_failure(
                 &mut anchor,
@@ -3879,6 +4051,19 @@ impl Cgroup {
     }
     pub fn locator(&self) -> &Path {
         &self.path
+    }
+    /// The same cgroup in `/proc/<pid>/cgroup` form (`/<relative>` under the
+    /// cgroup-v2 root), so launch-time validation can compare what systemd
+    /// was asked to create against what the workload actually reports being
+    /// in (issue #1).
+    pub fn proc_path(&self) -> String {
+        let relative = self
+            .path
+            .strip_prefix(CGROUP_V2_ROOT)
+            .unwrap_or(&self.path)
+            .to_string_lossy()
+            .to_string();
+        format!("/{}", relative.trim_start_matches('/'))
     }
     pub fn identity(&self) -> &CgroupIdentity {
         &self.identity
@@ -4296,9 +4481,10 @@ fn wait_for_scope_cgroup(
     unit: &str,
     identity: &CgroupIdentity,
     systemctl: &Path,
+    bus_flag: &str,
     timeout: Duration,
 ) -> Result<PathBuf> {
-    wait_for_scope_cgroup_with(id, unit, systemctl, timeout, |path| {
+    wait_for_scope_cgroup_with(id, unit, systemctl, bus_flag, timeout, |path| {
         validate_recorded_cgroup(id, path, Some(identity))
     })
 }
@@ -4307,6 +4493,7 @@ fn wait_for_scope_cgroup_with(
     id: Uuid,
     unit: &str,
     systemctl: &Path,
+    bus_flag: &str,
     timeout: Duration,
     mut validate: impl FnMut(&Path) -> Result<Option<PathBuf>>,
 ) -> Result<PathBuf> {
@@ -4314,7 +4501,7 @@ fn wait_for_scope_cgroup_with(
     loop {
         let mut command = Command::new(systemctl);
         command.args([
-            "--user",
+            bus_flag,
             "show",
             &format!("{unit}.scope"),
             "-p",
@@ -4722,6 +4909,8 @@ mod tests {
             phase: Phase::Exited,
             worker_pid: None,
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(true),
@@ -5118,6 +5307,8 @@ mod tests {
             phase: Phase::Running,
             worker_pid: Some(pid),
             workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: Some(false),
@@ -6212,12 +6403,18 @@ mod tests {
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut validations = 0;
-        let path =
-            wait_for_scope_cgroup_with(id, &unit, &systemctl, Duration::from_secs(1), |path| {
+        let path = wait_for_scope_cgroup_with(
+            id,
+            &unit,
+            &systemctl,
+            "--user",
+            Duration::from_secs(1),
+            |path| {
                 validations += 1;
                 Ok(Some(path.to_path_buf()))
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             path,

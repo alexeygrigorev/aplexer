@@ -252,6 +252,55 @@ Configured memory, PID, CPU quota, and CPU period values must be greater than
 zero. `cpu_period_us` is meaningful only with `cpu_quota_us`; a quota without an
 explicit period keeps the 100,000 µs default.
 
+## Worker placement and the per-user systemd manager
+
+`setsid()` gives each session worker terminal/session separation only. It does
+not move the worker out of its cgroup and does not change which service manager
+owns it. On a systemd host that leaves a real failure domain (issue #1): when
+the per-user manager enters `exit.target` — `systemctl --user exit`, for
+example during a graphical logout — everything beneath `user@UID.service` dies
+together, including any worker forked from a launch under a user unit/scope and
+every resource-limited workload aplexer places in its
+`systemd-run --user --scope`. Workers launched from a plain SSH/console session
+live in logind's `session-*.scope`, owned by the system manager, and survive.
+This is not hypothetical: the 2026-08-27 incident killed every session started
+from beneath `user@1000.service` in one stroke while the SSH-launched ones
+survived.
+
+What aplexer does about it:
+
+- **Records the evidence.** The worker reads its actual cgroup from
+  `/proc/<pid>/cgroup` at launch and persists it as `worker_cgroup` (and
+  `workload_cgroup` for the workload leader, cross-checked against the
+  containment scope for limited sessions). After a manager-wide kill, when
+  every `/proc` trace is gone, the record still names the failure domain that
+  did it.
+- **Classifies it.** `a status --json`, `a list --json`, and `a snapshot --json`
+  rows carry `worker_placement` / `workload_placement`:
+  `{ "cgroup": ..., "placement": "init_owned" | "login_session" |
+  "user_manager" | "system_slice" | "container" | "unknown",
+  "vulnerable_to_user_manager_exit": bool }`.
+- **Warns.** `a start` prints a one-line stderr warning when the fresh
+  session's worker landed in the user-manager subtree, and `a doctor` carries a
+  warning-severity `launch_placement` check with advice (it never fails the
+  checkup over a placement you can work around). Warn, not fail: a vulnerable
+  session works fine until the manager exits.
+- **Opt-in escape.** `APLEXER_LAUNCH_SYSTEM_SCOPE=system a start ...` places
+  the worker in a system-manager scope (`systemd-run --system --scope --collect
+  --unit=aplexer-worker-<id>`) — and resource-limited workloads at the system
+  level too — so neither shares the per-user manager's lifecycle. The backend
+  is probed first; on a stock host a regular user is not authorized to create
+  system scopes (`org.freedesktop.systemd1.manage-units`), the probe fails, and
+  the start proceeds exactly as before with the reason on stderr. The escape
+  never runs implicitly and never breaks a start.
+
+What this does **not** do: make sessions started from beneath `user@.service`
+survive a user-manager exit by default. That needs a launch backend outside the
+per-user manager entirely — a small system-level, per-user launcher service
+with delegated aplexer control — which is deliberate future work (spec.md
+section 7.5). If a session is lost this way, the record stays and `a doctor`
+names the recovery command (`a prune`, `a kill`, or `a forget --force`).
+
 ## Durable lifecycle
 
 Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker when something failed. A session that **exits cleanly** — `exit`, Ctrl-D / shell EOF, a command that finished, or `a kill` — is removed entirely. The worker deletes the record itself once it proves the containment domain empty (any finalize failure, and OOM, keep the evidence), so a finished session disappears from `a list` — and from PocketShell's session list — instead of lingering as an exited row that every client keeps picking up. Failed and OOM records stay until you discard them with `a forget --force` or `a prune`.

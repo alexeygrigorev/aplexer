@@ -297,13 +297,17 @@ fn status_json_agrees_with_list_json_and_human_output_for_a_live_record() {
 }
 
 /// Additive-only wire check: every key the released CLI put on the wire for
-/// this fixture is still there, and the only things added are the two
-/// query-time derived fields -- `state` (liveness, see `observed_state`) and
+/// this fixture is still there, and the only things added are the deliberate
+/// query-time derived fields -- `state` (liveness, see `observed_state`),
 /// `agent` (which agent is live in the workload's process tree,
-/// pocketshell issue #2580). The baseline is the released binary's real output (see
+/// pocketshell issue #2580), and the issue #1 placement set: the recorded
+/// `worker_cgroup`/`workload_cgroup` (real /proc evidence, so a
+/// manager-wide kill leaves the failure domain provable) and the derived
+/// `worker_placement`/`workload_placement` summaries classified from them.
+/// The baseline is the released binary's real output (see
 /// `BASELINE_STATUS_JSON_KEYS`), so this fails on a removed or renamed key
 /// even though nothing in the source says "these keys are load-bearing", and
-/// it fails again the moment a THIRD field appears without a deliberate
+/// it fails again the moment a further field appears without a deliberate
 /// decision to widen the wire.
 #[test]
 fn status_json_adds_only_the_derived_state_and_agent_fields() {
@@ -331,7 +335,15 @@ fn status_json_adds_only_the_derived_state_and_agent_fields() {
     let added: Vec<&String> = observed.difference(&baseline).collect();
     assert_eq!(
         added,
-        vec!["agent", "state"],
-        "`a status --json` changed its wire shape by more than the additive `agent`/`state` fields"
+        vec![
+            "agent",
+            "state",
+            "worker_cgroup",
+            "worker_placement",
+            "workload_cgroup",
+            "workload_placement",
+        ],
+        "`a status --json` changed its wire shape by more than the additive derived \
+         state/agent/placement fields"
     );
 }

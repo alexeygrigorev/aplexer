@@ -299,6 +299,8 @@ fn fresh_start_reclaims_a_dead_holder_under_its_exact_name() {
         phase: Phase::Exited,
         worker_pid: None,
         workload_pid: None,
+        worker_cgroup: None,
+        workload_cgroup: None,
         containment_cgroup: None,
         containment_cgroup_identity: None,
         containment_empty: Some(true),

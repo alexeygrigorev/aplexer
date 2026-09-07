@@ -350,6 +350,8 @@ fn a_terminal_record_never_reports_an_agent_from_a_recycled_pid() {
             phase,
             worker_pid: None,
             workload_pid: Some(workload_pid),
+            worker_cgroup: None,
+            workload_cgroup: None,
             containment_cgroup: None,
             containment_cgroup_identity: None,
             containment_empty: None,
