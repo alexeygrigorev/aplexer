@@ -410,6 +410,17 @@ automatically targets the new worker after a switch.
 
 ## 6. Keybindings and numbering: decisions and rationale
 
+> **Superseded in part.** The table below is the keymap as this design
+> shipped. Session navigation has since moved off `n`/`p` onto the arrow
+> keys, workspace navigation was added, and `n` now creates: `Ctrl-b
+> Right`/`Left` = next/previous session in this workspace, `Ctrl-b
+> Down`/`Up` = next/previous workspace (entered at its most recently
+> accessed session), `Ctrl-b n` = create another session in this workspace
+> and switch to it, `Ctrl-b p` = unbound. `N`/`P`, `1-9`, `l`, `d`, `r`,
+> `[` and `?` are unchanged. The rationale below still applies; the
+> authoritative keymap is `ATTACH_BINDINGS` in src/bin/a.rs, which both
+> `a keys` and the `Ctrl-b ?` flash are generated from.
+
 | Chord | Action |
 |---|---|
 | `Ctrl-]` | detach (unchanged) |

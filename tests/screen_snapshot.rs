@@ -1405,10 +1405,10 @@ fn switching_sessions_drops_the_previous_sessions_scroll_region() {
     let mut client = PtyClient::spawn(&harness, &id_a, 24, 80);
     client.wait_for(b"\x1b[5;15r", 0, "session A's scroll region");
 
-    // Ctrl-b n: with exactly two attachable sessions in this workspace, "next"
-    // is B whichever way the group is ordered.
+    // Ctrl-b Right: with exactly two attachable sessions in this workspace,
+    // "next" is B whichever way the group is ordered.
     let switch_at = client.mark();
-    client.send(&[0x02, b'n']);
+    client.send(SWITCH_NEXT_CHORD);
     // The switch chord has to round-trip through the worker before the client
     // can act on it, and `reset_workload_margins` runs immediately before B's
     // snapshot payload is written -- so the offset of B's own marker is the
@@ -1493,7 +1493,7 @@ fn switching_sessions_drops_the_previous_sessions_scroll_region() {
     // or A comes back with its region dropped -- the very bug the snapshot
     // scan fixes on a first attach, reintroduced on every switch.
     let back_at = client.mark();
-    client.send(&[0x02, b'n']);
+    client.send(SWITCH_NEXT_CHORD);
     // Same anchoring point as the switch out: the first `5;15` after the chord
     // is A's snapshot payload passing through, which is where the client
     // re-learns A's region. A `1;23r` before it is the client still correctly
@@ -1585,7 +1585,7 @@ fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
         vt100::MouseProtocolEncoding::Sgr
     );
 
-    client.send(&[0x02, b'n']);
+    client.send(SWITCH_NEXT_CHORD);
     let target_at =
         client.wait_for_offset(b"B-PLAIN-MARK", switch_at, "session B's plain snapshot");
     let out = client.output();
@@ -1938,4 +1938,373 @@ fn a_wheel_roll_opens_scroll_mode_with_no_prefix_key() {
 
     client.detach();
     harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+// -- The attach keymap: `Ctrl-b n` creates, the arrows navigate --
+//
+// Session navigation moved off `n`/`p` onto `Ctrl-b Right`/`Left` (asserted by
+// the two switch tests above, which press the chord for real), workspace
+// navigation onto `Ctrl-b Down`/`Up`, and `Ctrl-b n` became "create another
+// session in this workspace and switch to it".
+//
+// The tests below cover what is new: the create really does make a session the
+// way `a new` would and really moves the attached client onto it, a create
+// that fails leaves the attachment completely alone, and the workspace chords
+// hop between workspaces at their most recently used session.
+//
+// All of them drive `a attach` on a real PTY (`PtyClient`) rather than the raw
+// control socket, because the whole keymap lives on the client's input thread,
+// which only runs when stdin is a tty.
+
+/// `Ctrl-b Right` -- next session in this workspace, in the CSI encoding a
+/// terminal uses outside application-cursor mode.
+const SWITCH_NEXT_CHORD: &[u8] = b"\x02\x1b[C";
+/// `Ctrl-b Down` / `Ctrl-b Up` -- next / previous workspace. Written in the
+/// SS3 encoding on purpose: an attached TUI can put the terminal into
+/// application-cursor mode at any moment, and both encodings have to work.
+const NEXT_WORKSPACE_CHORD: &[u8] = b"\x02\x1bOB";
+const PREV_WORKSPACE_CHORD: &[u8] = b"\x02\x1bOA";
+
+/// Writes a config with a distinctively-named default engine, so a created
+/// session's recorded `engine`/`command` prove it went through
+/// `Config::resolve` -- neither a hard-coded shell nor a copy of whatever the
+/// currently attached session happens to be running.
+fn write_probe_engine_config(harness: &Harness) {
+    std::fs::write(
+        &harness.config_file,
+        "version = 1\n\
+         default_engine = \"probe\"\n\
+         [engines.probe]\n\
+         command = [\"bash\", \"--norc\", \"-i\"]\n",
+    )
+    .expect("write config");
+}
+
+fn canonical(workspace: &Path) -> String {
+    workspace
+        .canonicalize()
+        .expect("canonical workspace")
+        .to_str()
+        .expect("utf8 workspace")
+        .to_string()
+}
+
+/// Every session record in `workspace`, in `a list --json` order.
+fn workspace_records(harness: &Harness, workspace: &Path) -> Vec<Value> {
+    let stdout = harness.run_ok(&["list", "--json"], Duration::from_secs(10));
+    let rows: Vec<Value> = serde_json::from_str(&stdout).expect("`a list --json` output is JSON");
+    let target = canonical(workspace);
+    rows.into_iter()
+        .filter(|row| row["workspace"].as_str() == Some(target.as_str()))
+        .collect()
+}
+
+/// Polls until a session other than `exclude` exists in `workspace`. The chord
+/// starts a real worker, so this is a wait, not a read.
+fn wait_for_sibling(harness: &Harness, workspace: &Path, exclude: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let found = workspace_records(harness, workspace)
+            .into_iter()
+            .find(|row| row["id"].as_str() != Some(exclude));
+        if let Some(found) = found {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no second session appeared in {} within 20s",
+            workspace.display()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Polls the host terminal (the captured stream replayed through vt100) until
+/// its rendered screen contains `needle`. The counterpart to `wait_for` for
+/// assertions about what the user can *see* rather than which bytes went out
+/// -- the status bar in particular is repainted on its own timers, and its
+/// opening flash sits over it for the first few seconds of every attach.
+fn wait_for_host_contents(client: &PtyClient, needle: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let out = client.output();
+        let contents = host_terminal(&out, 24, 80).screen().contents();
+        if contents.contains(needle) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what} ({needle:?}); host screen:\n{contents}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn ctrl_b_n_creates_a_session_in_this_workspace_and_switches_to_it() {
+    let harness = Harness::new();
+    write_probe_engine_config(&harness);
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("new-session");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // The attached session is started with an explicit `--` command, so its
+    // own `command` is distinguishable from the configured engine's.
+    let id_a = start_session(&harness, &workspace, "main");
+    harness.run_ok(
+        &["send", &id_a, r#"printf 'A-SESSION-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id_a, "A-SESSION-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id_a, 24, 80);
+    client.wait_for(b"A-SESSION-MARK", 0, "session A's snapshot");
+
+    let create_at = client.mark();
+    client.send(&[0x02, b'n']);
+
+    let created = wait_for_sibling(&harness, &workspace, &id_a);
+    let new_id = created["id"].as_str().expect("new session id").to_string();
+
+    // Same workspace, `--fresh`'s tag allocation (`main` is live, so the next
+    // free suffix), and the *configured default engine* -- what `a start` in
+    // this directory would have given, not a clone of session A's `--` command
+    // and not a hard-coded shell.
+    assert_eq!(
+        created["workspace"].as_str(),
+        Some(canonical(&workspace).as_str())
+    );
+    assert_eq!(
+        created["tag"].as_str(),
+        Some("main-2"),
+        "the chord must reuse --fresh's suffix walk; record: {created}"
+    );
+    assert_eq!(
+        created["engine"].as_str(),
+        Some("probe"),
+        "the new session must come from Config::resolve's default engine; record: {created}"
+    );
+    assert_eq!(
+        created["command"],
+        serde_json::json!(["bash", "--norc", "-i"]),
+        "the new session must run the configured engine's command; record: {created}"
+    );
+
+    // The client is *in* it: a marker printed into the new session lands on
+    // this terminal without anyone attaching again.
+    harness.run_ok(
+        &[
+            "send",
+            &new_id,
+            r#"printf 'NEW-SESSION-%s\n' MARK"#,
+            "--enter",
+        ],
+        Duration::from_secs(5),
+    );
+    let landed_at = client.wait_for_offset(
+        b"NEW-SESSION-MARK",
+        create_at,
+        "the created session's output on the attached terminal",
+    );
+
+    // The switch's terminal reset must not pop the host back to the primary
+    // screen on the way (that would re-expose the pre-attach scrollback) --
+    // the same invariant `switching_from_alt_mouse_session_...` asserts for a
+    // plain switch, which the create rides on.
+    let out = client.output();
+    assert!(
+        find_bytes(&out[create_at..landed_at], b"\x1b[?1049l").is_none(),
+        "creating a session popped the host off the alternate screen; captured:\n{}",
+        escape(&out[create_at..landed_at])
+    );
+    let host = host_terminal(&out, 24, 80);
+    assert!(
+        host.screen().alternate_screen(),
+        "the attach client holds the host on the alternate screen across a create"
+    );
+    let contents = host.screen().contents();
+    assert!(
+        contents.contains("NEW-SESSION-MARK"),
+        "the host terminal is not showing the created session; screen:\n{contents}"
+    );
+    // The status bar follows the client onto the new session. Waited for
+    // rather than read once: the attach's own opening flash ("attached to
+    // ...") owns the bar for `FLASH_DURATION` first, and a create is fast
+    // enough to land well inside it.
+    wait_for_host_contents(
+        &client,
+        "main-2",
+        "the status bar naming the created session",
+    );
+
+    // `Ctrl-b l` still means "back where I was": the create is an ordinary
+    // switch as far as the last-session bookkeeping is concerned.
+    let back_at = client.mark();
+    client.send(&[0x02, b'l']);
+    client.wait_for(
+        b"A-SESSION-MARK",
+        back_at,
+        "session A's screen on the way back",
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id_a, "--signal", "KILL"], Duration::from_secs(5));
+    harness.run_ok(
+        &["kill", &new_id, "--signal", "KILL"],
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn ctrl_b_n_failure_reports_on_the_bar_and_keeps_the_attach() {
+    let harness = Harness::new();
+    write_probe_engine_config(&harness);
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("new-session-failure");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id_a = start_session(&harness, &workspace, "main");
+    harness.run_ok(
+        &["send", &id_a, r#"printf 'STAY-PUT-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    wait_for_screen_marker(&harness, &id_a, "STAY-PUT-MARK");
+
+    let mut client = PtyClient::spawn(&harness, &id_a, 24, 80);
+    client.wait_for(b"STAY-PUT-MARK", 0, "session A's snapshot");
+
+    // Break the config *under* the live client: `Config::load` runs inside the
+    // chord, so this is the "bad config" failure the feature has to survive
+    // (tag exhaustion and a worker that won't start fail in the same place,
+    // before anything about the current attach has been touched).
+    std::fs::write(
+        &harness.config_file,
+        "version = 1\ndefault_engine = \"nope\"\n",
+    )
+    .expect("rewrite config");
+
+    let fail_at = client.mark();
+    client.send(&[0x02, b'n']);
+    client.wait_for(
+        b"nope",
+        fail_at,
+        "the failed create's message on the status bar",
+    );
+
+    // Nothing was created, and the client is still attached to A -- proven by
+    // A's output still arriving on this terminal.
+    std::fs::remove_file(&harness.config_file).expect("drop the broken config");
+    let records = workspace_records(&harness, &workspace);
+    assert_eq!(
+        records.len(),
+        1,
+        "a failed create must not leave a session behind: {records:?}"
+    );
+    harness.run_ok(
+        &["send", &id_a, r#"printf 'STILL-HERE-%s\n' MARK"#, "--enter"],
+        Duration::from_secs(5),
+    );
+    client.wait_for(
+        b"STILL-HERE-MARK",
+        fail_at,
+        "session A's output after the failed create",
+    );
+
+    let out = client.output();
+    let host = host_terminal(&out, 24, 80);
+    assert!(
+        host.screen().alternate_screen(),
+        "a failed create must not strand the host off the alternate screen"
+    );
+    let contents = host.screen().contents();
+    assert!(
+        contents.contains("STILL-HERE-MARK"),
+        "the host terminal stopped showing the session it is attached to; screen:\n{contents}"
+    );
+
+    client.detach();
+    harness.run_ok(&["kill", &id_a, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+#[test]
+fn ctrl_b_down_and_up_hop_workspaces_at_their_most_recent_session() {
+    let harness = Harness::new();
+    write_probe_engine_config(&harness);
+    let root = TempDir::new().expect("workspace root");
+    let here = root.path().join("hop-here");
+    let there = root.path().join("hop-there");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&there).unwrap();
+
+    let id_here = start_session(&harness, &here, "main");
+    // Two sessions over there, created oldest-first. `a list` order is
+    // newest-created-first, so `newer` is what "the first session in that
+    // workspace" would mean -- and the chord must ignore that in favour of
+    // the one actually used most recently.
+    let id_older = start_session(&harness, &there, "older");
+    let id_newer = start_session(&harness, &there, "newer");
+    // `%s` keeps each marker out of the echoed command text, so finding it in
+    // the client's output means the *session* printed it.
+    for (id, prefix) in [
+        (&id_here, "HERE"),
+        (&id_older, "OLDER"),
+        (&id_newer, "NEWER"),
+    ] {
+        harness.run_ok(
+            &[
+                "send",
+                id,
+                &format!("printf '{prefix}-%s\\n' MARK"),
+                "--enter",
+            ],
+            Duration::from_secs(5),
+        );
+    }
+    wait_for_screen_marker(&harness, &id_here, "HERE-MARK");
+    wait_for_screen_marker(&harness, &id_older, "OLDER-MARK");
+    wait_for_screen_marker(&harness, &id_newer, "NEWER-MARK");
+
+    // Attaching is what stamps `last_accessed_ms`, so this is how "the
+    // session I was last in over there" gets established -- on the *older*
+    // one, against list order.
+    PtyClient::spawn(&harness, &id_older, 24, 80).detach();
+
+    let mut client = PtyClient::spawn(&harness, &id_here, 24, 80);
+    client.wait_for(b"HERE-MARK", 0, "the starting workspace's session");
+
+    let hop_at = client.mark();
+    client.send(NEXT_WORKSPACE_CHORD);
+    client.wait_for(
+        b"OLDER-MARK",
+        hop_at,
+        "the other workspace's most recently attached session",
+    );
+    let out = client.output();
+    assert!(
+        find_bytes(&out[hop_at..], b"NEWER-MARK").is_none(),
+        "the workspace hop landed on list-order's first session instead of the \
+         most recently attached one; captured:\n{}",
+        escape(&out[hop_at..])
+    );
+
+    // And back: with two workspaces, `Ctrl-b Up` is the other direction of the
+    // same cycle.
+    let back_at = client.mark();
+    client.send(PREV_WORKSPACE_CHORD);
+    client.wait_for(
+        b"HERE-MARK",
+        back_at,
+        "the starting workspace, hopped back to",
+    );
+
+    let out = client.output();
+    let host = host_terminal(&out, 24, 80);
+    assert!(
+        host.screen().alternate_screen(),
+        "the attach client holds the host on the alternate screen across workspace hops"
+    );
+
+    client.detach();
+    for id in [&id_here, &id_older, &id_newer] {
+        harness.run_ok(&["kill", id, "--signal", "KILL"], Duration::from_secs(5));
+    }
 }

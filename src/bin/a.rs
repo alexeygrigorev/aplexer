@@ -3652,23 +3652,27 @@ fn cmd_completions(args: CompletionsArgs) -> Result<()> {
     Ok(())
 }
 
-/// `a hotkeys` -- a lookup command for the attach-mode Ctrl-b chords, kept in
-/// sync by hand with the attach status bar's `?` flash (`ATTACH_KEY_HELP`,
-/// drawn where `attach()` enters raw mode) and the `SwitchTarget` match arms
-/// in the attach loop's byte scanner -- there is one authoritative keymap,
-/// this just
-/// prints it somewhere you can look it up without already being attached.
+/// `a hotkeys` -- a lookup command for the attach-mode Ctrl-b chords,
+/// rendered from `ATTACH_BINDINGS`, the same table the attach status bar's
+/// `?` flash (`attach_key_help`) renders. There is one authoritative keymap
+/// and one place it is written down; this just prints it somewhere you can
+/// look it up without already being attached.
 fn cmd_hotkeys() -> Result<()> {
     println!("Attach-mode keys (press Ctrl-b, then one of these):");
     println!();
-    println!("  ?        show this reference in the status bar");
-    println!("  [        scroll back through this session's output (q or Esc to leave)");
-    println!("  d        detach (the workload keeps running)");
-    println!("  r        redraw the live screen (recover a garbled display)");
-    println!("  n / p    next / previous session in this workspace");
-    println!("  N / P    next / previous session across all workspaces");
-    println!("  1-9      jump to the numbered session in the status bar");
-    println!("  l        return to the previously attached session");
+    let width = ATTACH_BINDINGS
+        .iter()
+        .map(|b| b.keys.len())
+        .max()
+        .unwrap_or(0);
+    for binding in ATTACH_BINDINGS {
+        println!(
+            "  {:width$}  {}",
+            binding.keys,
+            binding.description,
+            width = width
+        );
+    }
     println!();
     println!("Any other key after Ctrl-b is forwarded through untouched.");
     println!();
@@ -5258,11 +5262,89 @@ type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
 /// rather than two: help text has to be readable, not merely noticed.
 const FLASH_DURATION: Duration = Duration::from_secs(3);
 
+/// One attach-mode chord, as both renderings need it.
+///
+/// The keymap is defined **once**, here: the `Ctrl-b ?` status-bar flash and
+/// the `a keys`/`a hotkeys` listing are both generated from
+/// `ATTACH_BINDINGS`, so a binding can no longer be changed in the scanner
+/// and updated in only one of the two places that document it. (It used to be
+/// two hand-maintained lists with a comment asking future editors to keep
+/// them in sync.) Anything else that has to show the keymap should read this
+/// table too rather than adding a third copy.
+struct AttachBinding {
+    /// The keys, as the `a keys` listing's left column shows them.
+    keys: &'static str,
+    /// `key label` for the one-line status-bar flash, which has a terminal
+    /// width to live inside; `None` keeps a binding out of that line only.
+    /// Order here is the order shown, and the flash is truncated from the
+    /// right, so the entries most worth seeing on an 80-column terminal come
+    /// first.
+    brief: Option<&'static str>,
+    /// The sentence `a keys` prints.
+    description: &'static str,
+}
+
+const ATTACH_BINDINGS: &[AttachBinding] = &[
+    AttachBinding {
+        keys: "Right / Left",
+        brief: Some("←/→ session"),
+        description: "next / previous session in this workspace",
+    },
+    AttachBinding {
+        keys: "Down / Up",
+        brief: Some("↑/↓ workspace"),
+        description: "next / previous workspace (at its most recent session)",
+    },
+    AttachBinding {
+        keys: "n",
+        brief: Some("n new"),
+        description: "create another session in this workspace and switch to it",
+    },
+    AttachBinding {
+        keys: "d",
+        brief: Some("d detach"),
+        description: "detach (the workload keeps running)",
+    },
+    AttachBinding {
+        keys: "[",
+        brief: Some("[ scroll"),
+        description: "scroll back through this session's output (q or Esc to leave)",
+    },
+    AttachBinding {
+        keys: "N / P",
+        brief: Some("N/P global"),
+        description: "next / previous session across all workspaces",
+    },
+    AttachBinding {
+        keys: "1-9",
+        brief: Some("1-9 jump"),
+        description: "jump to the numbered session in the status bar",
+    },
+    AttachBinding {
+        keys: "l",
+        brief: Some("l last"),
+        description: "return to the previously attached session",
+    },
+    AttachBinding {
+        keys: "r",
+        brief: Some("r redraw"),
+        description: "redraw the live screen (recover a garbled display)",
+    },
+    AttachBinding {
+        keys: "?",
+        brief: Some("? help"),
+        description: "show this reference in the status bar",
+    },
+];
+
 /// The one-line key reference `Ctrl-b ?` flashes onto the status bar --
 /// the same chords `a keys`/`a hotkeys` print, compressed to what fits a
-/// terminal line. Consumed locally: no byte reaches the workload.
-const ATTACH_KEY_HELP: &str =
-    "Ctrl-b: [ scroll · d detach · r redraw · n/p switch · N/P global · 1-9 jump · l last · ? help";
+/// terminal line (and truncated by the bar renderer when it does not).
+/// Consumed locally: no byte reaches the workload.
+fn attach_key_help() -> String {
+    let brief: Vec<&str> = ATTACH_BINDINGS.iter().filter_map(|b| b.brief).collect();
+    format!("Ctrl-b: {}", brief.join(" · "))
+}
 
 /// Shows a transient message on the status bar and redraws immediately --
 /// the single channel for attach hints, help, and switch failures, so
@@ -6416,10 +6498,15 @@ fn seed_client_scrollback(
 /// (docs/fast-session-switching-design.md section 3).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SwitchTarget {
-    /// `Ctrl-b n`: next session in the current workspace.
+    /// `Ctrl-b Right`: next session in the current workspace.
     Next,
-    /// `Ctrl-b p`: previous session in the current workspace.
+    /// `Ctrl-b Left`: previous session in the current workspace.
     Prev,
+    /// `Ctrl-b Down`: the next workspace in `a list` order, entered at its
+    /// most recently accessed session.
+    NextWorkspace,
+    /// `Ctrl-b Up`: the previous workspace, likewise.
+    PrevWorkspace,
     /// `Ctrl-b N`: next session across all workspaces (`a list` order).
     NextGlobal,
     /// `Ctrl-b P`: previous session across all workspaces.
@@ -6430,6 +6517,15 @@ enum SwitchTarget {
     /// (1-based) of the current workspace, no skipping -- must mean exactly
     /// what the status bar shows.
     Index(usize),
+    /// `Ctrl-b n`: create a brand-new session in the attached session's
+    /// workspace and switch to it. (Session navigation moved to the arrow
+    /// keys, which is what freed `n` to mean "new".) The odd one out -- every
+    /// other variant *selects* an existing session, this one *makes* the
+    /// session it then selects -- which is why it is resolved by
+    /// `create_sibling_session` in `perform_switch` rather than by
+    /// `pick_switch_target`. Everything after resolution (establish, swap,
+    /// `last` bookkeeping, failure containment) is the ordinary switch path.
+    New,
 }
 
 /// True iff `check_attachable` would pass; used to skip dead sessions when
@@ -6464,6 +6560,33 @@ fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<S
     None
 }
 
+/// The session a workspace is *entered* at by `Ctrl-b Down`/`Up`: the one
+/// used most recently (`last_accessed_ms`, stamped whenever a client
+/// attaches), which is the session a returning user means by "that
+/// workspace". Ties and a group where nothing has ever been attached fall
+/// back to `a list` order -- the first row, i.e. what the status bar
+/// numbers `1`. Unattachable sessions are skipped, so a workspace whose
+/// most recent session has since died is entered at its next-best one
+/// rather than erroring; `None` means the whole group is dead, and the
+/// caller moves on to the next workspace.
+fn workspace_entry_session(group: &[SessionRecord]) -> Option<SessionRecord> {
+    let mut best: Option<&SessionRecord> = None;
+    for candidate in group.iter().filter(|r| is_attachable(r)) {
+        let better = match best {
+            // Strictly greater: on a tie the earlier (higher in `a list`)
+            // row wins, so "never attached" groups enter at row 1.
+            Some(current) => {
+                candidate.last_accessed_ms.unwrap_or(0) > current.last_accessed_ms.unwrap_or(0)
+            }
+            None => true,
+        };
+        if better {
+            best = Some(candidate);
+        }
+    }
+    best.cloned()
+}
+
 /// Pure candidate selection over the same groups `a list` prints (see
 /// `group_by_workspace`). Split from `resolve_switch_target` (the
 /// paths-touching wrapper) so it is unit-testable without a filesystem.
@@ -6472,6 +6595,10 @@ fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<S
 /// - `Next`/`Prev`: candidates are the current session's own workspace
 ///   group; skips dead sessions; wraps; errors if nothing else is
 ///   attachable there.
+/// - `NextWorkspace`/`PrevWorkspace`: candidates are whole *groups*, in that
+///   same `a list` order, skipping the current one and any group with
+///   nothing attachable in it; the chosen group is entered at
+///   `workspace_entry_session`.
 /// - `NextGlobal`/`PrevGlobal`: candidates are every group flattened in
 ///   `a list` workspace order (the remembered `--sort`), then list order
 ///   inside each group -- exactly the top-to-bottom order of `a list`.
@@ -6502,6 +6629,41 @@ fn pick_switch_target(
             walk_group(group, current_id, target == SwitchTarget::Prev)
                 .ok_or_else(|| anyhow!("no other running session in this workspace"))
         }
+        SwitchTarget::NextWorkspace | SwitchTarget::PrevWorkspace => {
+            // Workspace-level cycling, over the same top-level order `a list`
+            // prints (the remembered `--sort`). The current workspace is
+            // skipped, so this is always a real move; a workspace with
+            // nothing attachable left in it is stepped over rather than
+            // becoming an error the user has to press through.
+            let len = groups.len();
+            if len == 0 {
+                bail!("no sessions to switch to");
+            }
+            let backwards = target == SwitchTarget::PrevWorkspace;
+            let start = groups
+                .iter()
+                .position(|(ws, _)| ws == current_workspace)
+                .unwrap_or(0);
+            for step in 1..=len {
+                let index = if backwards {
+                    (start + len - step) % len
+                } else {
+                    (start + step) % len
+                };
+                let (workspace, group) = &groups[index];
+                // Comparing the path (not the index) is what makes the
+                // "current workspace not in the list" case -- it was just
+                // killed underneath us -- consider every group, including
+                // index 0, instead of silently skipping one.
+                if workspace == current_workspace {
+                    continue;
+                }
+                if let Some(entry) = workspace_entry_session(group) {
+                    return Ok(entry);
+                }
+            }
+            bail!("no other workspace has a running session")
+        }
         SwitchTarget::NextGlobal | SwitchTarget::PrevGlobal => {
             let flat: Vec<SessionRecord> = groups.iter().flat_map(|(_, g)| g.clone()).collect();
             walk_group(&flat, current_id, target == SwitchTarget::PrevGlobal)
@@ -6517,6 +6679,12 @@ fn pick_switch_target(
             }
             Ok(group[n - 1].clone())
         }
+        // Not reachable through `perform_switch`, which resolves `New` by
+        // *creating* the session before it ever gets here (see the variant's
+        // doc comment). Spelled out rather than folded into another arm so a
+        // future caller that forgets gets a named error instead of silently
+        // switching somewhere arbitrary.
+        SwitchTarget::New => bail!("new-session target is created, not selected"),
         SwitchTarget::Last => {
             let id = last.ok_or_else(|| anyhow!("no previous session"))?;
             groups
@@ -6537,6 +6705,71 @@ fn resolve_switch_target(
 ) -> Result<SessionRecord> {
     let groups = group_by_workspace(list_records(paths)?, load_list_sort(paths));
     pick_switch_target(&groups, &current.workspace, current.id, target, last)
+}
+
+/// How long `Ctrl-b c` waits for the new session's workload to come up before
+/// giving up -- `a start`'s own `--startup-timeout-ms` default, because this
+/// chord is `a new` with the CLI trip removed and must not be quietly less
+/// patient than typing it.
+const NEW_SESSION_STARTUP_TIMEOUT_MS: u64 = 10_000;
+
+/// `Ctrl-b c`'s half of the chord: create another session in the attached
+/// session's workspace, the way `a new` (i.e. `a start --fresh --attach`)
+/// would if the user had detached to run it.
+///
+/// Deliberately *not* a clone of `current`: the promise is "what `a start`
+/// gives me in this workspace", so engine/profile are left `None` for
+/// `Config::resolve` to fill from the configured default engine (and its
+/// default profile), the tag base is `DEFAULT_HUMAN_TAG` -- the same base
+/// `a start`/`a new`/`a here` use -- and cwd defaults to the workspace.
+/// Inheriting the attached session's engine instead would make the chord mean
+/// "another one of these", which is a different (and unrequested) feature, and
+/// would be surprising the moment the user is attached to a `--` command
+/// session that was never meant to be spawned twice.
+///
+/// Tag allocation is `--fresh`'s, not a reimplementation: `start_session`
+/// picks the first free `<tag>`/`<tag>-2`/`<tag>-3` … *under the registry
+/// lock*, so two clients pressing `Ctrl-b c` at the same instant cannot claim
+/// the same suffix, and a dead holder is still reclaimed under its own name
+/// rather than skipped (tests/fresh_start.rs).
+///
+/// `geometry` is the host's workload-sized `(rows, cols)` (already
+/// reserved-rows-adjusted, exactly what the following `establish` sends), so
+/// the new worker's PTY is born at the right size and its first snapshot needs
+/// no SIGWINCH repaint -- the same thing `a start --attach` does with the
+/// terminal it was typed into.
+///
+/// Errors propagate to `perform_switch`'s caller untouched: nothing here has
+/// touched the live attachment, so a bad config or an exhausted tag space is a
+/// status-bar flash and the user stays exactly where they were.
+fn create_sibling_session(
+    paths: &Paths,
+    current: &SessionRecord,
+    geometry: Option<(u16, u16)>,
+) -> Result<SessionRecord> {
+    let request = aplexer::api::StartRequest {
+        workspace: current.workspace.clone(),
+        tag: DEFAULT_HUMAN_TAG.to_string(),
+        engine: None,
+        profile: None,
+        cwd: None,
+        env: BTreeMap::new(),
+        command: Vec::new(),
+        memory: None,
+        pids: None,
+        cpu_quota_us: None,
+        cpu_period_us: 100_000,
+        history_bytes: None,
+        no_skip_permissions: false,
+        startup_timeout_ms: NEW_SESSION_STARTUP_TIMEOUT_MS,
+        worker_rows: geometry.map(|(rows, _)| rows),
+        worker_cols: geometry.map(|(_, cols)| cols),
+        python: None,
+        // The whole point: never fail because this workspace already has a
+        // `main`, take `main-2` instead.
+        fresh: true,
+    };
+    aplexer::api::start_session(paths, &request).context("create a session in this workspace")
 }
 
 /// Result of `establish()`: the connected/subscribed stream, its initial
@@ -6821,7 +7054,8 @@ enum InputAction {
     Forward(Vec<u8>),
     /// `Ctrl-b d`.
     Detach,
-    /// `Ctrl-b n/p/N/P/l/1-9`.
+    /// `Ctrl-b n/p/N/P/l/1-9`, and `Ctrl-b c` (which creates the session it
+    /// then switches to -- see `SwitchTarget::New`).
     Switch(SwitchTarget),
     /// `Ctrl-b ?`: a purely local help flash on the status bar. Consumed
     /// like every other chord -- no byte reaches the workload, so asking
@@ -6844,16 +7078,86 @@ enum InputAction {
 /// just within one buffer: `Ctrl-b` can legitimately arrive as the very
 /// last byte of one `read()` and the following key as the first byte of the
 /// next.
+/// Whether `fd` has input waiting, waiting up to `timeout` for it. Used only
+/// to bound the scanner's wait for the rest of an arrow chord, so an error
+/// (or a signal) answers "yes": the caller falls through to its ordinary
+/// blocking `read`, which is where read errors are already handled.
+fn readable(fd: libc::c_int, timeout: Duration) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().clamp(0, i32::MAX as u128) as i32;
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, millis) };
+    ready != 0
+}
+
+/// How long a `Ctrl-b ESC` may wait for the rest of an arrow-key sequence
+/// before the scanner concludes there is no arrow coming and forwards the
+/// withheld bytes to the workload.
+///
+/// The arrow chords (`Ctrl-b Left/Right/Up/Down`) are multi-byte -- `ESC [ C`
+/// in normal cursor mode, `ESC O C` in application cursor mode, which plenty
+/// of TUIs enable -- and a PTY read can split them anywhere, so the scanner
+/// has to be able to hold a half-typed one across `read()` calls. But a bare
+/// `Ctrl-b ESC` (a user reaching for the workload's own Escape, having
+/// touched the prefix key by accident) is indistinguishable from the first
+/// byte of an arrow until either the rest arrives or enough time passes, and
+/// holding it indefinitely would leave an editor sitting in insert mode with
+/// no idea why. So the wait is bounded: the input thread polls for this long
+/// while the scanner holds a partial chord and, on silence, flushes it
+/// through (`InputScanner::flush_pending`).
+///
+/// 100ms is far longer than the gap a terminal can put between the bytes of
+/// one escape sequence (they are written in a single `write`; a split is a
+/// buffer boundary, not a pause) and short enough to read as instant for the
+/// Escape case. It is only ever paid after a literal `Ctrl-b ESC`, never on
+/// ordinary input.
+const CHORD_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Default)]
 struct InputScanner {
     pending_ctrl_b: bool,
+    /// Bytes withheld *after* a `Ctrl-b` because they could still complete an
+    /// arrow chord: `ESC`, `ESC [`, or `ESC O`, and nothing else. Empty at
+    /// every other moment, which is what `awaiting_escape` reports. The
+    /// withheld `Ctrl-b` itself is implied (it is not stored here) and is
+    /// re-emitted ahead of these bytes whenever the sequence turns out not to
+    /// be a chord.
+    pending_escape: Vec<u8>,
 }
 
 impl InputScanner {
+    /// True while a partial arrow chord is held. The input thread uses this
+    /// to bound its wait for the rest (see `CHORD_ESCAPE_TIMEOUT`).
+    fn awaiting_escape(&self) -> bool {
+        !self.pending_escape.is_empty()
+    }
+
+    /// Give up on a partial arrow chord and release what was withheld -- the
+    /// `Ctrl-b` and the escape bytes -- as ordinary input, exactly as the
+    /// "not a bound chord" fall-through in `scan` does.
+    ///
+    /// Deliberately does *not* flush a lone pending `Ctrl-b`: waiting
+    /// indefinitely for its second key is this keymap's documented behavior
+    /// (a chord is only a chord once its key arrives), and only the
+    /// multi-byte arrows introduced ambiguity worth timing out.
+    fn flush_pending(&mut self) -> Vec<InputAction> {
+        if self.pending_escape.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![0x02];
+        out.append(&mut self.pending_escape);
+        vec![InputAction::Forward(out)]
+    }
+
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
     /// `Ctrl-b d` detaches; `?` flashes the key reference; `r` redraws the
-    /// live screen; `[` opens the scrollback pager; `n p N P l 1-9` switch.
-    /// Anything else pending is "not a
+    /// live screen; `[` opens the scrollback pager; `n` creates another
+    /// session in this workspace and switches to it; `Right`/`Left` move
+    /// between the sessions of this workspace and `Down`/`Up` between
+    /// workspaces; `N P l 1-9` switch. Anything else pending is "not a
     /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
     /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
     /// still pass through to the workload untouched.
@@ -6863,8 +7167,58 @@ impl InputScanner {
         let mut i = 0;
         while i < buffer.len() {
             let byte = buffer[i];
+            // Mid-arrow: `pending_escape` is only ever non-empty between the
+            // `ESC` of a possible `Ctrl-b <arrow>` and its final byte, and
+            // `pending_ctrl_b` is cleared before we get here, so the two
+            // states cannot both be live.
+            if !self.pending_escape.is_empty() {
+                let complete = match (self.pending_escape.len(), byte) {
+                    // Both encodings: CSI (`ESC [`, normal cursor mode) and
+                    // SS3 (`ESC O`, application cursor mode). A TUI can flip
+                    // the terminal into either, so binding only one of them
+                    // would make the arrows work until the workload changed
+                    // its mind.
+                    (1, b'[') | (1, b'O') => {
+                        self.pending_escape.push(byte);
+                        i += 1;
+                        continue;
+                    }
+                    (2, b'A') => Some(SwitchTarget::PrevWorkspace),
+                    (2, b'B') => Some(SwitchTarget::NextWorkspace),
+                    (2, b'C') => Some(SwitchTarget::Next),
+                    (2, b'D') => Some(SwitchTarget::Prev),
+                    _ => None,
+                };
+                match complete {
+                    Some(target) => {
+                        self.pending_escape.clear();
+                        if !out.is_empty() {
+                            actions.push(InputAction::Forward(std::mem::take(&mut out)));
+                        }
+                        actions.push(InputAction::Switch(target));
+                        i += 1;
+                        continue;
+                    }
+                    None => {
+                        // Not an arrow after all (`Ctrl-b ESC`, `Ctrl-b ESC [ H`,
+                        // ...): release the withheld `Ctrl-b` and escape bytes
+                        // and reprocess this byte normally -- it may itself be
+                        // a fresh `Ctrl-b`, so `i` does not advance.
+                        out.push(0x02);
+                        out.append(&mut self.pending_escape);
+                        continue;
+                    }
+                }
+            }
             if self.pending_ctrl_b {
                 self.pending_ctrl_b = false;
+                // `ESC` after the prefix is the start of a possible arrow
+                // chord; withhold it until the following bytes say which.
+                if byte == 0x1b {
+                    self.pending_escape.push(byte);
+                    i += 1;
+                    continue;
+                }
                 let action = match byte {
                     b'd' => {
                         if !out.is_empty() {
@@ -6876,8 +7230,13 @@ impl InputScanner {
                     b'?' => Some(InputAction::Help),
                     b'r' => Some(InputAction::Redraw),
                     b'[' => Some(InputAction::Scroll),
-                    b'n' => Some(InputAction::Switch(SwitchTarget::Next)),
-                    b'p' => Some(InputAction::Switch(SwitchTarget::Prev)),
+                    // The product ask, on the key the user asked for. Session
+                    // navigation lives on the arrows (above), so `n` is free
+                    // to mean "new" the way it reads. `p` is deliberately
+                    // *unbound*: it was only ever the other half of `n`/`p`,
+                    // and leaving it as a lone "previous" next to an `n` that
+                    // creates would be a trap. It falls through untouched.
+                    b'n' => Some(InputAction::Switch(SwitchTarget::New)),
                     b'N' => Some(InputAction::Switch(SwitchTarget::NextGlobal)),
                     b'P' => Some(InputAction::Switch(SwitchTarget::PrevGlobal)),
                     b'l' => Some(InputAction::Switch(SwitchTarget::Last)),
@@ -6939,23 +7298,32 @@ fn perform_switch(
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let last = *last_session.lock().unwrap_or_else(PoisonError::into_inner);
-    let next = resolve_switch_target(paths, &current, target, last)?;
-    if next.id == current.id {
-        return Ok(()); // switching to yourself: silent no-op
-    }
-    check_attachable(&next)?;
-    switch_in_progress.store(true, Ordering::Relaxed);
     // Current terminal geometry (docs/fast-session-switching-design.md
     // section 5.2 / docs/terminal-state-design.md section 10.2): passed
     // into the Attach so the new session's snapshot renders at the right
     // size immediately, rather than relying solely on the post-switch
-    // explicit Resize send below.
+    // explicit Resize send below. Read before resolution because
+    // `SwitchTarget::New` also hands it to the worker it starts.
     let geometry = term
         .lock()
         .ok()
         .map(|g| *g)
         .filter(|g| g.rows > 0)
         .map(|g| (reserved_rows(g.rows), g.cols));
+    // `New` makes its target instead of picking one; everything below is the
+    // same for both, which is what keeps "which key creates a session" a
+    // one-line change in `InputScanner::scan`. Creation happens here, still
+    // before the current attachment has been touched, so a failed create is
+    // indistinguishable from a failed resolve: an Err, and the user stays put.
+    let next = match target {
+        SwitchTarget::New => create_sibling_session(paths, &current, geometry)?,
+        _ => resolve_switch_target(paths, &current, target, last)?,
+    };
+    if next.id == current.id {
+        return Ok(()); // switching to yourself: silent no-op
+    }
+    check_attachable(&next)?;
+    switch_in_progress.store(true, Ordering::Relaxed);
     let result = (|| -> Result<()> {
         let handshake = establish(&next, replay_bytes, want_screen, geometry)?;
         let reader = handshake.reader;
@@ -7222,7 +7590,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let mut buffer = [0u8; 8192];
         // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
         // Ctrl-b ? flashes the key reference, Ctrl-b r redraws the live
-        // screen, Ctrl-b n/p/N/P/l/1-9 switch sessions, anything else
+        // screen, Ctrl-b c creates another session here, Ctrl-b n/p/N/P/l/1-9
+        // switch sessions, anything else
         // pending is not a real prefix (both bytes forward to the
         // workload). See
         // `InputScanner` for the byte-level rules and why this needs to
@@ -7234,7 +7603,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
         // has no such command-prefix system and isn't growing one just for
         // this, so the simplest reasonable behavior is used instead: a
-        // *bound* Ctrl-b sequence (d/?/r/n/p/N/P/l/1-9) is consumed; anything
+        // *bound* Ctrl-b sequence (d/?/r/c/n/p/N/P/l/1-9) is consumed; anything
         // else is not a prefix at all -- both bytes are forwarded through as
         // ordinary input, so a program that wants a literal Ctrl-b (some
         // editors and REPLs use it) isn't broken by this feature.
@@ -7246,28 +7615,39 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         // turns a wheel roll up into the pager.
         let mut scroll_input = ScrollInput::default();
         'outer: while input_active.load(Ordering::Relaxed) {
-            let n = match input.read(&mut buffer) {
-                Ok(0) => {
-                    input_detached.store(true, Ordering::Relaxed);
-                    detach_attached_client(&input_writer, &input_active);
-                    break;
+            // The only place this loop does not simply block on stdin: while
+            // the scanner holds a half-typed arrow chord, the rest of it has
+            // a deadline (see `CHORD_ESCAPE_TIMEOUT`), after which the
+            // withheld bytes are released to the workload as ordinary input.
+            let actions = if scanner.awaiting_escape()
+                && !readable(libc::STDIN_FILENO, CHORD_ESCAPE_TIMEOUT)
+            {
+                scanner.flush_pending()
+            } else {
+                let n = match input.read(&mut buffer) {
+                    Ok(0) => {
+                        input_detached.store(true, Ordering::Relaxed);
+                        detach_attached_client(&input_writer, &input_active);
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        input_detached.store(true, Ordering::Relaxed);
+                        detach_attached_client(&input_writer, &input_active);
+                        break;
+                    }
+                };
+                if !input_tty {
+                    if send_data(&input_writer, &buffer[..n]).is_err() {
+                        detach_attached_client(&input_writer, &input_active);
+                        break;
+                    }
+                    continue;
                 }
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    input_detached.store(true, Ordering::Relaxed);
-                    detach_attached_client(&input_writer, &input_active);
-                    break;
-                }
+                scanner.scan(&buffer[..n])
             };
-            if !input_tty {
-                if send_data(&input_writer, &buffer[..n]).is_err() {
-                    detach_attached_client(&input_writer, &input_active);
-                    break;
-                }
-                continue;
-            }
-            for action in scanner.scan(&buffer[..n]) {
+            for action in actions {
                 match action {
                     InputAction::Forward(bytes) => {
                         // Ordering matters: a Forward before a Switch goes
@@ -7294,7 +7674,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         break 'outer;
                     }
                     InputAction::Help => {
-                        flash_status(&input_status_ctx, ATTACH_KEY_HELP);
+                        flash_status(&input_status_ctx, attach_key_help());
                     }
                     InputAction::Redraw => {
                         // `Ctrl-b r` means "this display is garbled, redraw
@@ -7314,7 +7694,11 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     InputAction::Switch(target) => {
                         // A switch replaces the model wholesale; the pager
                         // is looking at the outgoing session's history, so
-                        // it has to close before the swap.
+                        // it has to close before the swap. `SwitchTarget::New`
+                        // (Ctrl-b c) rides this same arm: it starts a session
+                        // first and then switches to it, so a create that
+                        // fails lands in the same Err below -- a flash on the
+                        // bar, the attach to the current session untouched.
                         exit_scroll_mode(&input_status_ctx);
                         let result = perform_switch(
                             &input_paths,
@@ -8074,13 +8458,229 @@ mod switching_tests {
     }
 
     #[test]
-    fn scan_ctrl_b_n_is_switch_next() {
+    fn scan_ctrl_b_n_asks_for_a_new_session() {
         let mut s = InputScanner::default();
         let actions = s.scan(&[0x02, b'n']);
         assert!(matches!(
             actions.as_slice(),
-            [InputAction::Switch(SwitchTarget::Next)]
+            [InputAction::Switch(SwitchTarget::New)]
         ));
+        // Split across reads, like every other chord: the prefix state has to
+        // survive the read() boundary.
+        let mut split = InputScanner::default();
+        assert!(split.scan(&[0x02]).is_empty());
+        assert!(matches!(
+            split.scan(b"n").as_slice(),
+            [InputAction::Switch(SwitchTarget::New)]
+        ));
+        // And the chord bytes never reach the workload -- pressing it must
+        // not type an `n` into whatever has the prompt.
+        let mut mixed = InputScanner::default();
+        let actions = mixed.scan(&[b'a', 0x02, b'n', b'z']);
+        assert_eq!(actions.len(), 3);
+        match &actions[0] {
+            InputAction::Forward(b) => assert_eq!(b, b"a"),
+            _ => panic!("expected the pre-chord byte forwarded"),
+        }
+        assert!(matches!(actions[1], InputAction::Switch(SwitchTarget::New)));
+        match &actions[2] {
+            InputAction::Forward(b) => assert_eq!(b, b"z"),
+            _ => panic!("expected the post-chord byte forwarded"),
+        }
+    }
+
+    /// Session navigation lives on Right/Left and workspace navigation on
+    /// Down/Up, in *both* encodings a terminal can send them in: CSI
+    /// (`ESC [ C`) in normal cursor mode and SS3 (`ESC O C`) in application
+    /// cursor mode, which a TUI in the session can turn on at any moment.
+    #[test]
+    fn scan_ctrl_b_arrows_navigate_in_both_cursor_modes() {
+        for introducer in [b'[', b'O'] {
+            for (final_byte, expected) in [
+                (b'C', SwitchTarget::Next),
+                (b'D', SwitchTarget::Prev),
+                (b'B', SwitchTarget::NextWorkspace),
+                (b'A', SwitchTarget::PrevWorkspace),
+            ] {
+                let mut s = InputScanner::default();
+                let actions = s.scan(&[0x02, 0x1b, introducer, final_byte]);
+                match actions.as_slice() {
+                    [InputAction::Switch(target)] => assert_eq!(
+                        *target, expected,
+                        "ESC {} {} should mean {expected:?}",
+                        introducer as char, final_byte as char
+                    ),
+                    other => panic!(
+                        "ESC {} {} was not consumed as a chord ({} action(s))",
+                        introducer as char,
+                        final_byte as char,
+                        other.len()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A terminal writes an escape sequence in one `write`, but a PTY read can
+    /// still split it anywhere -- every prefix has to survive the boundary,
+    /// including `Ctrl-b` and `ESC` landing in different reads.
+    #[test]
+    fn scan_ctrl_b_arrow_split_across_every_read_boundary() {
+        let chord: &[u8] = &[0x02, 0x1b, b'[', b'C'];
+        for split in 1..chord.len() {
+            let mut s = InputScanner::default();
+            let first = s.scan(&chord[..split]);
+            assert!(
+                first.is_empty(),
+                "a partial chord split at {split} must emit nothing yet"
+            );
+            assert!(
+                s.awaiting_escape() || split == 1,
+                "split at {split} should leave the scanner holding escape bytes"
+            );
+            assert!(
+                matches!(
+                    s.scan(&chord[split..]).as_slice(),
+                    [InputAction::Switch(SwitchTarget::Next)]
+                ),
+                "a chord split at {split} did not resolve"
+            );
+        }
+    }
+
+    /// `Ctrl-b` then a bare `ESC` is not a chord: once the input thread stops
+    /// waiting for the rest of an arrow (`CHORD_ESCAPE_TIMEOUT`), both
+    /// withheld bytes go to the workload, so an editor still gets its Escape.
+    #[test]
+    fn scan_ctrl_b_escape_flushes_when_no_arrow_follows() {
+        let mut s = InputScanner::default();
+        assert!(s.scan(&[0x02, 0x1b]).is_empty());
+        assert!(s.awaiting_escape());
+        assert_eq!(bytes(&s.flush_pending()), vec![0x02, 0x1b]);
+        assert!(!s.awaiting_escape());
+        // Nothing is left behind: the next key is scanned from scratch.
+        assert!(matches!(
+            s.scan(&[0x02, b'n']).as_slice(),
+            [InputAction::Switch(SwitchTarget::New)]
+        ));
+
+        // A lone `Ctrl-b` is *not* flushed: waiting for its second key is the
+        // keymap's contract, and only the multi-byte arrows are ambiguous.
+        let mut lone = InputScanner::default();
+        assert!(lone.scan(&[0x02]).is_empty());
+        assert!(!lone.awaiting_escape());
+        assert!(lone.flush_pending().is_empty());
+    }
+
+    /// An escape sequence after the prefix that is *not* an arrow (Home, F1,
+    /// ...) forwards every withheld byte in order rather than swallowing any.
+    #[test]
+    fn scan_ctrl_b_non_arrow_escape_forwards_every_byte() {
+        let mut s = InputScanner::default();
+        assert_eq!(bytes(&s.scan(&[0x02, 0x1b, b'[', b'H'])), {
+            let mut expected = vec![0x02, 0x1b];
+            expected.extend_from_slice(b"[H");
+            expected
+        });
+        let mut alt = InputScanner::default();
+        assert_eq!(
+            bytes(&alt.scan(&[0x02, 0x1b, b'x'])),
+            vec![0x02, 0x1b, b'x']
+        );
+    }
+
+    /// `p` was only ever the other half of `n`/`p`. With `n` now meaning
+    /// "new", a lone "previous" on `p` would be a trap, so it is unbound and
+    /// forwards -- and `N`/`P` are untouched.
+    #[test]
+    fn scan_ctrl_b_p_is_unbound_but_capital_p_still_switches() {
+        let mut s = InputScanner::default();
+        assert_eq!(bytes(&s.scan(&[0x02, b'p'])), vec![0x02, b'p']);
+        assert!(matches!(
+            s.scan(&[0x02, b'N']).as_slice(),
+            [InputAction::Switch(SwitchTarget::NextGlobal)]
+        ));
+        assert!(matches!(
+            s.scan(&[0x02, b'P']).as_slice(),
+            [InputAction::Switch(SwitchTarget::PrevGlobal)]
+        ));
+    }
+
+    /// The arrow chords must not have eaten the bracket-ish keys next to
+    /// them: `[` is still the pager and the digits still jump.
+    #[test]
+    fn scan_ctrl_b_bracket_and_digits_survive_the_arrow_chords() {
+        let mut s = InputScanner::default();
+        assert!(matches!(
+            s.scan(&[0x02, b'[']).as_slice(),
+            [InputAction::Scroll]
+        ));
+        assert!(matches!(
+            s.scan(&[0x02, b'4']).as_slice(),
+            [InputAction::Switch(SwitchTarget::Index(4))]
+        ));
+        assert!(matches!(
+            s.scan(&[0x02, b'l']).as_slice(),
+            [InputAction::Switch(SwitchTarget::Last)]
+        ));
+        assert!(matches!(
+            s.scan(&[0x02, b'r']).as_slice(),
+            [InputAction::Redraw]
+        ));
+        assert!(matches!(
+            s.scan(&[0x02, b'?']).as_slice(),
+            [InputAction::Help]
+        ));
+    }
+
+    /// The keymap has exactly one definition; the two renderings are views of
+    /// it. This is the guard on that: both must mention every bound key.
+    #[test]
+    fn the_key_reference_is_generated_from_the_binding_table() {
+        let help = attach_key_help();
+        assert!(help.starts_with("Ctrl-b: "));
+        for binding in ATTACH_BINDINGS {
+            if let Some(brief) = binding.brief {
+                assert!(
+                    help.contains(brief),
+                    "the status-bar reference dropped {brief:?}: {help}"
+                );
+            }
+        }
+        // The bindings the scanner actually implements, spelled as the table
+        // spells them -- a binding added to the scanner and forgotten here (or
+        // the reverse) fails this.
+        let keys: Vec<&str> = ATTACH_BINDINGS.iter().map(|b| b.keys).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "Right / Left",
+                "Down / Up",
+                "n",
+                "d",
+                "[",
+                "N / P",
+                "1-9",
+                "l",
+                "r",
+                "?"
+            ]
+        );
+    }
+
+    /// `SwitchTarget::New` is created, never selected: `pick_switch_target`
+    /// must say so rather than quietly resolving somewhere.
+    #[test]
+    fn pick_switch_target_refuses_to_select_a_new_session() {
+        let ws = PathBuf::from("/ws/new");
+        let a = mk_record("/ws/new", "a", Phase::Running);
+        let groups = vec![(ws.clone(), vec![a.clone()])];
+        let error = pick_switch_target(&groups, &ws, a.id, SwitchTarget::New, None)
+            .expect_err("New must not be selectable");
+        assert!(
+            format!("{error:#}").contains("created, not selected"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -8113,10 +8713,10 @@ mod switching_tests {
     fn scan_split_across_reads() {
         let mut s = InputScanner::default();
         assert!(s.scan(&[0x02]).is_empty());
-        let actions = s.scan(b"n");
+        let actions = s.scan(b"N");
         assert!(matches!(
             actions.as_slice(),
-            [InputAction::Switch(SwitchTarget::Next)]
+            [InputAction::Switch(SwitchTarget::NextGlobal)]
         ));
     }
 
@@ -8834,6 +9434,105 @@ mod switching_tests {
         let prev =
             pick_switch_target(&groups, Path::new("/ws/a"), a1, SwitchTarget::Prev, None).unwrap();
         assert_eq!(prev.id, a2); // wraps backward past dead a3 too
+    }
+
+    /// `Ctrl-b Down`/`Up` move a *workspace* at a time and enter the one they
+    /// land on at its most recently accessed session -- the session a
+    /// returning user means by "that workspace".
+    #[test]
+    fn workspace_hop_enters_at_the_most_recently_accessed_session() {
+        let ws_a = "/ws/a";
+        let ws_b = "/ws/b";
+        let mut a1 = mk_record(ws_a, "main", Phase::Running);
+        a1.worker_pid = Some(std::process::id());
+        let mut b1 = mk_record(ws_b, "first", Phase::Running);
+        let mut b2 = mk_record(ws_b, "second", Phase::Running);
+        b1.worker_pid = Some(std::process::id());
+        b2.worker_pid = Some(std::process::id());
+        // `b2` is listed second but was attached to more recently.
+        b1.last_accessed_ms = Some(1_000);
+        b2.last_accessed_ms = Some(2_000);
+        let (b1_id, b2_id) = (b1.id, b2.id);
+        let groups = vec![
+            (PathBuf::from(ws_a), vec![a1.clone()]),
+            (PathBuf::from(ws_b), vec![b1, b2]),
+        ];
+        for target in [SwitchTarget::NextWorkspace, SwitchTarget::PrevWorkspace] {
+            // Two workspaces, so next and previous are the same one; both
+            // must enter it at b2, not at list position 1.
+            let picked = pick_switch_target(&groups, Path::new(ws_a), a1.id, target, None).unwrap();
+            assert_eq!(picked.id, b2_id, "{target:?} entered the wrong session");
+        }
+
+        // Never attached: fall back to `a list` order, i.e. the session the
+        // status bar numbers 1.
+        let mut c1 = mk_record(ws_b, "first", Phase::Running);
+        let mut c2 = mk_record(ws_b, "second", Phase::Running);
+        c1.worker_pid = Some(std::process::id());
+        c2.worker_pid = Some(std::process::id());
+        c1.id = b1_id;
+        let fresh = vec![
+            (PathBuf::from(ws_a), vec![a1.clone()]),
+            (PathBuf::from(ws_b), vec![c1, c2]),
+        ];
+        let picked = pick_switch_target(
+            &fresh,
+            Path::new(ws_a),
+            a1.id,
+            SwitchTarget::NextWorkspace,
+            None,
+        )
+        .unwrap();
+        assert_eq!(picked.id, b1_id);
+    }
+
+    /// A workspace with nothing attachable left in it is stepped over, not
+    /// turned into an error the user has to press through; when every other
+    /// workspace is like that, the error says so and (via `perform_switch`)
+    /// the attach is left alone.
+    #[test]
+    fn workspace_hop_skips_dead_workspaces_and_reports_when_none_remain() {
+        let ws_a = "/ws/a";
+        let ws_dead = "/ws/dead";
+        let ws_c = "/ws/c";
+        let mut a1 = mk_record(ws_a, "main", Phase::Running);
+        a1.worker_pid = Some(std::process::id());
+        let mut corpse = mk_record(ws_dead, "gone", Phase::Exited);
+        corpse.worker_pid = None;
+        let mut c1 = mk_record(ws_c, "live", Phase::Running);
+        c1.worker_pid = Some(std::process::id());
+        let c1_id = c1.id;
+        let groups = vec![
+            (PathBuf::from(ws_a), vec![a1.clone()]),
+            (PathBuf::from(ws_dead), vec![corpse.clone()]),
+            (PathBuf::from(ws_c), vec![c1]),
+        ];
+        let picked = pick_switch_target(
+            &groups,
+            Path::new(ws_a),
+            a1.id,
+            SwitchTarget::NextWorkspace,
+            None,
+        )
+        .unwrap();
+        assert_eq!(picked.id, c1_id, "the dead workspace was not skipped");
+
+        let alone = vec![
+            (PathBuf::from(ws_a), vec![a1.clone()]),
+            (PathBuf::from(ws_dead), vec![corpse]),
+        ];
+        let error = pick_switch_target(
+            &alone,
+            Path::new(ws_a),
+            a1.id,
+            SwitchTarget::PrevWorkspace,
+            None,
+        )
+        .expect_err("nowhere to go");
+        assert!(
+            format!("{error:#}").contains("no other workspace"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
