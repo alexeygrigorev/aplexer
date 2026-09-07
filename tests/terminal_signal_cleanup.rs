@@ -137,10 +137,17 @@ fn termination_signals_restore_real_pty_termios_and_terminal_ui() {
             restored.c_lflag & (libc::ICANON | libc::ECHO),
             original.c_lflag & (libc::ICANON | libc::ECHO)
         );
+        // `TERMINAL_RESET_SEQUENCE` verbatim. `\x1b[?1007h` restores
+        // xterm's alternate-screen scroll translation, which the attach
+        // client turns off for the duration (see `ATTACH_ALT_SCREEN_ENTER`
+        // in src/bin/a.rs): with the host held on the alternate screen,
+        // that translation answers a wheel event by typing cursor keys
+        // into the workload. The mode is terminal-global, so detach has to
+        // put it back.
         read_until(
             &mut master,
             &mut bytes,
-            b"\x1b[?1049l\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
+            b"\x1b[?1049l\x1b[?1007h\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
         );
 
         let _ = harness.output(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
@@ -216,7 +223,7 @@ fn redirected_stdin_eof_resets_modes_written_to_tty_stdout() {
     read_until(
         &mut master,
         &mut bytes,
-        b"\x1b[?1049l\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
+        b"\x1b[?1049l\x1b[?1007h\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[r\x1b[0m\x1b[2J\x1b[H\x1b[?25h",
     );
     assert!(
         bytes
