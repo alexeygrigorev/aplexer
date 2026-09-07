@@ -1132,11 +1132,14 @@ fn state_glyph(state: &str) -> (&'static str, &'static str) {
 /// vocabulary from docs/cli-ux.md section 4:
 ///
 /// - a fresh `a state-report` push is semantic fact: `working`/`waiting`/`idle`
+///   -- including for `shell`-engine sessions, where the agent was started
+///   by hand inside the shell and the push is the only semantic signal
 /// - PTY-recency inference never claims semantics: recent output is
 ///   `active`, silence is `quiet` -- deliberately NOT `waiting`, because
 ///   "the terminal went quiet" cannot tell a blocked agent from a long
 ///   compute step
-/// - a plain shell is just `running` no matter how quiet its PTY is
+/// - a plain shell with no fresh push is just `running` no matter how quiet
+///   its PTY is
 ///
 /// Returns `(state, source)` where source is `reported`, `activity`, or
 /// `lifecycle`, so callers can qualify inferred states instead of faking
@@ -1162,15 +1165,27 @@ fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static
         }
         Phase::Failed => ("failed", "lifecycle"),
         Phase::Running => {
+            // A fresh state-report push is what the agent says it is --
+            // checked before the shell early return below, because a hook
+            // firing inside a shell session (the normal case: the agent was
+            // launched by hand, `APLEXER_SESSION_ID` is still injected) is
+            // fact, not a guess. Without it, an idle opencode/grok inside a
+            // shell session would show `running` forever.
+            let (state, source) = aplexer::watch::derive_agent_state_with_source(record, now);
+            if source == "reported" {
+                return match state {
+                    "running" => ("working", "reported"),
+                    "waiting" => ("waiting", "reported"),
+                    "idle" => ("idle", "reported"),
+                    // Defensive only: fresh_reported_state only ever
+                    // produces the three values above.
+                    _ => (state, source),
+                };
+            }
             if record.engine == "shell" {
                 return ("running", "lifecycle");
             }
-            let (state, source) = aplexer::watch::derive_agent_state_with_source(record, now);
             match (state, source) {
-                // A fresh state-report push is what the agent says it is.
-                ("running", "reported") => ("working", "reported"),
-                ("waiting", "reported") => ("waiting", "reported"),
-                ("idle", "reported") => ("idle", "reported"),
                 // The heuristic's "running/waiting" words imply agent
                 // semantics the PTY cannot actually know; translate to
                 // activity words that don't.
@@ -6167,6 +6182,24 @@ mod switching_tests {
         // A plain shell stays `running` however quiet its PTY is.
         let mut record = mk_record("/ws/state", "shell", Phase::Running);
         record.last_activity_ms = Some(now.saturating_sub(60_000));
+        assert_eq!(session_ui_state(&record, now), ("running", "lifecycle"));
+
+        // But a fresh hook push inside a shell session is fact, not a
+        // guess: the agent was started by hand, `APLEXER_SESSION_ID` is
+        // still injected, and without this an idle agent in a shell
+        // session would read `running` forever.
+        record.reported_state = Some("idle".to_string());
+        record.reported_state_at_ms = Some(now);
+        assert_eq!(session_ui_state(&record, now), ("idle", "reported"));
+        record.reported_state = Some("waiting".to_string());
+        assert_eq!(session_ui_state(&record, now), ("waiting", "reported"));
+        record.reported_state = Some("working".to_string());
+        assert_eq!(session_ui_state(&record, now), ("working", "reported"));
+
+        // A stale push falls back to plain `running` for shells (no
+        // activity words: those would claim an agent the record cannot
+        // see).
+        record.reported_state_at_ms = Some(now.saturating_sub(60_000));
         assert_eq!(session_ui_state(&record, now), ("running", "lifecycle"));
 
         // Non-terminal phase + dead worker = broken, regardless of what the
