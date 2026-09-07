@@ -83,6 +83,9 @@
     "last_activity_ms": {
       "type": ["integer", "null"]
     },
+    "last_accessed_ms": {
+      "type": ["integer", "null"]
+    },
     "phase": {
       "enum": [
         "starting",

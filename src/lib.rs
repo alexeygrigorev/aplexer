@@ -564,6 +564,13 @@ pub struct SessionRecord {
     /// activity, not true agent-semantic state (spec.md section 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<u64>,
+    /// Last time a client attached to this session's PTY. Distinct from
+    /// `last_activity_ms` (workload output) and `updated_at_ms` (any record
+    /// write): attach is the "I looked at this" event used to sort
+    /// workspaces by recency of access. Absent on records created before
+    /// the field existed, and on sessions that have never been attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed_ms: Option<u64>,
     /// Semantic state a hook running inside the session pushed via
     /// `a state-report` (docs/pocketshell-integration-plan.md Open question
     /// #2), one of `REPORTED_AGENT_STATES`. `None` means no hook has ever
@@ -4437,6 +4444,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            last_accessed_ms: None,
             reported_state: None,
             reported_state_at_ms: None,
             phase: Phase::Exited,
@@ -4781,6 +4789,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            last_accessed_ms: None,
             reported_state: None,
             reported_state_at_ms: None,
             phase: Phase::Running,

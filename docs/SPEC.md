@@ -1060,6 +1060,7 @@ Representative element (additional persisted fields may also be present):
     "history_bytes": 4194304,
     "created_at_ms": 1787738302000,
     "updated_at_ms": 1787738821000,
+    "last_accessed_ms": 1787738821000,
     "phase": "running",
     "worker_pid": 12345,
     "workload_pid": 12352,
@@ -1071,6 +1072,12 @@ Representative element (additional persisted fields may also be present):
   }
 ]
 ```
+
+`last_accessed_ms` is when a client last attached to the session's PTY
+(absent until the first attach, including on records written before the
+field existed). It is not PTY-output recency (`last_activity_ms`) and not
+the generic record-write clock (`updated_at_ms`). Human `a list --sort
+accessed` uses the newest of these per workspace.
 
 `phase` is the persisted fact -- whatever the worker last wrote. `state` is
 the derived one, and is the same value `a status` prints -- in its human

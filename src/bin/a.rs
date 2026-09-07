@@ -6577,6 +6577,7 @@ mod switching_tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             last_activity_ms: None,
+            last_accessed_ms: None,
             reported_state: None,
             reported_state_at_ms: None,
             phase,

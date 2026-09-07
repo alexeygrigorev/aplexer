@@ -44,6 +44,7 @@ fn status_cli_bounds_connect_to_a_saturated_control_backlog() {
         created_at_ms: 1,
         updated_at_ms: 1,
         last_activity_ms: None,
+        last_accessed_ms: None,
         reported_state: None,
         reported_state_at_ms: None,
         phase: Phase::Running,

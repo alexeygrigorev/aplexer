@@ -960,6 +960,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_activity_ms: None,
+            last_accessed_ms: None,
             reported_state: None,
             reported_state_at_ms: None,
             phase: Phase::Running,
@@ -2937,6 +2938,13 @@ fn handle_attach(
         AttachPayload::Tail(history_bytes)
     };
     let (client_id, subscription, initial, rx) = runtime.attach_client(payload, geometry)?;
+    // Best-effort: attach is the "someone looked at this" event used by
+    // `a list --sort accessed`. A persist failure must not refuse the
+    // attach; the next successful attach (or a later record write that
+    // races this one) will stamp it.
+    let _ = runtime.update_record(|record| {
+        record.last_accessed_ms = Some(now_ms());
+    });
     let _attach_guard = AttachGuard {
         runtime: runtime.clone(),
         client_id,
