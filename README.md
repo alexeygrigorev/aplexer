@@ -377,8 +377,45 @@ In short: aplexer trades a single, simple, inspectable server for a swarm of sma
 
 ## Validation
 
+`./scripts/validate.sh` is the gate: repository hygiene, `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, both Rust suites through
+`scripts/check-test-execution.sh` (executed-count floors, not ratchets), and the
+`python/` and `python-cli/` pytest suites.
+
 ```bash
 ./scripts/validate.sh
+```
+
+GitHub Actions runs that same script on every push to `main` and every pull
+request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), so a broken
+branch fails before anyone reaches for a release tag; running the script rather
+than re-listing its commands in YAML is what keeps a laptop and CI from
+drifting. That workflow lints and tests on a pinned recent stable
+toolchain rather than on the MSRV, because clippy's default lint set moves
+between releases and this tree is only clean under the newer one; a second,
+compile-only job holds the `rust-version` floor that
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
+ships with, so an MSRV break still cannot wait for a release tag to surface.
+Release tags keep their own workflow unchanged.
+
+Five tests stay `#[ignore]`d and so do not run in CI. That is a recorded
+coverage hole, not an accident: a GitHub-hosted runner has no cgroup-v2
+delegation to the running user and this repo has no emulator/Docker cgroup lane,
+and the remaining two want real agent binaries or are a manual measurement. The
+executed-count guard counts only passed and failed tests, never ignored ones, so
+quarantining them cannot help a collapsed suite clear its floor. Run them by
+hand instead — the first two on a machine with systemd `--user` cgroup-v2
+delegation:
+
+```bash
+# cgroup-v2 delegation; also spawns and SIGKILLs real worker processes
+cargo test --test oom_isolation -- --ignored --nocapture
+# cgroup-v2 delegation
+cargo test --lib recorded_cgroup_observed_empty -- --ignored --nocapture
+# needs real agent binaries on PATH; takes a minute or two
+cargo test --test transcript_live -- --ignored --nocapture
+# manual attach round-trip latency measurement
+cargo test --test screen_snapshot attach_round_trip_latency -- --ignored --nocapture
 ```
 
 ## Full design doc

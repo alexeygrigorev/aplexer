@@ -89,6 +89,7 @@ def test_client_paths_are_instance_local_including_start(monkeypatch, tmp_path):
             state_dir,
             runtime_dir,
             config,
+            fresh=False,
         ):
             calls.append(("start", state_dir, runtime_dir, config))
             return json.dumps(
@@ -358,22 +359,26 @@ def test_native_clients_isolate_worker_start_and_snapshot():
             config=second_root / "config.toml",
         )
 
-        command = ["/bin/sleep", "0.2"]
+        # A long-lived workload, deliberately. A session now removes its own
+        # record as soon as its workload exits, so a `sleep 0.2` here made the
+        # isolation assertions below a race against that cleanup -- on a loaded
+        # machine `first.list()` came back empty and the test failed for a
+        # reason that has nothing to do with isolation. Kill explicitly instead,
+        # and wait for the records to go, which pins the same "no files left
+        # behind" property the short sleep was reaching for.
+        command = ["/bin/sleep", "30"]
         first_session = first.start(workspace=root, tag="first", command=command)
         second_session = second.start(workspace=root, tag="second", command=command)
 
         assert {session.id for session in first.list()} == {first_session.id}
         assert {session.id for session in second.list()} == {second_session.id}
 
-        # Let both short-lived workers release their files before cleanup.
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if not first.list() and not second.list():
-                break
-            time.sleep(0.02)
-        else:
-            raise AssertionError("short-lived isolation-test workers did not exit")
-        time.sleep(0.1)
+        first.kill(first_session.id, signal=9, grace_ms=0)
+        second.kill(second_session.id, signal=9, grace_ms=0)
+        _wait_until_gone(first, first_session.id)
+        _wait_until_gone(second, second_session.id)
+        assert first.list() == []
+        assert second.list() == []
 
 
 def _wait_until_gone(client, selector, timeout=5):
