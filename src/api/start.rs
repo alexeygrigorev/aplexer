@@ -371,7 +371,7 @@ fn await_worker_exit_before_readiness_poll(
 /// record read here was written by the worker this same call just spawned,
 /// so the legacy shape is unreachable and the strict `Some(true)` comparison
 /// cannot reject a genuinely completed session.
-fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
+pub(super) fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
     matches!(record.phase, Phase::Exiting | Phase::Exited)
         && record.exit.is_some()
         && record.containment_empty == Some(true)
