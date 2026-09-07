@@ -129,7 +129,15 @@ class Client:
         memory: str | None = None,
         pids: int | None = None,
         no_skip_permissions: bool = False,
+        fresh: bool = False,
     ) -> Session:
+        """Start one session and return its record.
+
+        ``fresh=True`` means "always creates": when the requested
+        ``workspace``+``tag`` pair is already held by a live session, the
+        next free ``<tag>-2``, ``<tag>-3`` … suffix is claimed instead of
+        raising, and the returned record carries the tag actually used.
+        """
         raw = json.loads(
             _call_native(
                 "start",
@@ -146,6 +154,7 @@ class Client:
                 sys.executable,
                 10_000,
                 *self._path_args(),
+                fresh,
             )
         )
         return Session.from_dict(raw)

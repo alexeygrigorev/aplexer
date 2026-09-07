@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 fn record(paths: &Paths, workspace: &Path, id: Uuid, tag: &str) -> SessionRecord {
     SessionRecord {
+        parent_session: None,
         schema_version: 1,
         id,
         workspace: workspace.to_path_buf(),

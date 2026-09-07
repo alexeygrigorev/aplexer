@@ -760,6 +760,7 @@ mod tests {
 
     fn sample_record(phase: Phase) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::nil(),
             workspace: "/tmp".into(),

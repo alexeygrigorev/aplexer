@@ -977,6 +977,7 @@ mod startup_cleanup_tests {
         containment_empty: Option<bool>,
     ) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::nil(),
             workspace: PathBuf::from("/ws"),
@@ -1549,6 +1550,13 @@ pub struct StartRequest {
     /// When set, spawn the worker as `python -m aplexer worker --id …`
     /// (Python bindings). Otherwise spawn the `aplexer` worker binary.
     pub python: Option<PathBuf>,
+    /// Never fail because the requested `workspace+tag` is live: when that
+    /// pair is held by a session `start_session` would refuse to supersede,
+    /// claim the next free `<tag>-2`, `<tag>-3`, … suffix instead. This is
+    /// what makes `a new` mean "another session in this workspace" (where
+    /// `a here` means create-or-attach), and it is decided under the registry
+    /// lock, so the caller cannot race another start into its suffix.
+    pub fresh: bool,
 }
 
 fn connect_startup_control(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
@@ -1891,6 +1899,52 @@ fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
         && record.containment_empty == Some(true)
 }
 
+/// The `SessionRecord::parent_session` value for a session being started
+/// here: the calling process's ambient `APLEXER_SESSION_ID` stamp (see
+/// `discover_session_id`, which also walks ancestor environments), kept only
+/// when it names a record that still exists. Deliberately infallible -- a
+/// stale stamp (parent already killed/forgotten, a leftover export, an
+/// unparsable value) means "no recorded lineage", never a failed start.
+fn resolve_parent_session(paths: &Paths) -> Option<Uuid> {
+    let parent = crate::discover_session_id()?;
+    read_session_record(paths, parent).map(|_| parent).ok()
+}
+
+/// The tag a `--fresh` start should claim: the requested base itself while
+/// nothing live holds it, otherwise the first `<base>-2`, `<base>-3`, …
+/// suffix no live session holds either. "Live" here means exactly what the
+/// supersede check in `start_session` refuses to take -- a holder
+/// `reap_verdict` would hand over does not count, so a dead `main-2` is
+/// reclaimed under its own name rather than skipped. `None` means no
+/// candidate fits `validate_tag` any more, which for a valid base can only
+/// be the 64-byte length cap.
+pub fn pick_fresh_tag(records: &[SessionRecord], workspace: &Path, base: &str) -> Option<String> {
+    let live_holder = |tag: &str| {
+        records
+            .iter()
+            .find(|r| r.workspace == workspace && r.tag == tag)
+            .filter(|r| crate::reap_verdict(r).is_none())
+    };
+    // Suffixes start at 2: a bare `main` plus `main-2` reads as "the main
+    // one and its first sibling", not as an off-by-one list. A base that
+    // already ends in `-<number>` (or cannot be suffixed numerically at all)
+    // simply continues from the next integer.
+    let mut candidate = base.to_string();
+    while live_holder(&candidate).is_some() {
+        candidate = match candidate
+            .rsplit_once('-')
+            .and_then(|(stem, n)| n.parse::<u64>().ok().map(|n| format!("{stem}-{}", n + 1)))
+        {
+            Some(next) => next,
+            None => format!("{base}-2"),
+        };
+        if validate_tag(&candidate).is_err() {
+            return None;
+        }
+    }
+    Some(candidate)
+}
+
 pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord> {
     ensure_sigchld_compatible_for_child_management()?;
     validate_tag(&req.tag)?;
@@ -1933,14 +1987,36 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
     // Read under the registry lock taken above, and keep holding it through
     // the whole spawn: this read IS the locked read, and no other aplexer
     // command can modify the registry until this call returns.
-    let superseded = list_records(paths)?
-        .into_iter()
-        .find(|r| r.workspace == workspace && r.tag == req.tag);
+    let registry = list_records(paths)?;
+    let holder_of = |tag: &str| {
+        registry
+            .iter()
+            .find(|r| r.workspace == workspace && r.tag == tag)
+    };
+    let mut tag = req.tag.clone();
     // Held for the rest of the call when the predecessor is a pre-PID stub,
     // so a worker that was spawned into it cannot come up on top of the
     // state we are about to archive and delete.
     let mut _superseded_fence: Option<FileLock> = None;
     let mut reclaim: Option<ContainmentReap> = None;
+    if req.fresh {
+        // `--fresh` promises "always creates": a requested pair held by
+        // something live is not an error, it is a reason to move to the next
+        // free suffix. A pair that is free, or held only by a record
+        // `reap_verdict` would hand over, keeps the exact requested tag --
+        // the reclaim path below already owns taking those.
+        let Some(chosen) = pick_fresh_tag(&registry, &workspace, &req.tag) else {
+            bail!(
+                "no free tag: every `{0}`, `{0}-2`, `{0}-3`, … candidate in this \
+                 workspace is taken or would exceed the tag length limit",
+                req.tag
+            );
+        };
+        if chosen != req.tag {
+            tag = chosen;
+        }
+    }
+    let superseded = holder_of(&tag).cloned();
     if let Some(existing) = &superseded {
         // Taking this pair means archiving and then DELETING the holder's
         // durable state -- the same destruction `a prune` performs -- so it
@@ -1979,11 +2055,13 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         atomic_write_json(&launch_environment_path, &launch.env)?;
         let _launch_environment_guard = LaunchEnvironmentGuard(launch_environment_path);
         let now = crate::now_ms();
+        let parent_session = resolve_parent_session(paths);
         let record = SessionRecord {
+            parent_session,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: workspace.clone(),
-            tag: req.tag.clone(),
+            tag,
             engine: launch.engine,
             profile: launch.profile,
             command: launch.command,
@@ -2178,6 +2256,117 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
 }
 
 #[cfg(test)]
+mod fresh_tag_tests {
+    use super::*;
+
+    /// A record liveness is decided by pid probes (`reap_verdict`), so a
+    /// "live" holder only needs a pid that exists -- the test process's own
+    /// -- and a reclaimable one needs no pids plus an empty-containment
+    /// shape, exactly like `mod reclaim_tests`' zombie fixture.
+    fn record(workspace: &str, tag: &str, worker_pid: Option<u32>) -> SessionRecord {
+        SessionRecord {
+            parent_session: None,
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            workspace: PathBuf::from(workspace),
+            tag: tag.to_string(),
+            engine: "shell".to_string(),
+            profile: None,
+            command: vec![],
+            cwd: PathBuf::from(workspace),
+            env: Default::default(),
+            env_unset: Default::default(),
+            limits: Default::default(),
+            history_bytes: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_activity_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
+            phase: Phase::Running,
+            worker_pid,
+            workload_pid: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(false),
+            socket_path: PathBuf::from("/nonexistent"),
+            history_path: PathBuf::from("/nonexistent"),
+            exit: None,
+            error: None,
+        }
+    }
+
+    fn live(workspace: &str, tag: &str) -> SessionRecord {
+        record(workspace, tag, Some(std::process::id()))
+    }
+
+    fn dead(workspace: &str, tag: &str) -> SessionRecord {
+        record(workspace, tag, None)
+    }
+
+    #[test]
+    fn free_base_is_used_verbatim() {
+        let ws = Path::new("/ws");
+        assert_eq!(pick_fresh_tag(&[], ws, "main"), Some("main".into()));
+    }
+
+    #[test]
+    fn live_base_moves_to_the_next_free_suffix() {
+        let ws = Path::new("/ws");
+        let records = vec![live("/ws", "main")];
+        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-2".into()));
+    }
+
+    #[test]
+    fn suffix_walk_skips_taken_numbers() {
+        let ws = Path::new("/ws");
+        let records = vec![live("/ws", "main"), live("/ws", "main-2")];
+        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-3".into()));
+    }
+
+    #[test]
+    fn reclaimable_holder_keeps_the_requested_tag() {
+        // A dead `main` is not "someone else's session": the ordinary
+        // reclaim path takes the exact name, so `--fresh` must not skip it.
+        let ws = Path::new("/ws");
+        let records = vec![dead("/ws", "main")];
+        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main".into()));
+    }
+
+    #[test]
+    fn reclaimable_suffix_is_taken_under_its_own_name() {
+        let ws = Path::new("/ws");
+        let records = vec![live("/ws", "main"), dead("/ws", "main-2")];
+        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-2".into()));
+    }
+
+    #[test]
+    fn other_workspaces_do_not_count() {
+        let ws = Path::new("/ws");
+        let records = vec![live("/elsewhere", "main"), live("/elsewhere", "main-2")];
+        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main".into()));
+    }
+
+    #[test]
+    fn base_with_trailing_number_increments_from_it() {
+        let ws = Path::new("/ws");
+        let records = vec![live("/ws", "review-2")];
+        assert_eq!(
+            pick_fresh_tag(&records, ws, "review-2"),
+            Some("review-3".into())
+        );
+    }
+
+    #[test]
+    fn length_capped_base_reports_no_candidate() {
+        let ws = Path::new("/ws");
+        let base = "a".repeat(64);
+        let records = vec![live("/ws", &base)];
+        assert_eq!(pick_fresh_tag(&records, ws, &base), None);
+    }
+}
+
+#[cfg(test)]
 mod reclaim_tests {
     use super::*;
     use crate::{atomic_write_json, ContainmentReap};
@@ -2208,6 +2397,7 @@ mod reclaim_tests {
     /// nothing left running.
     fn zombie_record() -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::new_v4(),
             workspace: PathBuf::from("/ws/zombie"),

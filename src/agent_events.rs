@@ -28,7 +28,10 @@
 //!   `last_activity_ms` writes cannot race it away.
 //! - **Re-locate** if the bound path disappears (agent rotated the log).
 //!
-//! Supported engines: claude, codex, grok. `shell`/`gemini`/`opencode` have
+//! Supported engines: claude, codex, grok. Variant engines identified with a
+//! family by `engine_family` (e.g. `zcodex`, a codex-rs fork) parse and
+//! locate through their family's machinery while keeping their own engine id
+//! on emitted events. `shell`/`gemini`/`opencode` have
 //! no reader here yet. Claude's native `.jsonl` is the Anthropic Messages
 //! API event shape (same functions as heru's claude adapter). Codex's
 //! native rollout (`response_item`) is a different shape from `codex exec
@@ -49,7 +52,7 @@
 //!   skip the small deltas.
 
 use crate::watch::{iso8601_utc, UnifiedEvent};
-use crate::{atomic_write_json, now_ms, Result, SessionRecord};
+use crate::{atomic_write_json, engine_family, now_ms, Result, SessionRecord};
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -629,7 +632,9 @@ enum WireFormat {
 }
 
 fn wire_format_for(engine: &str) -> Result<WireFormat> {
-    match engine {
+    // Variant engines (see `engine_family`) parse as their family -- the
+    // session's own engine id is what lands on emitted events.
+    match engine_family(engine) {
         "claude" => Ok(WireFormat::Claude),
         "codex" => Ok(WireFormat::CodexNative),
         "grok" => Ok(WireFormat::Grok),
@@ -815,7 +820,7 @@ pub fn locate_transcript(
     created_at_ms: u64,
     env: &BTreeMap<String, String>,
 ) -> Option<PathBuf> {
-    match engine {
+    match engine_family(engine) {
         "claude" => locate_claude_transcript(cwd, created_at_ms, env),
         "codex" => locate_codex_transcript(cwd, created_at_ms, env),
         "grok" => locate_grok_transcript(cwd, created_at_ms, env),
@@ -1243,6 +1248,7 @@ pub fn read_transcript_events(engine: &str, path: &Path) -> Result<Vec<UnifiedEv
 
 fn dummy_record(engine: &str) -> SessionRecord {
     SessionRecord {
+        parent_session: None,
         schema_version: crate::SCHEMA_VERSION,
         id: uuid::Uuid::nil(),
         workspace: PathBuf::from("/"),
@@ -1404,6 +1410,52 @@ mod tests {
             Some("thread-abc")
         );
         assert_eq!(codex_native_cwd(&payload).as_deref(), Some("/tmp/x"));
+    }
+
+    #[test]
+    fn zcodex_rides_the_codex_machinery() {
+        // Family identification: the variant parses with codex's wire format...
+        assert!(matches!(
+            wire_format_for("zcodex").unwrap(),
+            WireFormat::CodexNative
+        ));
+        // ...while events emitted from its rollout carry the variant's own
+        // engine id, not the family's.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-09-06T12:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = read_transcript_events("zcodex", &path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].engine, "zcodex");
+        assert_eq!(events[0].role.as_deref(), Some("assistant"));
+        assert_eq!(events[0].content, "hello");
+
+        // Location rides the codex heuristic too: the CODEX_HOME sessions
+        // tree, disambiguated by the rollout's own session_meta cwd.
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions/2026/09/06");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("thread-z.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread-z","cwd":"/tmp/zcodex-work"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_HOME".to_string(), home.path().display().to_string());
+        let found =
+            locate_transcript("zcodex", Path::new("/tmp/zcodex-work"), now_ms(), &env).unwrap();
+        assert_eq!(found, rollout);
     }
 
     #[test]

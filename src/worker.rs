@@ -10,7 +10,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -794,6 +794,7 @@ mod tests {
         // candidate was serialized, exercising the publish boundary.
         fs::create_dir(&record_path).unwrap();
         let record = SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: dir.path().to_path_buf(),
@@ -850,6 +851,7 @@ mod tests {
             record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
+            kill_requested: AtomicBool::new(false),
         };
 
         assert!(runtime
@@ -951,6 +953,12 @@ struct WorkerRuntime {
     /// thread piggybacks on that same tick to persist this into
     /// `SessionRecord::last_activity_ms`, and only when it actually changed.
     last_activity_ms: AtomicU64,
+    /// Set when a `kill` RPC was accepted (the `Operation::Kill` arm): the
+    /// operator asked for this session to end, so the lifecycle finalization
+    /// removes the durable record instead of parking an `exited` row in
+    /// `a list`. A natural exit never sets it, which keeps post-mortem
+    /// capture/status for sessions that ended on their own.
+    kill_requested: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -1797,6 +1805,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
+            kill_requested: AtomicBool::new(false),
         });
         start_worker_threads(
             Arc::clone(&runtime),
@@ -2523,7 +2532,13 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     if !containment_empty {
         runtime
             .output
-            .fail_subscribers(fatal.unwrap_or_else(|| "containment cleanup was not proven".into()));
+            // Cloned so the killed-session removal below can still ask
+            // whether finalization failed; this path runs only when it did.
+            .fail_subscribers(
+                fatal
+                    .clone()
+                    .unwrap_or_else(|| "containment cleanup was not proven".into()),
+            );
         // Retain the worker as the subreaper boundary, along with its socket,
         // cgroup handle, and runtime evidence. A later `a kill` can retry;
         // this monitor will finalize only after it independently observes the
@@ -2559,10 +2574,28 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     if let Some(cg) = cg {
         cg.cleanup();
     }
-    // Keep the terminal record, history, final screen, and transcript
-    // binding for successful exits too. Besides enabling post-mortem
-    // capture/status, this gives polling watchers a durable transition
-    // to observe. `a kill` and `a prune` remain explicit cleanup paths.
+    // A natural exit keeps the terminal record, history, final screen, and
+    // transcript binding: besides enabling post-mortem capture/status, this
+    // gives polling watchers a durable transition to observe (`a forget` and
+    // `a prune` remain the explicit cleanup paths for those records). A
+    // session the operator killed is different -- `a kill` means "gone from
+    // `a list`", not "exited row until someone prunes it", so the accepted
+    // kill's finalization removes the durable state itself, but only under
+    // the same proof bar every other removal path applies: finalization ran
+    // clean and the containment domain was proven empty. Any failure above
+    // (`fatal` -- record persist, history flush -- or an unproven domain)
+    // keeps the evidence, exactly like `a kill`'s own client-side paths do.
+    let id = runtime.record().map(|record| record.id).ok();
+    if runtime.kill_requested.load(Ordering::Relaxed) && fatal.is_none() && containment_empty {
+        if let Some(id) = id {
+            match fs::remove_dir_all(runtime.paths.state_session(id)) {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("aplexer worker: remove killed session {id} state: {error:#}");
+                }
+            }
+        }
+    }
     // The workload is gone and the final record/history are persisted;
     // a daemonless design must not leave a worker process (plus its
     // socket and runtime dir) behind for every session that ever ran.
@@ -2692,7 +2725,16 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
             Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
         },
         Operation::Kill { signal, grace_ms } => match runtime.kill(signal, grace_ms) {
-            Ok(()) => write_json(&mut stream, &Response::ok(id, json!({"signalled":true})))?,
+            Ok(()) => {
+                // Accepted before the response is written: from here the
+                // lifecycle finalization owns removing this session's
+                // durable record (see run_lifecycle), so `a kill` leaves
+                // nothing behind in `a list`. A failed kill never sets the
+                // flag -- the record stays as evidence for the client-side
+                // recovery paths.
+                runtime.kill_requested.store(true, Ordering::Relaxed);
+                write_json(&mut stream, &Response::ok(id, json!({"signalled":true})))?
+            }
             Err(e) => write_json(&mut stream, &Response::error(id, format!("{e:#}")))?,
         },
         Operation::Rename { workspace, tag } => match runtime.rename(workspace, tag) {

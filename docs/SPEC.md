@@ -1741,11 +1741,18 @@ Never treat an enumeration failure as “all sessions are gone”.
 Four operations remove session records, and they differ by what they are
 willing to claim:
 
-- `a kill SESSION` acts. It signals the workload, and removes the record only
-  when it can prove the containment domain is empty. For a broken unlimited
-  session it refuses ("no authoritative containment locator") and preserves
-  both the durable and runtime directories rather than report a cleanup it
-  did not perform.
+- `a kill SESSION` acts, and a killed session is gone from `a list`. It
+  signals the workload, and the worker that accepted the kill then removes
+  the record itself during finalization (`a kill` waits briefly for that
+  and reports if the record survived), so a killed session stops appearing
+  in every listing client instead of lingering as an `exited` row. That
+  removal keeps the same proof bar as every other remover: the worker
+  deletes the record only when finalization ran clean and proved the
+  containment domain empty. For a broken unlimited session it refuses
+  ("no authoritative containment locator") and preserves both the durable
+  and runtime directories rather than report a cleanup it did not perform.
+  Sessions that exit on their own keep their records for post-mortem
+  capture/status; `a forget` and `a prune` remain their cleanup paths.
 - `a prune` claims nothing and signals nothing. It removes a record only when
   the worker is gone, the workload leader is gone, and containment holds no
   remaining handle: either proven empty (by the worker, or by reading the

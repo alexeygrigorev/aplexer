@@ -61,6 +61,7 @@ Success looks like:
 - `a here` is the memorable path for create-or-attach in the current directory;
 - engine and tag are optional, positional refinements: `a here codex review`;
 - a full explicit path remains available: `a new --engine codex --tag review`;
+- `a new` is the "always creates" counterpart: a fresh session in the current workspace, taking the next free `<tag>-2` suffix when the tag is already live, so adding a session to a workspace that already has one is one word (`start --fresh` is the same behavior on the machine contract);
 - engine/profile discovery is one command away;
 - rerunning the same intent resumes the existing live session.
 
@@ -164,7 +165,7 @@ PR #4 implements the highest-frequency, lowest-contract-risk improvements.
 - the human vocabulary is real Clap commands and visible aliases (so
   completions and `a help` know every name):
   - `a here` -> current-directory create-or-attach;
-  - `a new` -> `start --attach`;
+  - `a new` -> `start --attach --fresh` (always creates; `here` resumes);
   - `a open` -> `attach`;
   - `a ps` -> `list`;
   - `a current` -> `whoami`;

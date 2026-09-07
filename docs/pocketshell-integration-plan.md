@@ -113,7 +113,15 @@ That is no longer remotely true. Verified against the built binary and source:
 
 - `a start` — `--workspace/--tag/--engine/--profile/--cwd/--env KEY=VALUE/--memory/--pids/
   --cpu-quota-us/--history-bytes/--attach/-- <command>`, `--json`. Reclaims a workspace+tag held
-  by a finished session; refuses live/broken claims.
+  by a finished session; refuses live/broken claims. `--fresh` (0.1.4) turns a live claim from
+  an error into "take the next free `<tag>-2` suffix", decided under the registry lock;
+  `a new` is that behavior with `--attach` implied — the "another session in this workspace"
+  verb, where `a here`/`a -` stay create-or-attach. PocketShell seam: once the pinned
+  `aplexer` dep reaches 0.1.4, the client-side blocker-reaping machinery in
+  `sessions.py` (`_reap_aplexer_blockers` et al., the #2554 workaround for 0.1.3 refusing
+  corpse-held tags) can be dropped — plain `a start` reclaims those itself — and any
+  "create another session here" flow becomes one `--fresh` call that reads the claimed
+  `tag` back from the record, instead of snapshot probing + client-side `name-2` uniquing.
 - `a list` / `a snapshot` (aliases of the same listing; `--running`, `--json`). JSON is the
   public `SessionRecord` per session (launch environment redacted to config-directory metadata)
   enriched with `worker_alive`; human output is a workspace-grouped tree. Cheap by design (pid
@@ -466,7 +474,7 @@ only emitted for sessions created after watch starts, not for the initial baseli
 | `agent.state` | `status` | `metadata.event="agent.state"`, `metadata.state`; `content` = state string for display | Currently a coarse phase/output-recency proxy producing `starting`, `running`, `waiting`, `exited`, `oom`, or `error`; it cannot distinguish semantic waiting from a quiet long-running operation. The broader spec values `idle` and `unknown` are not emitted. Hook-driven semantic state remains future work. |
 | `session.oom` | `error` | `error="workload killed: cgroup memory limit"`; `metadata.event="session.oom"`, `metadata.resource="memory"`; the native exit detail remains in the adjacent `session.exited` event | `ResourceLimitEvent` is heru's normalized shape for this, but it is not a stream event there. The current mapping reuses only its resource vocabulary. |
 | `session.exited` | `status` | `metadata.event="session.exited"`, `metadata.reason` (`exit`/`signal`/`killed`), optional `metadata.exit_code` | Implemented as `status` for both normal and abnormal exit; OOM additionally emits the preceding `error` event. |
-| `session.deleted` | `status` | `metadata.event="session.deleted"`, `metadata.session_id` | no heru analogue; pure metadata event. Now has a real trigger in the implementation: `a kill` removes finished sessions' state |
+| `session.deleted` | `status` | `metadata.event="session.deleted"`, `metadata.session_id` | no heru analogue; pure metadata event. Now has a real trigger in the implementation: `a kill` removes the killed session's state (worker-side, at finalization), so the phone sees `deleted` — not a lingering `exited` row — for every kill |
 
 The earlier proposal also named `session.activity`; it is **not emitted**. PTY activity is
 coalesced into `agent.state` changes by a 3-second recency heuristic, avoiding a high-rate event

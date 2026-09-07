@@ -61,6 +61,7 @@ impl Harness {
 
     fn starting_record(&self, id: Uuid) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: 1,
             id,
             workspace: self.workspace.path().to_path_buf(),

@@ -154,6 +154,25 @@
         "string",
         "null"
       ]
+    },
+    "parent_session": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "reported_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reported_state_at_ms": {
+      "type": [
+        "number",
+        "null"
+      ]
     }
   },
   "additionalProperties": false

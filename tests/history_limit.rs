@@ -110,6 +110,7 @@ fn embedded_api_rejects_usize_max_before_worker_spawn() {
         worker_rows: None,
         worker_cols: None,
         python: None,
+        fresh: false,
     };
 
     let error = start_session(&paths, &request).unwrap_err();

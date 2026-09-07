@@ -529,6 +529,14 @@ pub struct SessionRecord {
     pub engine: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Session this one was started from: the `a start` client's ambient
+    /// `APLEXER_SESSION_ID` (`discover_session_id`), recorded only when it
+    /// named a session record that still existed at start time. Best-effort
+    /// provenance, not an enforced hierarchy -- the parent may be killed or
+    /// forgotten later, leaving this pointing at a removed record on
+    /// purpose, so the lineage fact survives the parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<Uuid>,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     #[serde(default)]
@@ -1459,6 +1467,20 @@ fn default_config_version() -> u32 {
     1
 }
 
+/// Transcript-family normalization: a variant engine -- a fork of a built-in
+/// engine CLI with the same wire format and the same native conversation-log
+/// location -- is identified with that engine's family for parsing, while
+/// sessions and emitted events keep the variant's own id. `zcodex` is a
+/// codex-rs fork (same `-c` overrides, same rollout JSONL under
+/// `CODEX_HOME`/`~/.codex`), so it rides the codex machinery; everything
+/// else is its own family.
+pub fn engine_family(engine: &str) -> &str {
+    match engine {
+        "zcodex" => "codex",
+        other => other,
+    }
+}
+
 /// A single engine's profile-discovery rule (spec.md 9.2 / 23: "Aplexer
 /// should absorb PocketShell's existing profile discovery concepts"), ported
 /// from PocketShell's `tools/pocketshell/src/pocketshell/profiles.py`.
@@ -1804,6 +1826,22 @@ impl Config {
                 env_unset: Vec::new(),
                 // ported from pocketshell engines.py's claude LaunchSpec
                 skip_permissions_argv: vec!["--dangerously-skip-permissions".into()],
+            },
+        );
+        // `zcodex` is a codex variant (see `engine_family`): a codex-rs fork
+        // with the same CLI surface and the same rollout log, so its launch
+        // spec mirrors codex's exactly, with the fork's own binary name.
+        config.engines.insert(
+            "zcodex".into(),
+            EngineConfig {
+                command: vec![
+                    "zcodex".into(),
+                    "-c".into(),
+                    "check_for_update_on_startup=false".into(),
+                ],
+                env: BTreeMap::new(),
+                env_unset: Vec::new(),
+                skip_permissions_argv: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             },
         );
         config.engines.insert(
@@ -4382,6 +4420,7 @@ mod tests {
 
     fn registry_record(paths: &Paths, id: Uuid) -> SessionRecord {
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: paths.state_root.clone(),
@@ -4410,6 +4449,30 @@ mod tests {
             exit: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn zcodex_is_a_built_in_codex_variant() {
+        let config = load_config_text("").unwrap();
+        let zcodex = config
+            .engines
+            .get("zcodex")
+            .expect("built-in zcodex engine");
+        assert_eq!(
+            zcodex.command,
+            vec![
+                "zcodex".to_string(),
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+            ]
+        );
+        assert_eq!(
+            zcodex.skip_permissions_argv,
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+        assert_eq!(engine_family("zcodex"), "codex");
+        assert_eq!(engine_family("codex"), "codex");
+        assert_eq!(engine_family("claude"), "claude");
     }
 
     #[test]
@@ -4701,6 +4764,7 @@ mod tests {
     fn liveness_record(state_dir: &Path) -> SessionRecord {
         let pid = std::process::id();
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id: Uuid::new_v4(),
             workspace: state_dir.to_path_buf(),

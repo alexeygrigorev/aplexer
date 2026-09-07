@@ -147,6 +147,9 @@ fn snapshot(
     state_dir=None,
     runtime_dir=None,
     config=None,
+    // Last so the positional call shapes of older clients (which stop at
+    // `startup_timeout_ms` or pass the three path overrides) keep mapping.
+    fresh=false,
 ))]
 fn start(
     workspace: &str,
@@ -164,6 +167,7 @@ fn start(
     state_dir: Option<&str>,
     runtime_dir: Option<&str>,
     config: Option<&str>,
+    fresh: bool,
 ) -> PyResult<String> {
     let req = StartRequest {
         workspace: PathBuf::from(workspace),
@@ -183,6 +187,7 @@ fn start(
         worker_rows: None,
         worker_cols: None,
         python: python.map(PathBuf::from),
+        fresh,
     };
     let record = api::start_session(
         &paths(state_dir, runtime_dir, config).map_err(py_err)?,

@@ -49,6 +49,7 @@ impl Harness {
         paths.ensure().unwrap();
         let id = Uuid::now_v7();
         let record = SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: self.workspace.path().to_path_buf(),

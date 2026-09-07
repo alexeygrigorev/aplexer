@@ -4,7 +4,7 @@
 
 ## What's different from tmux
 
-- **Sessions are `workspace + tag + engine + profile`, not flat pane names.** `~/git/pocketshell:review` running `codex/zai` is a real, addressable identity (spec.md §§1–3) — `a list` groups sessions by workspace and shows engine/profile for each, instead of a flat list of pane titles you have to keep straight yourself.
+- **Sessions are `workspace + tag + engine + profile`, not flat pane names.** `~/git/pocketshell:review` running `codex/zai` is a real, addressable identity (spec.md §§1–3) — `a list` groups sessions by workspace and shows engine/profile for each, instead of a flat list of pane titles you have to keep straight yourself. And when a session is started from *inside* another session (an agent spawning `a start`), the child records its parent (`parent_session` in the record and every `--json` payload; `↳ parent` in `a list`, a `parent` line in `a status`), so agent-spawned sessions stay traceable to where they came from.
 - **Aplexer owns how each agent actually launches**, not just how it's displayed. Engine definitions (spec.md §8) capture the real launch command, permission-bypass flags, and profile config-dir wiring per engine — `a - clz` starts Claude routed through its Z.AI profile (the right `CLAUDE_CONFIG_DIR` set automatically) with one two-letter shortcut, instead of a hand-assembled command line you have to get right every time. See [Engines, profiles, and shortcuts](#engines-profiles-and-shortcuts).
 - **Every session is independently resource-isolated**, because agent workloads — a runaway test loop, an agent that spawns its own build — are exactly the kind of thing that eats memory unpredictably. A `--memory`-capped session gets OOM-killed on its own by the kernel's real cgroup OOM killer, without taking any other session down. See [Resource isolation](#resource-isolation) and [Daemonless vs. tmux](#daemonless-vs-tmux) below.
 - **Agents can find out where they are and talk to each other.** `a whoami` lets an agent (or a hook, or a script) running inside a session ask "which session am I, what engine/profile, what workspace" — there's no tmux equivalent because a tmux pane has no agent identity to ask about. `a message` gives sibling agents in the same workspace a durable inbox plus direct-to-pane delivery for real handoffs ("backend's done, see api.md"). See [Inter-agent messaging](#inter-agent-messaging).
@@ -92,12 +92,14 @@ a                         sessions at a glance (workspaces, states, what needs y
 a here                    create or reattach the main session in this directory
 a here codex review       create or reattach Codex, tagged review
 a open review             attach by tag in the current workspace
+a new                     another fresh session in this workspace, attached
+                          (tag already live? it takes the next free main-2, main-3, …)
 a new --engine shell      start and attach, with start's full flag surface
 a current                 which session is this shell inside?
 a keys                    the attach-mode key reference
 ```
 
-`a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations.
+`a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations. The create verbs split cleanly: `here`/`a -` are **create-or-attach** (a live session with that tag is reattached), `new` is **always creates** (`--fresh` on `start`: a live holder moves the start to the next free `<tag>-2` suffix instead of refusing). The same `--fresh` flag is the machine path — `a --json start --workspace W --tag main --fresh` returns the record with the tag it actually claimed, so a client can add a session to a workspace without inventing unique names itself.
 
 Presentation is TTY-aware by construction: richer tables, semantic agent states (`working`/`waiting`/`idle` from a fresh `a state-report`, honest `active`/`quiet` from PTY-recency otherwise), and the one-line attach status bar exist only when stdout is a real terminal. Redirected output and every `--json` path keep their exact pre-existing format, and `Ctrl-b ?` (attach help flash) never sends a byte to the workload. While attached, the status bar keeps task identity, semantic state, sibling sessions, and `^b ?` visible, dropping detail from the right on narrow terminals.
 
@@ -122,6 +124,9 @@ command = ["$SHELL", "-l"]   # resolved from $SHELL at load time, "/bin/sh" as a
 [engines.codex]
 command = ["codex", "-c", "check_for_update_on_startup=false"]
 
+[engines.zcodex]
+command = ["zcodex", "-c", "check_for_update_on_startup=false"]
+
 [engines.claude]
 command = ["claude"]
 
@@ -132,7 +137,7 @@ command = ["gemini"]
 command = ["grok"]
 ```
 
-Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703).
+Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703). `zcodex` is a codex variant — a codex-rs fork with the same CLI surface and the same rollout log (`CODEX_HOME`, defaulting to `~/.codex`) — so its builtin mirrors codex's and its conversation-log handling (`a transcript`, below) rides the codex machinery (`engine_family` in `src/lib.rs`), with sessions and emitted events keeping the `zcodex` engine id.
 
 Agent engine ids (every id except the literal `shell` engine) always add the
 built-in provider/cloud credential list to `env_unset`, preserving the
@@ -245,7 +250,7 @@ explicit period keeps the 100,000 µs default.
 
 ## Durable lifecycle
 
-Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker.
+Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker. A session that **exited on its own** keeps that record — final screen, bounded history, transcript binding — until you explicitly discard it with `a forget --force` or `a prune`. A session you **killed is different**: `a kill` removes it entirely. The worker that accepted the kill deletes the record itself once it proves the containment domain empty (any finalize failure keeps the evidence and says so), so a killed session disappears from `a list` — and from PocketShell's session list — instead of lingering as an exited row that every client keeps picking up.
 
 ## Watching events
 
@@ -261,7 +266,7 @@ a watch --jsonl --all   # also include shell (non-agent) sessions
 
 ## Conversation events (`a transcript`)
 
-PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`).
+PocketShell's conversation pane needs structured events from a live `a start` session, not a second headless invocation of the agent. `a transcript` locates the native JSONL the engine CLI already writes (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, `~/.codex/sessions/<Y>/<M>/<D>/<session>.jsonl`, `$GROK_HOME/sessions/<urlencoded-cwd>/<id>/updates.jsonl`), parses it, and emits heru `UnifiedEvent` JSONL (or a compact human rendering without `--json`). Variant engines identified with a built-in family — currently `zcodex`, a codex variant — locate and parse through their family's machinery while keeping their own engine id on the emitted events.
 
 How the log is captured and kept: aplexer does **not** copy conversation bytes into its own state. The engine's append-only JSONL is the source of truth (PTY `history.bin` is a separate, raw terminal capture). The first successful locate writes a bind sidecar `<state>/sessions/<id>/transcript.json` so later pages and `--follow` hit the same file even if another session shares the cwd. If the bound file disappears, the next call re-runs the heuristic.
 
@@ -304,9 +309,12 @@ print(client.list())
 print(client.status(session.id))
 client.send(session.id, b"printf 'hello\\n'\n")
 raw_output = client.capture(session.id, max_bytes=4096)
+# kill ends the workload and removes the session outright -- there is no
+# record left to clean up afterwards.
 client.kill(session.id, signal=15, grace_ms=2000)
 
-# Once status reports that the worker is gone, explicitly discard its records.
+# A session that exited on its own keeps its records instead; discard them
+# explicitly once its status reports the worker is gone.
 result = client.forget(session.id, force=True)
 print(result.workload_may_survive)
 ```

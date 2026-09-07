@@ -29,7 +29,7 @@ use uuid::Uuid;
     name = "a",
     version,
     about = "Run, inspect, and switch between durable agent sessions",
-    after_help = "Common workflows:\n  a                         sessions at a glance\n  a here                    create or reattach the main session here\n  a here codex review       create or reattach Codex, tagged review\n  a open review             attach by tag in the current workspace\n  a new --engine shell      start and attach using full start options\n  a current                 show the session containing this shell\n  a keys                    show keys available while attached"
+    after_help = "Common workflows:\n  a                         sessions at a glance\n  a here                    create or reattach the main session here\n  a here codex review       create or reattach Codex, tagged review\n  a new                     another fresh session in this workspace, attached\n  a new --engine shell      start and attach using full start options\n  a open review             attach by tag in the current workspace\n  a current                 show the session containing this shell\n  a keys                    show keys available while attached"
 )]
 struct Cli {
     #[arg(
@@ -46,8 +46,10 @@ struct Cli {
 enum Commands {
     /// Start a new session (workspace + tag + engine/profile) and its worker.
     Start(StartArgs),
-    /// Start a new session and immediately attach to it (`--attach` implied;
-    /// every other flag is `start`'s).
+    /// Start a new session and immediately attach to it (`--attach` and
+    /// `--fresh` implied; every other flag is `start`'s). When the requested
+    /// workspace+tag is already live, the next free `<tag>-2` suffix is
+    /// started instead -- `new` always creates, `here`/`a -` create-or-attach.
     New(StartArgs),
     /// Create-or-attach in the current workspace -- the typed-out form of
     /// `a -`: `a here [engine [tag]]`, or `a here <command...>` to run a
@@ -178,6 +180,12 @@ struct StartArgs {
     /// and-sandbox` / `--dangerously-skip-permissions` / `--always-approve`).
     #[arg(long)]
     no_skip_permissions: bool,
+    /// When the requested workspace+tag is already held by a live session,
+    /// claim the next free `<tag>-2`, `<tag>-3`, … suffix instead of
+    /// failing. `a new` implies this; `start` without it keeps the strict
+    /// create-by-exact-tag contract.
+    #[arg(long)]
+    fresh: bool,
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<OsString>,
 }
@@ -537,6 +545,10 @@ fn run() -> Result<()> {
         Commands::Start(args) => cmd_start(&paths, args, cli.json),
         Commands::New(mut args) => {
             args.attach = true;
+            // `new` is the "always creates" verb: a live session holding the
+            // tag is a reason to take the next free suffix, never an error.
+            // `here`/`a -` stay create-or-attach.
+            args.fresh = true;
             cmd_start(&paths, args, cli.json)
         }
         Commands::Here(args) => {
@@ -768,6 +780,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         worker_rows,
         worker_cols,
         python: None,
+        fresh: args.fresh,
     };
     let ready = aplexer::api::start_session(paths, &req)?;
     if json_output {
@@ -827,6 +840,26 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Lineage labels: a session started from inside another session (`a
+    // start` ran with its parent's APLEXER_SESSION_ID still in the
+    // environment) shows where it came from -- the parent's tag while its
+    // record exists, a short id once it doesn't, since the recorded lineage
+    // deliberately survives a killed or forgotten parent.
+    let lineage_labels: BTreeMap<Uuid, String> = {
+        let by_id: BTreeMap<Uuid, &SessionRecord> =
+            records.iter().map(|record| (record.id, record)).collect();
+        records
+            .iter()
+            .filter_map(|record| {
+                let parent = record.parent_session?;
+                let label = match by_id.get(&parent) {
+                    Some(parent_record) => parent_record.tag.clone(),
+                    None => parent.to_string()[..8].to_string(),
+                };
+                Some((record.id, format!(" ↳ {label}")))
+            })
+            .collect()
+    };
     let groups = group_by_workspace(records);
     let home = env::var_os("HOME").map(PathBuf::from);
     let current_workspace = resolve_message_workspace(None).ok();
@@ -922,15 +955,20 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             } else {
                 String::new()
             };
+            let lineage = match lineage_labels.get(&record.id) {
+                Some(label) => paint(color, ANSI_DIM, label),
+                None => String::new(),
+            };
             println!(
-                "{} {:>2}  {}  {}  {}{} {}",
+                "{} {:>2}  {}  {}  {}{} {}{}",
                 paint(color, ANSI_GRAY, connector),
                 index + 1,
                 tag,
                 engine,
                 state_text,
                 attention_mark,
-                age
+                age,
+                lineage
             );
         }
     }
@@ -941,7 +979,7 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         paint(
             color,
             ANSI_DIM,
-            "Attach: a <workspace#> [session#|tag] · Start here: a here [engine] [tag] · Help: a help"
+            "Attach: a <workspace#> [session#|tag] · Here: a here [engine] [tag] · Another: a new · Help: a help"
         )
     );
     Ok(())
@@ -1414,6 +1452,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
             attach: true,
             startup_timeout_ms: 10_000,
             no_skip_permissions: false,
+            fresh: false,
             command,
         },
         false,
@@ -1784,6 +1823,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if io::stdout().is_terminal() {
         cmd_status_tty(
+            paths,
             &current,
             &raw,
             worker_reachable,
@@ -1864,6 +1904,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
 /// containment evidence rather than a generic "try these commands" list.
 /// The redirected rendering above stays byte-identical to the pre-UX format.
 fn cmd_status_tty(
+    paths: &Paths,
     current: &SessionRecord,
     raw: &Value,
     worker_reachable: bool,
@@ -1910,6 +1951,17 @@ fn cmd_status_tty(
     println!("  workspace   {workspace}");
     println!("  engine      {engine}");
     println!("  session     {}", current.id);
+    if let Some(parent) = current.parent_session {
+        // Same rendering rule as `a list`: the parent's tag while its
+        // record exists, a short id once it doesn't.
+        let label = read_record(&paths.record(parent))
+            .map(|record| record.tag)
+            .unwrap_or_else(|_| parent.to_string()[..8].to_string());
+        println!(
+            "  {}",
+            paint(color, ANSI_DIM, &format!("parent      {label}"))
+        );
+    }
     if let Some(foreground) = foreground_override(current, raw) {
         println!("  foreground  {foreground}");
     }
@@ -2164,6 +2216,46 @@ fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// How long `cmd_kill` waits, after an accepted kill RPC, for the worker to
+/// remove the killed session's durable record itself. Normal finalization
+/// lands within milliseconds (bounded above by the worker's attach-drain
+/// window), so this is a settling pause, not a retry campaign; the deadline
+/// only bounds the pathological cases, which are reported, never looped on.
+const KILL_RECORD_REMOVAL_WAIT: Duration = Duration::from_secs(5);
+
+/// Outcome of waiting for a killed session's record to disappear. The
+/// worker that accepted the kill RPC removes the record during
+/// finalization, but only when finalization ran clean and proved the
+/// containment domain empty -- so `Kept` (worker exited, record stayed)
+/// means the worker had something to say about this exit, and `Pending`
+/// (worker still alive at the deadline) means the removal is still in
+/// flight or the worker is holding the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillRecordOutcome {
+    Removed,
+    Kept,
+    Pending,
+}
+
+/// After an accepted kill RPC, watch the record directory until the worker
+/// deletes it (or until [`KILL_RECORD_REMOVAL_WAIT`] runs out). Only the
+/// worker may remove a record whose worker process is still finishing --
+/// deleting it client-side would race the worker's own final record write
+/// into a persist-error retry loop -- so this observes instead of acting.
+fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
+    let deadline = Instant::now() + KILL_RECORD_REMOVAL_WAIT;
+    while Instant::now() < deadline {
+        if !paths.record(id).exists() {
+            return KillRecordOutcome::Removed;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    match read_record(&paths.record(id)) {
+        Ok(record) if record.worker_alive() => KillRecordOutcome::Pending,
+        _ => KillRecordOutcome::Kept,
+    }
+}
+
 /// A worker pid may still exist even though its control socket is gone.
 /// Only this one rare case counts as "force-cleanable": a live, reachable
 /// worker can also fail an RPC, but then it must not be signalled directly.
@@ -2223,17 +2315,57 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
         if !record.worker_finished() {
             recover_broken_containment(&record, signal, args.grace_ms)?;
             mark_broken_workload_killed(paths, &record)?;
-        } else {
-            if !record.containment_proven_empty() {
-                recover_broken_containment(&record, signal, args.grace_ms)?;
+            // That finalization was client-side and deliberately kept the
+            // evidence for a broken workload; the worker is already gone,
+            // so there is no worker-side removal to wait for below.
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"id":record.id,"signal":signal,"record_removed":false})
+                );
             }
-            remove_session_state(paths, record.id)
-                .with_context(|| format!("remove finished session {}", record.id))?;
-            eprintln!("a: removed {} session {}", record.phase.name(), record.id);
+            return Ok(());
         }
+        if !record.containment_proven_empty() {
+            recover_broken_containment(&record, signal, args.grace_ms)?;
+        }
+        remove_session_state(paths, record.id)
+            .with_context(|| format!("remove finished session {}", record.id))?;
+        eprintln!("a: removed {} session {}", record.phase.name(), record.id);
+        if json_output {
+            println!(
+                "{}",
+                json!({"id":record.id,"signal":signal,"record_removed":true})
+            );
+        }
+        return Ok(());
+    }
+    // The RPC was accepted, so the worker removes the record itself during
+    // finalization. Give it a moment so `a kill` returns with the session
+    // already gone from `a list` (a client that kills-then-lists must never
+    // observe the exited corpse the old behavior left behind), and say so
+    // plainly on the two outcomes where the record is still there.
+    let removed = wait_for_kill_record_removal(paths, record.id);
+    match removed {
+        KillRecordOutcome::Removed => {}
+        KillRecordOutcome::Kept => eprintln!(
+            "a: killed session {}, but its worker kept the record (a finalize failure worth inspecting: `a status {}`)",
+            record.id, record.id
+        ),
+        KillRecordOutcome::Pending => eprintln!(
+            "a: killed session {}; its worker is still finalizing, the record disappears on its own unless the worker failed",
+            record.id
+        ),
     }
     if json_output {
-        println!("{}", json!({"id":record.id,"signal":signal}));
+        println!(
+            "{}",
+            json!({
+                "id": record.id,
+                "signal": signal,
+                "record_removed": removed == KillRecordOutcome::Removed,
+            })
+        );
     }
     Ok(())
 }
@@ -6143,6 +6275,7 @@ mod switching_tests {
     fn mk_record(workspace: &str, tag: &str, phase: Phase) -> SessionRecord {
         let id = Uuid::new_v4();
         SessionRecord {
+            parent_session: None,
             schema_version: SCHEMA_VERSION,
             id,
             workspace: PathBuf::from(workspace),
