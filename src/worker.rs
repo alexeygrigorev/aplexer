@@ -632,6 +632,35 @@ mod tests {
     }
 
     #[test]
+    fn small_burst_of_many_tiny_writes_does_not_evict_subscriber() {
+        // Regression test for attach spontaneously detaching on busy
+        // sessions (e.g. data-engineering-zoomcamp / machine-learning-zoomcamp
+        // codex TUIs): a resize-triggered repaint arrives as dozens of small
+        // PTY reads (a few hundred bytes each, ~30KB total). The old
+        // event-count-only queue (32 events) evicted the just-attached client
+        // even though the backlog was tiny, and `a attach` printed
+        // "attached client fell behind live output" and detached. A burst
+        // that is small in bytes must not evict, no matter how many events
+        // it takes.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        let chunk = vec![b'x'; 200];
+        for _ in 0..200 {
+            hub.append(&chunk).unwrap();
+        }
+
+        assert!(
+            !hub.inner.lock().unwrap().subscribers.is_empty(),
+            "a 40KB burst of small writes evicted the subscriber"
+        );
+        for _ in 0..200 {
+            assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
+        }
+    }
+
+    #[test]
     fn full_subscriber_queue_drains_before_explicit_exit() {
         let dir = tempfile::tempdir().unwrap();
         let hub = test_hub(&dir);
