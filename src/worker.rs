@@ -27,11 +27,24 @@ enum OutputEvent {
     Error(String),
 }
 
-/// Bound memory retained on behalf of clients that stop reading. PTY reads
-/// are at most 32 KiB, so this caps queued data at roughly 1 MiB per client
-/// (layout events are small). A lagging client is disconnected and can
-/// reattach to obtain a fresh tail or screen snapshot.
-const SUBSCRIBER_QUEUE_EVENTS: usize = 32;
+/// Bound memory retained on behalf of clients that stop reading.
+///
+/// The queue is bounded by **bytes first, events second**: a lagging client
+/// is evicted once its backlog exceeds roughly 1 MiB of PTY data *or* 1024
+/// queued events, whichever comes first. Bytes are the real memory bound
+/// (PTY reads are at most 32 KiB); the event cap only bounds per-event
+/// overhead for pathological streams of tiny writes.
+///
+/// An event-count-only bound (the old 32-event queue) evicted clients on
+/// bursts that were tiny in bytes but numerous in events -- e.g. a
+/// resize-triggered TUI repaint arriving as dozens of few-hundred-byte PTY
+/// reads (~30KB total). That made `a attach` print "attached client fell
+/// behind live output" and detach immediately on busy sessions, even though
+/// the backlog was negligible. A lagging client is still disconnected and
+/// can reattach for a fresh tail or screen snapshot, but only when its
+/// backlog is actually large.
+const MAX_SUBSCRIBER_QUEUED_BYTES: usize = 1024 * 1024;
+const MAX_SUBSCRIBER_QUEUED_EVENTS: usize = 1024;
 const MAX_SUBSCRIBERS: usize = 64;
 /// Attach connections are long-lived, while ordinary RPCs are short-lived.
 /// Leave room above the subscriber ceiling for status/capture/kill calls,
@@ -313,54 +326,129 @@ struct HubInner {
     terminal: Option<OutputEvent>,
 }
 
+fn output_event_queued_bytes(event: &OutputEvent) -> usize {
+    match event {
+        OutputEvent::Data(data) => data.len(),
+        // Layout changes are a few bools; Exit/Error are terminal outcomes,
+        // never queued behind data.
+        _ => 0,
+    }
+}
+
+struct SubscriberState {
+    queue: VecDeque<OutputEvent>,
+    queued_bytes: usize,
+    terminal: Option<OutputEvent>,
+    terminal_taken: bool,
+    sender_alive: bool,
+    receiver_alive: bool,
+}
+
+struct SubscriberShared {
+    state: Mutex<SubscriberState>,
+    cvar: Condvar,
+}
+
+impl SubscriberShared {
+    fn poisoned_lock(&self) -> std::sync::MutexGuard<'_, SubscriberState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct SubscriberSender {
-    events: mpsc::SyncSender<OutputEvent>,
-    terminal: mpsc::SyncSender<OutputEvent>,
+    shared: Arc<SubscriberShared>,
 }
 
 impl SubscriberSender {
     fn try_event(&self, event: OutputEvent) -> bool {
-        match self.events.try_send(event) {
-            Ok(()) => true,
-            Err(mpsc::TrySendError::Full(_)) => {
-                let _ = self.terminal.try_send(OutputEvent::Error(
-                    "attached client fell behind live output; reattach for a fresh snapshot".into(),
-                ));
-                false
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        let mut state = self.shared.poisoned_lock();
+        if !state.receiver_alive {
+            return false;
         }
+        if state.terminal.is_some() {
+            return true;
+        }
+        let bytes = output_event_queued_bytes(&event);
+        if state.queue.len() >= MAX_SUBSCRIBER_QUEUED_EVENTS
+            || state.queued_bytes.saturating_add(bytes) > MAX_SUBSCRIBER_QUEUED_BYTES
+        {
+            state.terminal = Some(OutputEvent::Error(
+                "attached client fell behind live output; reattach for a fresh snapshot".into(),
+            ));
+            self.shared.cvar.notify_all();
+            return false;
+        }
+        state.queued_bytes = state.queued_bytes.saturating_add(bytes);
+        state.queue.push_back(event);
+        self.shared.cvar.notify_one();
+        true
     }
 
     fn terminate(self, event: OutputEvent) {
-        let _ = self.terminal.try_send(event);
+        {
+            let mut state = self.shared.poisoned_lock();
+            if state.terminal.is_none() {
+                state.terminal = Some(event);
+            }
+            self.shared.cvar.notify_all();
+        }
+        // `self` drops here, marking the sender gone (see Drop impl).
+    }
+}
+
+impl Drop for SubscriberSender {
+    fn drop(&mut self) {
+        let mut state = self.shared.poisoned_lock();
+        state.sender_alive = false;
+        self.shared.cvar.notify_all();
     }
 }
 
 struct OutputReceiver {
-    events: mpsc::Receiver<OutputEvent>,
-    terminal: mpsc::Receiver<OutputEvent>,
+    shared: Arc<SubscriberShared>,
 }
 
 impl OutputReceiver {
     /// Drain already-queued output before reporting the terminal outcome.
-    /// If no output is ready, a terminal event wins immediately; otherwise
-    /// blocking on the data channel is safe because terminal publication also
-    /// drops its sender and wakes this receive.
+    /// Queued data always wins over a terminal event; once the queue is
+    /// empty the terminal outcome (if any) is returned exactly once, and
+    /// afterwards the receiver reports disconnection -- mirroring the old
+    /// two-channel `mpsc` behavior this replaced.
     fn recv(&self) -> Result<OutputEvent, mpsc::RecvError> {
-        match self.events.try_recv() {
-            Ok(event) => return Ok(event),
-            Err(mpsc::TryRecvError::Disconnected) => return self.terminal.recv(),
-            Err(mpsc::TryRecvError::Empty) => {}
+        let mut state = self.shared.poisoned_lock();
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                state.queued_bytes = state
+                    .queued_bytes
+                    .saturating_sub(output_event_queued_bytes(&event));
+                return Ok(event);
+            }
+            if let Some(terminal) = state.terminal.clone() {
+                if !state.terminal_taken {
+                    state.terminal_taken = true;
+                    return Ok(terminal);
+                }
+                return Err(mpsc::RecvError);
+            }
+            if !state.sender_alive {
+                return Err(mpsc::RecvError);
+            }
+            state = self
+                .shared
+                .cvar
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        match self.terminal.try_recv() {
-            Ok(event) => Ok(event),
-            Err(mpsc::TryRecvError::Disconnected) => self.events.recv(),
-            Err(mpsc::TryRecvError::Empty) => match self.events.recv() {
-                Ok(event) => Ok(event),
-                Err(_) => self.terminal.recv(),
-            },
-        }
+    }
+}
+
+impl Drop for OutputReceiver {
+    fn drop(&mut self) {
+        let mut state = self.shared.poisoned_lock();
+        state.receiver_alive = false;
+        self.shared.cvar.notify_all();
     }
 }
 
@@ -486,25 +574,27 @@ impl OutputHub {
         }
         let id = inner.next_id;
         inner.next_id += 1;
-        let (events_tx, events_rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_EVENTS);
-        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(SubscriberShared {
+            state: Mutex::new(SubscriberState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                terminal: None,
+                terminal_taken: false,
+                sender_alive: true,
+                receiver_alive: true,
+            }),
+            cvar: Condvar::new(),
+        });
         let subscriber = SubscriberSender {
-            events: events_tx,
-            terminal: terminal_tx,
+            shared: Arc::clone(&shared),
         };
+        let receiver = OutputReceiver { shared };
         if let Some(terminal) = inner.terminal.clone() {
             subscriber.terminate(terminal);
         } else {
             inner.subscribers.insert(id, subscriber);
         }
-        Ok((
-            id,
-            initial,
-            OutputReceiver {
-                events: events_rx,
-                terminal: terminal_rx,
-            },
-        ))
+        Ok((id, initial, receiver))
     }
     fn unsubscribe(&self, id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -617,12 +707,37 @@ mod tests {
         let hub = test_hub(&dir);
         let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
 
-        for _ in 0..=SUBSCRIBER_QUEUE_EVENTS {
+        // Fill past the ~1 MiB byte cap with max-size PTY reads: 32 x 32 KiB
+        // fits exactly, the 33rd exceeds it and evicts.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..33 {
+            hub.append(&chunk).unwrap();
+        }
+
+        assert!(hub.inner.lock().unwrap().subscribers.is_empty());
+        for _ in 0..32 {
+            assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
+        }
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Error(message) if message.contains("fell behind")
+        ));
+    }
+
+    #[test]
+    fn event_cap_still_bounds_a_pathological_stream_of_tiny_writes() {
+        // The byte cap alone would let a stream of 1-byte writes queue
+        // megabytes of per-event overhead; the event cap bounds that.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        for _ in 0..=MAX_SUBSCRIBER_QUEUED_EVENTS {
             hub.append(b"x").unwrap();
         }
 
         assert!(hub.inner.lock().unwrap().subscribers.is_empty());
-        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+        for _ in 0..MAX_SUBSCRIBER_QUEUED_EVENTS {
             assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
         }
         assert!(matches!(
@@ -665,9 +780,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = test_hub(&dir);
         let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
-        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
-            hub.append(b"x").unwrap();
+        // A full (but not over-full) queue: 32 x 32 KiB == the 1 MiB byte
+        // cap exactly, so nothing is evicted and `finish` must still deliver
+        // every queued byte before the Exit.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..32 {
+            hub.append(&chunk).unwrap();
         }
+        assert!(!hub.inner.lock().unwrap().subscribers.is_empty());
         let exit = ExitInfo {
             code: Some(0),
             signal: None,
@@ -676,7 +796,7 @@ mod tests {
         };
         hub.finish(exit.clone());
 
-        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+        for _ in 0..32 {
             assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
         }
         assert!(matches!(
@@ -690,12 +810,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hub = test_hub(&dir);
         let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
-        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
-            hub.append(b"x").unwrap();
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..32 {
+            hub.append(&chunk).unwrap();
         }
         hub.fail_subscribers("PTY failed".into());
 
-        for _ in 0..SUBSCRIBER_QUEUE_EVENTS {
+        for _ in 0..32 {
             assert!(matches!(rx.recv().unwrap(), OutputEvent::Data(_)));
         }
         assert!(matches!(
