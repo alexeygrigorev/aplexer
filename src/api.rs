@@ -1900,6 +1900,26 @@ fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
         && record.containment_empty == Some(true)
 }
 
+/// Reconstruct a start response for a worker that finished cleanly and
+/// deleted its own record (natural exit, Ctrl-D, or an in-startup kill).
+/// The on-disk record is already gone; this is only what `a start --json`
+/// returns to the client that launched it.
+fn auto_removed_completion(mut record: SessionRecord) -> SessionRecord {
+    if !matches!(record.phase, Phase::Exited) {
+        record.phase = Phase::Exited;
+    }
+    record.containment_empty = Some(true);
+    if record.exit.is_none() {
+        record.exit = Some(crate::ExitInfo {
+            code: None,
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: crate::now_ms(),
+        });
+    }
+    record
+}
+
 /// The `SessionRecord::parent_session` value for a session being started
 /// here: the calling process's ambient `APLEXER_SESSION_ID` stamp (see
 /// `discover_session_id`, which also walks ancestor environments), kept only
@@ -2052,8 +2072,37 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         // Environment values may contain credentials. Hand them to the worker
         // through a private, one-shot runtime file instead of placing them in
         // the durable/public session record returned by list/status/watch.
+        //
+        // Written WITHOUT fsync (benchmark PLAN P0.3): this file is deleted
+        // by the guard below as soon as startup completes, so crash
+        // durability across it is not required -- a crash before the worker
+        // reads it just fails this start, which rollback cleans up. The
+        // session record below keeps its full fsync + parent-sync durability
+        // (see worker_startup_transaction tests). Saves two fsyncs on every
+        // `a start`. Mode 0600: it carries secrets.
         let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
-        atomic_write_json(&launch_environment_path, &launch.env)?;
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&launch_environment_path)
+                .with_context(|| {
+                    format!(
+                        "create {}",
+                        launch_environment_path.display()
+                    )
+                })?;
+            serde_json::to_writer_pretty(&mut file, &launch.env).with_context(|| {
+                format!(
+                    "write {}",
+                    launch_environment_path.display()
+                )
+            })?;
+            use std::io::Write as _;
+            file.write_all(b"\n")?;
+        }
         let _launch_environment_guard = LaunchEnvironmentGuard(launch_environment_path);
         let now = crate::now_ms();
         let parent_session = resolve_parent_session(paths);
@@ -2137,6 +2186,7 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
         await_worker_exit_before_readiness_poll(&mut startup, paths, id)?;
         let started = Instant::now();
         let timeout = Duration::from_millis(req.startup_timeout_ms);
+        let mut last_seen = record.clone();
         loop {
             // Check the deadline first so a zero timeout is deterministic,
             // independent of whether the worker wins the scheduling race.
@@ -2146,7 +2196,20 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                     req.startup_timeout_ms
                 );
             }
+            // A clean finish deletes the record (natural exit, Ctrl-D, kill).
+            // That is success for this start, not "worker vanished".
+            if !paths.record(id).exists() {
+                if let Some(status) = startup.child_mut().try_wait()? {
+                    if status.success() {
+                        return Ok(auto_removed_completion(last_seen));
+                    }
+                    bail!("worker exited during startup: {status}");
+                }
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             let current = read_session_record(paths, id).context("read worker startup record")?;
+            last_seen = current.clone();
             match current.phase {
                 Phase::Running | Phase::Exiting | Phase::Exited if current.socket_path.exists() => {
                     let remaining = timeout.saturating_sub(started.elapsed());
@@ -2154,8 +2217,17 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                     if probe_worker_ready(&current, id, probe_timeout)? {
                         // The Ping response is the readiness commit. Read once
                         // more so a very short-lived workload can return its
-                        // newest durable phase.
-                        return read_session_record(paths, id).or(Ok(current));
+                        // newest durable phase -- or report the auto-removed
+                        // completion if the worker already deleted the record.
+                        return match read_session_record(paths, id) {
+                            Ok(latest) => Ok(latest),
+                            Err(_) if !paths.record(id).exists() => {
+                                Ok(auto_removed_completion(current))
+                            }
+                            Err(error) => {
+                                Err(error).context("read worker startup record after ready ping")
+                            }
+                        };
                     }
                 }
                 Phase::Failed => bail!(
@@ -2167,10 +2239,16 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
             if let Some(status) = startup.child_mut().try_wait()? {
                 // A worker that exited cleanly after durably recording a
                 // completed session did not fail to start (see
-                // `exited_worker_completed_startup`). An unreadable record
-                // falls through to the failure below rather than replacing
-                // the startup diagnosis with a read error.
+                // `exited_worker_completed_startup`). The same is true of
+                // a worker that finished and auto-removed its record: that
+                // deletion is itself the proof the lifecycle completed.
+                // An unreadable-but-still-present record falls through to
+                // the failure below rather than replacing the startup
+                // diagnosis with a read error.
                 if status.success() {
+                    if !paths.record(id).exists() {
+                        return Ok(auto_removed_completion(current));
+                    }
                     if let Ok(final_record) = read_session_record(paths, id) {
                         if exited_worker_completed_startup(&final_record) {
                             return Ok(final_record);
@@ -2179,7 +2257,12 @@ pub fn start_session(paths: &Paths, req: &StartRequest) -> Result<SessionRecord>
                 }
                 bail!("worker exited during startup: {status}");
             }
-            thread::sleep(Duration::from_millis(25));
+            // Polled at 5 ms, not 25 ms (benchmark PLAN P0.3): worker startup
+            // is a serial chain (record write -> spawn -> PTY -> workload ->
+            // Running record -> Ping), and every 25 ms quantum here is pure
+            // launcher idle time on top of it. Short-lived and infrequent --
+            // one wait per `a start`.
+            thread::sleep(Duration::from_millis(5));
         }
     })();
 

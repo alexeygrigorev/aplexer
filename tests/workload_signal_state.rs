@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const PROBE_ENV: &str = "APLEXER_TEST_SIGNAL_STATE_PROBE";
+/// How long the probe workload parks after reporting, as a backstop for a
+/// parent that never gets to kill it. Comfortably longer than the parent's
+/// own 10 s poll deadline, short enough that a crashed test run leaves
+/// nothing behind for long.
+const PROBE_LINGER: Duration = Duration::from_secs(30);
 
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Output {
     command
@@ -109,6 +114,19 @@ fn inherited_signal_state_is_normalized_for_workload() {
         );
         thread::sleep(Duration::from_millis(25));
     }
+
+    // The probe parks itself once it has spoken (see PROBE_LINGER), so tear
+    // the session down instead of waiting it out. Best-effort: the assertion
+    // above is the test, and the probe's own timeout bounds the process
+    // either way.
+    let _ = run_with_timeout(
+        {
+            let mut cmd = command(&runtime, &state);
+            cmd.args(["kill", id]);
+            cmd
+        },
+        Duration::from_secs(10),
+    );
 }
 
 #[test]
@@ -130,4 +148,17 @@ fn workload_signal_probe() {
         assert_eq!(libc::sigismember(&mask, libc::SIGUSR1), 0);
     }
     println!("signal-state-clean");
+
+    // Stay alive until the parent test has read that line.
+    //
+    // A session that ends removes its own record and history (see
+    // tests/kill_removes_session.rs), so a probe that exited the instant it
+    // printed would leave the poll loop above asking `a capture` about a
+    // session that no longer exists -- it would be testing record retention,
+    // not signal normalization. Lingering keeps this test about the thing it
+    // is named after, on the default configuration rather than an opted-in
+    // `keep_exited = true`. The parent kills the session as soon as it has
+    // its line; this timeout only bounds the process if the parent died
+    // first.
+    thread::sleep(PROBE_LINGER);
 }

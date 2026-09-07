@@ -254,7 +254,7 @@ explicit period keeps the 100,000 µs default.
 
 ## Durable lifecycle
 
-Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker. A session that **exited on its own** keeps that record — final screen, bounded history, transcript binding — until you explicitly discard it with `a forget --force` or `a prune`. A session you **killed is different**: `a kill` removes it entirely. The worker that accepted the kill deletes the record itself once it proves the containment domain empty (any finalize failure keeps the evidence and says so), so a killed session disappears from `a list` — and from PocketShell's session list — instead of lingering as an exited row that every client keeps picking up.
+Session records use versioned JSON and atomic `fsync` + rename replacement. PTY history is kept in a bounded incremental store and remains available after workload exit, alongside a `screen.txt` post-mortem — the plain-text screen as it looked the moment the worker exited, which `a capture --screen --plain` falls back to for a session that is no longer running. The worker finalizes the durable record before removing its socket, so status and post-mortem capture remain available without a live worker when something failed. A session that **exits cleanly** — `exit`, Ctrl-D / shell EOF, a command that finished, or `a kill` — is removed entirely. The worker deletes the record itself once it proves the containment domain empty (any finalize failure, and OOM, keep the evidence), so a finished session disappears from `a list` — and from PocketShell's session list — instead of lingering as an exited row that every client keeps picking up. Failed and OOM records stay until you discard them with `a forget --force` or `a prune`.
 
 ## Watching events
 
@@ -330,11 +330,11 @@ print(client.status(session.id))
 client.send(session.id, b"printf 'hello\\n'\n")
 raw_output = client.capture(session.id, max_bytes=4096)
 # kill ends the workload and removes the session outright -- there is no
-# record left to clean up afterwards.
+# record left to clean up afterwards. A clean natural exit (exit, Ctrl-D)
+# does the same.
 client.kill(session.id, signal=15, grace_ms=2000)
 
-# A session that exited on its own keeps its records instead; discard them
-# explicitly once its status reports the worker is gone.
+# Failed and OOM records stay; discard them explicitly.
 result = client.forget(session.id, force=True)
 print(result.workload_may_survive)
 ```

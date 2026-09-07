@@ -1,13 +1,21 @@
-//! `a kill` removes the killed session entirely.
+//! `a kill` and a clean natural exit both remove the session entirely.
 //!
-//! Killing a session used to leave its durable record behind as an `exited`
-//! row that every listing client (PocketShell included) kept rendering until
-//! someone ran `a forget`/`a prune`. Since the worker that accepts the kill
-//! RPC now removes the record itself during finalization, `a kill` must
-//! leave nothing to list: no state dir, no runtime dir, and a follow-up
-//! kill/forget answers "no matching session". A session that exits on its
-//! own keeps its record -- post-mortem capture remains the natural-exit
-//! behavior, and this file pins the distinction.
+//! Finished sessions used to leave a durable `exited` row that every listing
+//! client (PocketShell included) kept rendering until someone ran `a forget`
+//! / `a prune`. The worker now removes the record itself during finalization
+//! of a clean, proven-empty finish -- `a kill`, `exit`, Ctrl-D / shell EOF,
+//! or a command that ran to completion -- so nothing remains to list: no
+//! state dir, no runtime dir, and a follow-up kill/forget answers "no
+//! matching session". Failed and OOM records are the leftover diagnostic
+//! trail; this file pins the clean-exit removal.
+//!
+//! "Clean" here means the worker finalized without error and proved its
+//! containment domain empty -- not that the workload succeeded. A non-zero
+//! exit and a signalled workload are removed exactly like a zero exit; the
+//! process is over either way, and its exit status goes to whoever was
+//! watching rather than into a row nobody asked to keep. `keep_exited =
+//! true` in the config is the escape hatch back to durable post-mortem
+//! records.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -101,6 +109,13 @@ impl Harness {
 
     fn workspace(&self) -> std::path::PathBuf {
         self.runtime_dir.path().join("ws")
+    }
+
+    /// Write the config file this harness points `APLEXER_CONFIG` at. Must
+    /// be called before `start`, since the worker reads the file the session
+    /// was launched with.
+    fn write_config(&self, text: &str) {
+        std::fs::write(&self.config_file, text).expect("write config");
     }
 
     fn state_session(&self, id: &str) -> PathBuf {
@@ -216,32 +231,120 @@ fn kill_escalating_past_ignored_term_still_removes() {
 }
 
 #[test]
-fn natural_exit_still_keeps_the_record() {
+fn natural_exit_removes_the_record() {
     let harness = Harness::new();
     let workspace = harness.workspace();
     std::fs::create_dir_all(&workspace).unwrap();
+    // `true` is the same lifecycle as typing `exit` or Ctrl-D in an
+    // attached shell: the workload ends, the worker proves containment
+    // empty, and the record must disappear instead of parking as `exited`.
     let id = harness.start("natural", "true");
 
-    // The worker finalizes (phase Exited) and exits; the record must remain
-    // for post-mortem capture/status -- only kills remove it.
+    assert!(
+        harness.wait_until_record_gone(&id, Duration::from_secs(10)),
+        "a naturally exiting session left a durable record: {}",
+        harness.state_session(&id).display()
+    );
+    assert!(
+        !harness.list_ids().contains(&id),
+        "a naturally exiting session still appears in `a list --json`"
+    );
+    let (stdout, stderr) = harness.run_failing(&["status", &id, "--json"], Duration::from_secs(5));
+    let detail = format!("{stdout}{stderr}");
+    assert!(
+        detail.contains("no matching session"),
+        "status of a naturally exiting session should report it gone, got: {detail}"
+    );
+}
+
+#[test]
+fn non_zero_exit_removes_the_record() {
+    let harness = Harness::new();
+    std::fs::create_dir_all(harness.workspace()).unwrap();
+    // The reported lingering rows included an `exit code 1`. A command that
+    // failed is still a command that is over: there is no process left to
+    // manage, so there is nothing for `a list` to list.
+    let id = harness.start("failed-cmd", "exit 1");
+
+    assert!(
+        harness.wait_until_record_gone(&id, Duration::from_secs(10)),
+        "a session whose workload exited non-zero left a durable record: {}",
+        harness.state_session(&id).display()
+    );
+    assert!(
+        !harness.list_ids().contains(&id),
+        "a non-zero exit still appears in `a list --json`"
+    );
+}
+
+#[test]
+fn signalled_workload_removes_the_record() {
+    let harness = Harness::new();
+    std::fs::create_dir_all(harness.workspace()).unwrap();
+    // The reported lingering rows also included three SIGKILLs. A workload
+    // killed from outside aplexer (`kill -9 <workload pid>`, a supervisor, a
+    // crash) reaches the same finalization as `a kill`: the domain empties,
+    // and the record goes with it.
+    let id = harness.start("signalled", "kill -9 $$");
+
+    assert!(
+        harness.wait_until_record_gone(&id, Duration::from_secs(10)),
+        "a signalled session left a durable record: {}",
+        harness.state_session(&id).display()
+    );
+    assert!(
+        !harness.list_ids().contains(&id),
+        "a signalled session still appears in `a list --json`"
+    );
+}
+
+#[test]
+fn keep_exited_config_retains_the_terminal_record() {
+    let harness = Harness::new();
+    std::fs::create_dir_all(harness.workspace()).unwrap();
+    // The documented escape hatch for anyone who wants the post-mortem
+    // trail back. Everything else in this file runs with no config file at
+    // all, which is the default (`keep_exited = false`).
+    harness.write_config("version = 1\nkeep_exited = true\n");
+    let id = harness.start("kept", "exit 3");
+
+    // Wait for the worker to finish rather than sampling immediately: the
+    // point is that the record is still there once finalization is over,
+    // not that it exists during it. The worker unlinks its runtime dir on
+    // the way out either way, so that is the "finished" signal.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut exited = false;
-    while std::time::Instant::now() < deadline {
-        let stdout = harness.run_ok(&["status", &id, "--json"], Duration::from_secs(5));
-        let value: Value = serde_json::from_str(&stdout).expect("status JSON");
-        if value["phase"] == "exited" {
-            exited = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
+    while harness.runtime_session(&id).exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
     }
-    assert!(exited, "workload did not reach exited phase in time");
+    assert!(
+        !harness.runtime_session(&id).exists(),
+        "worker did not finish within the timeout"
+    );
+
     assert!(
         harness.state_session(&id).exists(),
-        "a naturally exiting session must keep its durable record"
+        "keep_exited = true must retain the durable record"
     );
-    assert!(
-        harness.list_ids().contains(&id),
-        "a naturally exiting session must stay listed until forgotten/pruned"
-    );
+    let listed = harness.run_ok(&["--json", "list"], Duration::from_secs(5));
+    let rows: Value = serde_json::from_str(&listed).expect("list JSON");
+    let row = rows
+        .as_array()
+        .expect("list array")
+        .iter()
+        .find(|row| row["id"] == id.as_str())
+        .unwrap_or_else(|| panic!("kept session missing from `a list`: {listed}"));
+    assert_eq!(row["phase"], "exited", "{row}");
+    assert_eq!(row["exit"]["code"], 3, "{row}");
+
+    // Deliberately not asserting that `a prune` then reaps this record.
+    // Prune's bar is pid liveness (`reap_verdict`), so what it decides here
+    // depends on whether the just-exited worker has been reaped by its
+    // parent yet -- and running the suite from inside an aplexer session
+    // (the normal way on this project) leaves that worker a zombie, which
+    // every `kill(pid, 0)` probe still calls alive. That is prune's
+    // contract, not this escape hatch's, and it is already owned by
+    // tests/prune_dead_records.rs under a fixture that controls process
+    // liveness directly. What belongs here is what `keep_exited = true`
+    // itself promises: the terminal record survives finalization and stays
+    // addressable, asserted above.
 }

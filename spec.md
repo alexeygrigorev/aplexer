@@ -1758,8 +1758,10 @@ willing to claim:
   containment domain empty. For a broken unlimited session it refuses
   ("no authoritative containment locator") and preserves both the durable
   and runtime directories rather than report a cleanup it did not perform.
-  Sessions that exit on their own keep their records for post-mortem
-  capture/status; `a forget` and `a prune` remain their cleanup paths.
+  Sessions that exit on their own (including Ctrl-D / shell EOF) are
+  removed the same way, under the same proof bar. Failed and OOM records
+  are kept for diagnosis; `a forget` and `a prune` remain their cleanup
+  paths.
 - `a prune` claims nothing and signals nothing. It removes a record only when
   the worker is gone, the workload leader is gone, and containment holds no
   remaining handle: either proven empty (by the worker, or by reading the

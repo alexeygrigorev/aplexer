@@ -2685,39 +2685,92 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
         oom_killed: oom,
         exited_at_ms: now_ms(),
     };
-    if let Err(history_error) = runtime.output.flush_history(true) {
-        let message = format!("persist final history: {history_error:#}");
-        fatal = Some(match fatal {
-            Some(existing) => format!("{existing}; {message}"),
-            None => message,
-        });
-    }
-    let error = fatal.clone();
-    let mut record_retry = HISTORY_RETRY_INITIAL;
-    loop {
-        let final_error = error.clone();
-        match runtime.update_record(|r| {
-            r.phase = if final_error.is_some() {
-                Phase::Failed
-            } else {
-                Phase::Exited
-            };
-            r.containment_empty = Some(containment_empty);
-            r.exit = Some(exit.clone());
-            r.error = final_error;
-        }) {
-            Ok(_) => break,
-            Err(persist_error) => {
-                // Never exit with a durable record that still claims this
-                // worker/workload is running. Keep the control socket alive
-                // so Status can expose `record_persistence_error` while the
-                // lifecycle retries.
-                eprintln!(
-                    "aplexer worker: persist final session state: {persist_error:#}; retrying in {}ms",
-                    record_retry.as_millis()
-                );
-                thread::sleep(record_retry);
-                record_retry = record_retry.saturating_mul(2).min(HISTORY_RETRY_MAX);
+    // A clean, proven-empty finish leaves no record: a workload that
+    // returned (zero or non-zero), Ctrl-D at a shell, a signalled workload,
+    // and `a kill` are all the same path. A session that is over is gone
+    // from `a list` the moment it is over -- not an `exited` tombstone that
+    // sits there until somebody runs `a prune` -- and the post-mortem
+    // writes that tombstone needed would be fsync-and-delete waste anyway
+    // (benchmark PLAN P0.2).
+    //
+    // Keep the durable `finish` path only when:
+    //
+    //  * something failed (`fatal`: a history flush or record persist error,
+    //    a PTY/waiter error) -- the record carries the reason, and nothing
+    //    else would report it;
+    //  * containment is not proven empty -- the record is the only remaining
+    //    handle on a domain that may still hold live processes, and dropping
+    //    it would strand them (`reap_verdict` / `a prune`'s bar);
+    //  * the workload was OOM-killed -- `oom_killed` is a diagnosis the
+    //    kernel made and the exit status alone does not carry, so it would
+    //    be unrecoverable rather than merely unrecorded;
+    //  * the operator asked for post-mortem records with `keep_exited = true`
+    //    in the config, which restores the old `exited`-until-pruned rows.
+    //
+    // Read here rather than at worker startup so it costs nothing on the
+    // start path and so editing the config takes effect for sessions that
+    // are already running.
+    let keep_exited = crate::config_keep_exited(&runtime.paths);
+    let will_remove = fatal.is_none() && containment_empty && !oom && !keep_exited;
+    if will_remove {
+        runtime.output.finish_killed(exit.clone());
+        if let Some(c) = cg.take() {
+            c.cleanup();
+        }
+        // Report a removal that could not happen (a read-only state dir, a
+        // vanished mount) rather than exiting silently on it. Nothing is
+        // lost when it fails: the record left behind still says the worker
+        // was running, its pid is about to be gone, and `a prune` reaps that
+        // shape -- but the operator should be able to see why a session they
+        // ended is still listed.
+        match runtime.record() {
+            Ok(record) => {
+                if let Err(error) = fs::remove_dir_all(runtime.paths.state_session(record.id)) {
+                    eprintln!(
+                        "aplexer worker: remove finished session {} state: {error:#}",
+                        record.id
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "aplexer worker: read record before removing finished session state: {error:#}"
+            ),
+        }
+    } else {
+        if let Err(history_error) = runtime.output.flush_history(true) {
+            let message = format!("persist final history: {history_error:#}");
+            fatal = Some(match fatal {
+                Some(existing) => format!("{existing}; {message}"),
+                None => message,
+            });
+        }
+        let error = fatal.clone();
+        let mut record_retry = HISTORY_RETRY_INITIAL;
+        loop {
+            let final_error = error.clone();
+            match runtime.update_record(|r| {
+                r.phase = if final_error.is_some() {
+                    Phase::Failed
+                } else {
+                    Phase::Exited
+                };
+                r.containment_empty = Some(containment_empty);
+                r.exit = Some(exit.clone());
+                r.error = final_error;
+            }) {
+                Ok(_) => break,
+                Err(persist_error) => {
+                    // Never exit with a durable record that still claims this
+                    // worker/workload is running. Keep the control socket alive
+                    // so Status can expose `record_persistence_error` while the
+                    // lifecycle retries.
+                    eprintln!(
+                        "aplexer worker: persist final session state: {persist_error:#}; retrying in {}ms",
+                        record_retry.as_millis()
+                    );
+                    thread::sleep(record_retry);
+                    record_retry = record_retry.saturating_mul(2).min(HISTORY_RETRY_MAX);
+                }
             }
         }
     }
@@ -2762,28 +2815,32 @@ fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
             thread::sleep(DESCENDANT_POLL_INTERVAL);
         }
     }
-    runtime.output.finish(exit.clone());
-    if let Some(cg) = cg {
-        cg.cleanup();
-    }
-    // A natural exit keeps the terminal record, history, final screen, and
-    // transcript binding: besides enabling post-mortem capture/status, this
-    // gives polling watchers a durable transition to observe (`a forget` and
-    // `a prune` remain the explicit cleanup paths for those records). A
-    // session the operator killed is different -- `a kill` means "gone from
-    // `a list`", not "exited row until someone prunes it", so the accepted
-    // kill's finalization removes the durable state itself, but only under
-    // the same proof bar every other removal path applies: finalization ran
-    // clean and the containment domain was proven empty. Any failure above
-    // (`fatal` -- record persist, history flush -- or an unproven domain)
-    // keeps the evidence, exactly like `a kill`'s own client-side paths do.
-    let id = runtime.record().map(|record| record.id).ok();
-    if runtime.kill_requested.load(Ordering::Relaxed) && fatal.is_none() && containment_empty {
-        if let Some(id) = id {
-            match fs::remove_dir_all(runtime.paths.state_session(id)) {
-                Ok(()) => {}
-                Err(error) => {
-                    eprintln!("aplexer worker: remove killed session {id} state: {error:#}");
+    // The fast path above already terminated subscribers, cleaned the cgroup,
+    // and removed the state dir -- skip the durable post-mortem writes below,
+    // which would just fsync-and-delete the same evidence (benchmark PLAN
+    // P0.2). The `!containment_empty` recovery loop is unreachable here
+    // (`will_remove` implies `containment_empty`).
+    if !will_remove {
+        runtime.output.finish(exit.clone());
+        if let Some(cg) = cg {
+            cg.cleanup();
+        }
+        // Failed and OOM sessions keep the terminal record, as does an
+        // explicit `keep_exited = true`. A clean finish whose containment
+        // proof arrived late (the recovery loop above) still removes:
+        // SIGTERM-to-worker, a descendant that outlived the leader, and
+        // Ctrl-D are the same "gone from `a list`" outcome as the fast
+        // path. Any remaining `fatal` keeps the evidence.
+        if fatal.is_none() && !oom && !keep_exited {
+            if let Ok(record) = runtime.record() {
+                match fs::remove_dir_all(runtime.paths.state_session(record.id)) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "aplexer worker: remove finished session {} state: {error:#}",
+                            record.id
+                        );
+                    }
                 }
             }
         }

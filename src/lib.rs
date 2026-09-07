@@ -1470,9 +1470,53 @@ pub struct Config {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
     pub shortcuts: BTreeMap<String, ShortcutConfig>,
+    /// Keep a durable record for a session whose workload finished.
+    ///
+    /// Default `false`: a session that ends -- `exit`, Ctrl-D at a shell,
+    /// a workload that returned non-zero, a signalled workload, or `a kill`
+    /// -- removes its own record and history, so it leaves `a list` the
+    /// moment it is over instead of parking an `exited` row there until
+    /// somebody runs `a prune`. Set `keep_exited = true` to retain those
+    /// post-mortem records (`a status`, `a capture --screen`, the durable
+    /// terminal transition a polling `a watch` can observe) and go back to
+    /// pruning them explicitly.
+    ///
+    /// Never suppresses evidence the operator did not choose to lose:
+    /// worker-side finalization failures, a containment domain that was
+    /// not proven empty, and OOM kills keep their record regardless (see
+    /// `run_lifecycle` in src/worker.rs).
+    #[serde(default)]
+    pub keep_exited: bool,
 }
 fn default_config_version() -> u32 {
     1
+}
+
+/// Read the `keep_exited` policy without building a full [`Config`].
+///
+/// The worker consults this on its exit path, where [`Config::load`] would
+/// be the wrong tool twice over: it walks the filesystem for engine profile
+/// discovery that finalization has no use for, and it fails the whole load
+/// on an unrelated invalid engine/profile/shortcut entry -- which would flip
+/// the retention policy as a side effect of a typo elsewhere in the file.
+/// Only the single field is parsed here, so an unreadable or unparsable
+/// config file (and a missing one, the common case) means the documented
+/// default: do not keep exited records.
+///
+/// The `Config` field above stays the source of truth for the name and the
+/// default; `config_keep_exited_matches_full_config_load` pins the two
+/// readers together.
+pub fn config_keep_exited(paths: &Paths) -> bool {
+    #[derive(Deserialize)]
+    struct KeepExitedOnly {
+        #[serde(default)]
+        keep_exited: bool,
+    }
+    fs::read_to_string(&paths.config_file)
+        .ok()
+        .and_then(|text| toml::from_str::<KeepExitedOnly>(&text).ok())
+        .map(|parsed| parsed.keep_exited)
+        .unwrap_or(false)
 }
 
 /// Transcript-family normalization: a variant engine -- a fork of a built-in
@@ -1938,6 +1982,10 @@ impl Config {
             config.engines.extend(user.engines);
             config.profiles.extend(user.profiles);
             config.shortcuts.extend(user.shortcuts);
+            // A bool has no "unset" value to test the way the options above
+            // do, and the built-in default is `false`, so the user's parsed
+            // value simply is the answer.
+            config.keep_exited = user.keep_exited;
         }
         // Profile-specific built-ins are useful only when discovery or user
         // config supplied their target profile. Insert them after merging so
@@ -4482,6 +4530,57 @@ mod tests {
         assert_eq!(engine_family("zcodex"), "codex");
         assert_eq!(engine_family("codex"), "codex");
         assert_eq!(engine_family("claude"), "claude");
+    }
+
+    /// `config_keep_exited` is a second reader of the same setting, chosen
+    /// so the worker's exit path does not depend on the whole config file
+    /// validating. It must agree with `Config::load` on every shape that
+    /// matters, or the escape hatch would silently mean different things to
+    /// `a` and to the worker that acts on it.
+    #[test]
+    fn config_keep_exited_matches_full_config_load() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_root: root.path().join("runtime"),
+            state_root: root.path().join("state"),
+            config_file: root.path().join("config.toml"),
+        };
+
+        // No config file at all: the documented default.
+        assert!(!config_keep_exited(&paths));
+
+        for (text, expected) in [
+            ("version = 1\n", false),
+            ("version = 1\nkeep_exited = false\n", false),
+            ("version = 1\nkeep_exited = true\n", true),
+        ] {
+            fs::write(&paths.config_file, text).unwrap();
+            assert_eq!(
+                Config::load(&paths).unwrap().keep_exited,
+                expected,
+                "Config::load disagreed for {text:?}"
+            );
+            assert_eq!(
+                config_keep_exited(&paths),
+                expected,
+                "config_keep_exited disagreed for {text:?}"
+            );
+        }
+
+        // An unrelated invalid entry fails `Config::load` outright. The
+        // worker's reader must not treat that as "keep records": a typo in
+        // an engine definition is not a retention decision.
+        fs::write(
+            &paths.config_file,
+            "version = 1\nkeep_exited = true\ndefault_engine = \"nope\"\n",
+        )
+        .unwrap();
+        assert!(Config::load(&paths).is_err());
+        assert!(config_keep_exited(&paths));
+
+        // Unparsable or unreadable config: default, never a panic.
+        fs::write(&paths.config_file, "this is not toml {{{").unwrap();
+        assert!(!config_keep_exited(&paths));
     }
 
     #[test]

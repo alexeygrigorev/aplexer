@@ -368,8 +368,7 @@ def test_native_clients_isolate_worker_start_and_snapshot():
         # Let both short-lived workers release their files before cleanup.
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            sessions = first.list() + second.list()
-            if all(session.phase in {"exited", "failed"} for session in sessions):
+            if not first.list() and not second.list():
                 break
             time.sleep(0.02)
         else:
@@ -377,15 +376,13 @@ def test_native_clients_isolate_worker_start_and_snapshot():
         time.sleep(0.1)
 
 
-def _wait_for_terminal_status(client, selector, timeout=5):
+def _wait_until_gone(client, selector, timeout=5):
     deadline = time.monotonic() + timeout
-    latest = None
     while time.monotonic() < deadline:
-        latest = client.status(selector)
-        if latest.phase in {"exited", "failed"} and not latest.raw["worker_alive"]:
-            return latest
+        if all(item.id != selector for item in client.list()):
+            return
         time.sleep(0.02)
-    raise AssertionError(f"session did not become terminal: {latest!r}")
+    raise AssertionError(f"session {selector} did not disappear from the list")
 
 
 def test_native_operations_round_trip_arbitrary_bytes_and_forget():
@@ -402,7 +399,7 @@ def test_native_operations_round_trip_arbitrary_bytes_and_forget():
         command = [
             "/bin/sh",
             "-c",
-            f"stty raw -echo; printf APX_READY; dd bs=1 count={len(payload)} 2>/dev/null",
+            f"stty raw -echo; printf APX_READY; dd bs=1 count={len(payload)} 2>/dev/null; sleep 1",
         ]
         session = client.start(workspace=root, tag="bytes", command=command)
 
@@ -421,15 +418,19 @@ def test_native_operations_round_trip_arbitrary_bytes_and_forget():
 
         assert client.status(session.id).raw["worker_reachable"] is True
         assert client.send(session.id, payload) == len(payload)
-        terminal = _wait_for_terminal_status(client, session.id)
-        assert terminal.phase == "exited"
-        assert client.capture(session.id).endswith(marker + payload)
-        forgotten = client.forget(session.id, force=True)
-        assert forgotten.forgotten
-        assert not forgotten.signalled
-        assert forgotten.containment_proven_empty
-        assert not forgotten.workload_may_survive
-        assert all(item.id != session.id for item in client.list())
+        deadline = time.monotonic() + 5
+        captured = b""
+        while time.monotonic() < deadline:
+            captured = client.capture(session.id)
+            if captured.endswith(marker + payload):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("captured bytes did not include the payload")
+        assert captured.endswith(marker + payload)
+        _wait_until_gone(client, session.id)
+        with pytest.raises(AplexerError, match="no matching session"):
+            client.forget(session.id, force=True)
 
 
 def test_native_kill_stops_live_session():
@@ -450,5 +451,4 @@ def test_native_kill_stops_live_session():
         with pytest.raises(AplexerError, match="kill grace exceeds maximum"):
             client.kill(session.id, grace_ms=30_001)
         assert client.kill(session.id, signal=15, grace_ms=200) is None
-        _wait_for_terminal_status(client, session.id)
-        assert client.forget(session.id, force=True).forgotten
+        _wait_until_gone(client, session.id)

@@ -327,10 +327,25 @@ fn prune_retains_a_live_session() {
     assert_eq!(listed["worker_alive"], true, "{listed}");
 }
 
-/// Second reported defect: `a kill` leaves the record behind at
-/// `phase: exited, worker_alive: true` while the worker winds down, so a
+/// Second reported defect: `a kill` left the record behind at
+/// `phase: exited, worker_alive: true` while the worker wound down, so a
 /// caller that kills and then prunes (pocketshell's Stop) used to get
 /// `{"removed": [], "retained_count": N}` and a row that never went away.
+///
+/// The fix moved further than "prune can now reap it": a session that ends
+/// removes its own record during finalization, so the row is gone with no
+/// prune at all (`tests/kill_removes_session.rs` pins that directly). What
+/// this test still owns is the *interaction* -- prune running right behind a
+/// kill must reach the same end state and must report it honestly, whichever
+/// of the two did the removing.
+///
+/// `removed` is therefore no longer asserted to name the session: the worker
+/// usually wins that race and prune correctly finds nothing left to reap.
+/// The assertions that carry the defect are the end state (no durable state,
+/// nothing listed, retained_count 0) plus the report never claiming an
+/// unproven reap for a session whose worker finalized cleanly -- and those
+/// are checked in both orders below, so neither outcome of the race can pass
+/// by accident.
 #[test]
 fn prune_immediately_after_kill_removes_the_record() {
     let harness = Harness::new();
@@ -340,24 +355,38 @@ fn prune_immediately_after_kill_removes_the_record() {
 
     harness.run_ok(&["kill", &session.id]);
     let pruned = harness.json(&["--json", "prune"]);
-    assert_eq!(
-        pruned["removed"],
-        serde_json::json!([session.id]),
-        "kill-then-prune was a no-op: {pruned}"
+    let removed = pruned["removed"].as_array().expect("removed array").clone();
+    assert!(
+        removed.is_empty() || removed == [Value::String(session.id.clone())],
+        "prune reaped something other than the killed session: {pruned}"
     );
     assert_eq!(pruned["retained_count"], 0, "{pruned}");
-    // The worker got to finish its own lifecycle, so this reap is proven
-    // clean -- it must not be reported as an unproven one.
+    // The worker got to finish its own lifecycle, so if prune did reap this
+    // record it was a proven-clean reap -- never an unproven one.
     assert_eq!(
         pruned["removed_without_containment_proof"],
         serde_json::json!([]),
         "{pruned}"
     );
+    // The end state is the point of the test, and it must hold whether the
+    // worker or prune got there first. A short wait covers the third
+    // possibility -- prune ran while the worker was still finalizing, saw a
+    // record it correctly refused to touch, and the worker removed it a
+    // moment later.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.state_dir_exists(&session.id) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(
         !harness.state_dir_exists(&session.id),
-        "durable state survived the reap"
+        "durable state survived both the kill and the prune"
     );
     assert!(harness.snapshot().is_empty(), "stopped record still listed");
+    // ... and a prune run after the dust settles is a clean no-op rather
+    // than an error or a phantom row.
+    let again = harness.json(&["--json", "prune"]);
+    assert_eq!(again["removed"], serde_json::json!([]), "{again}");
+    assert_eq!(again["retained_count"], 0, "{again}");
 }
 
 /// The invariant this change deliberately supersedes, pinned so it stays a
