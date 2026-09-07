@@ -4364,6 +4364,7 @@ fn feed_and_write(
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
 const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[?1049l\
+\x1b[?1007h\
 \x1b>\
 \x1b[?1l\
 \x1b[?2004l\
@@ -4380,8 +4381,20 @@ const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[?25h";
 
 /// Written once at attach start, before layout or the snapshot. Isolates the
-/// live session from the host's primary-screen scrollback (the `a` list).
-const ATTACH_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+/// live session from the host's primary-screen scrollback (the `a` list), and
+/// stops the host translating the mouse wheel into arrow keys.
+///
+/// `?1049h` alone created a second bug: the alternate screen has no
+/// scrollback, so a terminal with xterm's `alternateScroll` (DECSET 1007,
+/// on by default nearly everywhere) answers a wheel event by *synthesizing
+/// cursor-up/down key presses* and sending them to the workload. Inside an
+/// agent TUI that is not merely useless -- the wheel silently walks the
+/// agent's own menus and prompt history, i.e. scrolling to read types input
+/// into the session. `?1007l` turns that translation off for the duration of
+/// the attach, so the wheel does nothing instead of something destructive.
+/// `reset_terminal` restores it on detach, since the mode is terminal-global
+/// and the user's next `less`/`vim` expects the default back.
+const ATTACH_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h\x1b[?1007l";
 
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): the
