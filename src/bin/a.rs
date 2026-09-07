@@ -7826,6 +7826,66 @@ fn detach_attached_client(writer: &Arc<Mutex<UnixStream>>, active: &Arc<AtomicBo
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
+/// Why the attach frame loop stopped. The goodbye line is the user's
+/// diagnosis of which layer to look at, so "Detached" is reserved for a
+/// client that left on purpose -- a worker-side error or a dropped socket
+/// must not borrow that word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachStop {
+    /// Ctrl-b d, stdin EOF, or a terminal read/write failure that made this
+    /// client tear its own attach down.
+    ClientDetached,
+    /// The worker reported the workload gone (End frame we did not cause, or
+    /// `ServerEvent::Exit`).
+    SessionEnded,
+    /// The worker sent `ServerEvent::Error`: a PTY/waiter failure, a
+    /// containment cleanup that could not be proven, or a raw-tail
+    /// (`--history-bytes`) subscriber evicted for falling behind. Live-screen
+    /// subscribers coalesce instead of being evicted (issue #16), so for a
+    /// plain `a attach` this now means a genuine worker-side failure.
+    WorkerError,
+    /// The socket ended under us with no explanation: EOF, ConnectionReset,
+    /// or UnexpectedEof. The worker is unreachable; the session may well
+    /// still be fine.
+    SocketLost,
+}
+
+/// Client intent wins over everything but a session that actually ended:
+/// Ctrl-b d shuts our own stream down, so the frame loop very often then
+/// observes a reset that must not be reported as a connection loss.
+fn classify_attach_stop(
+    session_ended: bool,
+    detached_by_client: bool,
+    worker_error: bool,
+) -> AttachStop {
+    if session_ended {
+        AttachStop::SessionEnded
+    } else if detached_by_client {
+        AttachStop::ClientDetached
+    } else if worker_error {
+        AttachStop::WorkerError
+    } else {
+        AttachStop::SocketLost
+    }
+}
+
+/// `inspect_id` is the short session id when a record survived the session's
+/// end (Failed/OOM leftovers); a clean exit removes the record and leaves
+/// nothing to point the user at.
+fn attach_goodbye_line(stop: AttachStop, selector: &str, inspect_id: Option<&str>) -> String {
+    match stop {
+        AttachStop::ClientDetached => format!("Detached from {selector}."),
+        AttachStop::SessionEnded => match inspect_id {
+            Some(id) => format!(
+                "Session ended: {selector}. Inspect output with `a capture {id} --screen --plain`."
+            ),
+            None => format!("Session ended: {selector}."),
+        },
+        AttachStop::WorkerError => format!("Attach dropped: {selector}."),
+        AttachStop::SocketLost => format!("Connection to {selector} lost."),
+    }
+}
+
 fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
     check_attachable(record)?;
     let explicit_history = history_bytes.is_some();
@@ -8005,9 +8065,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     let input_writer = writer.clone();
     let input_active = active.clone();
     // Set when THIS client ends its attach on purpose (Ctrl-b d, or its
-    // stdin hit EOF) as opposed to the session ending under it -- the
-    // difference between the "Detached from ..." and "Session ended ..."
-    // goodbye lines below.
+    // stdin hit EOF) as opposed to the session ending under it. Combined
+    // with `session_ended` / `worker_error` after the frame loop, this is
+    // what keeps "Detached from ..." off the connection-loss and
+    // worker-error paths -- see `classify_attach_stop`.
     let detached_by_client = Arc::new(AtomicBool::new(false));
     let input_detached = detached_by_client.clone();
     let input_paths = paths.clone();
@@ -8383,8 +8444,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
 
     // Whether the session ended while we were attached to it (worker sent
     // End/Exit) as opposed to the client leaving first -- drives the
-    // honest goodbye line after terminal restoration.
+    // honest goodbye line after terminal restoration. `worker_error` is the
+    // `ServerEvent::Error` arm: neither a detach nor a clean workload exit.
     let mut session_ended = false;
+    let mut worker_error = false;
     'session: loop {
         loop {
             let frame = match read_frame(&mut reader) {
@@ -8456,6 +8519,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         }
                         ServerEvent::Error { message } => {
                             eprintln!("[aplexer: {message}]");
+                            worker_error = true;
                             break;
                         }
                         // The workload reset margins or flipped alt-screen
@@ -8582,27 +8646,30 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     if display_tty {
         // After restoration, so the message lands on a clean cooked
         // terminal: what happened to the session, not just that the client
-        // came back -- "Detached" means it is still running, "Session
-        // ended" means the workload is gone. A clean exit (including
+        // came back. "Detached" means the client left and the session is
+        // still running; "Session ended" means the workload is gone; the
+        // worker-error and connection-loss lines say which layer failed
+        // instead of blaming the user's own detach. A clean exit (including
         // Ctrl-D) removes the record; only Failed/OOM leftovers remain to
         // inspect.
         let current_record = shared_record
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if session_ended {
-            if paths.record(current_record.id).exists() {
-                eprintln!(
-                    "Session ended: {}. Inspect output with `a capture {} --screen --plain`.",
-                    current_record.selector(),
-                    &current_record.id.to_string()[..8]
-                );
-            } else {
-                eprintln!("Session ended: {}.", current_record.selector());
-            }
-        } else {
-            eprintln!("Detached from {}.", current_record.selector());
-        }
+        let short_id = current_record.id.to_string();
+        let inspect_id = paths
+            .record(current_record.id)
+            .exists()
+            .then(|| &short_id[..8]);
+        let stop = classify_attach_stop(
+            session_ended,
+            detached_by_client.load(Ordering::Relaxed),
+            worker_error,
+        );
+        eprintln!(
+            "{}",
+            attach_goodbye_line(stop, &current_record.selector(), inspect_id)
+        );
     }
     Ok(())
 }
@@ -8611,6 +8678,44 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
 #[allow(clippy::items_after_test_module)]
 mod switching_tests {
     use super::*;
+
+    #[test]
+    fn attach_goodbye_distinguishes_detach_error_and_socket_loss() {
+        let selector = "/ws:tag";
+        assert_eq!(
+            attach_goodbye_line(classify_attach_stop(false, true, false), selector, None),
+            "Detached from /ws:tag."
+        );
+        assert_eq!(
+            attach_goodbye_line(classify_attach_stop(false, false, true), selector, None),
+            "Attach dropped: /ws:tag."
+        );
+        assert_eq!(
+            attach_goodbye_line(classify_attach_stop(false, false, false), selector, None),
+            "Connection to /ws:tag lost."
+        );
+        // Ctrl-b d shuts our own stream down, so the frame loop that follows
+        // it usually sees a reset too. Client intent must still win, or every
+        // deliberate detach would report a connection loss.
+        assert_eq!(
+            classify_attach_stop(false, true, true),
+            AttachStop::ClientDetached
+        );
+        // Session end is unchanged, including the two-way split on whether a
+        // record survived to be inspected.
+        assert_eq!(
+            attach_goodbye_line(classify_attach_stop(true, false, false), selector, None),
+            "Session ended: /ws:tag."
+        );
+        assert_eq!(
+            attach_goodbye_line(
+                classify_attach_stop(true, true, true),
+                selector,
+                Some("0a1b2c3d")
+            ),
+            "Session ended: /ws:tag. Inspect output with `a capture 0a1b2c3d --screen --plain`."
+        );
+    }
 
     #[test]
     fn control_deadline_bounds_a_silent_worker_and_streaming_can_clear_it() {
