@@ -1590,11 +1590,7 @@ fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
         client.wait_for_offset(b"B-PLAIN-MARK", switch_at, "session B's plain snapshot");
     let out = client.output();
     let transition = &out[switch_at..target_at];
-    for reset in [
-        b"\x1b[?1049l".as_slice(),
-        b"\x1b[?1000l".as_slice(),
-        b"\x1b[?1006l".as_slice(),
-    ] {
+    for reset in [b"\x1b[?1000l".as_slice(), b"\x1b[?1006l".as_slice()] {
         assert!(
             find_bytes(transition, reset).is_some(),
             "switch did not emit mode reset {:?} before B's snapshot marker; captured:\n{}",
@@ -1602,9 +1598,18 @@ fn switching_from_alt_mouse_session_neutralizes_modes_before_plain_snapshot() {
             escape(transition)
         );
     }
+    assert!(
+        find_bytes(transition, b"\x1b[?1049l").is_none(),
+        "switch must not pop the host back to the primary screen (that re-exposes \
+         pre-attach scrollback); captured:\n{}",
+        escape(transition)
+    );
 
     let host_after = host_terminal(&out, 24, 80);
-    assert!(!host_after.screen().alternate_screen());
+    assert!(
+        host_after.screen().alternate_screen(),
+        "the attach client holds the host on the alternate screen until detach"
+    );
     assert_eq!(
         host_after.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None

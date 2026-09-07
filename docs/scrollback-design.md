@@ -203,21 +203,29 @@ Be upfront in user docs about the semantics:
   fast-session-switching §5.2 (coordination note: whichever branch merges
   second folds this in — it is a 1-line prefix on an existing sequence).
 - **Forbidden, aplexer-originated:** `\x1b[3J` (erases the user's saved
-  lines — the exact asset this design exists to protect), RIS `\x1bc`
-  (already deliberately avoided, see `reset_terminal`'s doc comment), and
-  alternate-screen enter `\x1b[?1049h`/`\x1b[?47h` for aplexer's own UI
-  (primary-screen relay is what makes native scrollback accumulate at all).
+  lines — the exact asset this design exists to protect) and RIS `\x1bc`
+  (already deliberately avoided, see `reset_terminal`'s doc comment).
+- **Attach owns the host alternate screen.** Primary-screen relay mixed the
+  pre-attach `a` list into native scrollback, so scrolling up while attached
+  showed those rows on top of the live session. `a attach` now writes
+  `\x1b[?1049h` once at start (and `\x1b[?1049l` only on detach). Workload
+  1049h/1049l still update the client's screen model; they are stripped from
+  host writes so a TUI exiting alt-screen cannot reveal the primary list
+  mid-attach. The primary screen — and its history — is frozen underneath
+  until detach.
 
 ### 4.2 The relay itself: no workload-sequence filtering
 
 Is scrollback pollution ever the *workload's* fault, and should the client
-filter relayed bytes? **No filtering, by design.** Byte-preserving relay is a
+filter relayed bytes? **Almost none, by design.** Byte-preserving relay is a
 spec contract (spec.md §16.6 "Output capture is byte-preserving"), filtering
 would require exactly the escape-sequence parser v1 refuses to build, and a
 workload emitting e.g. `\x1b[3J` (some `clear` implementations do) affects
 the host terminal identically with or without aplexer in the middle. The
-pollution problem is purely aplexer-status-bar hygiene; the relay is already
-correct.
+one exception is alt-screen enter/exit (`CSI ? 1049/1047/1048/47 h/l`):
+those are stripped from host writes (not from the model) so attach can own
+the host alternate screen, per §4.1. Combined DECSET lists keep every other
+mode. The rest of the relay stays byte-preserving.
 
 ### 4.3 Keybinding: `Ctrl-b [` stays unbound (reserved)
 
@@ -341,8 +349,9 @@ re-implementing blindly.
    the bandwidth reason, this item is already done.
 3. **Grep-proof the forbidden sequences**: assert (code comment + a unit test
    over the client's emitted-sequence constants if practical) that no
-   client-originated write contains `\x1b[3J`, `\x1bc`, or `\x1b[?1049h`.
-   Today none does; the test is to keep it that way.
+   client-originated write contains `\x1b[3J` or `\x1bc`. `\x1b[?1049h` is
+   now the attach client's own enter (see §4.1); it must not appear in the
+   *relay* of workload bytes, which `HostAltHold` strips.
 4. **Empirical emulator matrix** (manual, ~15 min per emulator; record
    results in this doc's §3.3 table, replacing the confidence column):
    for each of GNOME Terminal (VTE), xterm, kitty, alacritty (+ whatever the

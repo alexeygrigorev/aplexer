@@ -55,7 +55,7 @@ a attach --workspace "$PWD" --tag shell
 # Ctrl-b d detaches without terminating the workload.
 ```
 
-**Scrolling back** uses the host terminal's own gesture (wheel, Shift+PageUp). It never blocks typing into the session. If the live view looks garbled after scrolling, **Ctrl-b r** repaints it from the session's current screen. Output from while you were detached is `a capture --bytes N | less -R`.
+**Scrolling back.** Attach holds the host terminal on the alternate screen, so the `a` session list (and anything else on the primary screen) stays frozen underneath and cannot mix into the live view when you scroll. Wheel / Shift+PageUp never block typing. If the live screen itself looks wrong, **Ctrl-b r** repaints it from the session's current screen. Output from while you were detached is `a capture --bytes N | less -R`. On detach the primary screen — and its history — comes back.
 
 The canonical identity printed by `start` is a UUID. Commands accept a full UUID, an unambiguous prefix, or `--workspace PATH --tag TAG`. Core commands include `start`, `list`/`snapshot`, `attach`, `send`, `capture`, `status`, `kill`, `forget`, `rename`, `engines`, `profiles`, `watch`, and `doctor`.
 
@@ -100,6 +100,8 @@ a new --engine shell      start and attach, with start's full flag surface
 a current                 which session is this shell inside?
 a keys                    the attach-mode key reference
 ```
+
+`a list --sort name|created|accessed|activity` reorders the workspace tree (newest first for the time keys). The choice is remembered, so the `[N]` numbers `a N` uses stay the ones you just saw. Relative times use two units when they help (`5d 5h ago`, `5h 1m ago`).
 
 `a 2`, `a 2 review`, and `a - [engine [tag]]` keep working as the compact forms of the same operations. The create verbs split cleanly: `here`/`a -` are **create-or-attach** (a live session with that tag is reattached), `new` is **always creates** (`--fresh` on `start`: a live holder moves the start to the next free `<tag>-2` suffix instead of refusing). The same `--fresh` flag is the machine path — `a --json start --workspace W --tag main --fresh` returns the record with the tag it actually claimed, so a client can add a session to a workspace without inventing unique names itself.
 

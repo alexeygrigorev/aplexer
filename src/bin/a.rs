@@ -4136,11 +4136,16 @@ fn relay_to_terminal(
     data: &[u8],
 ) -> io::Result<()> {
     let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
-    let rewritten = {
+    {
         let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
-        s.relay(data)
-    };
-    out.write_all(rewritten.as_deref().unwrap_or(data))?;
+        let rewritten = s.relay(data);
+        let src = rewritten.as_deref().unwrap_or(data);
+        if let Some(filtered) = s.filter_host(src) {
+            out.write_all(&filtered)?;
+        } else {
+            out.write_all(src)?;
+        }
+    }
     out.flush()
 }
 
@@ -4162,9 +4167,17 @@ fn feed_and_write(
             s.reset(rows, cols);
         }
         s.feed(payload);
+        if let Some(filtered) = s.filter_host(prefix) {
+            out.write_all(&filtered)?;
+        } else {
+            out.write_all(prefix)?;
+        }
+        if let Some(filtered) = s.filter_host(payload) {
+            out.write_all(&filtered)?;
+        } else {
+            out.write_all(payload)?;
+        }
     }
-    out.write_all(prefix)?;
-    out.write_all(payload)?;
     out.flush()
 }
 
@@ -4190,17 +4203,18 @@ const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[H\
 \x1b[?25h";
 
+/// Written once at attach start, before layout or the snapshot. Isolates the
+/// live session from the host's primary-screen scrollback (the `a` list).
+const ATTACH_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
 fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
-    // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): if
-    // the session was on the alternate screen -- whether entered by a
-    // reattach snapshot (section 6.2 step 1) or by live workload output
-    // while attached -- detaching must return the *host* terminal to its
-    // primary screen, otherwise the user's real terminal is left stuck on
-    // the alt screen after detach. A no-op on a host already on the primary
-    // screen. This does not conflict with docs/scrollback-design.md section
-    // 4.1's "no alt-screen for aplexer's own UI" rule: aplexer still never
-    // *enters* the alt screen for itself; this only ever *exits* one that
-    // the workload's own live behavior put the host into.
+    // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): the
+    // attach client holds the host on the alternate screen for the whole
+    // session (see `ATTACH_ALT_SCREEN_ENTER`) so the pre-attach primary
+    // scrollback -- typically the `a` list -- cannot mix into the live view.
+    // Detach must return the host to that primary screen.
+    // Workload-originated 1049l is stripped from the relay and never
+    // reaches the host; this write is the one exit that does.
     //
     // The snapshot path also reproduces every input mode tracked by vt100.
     // Disable all of their possible variants unconditionally: application
@@ -4694,6 +4708,10 @@ fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
         return None;
     }
     ctx.pending_refresh.store(false, Ordering::Relaxed);
+    let snapshot = {
+        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        screen.filter_host(&snapshot).unwrap_or(snapshot)
+    };
     let mut seq = snapshot;
     if let Some((geom, text)) = status_bar_render(ctx) {
         if let Some(bar) = status_bar_redraw_locked(ctx, geom, &text, true) {
@@ -5563,12 +5581,17 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         sync_deferred_since: Arc::new(Mutex::new(None)),
     };
 
-    // Reservation asserted *first* (docs/terminal-state-design.md section
-    // 6.3 step 3): a workload sub-range margin the snapshot itself
-    // re-establishes below (numerically within rows 1..rows-1, since the
-    // workload PTY is one row shorter) lands after and wins, while a
-    // default-margin workload leaves this reservation standing.
+    // Hold the host on the alternate screen for the whole attach, *before*
+    // DECSTBM or the snapshot write anything. The primary screen -- and the
+    // `a` list sitting on it -- stays frozen underneath, so host scrollback
+    // cannot mix those rows into the live view. Workload 1049h/1049l still
+    // update the model; `filter_host` keeps them off the wire.
     if display_tty {
+        workload_screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hold_host_on_alt_screen();
+        let _ = write_locked(&stdout, ATTACH_ALT_SCREEN_ENTER);
         if let Some((rows, cols)) = initial_geometry {
             apply_terminal_layout(&stdout, &term, &workload_screen, rows, cols);
         }
