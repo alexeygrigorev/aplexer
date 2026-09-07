@@ -2949,6 +2949,8 @@ pub struct History {
     persisted: Option<RecoveredHistory>,
     #[cfg(test)]
     data_bytes_written: u64,
+    #[cfg(test)]
+    append_failure: Option<i32>,
 }
 impl History {
     pub fn open(path: PathBuf, cap: usize) -> Result<Self> {
@@ -2994,6 +2996,8 @@ impl History {
             persisted,
             #[cfg(test)]
             data_bytes_written: 0,
+            #[cfg(test)]
+            append_failure: None,
         };
         if had_v2 && !marker_present {
             let commit = &history
@@ -3021,10 +3025,18 @@ impl History {
         }
         Ok(history)
     }
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure(&mut self, errno: i32) {
+        self.append_failure = Some(errno);
+    }
     /// Appends only to the in-memory ring. Persisting from this hot path can
     /// both throttle PTY output and turn a disk failure into a PTY failure,
     /// so the worker owns periodic and final `flush()` attempts separately.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(errno) = self.append_failure {
+            return Err(io::Error::from_raw_os_error(errno)).context("append history");
+        }
         let added = u64::try_from(data.len()).context("history append length does not fit u64")?;
         let next_end = self
             .observed_end

@@ -548,7 +548,12 @@ impl OutputHub {
     }
     fn append(&self, data: &[u8]) -> Result<()> {
         let mut inner = lock(&self.inner)?;
-        inner.history.append(data)?;
+        if let Err(error) = inner.history.append(data) {
+            // History is best-effort: a full disk must not look like a
+            // broken PTY. Live fan-out and the screen model still see this
+            // chunk; Status keeps using history_persistence_error.
+            record_history_persistence_error(&mut inner, error);
+        }
         let layout = inner.screen.process(data);
         // Ordering matters and is automatic: both sends go through the same
         // per-subscriber mpsc channel under the same lock hold, so a Layout
@@ -658,13 +663,7 @@ impl OutputHub {
                 Ok(())
             }
             Err(error) => {
-                let message = format!("{error:#}");
-                inner.history_persistence_error = Some(message.clone());
-                inner.history_retry_at = Instant::now() + inner.history_retry_delay;
-                inner.history_retry_delay = inner
-                    .history_retry_delay
-                    .saturating_mul(2)
-                    .min(HISTORY_RETRY_MAX);
+                let message = record_history_persistence_error(&mut inner, error);
                 Err(anyhow!(message))
             }
         }
@@ -771,6 +770,13 @@ impl OutputHub {
                 subscriber.terminate(terminal.clone());
             }
         }
+    }
+    #[cfg(test)]
+    fn inject_history_append_failure(&self, errno: i32) {
+        lock(&self.inner)
+            .expect("output hub lock")
+            .history
+            .inject_append_failure(errno);
     }
 }
 
@@ -1110,6 +1116,50 @@ mod tests {
             read_persisted_history_tail(&history_path, None).unwrap(),
             b"still-live"
         );
+    }
+
+    #[test]
+    fn history_append_failure_does_not_drop_subscribers_or_stop_live_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(&dir);
+        let (_, _, rx) = hub.subscribe(AttachPayload::Tail(None)).unwrap();
+
+        hub.inject_history_append_failure(libc::ENOSPC);
+        hub.append(b"still-live").unwrap();
+
+        let error = hub
+            .history_persistence_error()
+            .expect("append failure must set history_persistence_error");
+        assert!(
+            error.contains("No space left on device") || error.contains("os error 28"),
+            "unexpected history persistence error: {error}"
+        );
+        assert!(
+            !hub.inner.lock().unwrap().subscribers.is_empty(),
+            "history append failure must not drop attached clients"
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Data(data) if data == b"still-live"
+        ));
+        assert_eq!(
+            hub.inner.lock().unwrap().history_retry_delay,
+            HISTORY_RETRY_INITIAL
+                .saturating_mul(2)
+                .min(HISTORY_RETRY_MAX),
+            "append failure must use the same capped backoff as flush"
+        );
+
+        hub.append(b"and-more").unwrap();
+        assert!(matches!(
+            rx.recv().unwrap(),
+            OutputEvent::Data(data) if data == b"and-more"
+        ));
+        assert!(
+            !hub.inner.lock().unwrap().subscribers.is_empty(),
+            "a later chunk after append failure must still fan out"
+        );
+        assert!(hub.history_persistence_error().is_some());
     }
 
     #[test]
@@ -1653,6 +1703,17 @@ fn resize_screen_and_pty(
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| anyhow!("worker lock poisoned"))
+}
+
+fn record_history_persistence_error(inner: &mut HubInner, error: impl std::fmt::Display) -> String {
+    let message = format!("{error:#}");
+    inner.history_persistence_error = Some(message.clone());
+    inner.history_retry_at = Instant::now() + inner.history_retry_delay;
+    inner.history_retry_delay = inner
+        .history_retry_delay
+        .saturating_mul(2)
+        .min(HISTORY_RETRY_MAX);
+    message
 }
 
 /// Make the worker the reparenting boundary for daemonized workload
@@ -2737,8 +2798,10 @@ fn run_pty_reader(mut master: File, runtime: Arc<WorkerRuntime>, tx: mpsc::Sende
             Ok(n) => {
                 runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
                 if let Err(error) = runtime.output.append(&buffer[..n]) {
-                    let _ = tx.send(LifeEvent::PtyError(format!("persist output: {error:#}")));
-                    break;
+                    // Hub lock poison is the only remaining append error;
+                    // history write failures stay on history_persistence_error.
+                    // Never treat either as a PTY/workload failure.
+                    eprintln!("aplexer worker: append output: {error:#}");
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
