@@ -24,9 +24,6 @@ pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 /// maximum-sized frame adds memory/write amplification without a usable read
 /// path.
 pub const MAX_HISTORY_BYTES: usize = MAX_FRAME_BYTES;
-pub(crate) const MAX_CGROUP_RECOVERY_MEMBERS: usize = 4096;
-pub(crate) const MAX_CGROUP_PROCS_BYTES: u64 = 128 * 1024;
-pub(crate) const CGROUP_RECOVERY_FD_RESERVE: u64 = 16;
 pub fn validate_history_bytes(value: usize) -> Result<usize> {
     if value > MAX_HISTORY_BYTES {
         bail!("history_bytes {value} exceeds the maximum of {MAX_HISTORY_BYTES} bytes (16 MiB)");

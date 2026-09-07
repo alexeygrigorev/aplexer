@@ -14,6 +14,7 @@
 //! sketch this fills in, and section 20 for the agent-state vocabulary.
 
 use crate::*;
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};

@@ -52,8 +52,8 @@
 //!   skip the small deltas.
 
 use crate::watch::{iso8601_utc, UnifiedEvent};
-use crate::{atomic_write_json, engine_family, now_ms, Result, SessionRecord};
-use anyhow::{anyhow, bail, Context};
+use crate::{atomic_write_json, engine_family, now_ms, SessionRecord};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;

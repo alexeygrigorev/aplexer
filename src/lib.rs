@@ -43,20 +43,6 @@ pub use persist::{atomic_write_json, atomic_write_bytes, FileLock};
 #[cfg(feature = "python")]
 mod python;
 
-use anyhow::{anyhow, bail, Context, Result};
-use std::collections::BTreeSet;
-use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 #[cfg(test)]
 mod tests {
@@ -64,6 +50,18 @@ mod tests {
     use std::collections::BTreeMap;
     use std::env;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use anyhow::{anyhow, bail, Result};
+    use std::ffi::CString;
+    use std::fs::{self, OpenOptions};
+    use std::path::{Path, PathBuf};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
     use crate::paths::{absolute_override_path, absolute_xdg_path};
     use serde::Deserialize;
     use std::io::Write;
