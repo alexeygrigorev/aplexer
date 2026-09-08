@@ -1242,6 +1242,52 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
     let color = color_enabled();
     let now = now_ms();
 
+    // One query-time detection walk per record (`api::record_agent`, the same
+    // source every `a list --json` row's `agent` field carries), shared by the
+    // engine-column width computation and every row below -- the same
+    // probe-once shape the liveness map in cmd_list_plain has (PLAN P1.1).
+    //
+    // The walks run fan-out across cores: one session's tree walk is
+    // sub-millisecond, but a registry of process-heavy sessions (an agent
+    // mid-build has hundreds of descendants, and a no-agent session pays the
+    // full walk) made the serial loop the dominant cost of the whole command
+    // -- 83 of 95 ms on a live 17-session registry. Chunked scoped threads
+    // keep it a fraction of the /proc reads it is made of, with the same
+    // per-record answers as the serial order (each row's `agent` is
+    // independent of every other's).
+    let agents: BTreeMap<Uuid, Option<aplexer::agent_kind::AgentKind>> = {
+        let records: Vec<&SessionRecord> = groups
+            .iter()
+            .flat_map(|(_, sessions)| sessions.iter())
+            .collect();
+        let worker_count = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, records.len().max(1));
+        let chunk_size = records.len().div_ceil(worker_count);
+        thread::scope(|scope| {
+            let handles: Vec<_> = records
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|record| (record.id, aplexer::api::record_agent(record)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| {
+                    handle.join().expect(
+                        "agent detection worker panicked; detection is infallible by contract",
+                    )
+                })
+                .collect()
+        })
+    };
+
     for (workspace_index, (workspace, sessions)) in groups.iter().enumerate() {
         if workspace_index > 0 {
             println!();
@@ -1305,22 +1351,19 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         let engine_width = sessions
             .iter()
             .map(|record| {
-                terminal_display_width(&match &record.profile {
-                    Some(profile) => format!("{}/{}", record.engine, profile),
-                    None => record.engine.clone(),
-                })
+                terminal_display_width(&engine_label(
+                    record,
+                    agents.get(&record.id).copied().flatten(),
+                ))
             })
             .max()
             .unwrap_or(6)
-            .clamp(6, 22);
+            .clamp(6, 28);
         let last = sessions.len().saturating_sub(1);
         for (index, record) in sessions.iter().enumerate() {
             let (state, _, attention) = states[index];
             let connector = if index == last { "└─" } else { "├─" };
-            let engine = match &record.profile {
-                Some(profile) => format!("{}/{}", record.engine, profile),
-                None => record.engine.clone(),
-            };
+            let engine = engine_label(record, agents.get(&record.id).copied().flatten());
             let tag = paint(color, ANSI_BOLD, &fit_column(&record.tag, tag_width));
             let engine = paint(color, ANSI_DIM, &fit_column(&engine, engine_width));
             let (sdot, scolor) = state_glyph(state);
@@ -1503,6 +1546,34 @@ fn state_glyph(state: &str) -> (&'static str, &'static str) {
         "failed" | "broken" | "oom" => ("\u{2717}", ANSI_RED),
         _ => ("\u{25CB}", ANSI_GRAY), // "exited", "idle", "quiet"
     }
+}
+
+/// The status bar's animated state glyph: a braille spinner frame while the
+/// attached session's state is `working` -- a fresh `a state-report` push,
+/// i.e. the agent *said* it is running -- and `None` for every other state,
+/// meaning "keep `state_glyph`'s static glyph". Deliberately not `active`:
+/// that state is a PTY-recency guess (it fires while the user merely types
+/// at an agent TUI's prompt, and for any record with no activity sample at
+/// all), so spinning on it would promise work that is not happening. The
+/// reported state is the only signal that means "the agent is working" and
+/// not just "the terminal is warm"; without hooks installed the bar simply
+/// stays on its static glyph. So the bar only ever moves while there is
+/// work to point at: an idle, waiting, or dead session renders byte-stable
+/// text, and the dirty check in `draw_status_bar` keeps it write-free.
+///
+/// The frame index is a pure function of the wall clock, deliberately not
+/// thread-local counter state: the status thread, the frame loop's pending
+/// flush, and the input thread's flash redraw all render the bar
+/// independently, and this way any two calls within the same
+/// `SPINNER_FRAME_MS` window agree on the frame without sharing anything.
+/// (Sanitized-then-padded like all bar text, and the same width-1 as the
+/// `●` it replaces, so truncation math is unchanged.)
+fn spinner_frame(state: &str, now_ms: u64) -> Option<char> {
+    if state != "working" {
+        return None;
+    }
+    let idx = (now_ms / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    Some(SPINNER_FRAMES[idx])
 }
 
 /// The single human-facing state derivation: lifecycle facts first (a dead
@@ -2449,6 +2520,13 @@ fn cmd_status_tty(
     }
     println!("  workspace   {workspace}");
     println!("  engine      {engine}");
+    // Same display rule as the list and the attach status bar: the detected
+    // agent gets its own line only when the declared engine doesn't already
+    // name it (`api::record_agent`, the value `a status --json` reports as
+    // `agent`).
+    if let Some(agent) = extra_agent_label(current, aplexer::api::record_agent(current)) {
+        println!("  agent       {agent}");
+    }
     println!("  session     {}", current.id);
     if let Some(parent) = current.parent_session {
         // Same rendering rule as `a list`: the parent's tag while its
@@ -4641,6 +4719,21 @@ const STATUS_BAR_IDLE_GAP: Duration = Duration::from_millis(450);
 const STATUS_BAR_MAX_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
+/// While the attached session's state is `working` (a fresh `a state-report`
+/// push -- the agent said it is running; see `spinner_frame` for why the
+/// guessed `active` state deliberately does not animate), the state glyph
+/// becomes a braille spinner so the bar shows liveness a static state word
+/// cannot. The spinner is the only thing that moves: the rest of the bar is
+/// byte-identical frame to frame, so `draw_status_bar`'s dirty-check means
+/// the animation itself is the entire incremental write cost, and the
+/// instant the state word leaves working the glyph freezes back to
+/// `state_glyph`'s static one. One frame per `STATUS_BAR_POLL_INTERVAL`
+/// tick keeps the cadence aligned with the thread that drives it; ten
+/// frames is a 1.5s revolution -- standard spinner speed, deliberately
+/// unhurried.
+const SPINNER_FRAME_MS: u64 = STATUS_BAR_POLL_INTERVAL.as_millis() as u64;
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 /// How long a redraw may be held back purely because the workload has an
 /// unclosed synchronized-output block (`CSI ? 2026 h`).
 ///
@@ -5185,6 +5278,32 @@ fn live_status(record: &SessionRecord) -> Option<Value> {
     rpc_simple(record, Operation::Status, None).ok()
 }
 
+/// The attached session's record as the state derivation should see it.
+///
+/// `ctx.record` is a snapshot from attach/switch time, but state-report
+/// pushes land in the worker's in-memory record (and on disk) with no event
+/// reaching the attached client -- deriving the state from the snapshot
+/// alone would trust a push that is minutes old and miss every push made
+/// after attach, which is exactly the "agent started working while I
+/// watched" case the spinner exists for. The Status answer already
+/// serializes the worker's live record (`public_session_record`), so
+/// overlay its reported-state pair onto the snapshot. A missing field
+/// (older worker) or a failed RPC (`raw` None) leaves the snapshot
+/// untouched, same degradation as the memory indicator.
+fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> SessionRecord {
+    let mut fresh = record.clone();
+    let Some(raw) = raw else {
+        return fresh;
+    };
+    if let Some(s) = raw.get("reported_state").and_then(Value::as_str) {
+        fresh.reported_state = Some(s.to_string());
+    }
+    if let Some(ms) = raw.get("reported_state_at_ms").and_then(Value::as_u64) {
+        fresh.reported_state_at_ms = Some(ms);
+    }
+    fresh
+}
+
 /// Live memory indicator from the session's cgroup, if it has one -- a
 /// small "useful for our application" touch given aplexer's whole reason
 /// for existing is resource-isolated agent sessions. Best-effort: absence
@@ -5231,6 +5350,38 @@ fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
         return None;
     }
     Some(fg.to_string())
+}
+
+/// The detected agent's display name when it adds information beyond the
+/// declared engine, `None` when it doesn't. One display rule for every
+/// human surface (list rows, `a status`, the attach status bar): a session
+/// declared `engine: "claude"` that is running claude says "claude" once;
+/// a `shell` session running claude, or a `claude` session someone started
+/// codex inside, gets the detected name appended.
+fn extra_agent_label(
+    record: &SessionRecord,
+    detected: Option<aplexer::agent_kind::AgentKind>,
+) -> Option<&'static str> {
+    let agent = detected?;
+    (agent.name() != record.engine).then_some(agent.name())
+}
+
+/// The list/status engine cell: the declared `engine/profile` plus, when
+/// detection found a different live agent, the same ` -> agent` annotation
+/// `foreground_override` established for "what's actually running here"
+/// (e.g. `shell/default -> claude`).
+fn engine_label(
+    record: &SessionRecord,
+    detected: Option<aplexer::agent_kind::AgentKind>,
+) -> String {
+    let base = match &record.profile {
+        Some(profile) => format!("{}/{}", record.engine, profile),
+        None => record.engine.clone(),
+    };
+    match extra_agent_label(record, detected) {
+        Some(agent) => format!("{base} -> {agent}"),
+        None => base,
+    }
 }
 
 /// `{i}:{tag}[*][({state})]` for every session in the current workspace,
@@ -5503,11 +5654,11 @@ fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
 
 /// Status-bar text, adaptive by width. All layouts lead with identity and
 /// state -- the two things a returning human needs -- and drop detail from
-/// the right as the terminal narrows: full (workspace:tag, state,
-/// engine/foreground, memory, sibling list, help affordance), medium
-/// (tag-first), compact (tag + state + help), and a minimum that keeps
-/// state and `^b ?` alive on even a few columns. Renders a flashed message
-/// instead of all of these while one is active (section 6.1).
+/// the right as the terminal narrows: full (workspace:tag, state, detected
+/// agent, engine/foreground, memory, sibling list, help affordance), medium
+/// (tag-first), compact (tag + state + detected agent + help), and a minimum
+/// that keeps state and `^b ?` alive on even a few columns. Renders a flashed
+/// message instead of all of these while one is active (section 6.1).
 fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     {
         let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5530,19 +5681,40 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         None => record.engine.clone(),
     };
     let raw = live_status(&record);
-    if let Some(fg) = raw
+    // Which agent is live in this session right now -- the same query-time
+    // detection every JSON surface carries (`api::record_agent`): one walk
+    // of this session's own, shallow process tree per bar refresh, cheap
+    // next to the Status round-trip the bar already pays. When it names the
+    // same program as the live foreground read, the foreground annotation
+    // steps aside -- `claude  shell -> claude` would say claude twice -- so
+    // an agent not in the foreground (claude running, vim in front) shows
+    // both facts: `claude  shell -> vim`.
+    let agent = extra_agent_label(&record, aplexer::api::record_agent(&record));
+    let foreground = raw
         .as_ref()
         .and_then(|raw| foreground_override(&record, raw))
-    {
+        .filter(|fg| Some(fg.as_str()) != agent);
+    if let Some(fg) = foreground {
         ep.push_str(&format!(" -> {fg}"));
     }
+    let agent_segment = agent.map(|name| format!("  {name}")).unwrap_or_default();
     let mem = raw.as_ref().and_then(|raw| memory_indicator(&record, raw));
     let siblings = workspace_summary(ctx, &record);
-    let (state_word, _) = session_ui_state(&record, now_ms());
+    let state_record = overlay_reported_state(&record, raw.as_ref());
+    let now = now_ms();
+    let (state_word, _) = session_ui_state(&state_record, now);
     let (glyph, _) = state_glyph(state_word);
+    // Agent-busy states animate: the static dot is replaced by the current
+    // braille frame, and the bar starts moving (see the status thread's
+    // animation tick, which is what makes redraws actually happen at the
+    // frame rate even when the PTY itself is quiet).
+    let glyph = match spinner_frame(state_word, now) {
+        Some(frame) => frame.to_string(),
+        None => glyph.to_string(),
+    };
     let state = format!("{glyph} {}", state_word.to_uppercase());
 
-    let mut full = format!("{ws}:{}  {state}  {ep}", record.tag);
+    let mut full = format!("{ws}:{}  {state}{agent_segment}  {ep}", record.tag);
     if let Some(mem) = &mem {
         full.push_str(&format!("  mem {mem}"));
     }
@@ -5552,14 +5724,14 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     }
     full.push_str("  |  ^b ?");
 
-    let mut medium = format!("{}  {state}  {ep}", record.tag);
+    let mut medium = format!("{}  {state}{agent_segment}  {ep}", record.tag);
     if !siblings.is_empty() {
         medium.push_str("  |  ");
         medium.push_str(&siblings);
     }
     medium.push_str("  |  ^b ?");
 
-    let compact = format!("{}  {state}  ^b ?", record.tag);
+    let compact = format!("{}  {state}{agent_segment}  ^b ?", record.tag);
     let minimum = format!("{state}  ^b ?");
 
     let rendered = [full, medium, compact]
@@ -8697,6 +8869,10 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 .map(|t| *t)
                 .unwrap_or_else(|_| Instant::now());
             let mut drawn_for_current_idle = false;
+            // Whether the previous tick found the session agent-busy, so the
+            // spinner's stop gets one final freeze-frame draw (see the
+            // falling-edge note in the loop body).
+            let mut was_animating = false;
             while status_active.load(Ordering::Relaxed) {
                 thread::sleep(STATUS_BAR_POLL_INTERVAL);
                 let activity = match status_last_activity.lock() {
@@ -8736,7 +8912,41 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 flush_pending_layout(&thread_status_ctx);
                 let idle_for = activity.elapsed();
                 let overdue = last_draw.elapsed() >= STATUS_BAR_MAX_INTERVAL;
-                if (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
+                // While the attached session is agent-busy, the bar's state
+                // glyph is a spinner (`spinner_frame`) whose frame changes
+                // every SPINNER_FRAME_MS -- so "the text changed" becomes a
+                // redraw trigger of its own, independent of the PTY-activity
+                // debounce above. That is the point of the whole feature: the
+                // long silent stretch of a compute-bound tool call streams
+                // nothing, and without this branch the only remaining trigger
+                // would be the STATUS_BAR_MAX_INTERVAL forced tick, leaving
+                // the spinner visibly stuttering once every 3s. The
+                // dirty-check still guards the write itself: only the glyph
+                // segment differs frame to frame, and a tick whose frame was
+                // already flushed (a deferred write the frame loop performed)
+                // renders byte-identical text and costs nothing.
+                let animating = {
+                    let record = thread_status_ctx
+                        .record
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    spinner_frame(session_ui_state(&record, now_ms()).0, now_ms()).is_some()
+                };
+                // On the falling edge (work just stopped) draw once more even
+                // though the spinner no longer animates, so the glyph freezes
+                // back to its static form and the new state word lands within
+                // one poll tick instead of waiting out the 3s overdue bound.
+                // Unconditional on purpose: the last animation write was at
+                // most one frame ago, so any elapsed-time gate here would
+                // skip exactly the tick this exists for. The dirty-check
+                // still makes it a no-op when nothing actually changed.
+                let anim_due = animating || was_animating;
+                was_animating = animating;
+                if anim_due
+                    || (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle)
+                    || overdue
+                {
                     // `overdue` forces the write even if the text is
                     // unchanged -- see draw_status_bar's doc comment on why
                     // the margin-defense guarantee needs that. It does *not*
@@ -10747,6 +10957,233 @@ mod switching_tests {
         let flashed = status_bar_text(&ctx, 80);
         assert!(!flashed.chars().any(char::is_control), "{flashed:?}");
         assert!(!flashed.contains("\x1b[2J"), "{flashed:?}");
+    }
+
+    #[test]
+    fn agent_annotation_appears_only_when_it_adds_information() {
+        let mut record = mk_record("/ws", "t", Phase::Running);
+        assert_eq!(extra_agent_label(&record, None), None);
+
+        // A claude-engine session running claude already says claude ...
+        record.engine = "claude".to_string();
+        assert_eq!(
+            extra_agent_label(&record, Some(agent_kind::AgentKind::Claude)),
+            None
+        );
+        // ... but the same session running codex does not.
+        assert_eq!(
+            extra_agent_label(&record, Some(agent_kind::AgentKind::Codex)),
+            Some("codex")
+        );
+
+        // The engine cell annotates the declared engine/profile with the
+        // same ` -> agent` shape the foreground override established.
+        record.engine = "shell".to_string();
+        record.profile = Some("default".to_string());
+        assert_eq!(engine_label(&record, None), "shell/default");
+        assert_eq!(
+            engine_label(&record, Some(agent_kind::AgentKind::Claude)),
+            "shell/default -> claude"
+        );
+    }
+
+    /// A fake `claude` whose cmdline detection classifies, run as
+    /// `/bin/sh <script>` -- same script shape and same ETXTBSY reasoning as
+    /// `write_fake_claude` in tests/agent_detection.rs. The loop also
+    /// self-expires, so a test that panics before cleanup cannot leak an
+    /// immortal polling process.
+    fn spawn_fake_claude(dir: &Path) -> (PathBuf, std::process::Child) {
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("claude");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo running > \"$1\"\n\
+             i=0\n\
+             while [ -e \"$2\" ] && [ $i -lt 300 ]; do /bin/sleep 0.05; i=$((i+1)); done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let ready = dir.join("claude.ready");
+        let sentinel = dir.join("claude.keep-running");
+        fs::write(&sentinel, b"run").unwrap();
+        let child = Command::new("/bin/sh")
+            .arg(&script)
+            .arg(&ready)
+            .arg(&sentinel)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "fake claude never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+        (sentinel, child)
+    }
+
+    #[test]
+    fn status_bar_names_the_agent_running_in_a_shell_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sentinel, mut child) = spawn_fake_claude(dir.path());
+        let ctx = status_ctx_for_test(true);
+        ctx.record.lock().unwrap().workload_pid = Some(child.id());
+
+        // Full layout: the agent sits between the state and the engine cell.
+        let full = status_bar_text(&ctx, 256);
+        assert!(full.contains("\u{25cf} RUNNING  claude  shell"), "{full:?}");
+        // Narrow layout: the agent outlives the engine cell, same as the tag.
+        let compact = status_bar_text(&ctx, 32);
+        assert!(compact.contains("claude"), "{compact:?}");
+
+        fs::remove_file(&sentinel).unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn status_bar_does_not_repeat_an_agent_the_engine_already_names() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sentinel, mut child) = spawn_fake_claude(dir.path());
+        let ctx = status_ctx_for_test(true);
+        {
+            let mut record = ctx.record.lock().unwrap();
+            record.engine = "claude".to_string();
+            record.workload_pid = Some(child.id());
+        }
+
+        let full = status_bar_text(&ctx, 256);
+        assert!(full.contains("  claude  |  ^b ?"), "{full:?}");
+        assert!(!full.contains("claude  claude"), "{full:?}");
+
+        fs::remove_file(&sentinel).unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn spinner_frame_animates_only_the_reported_working_state() {
+        // `working` is the one state that means "the agent said it is
+        // running right now" (a fresh state-report push) -- the only one the
+        // spinner may run for. `active` is deliberately absent: it is a
+        // PTY-recency guess that also fires while the user types at a
+        // prompt, and for records with no activity sample at all.
+        for t in [0, 123_456_789] {
+            assert!(
+                spinner_frame("working", t).is_some(),
+                "working should animate"
+            );
+        }
+        // Everything else stays on `state_glyph`'s static glyph -- the bar
+        // must be motionless for an idle, waiting, or dead session, which is
+        // the "only when it's running" half of the feature.
+        for state in [
+            "active", "running", "waiting", "idle", "quiet", "starting", "stopping", "broken",
+            "exited", "oom", "failed",
+        ] {
+            assert_eq!(spinner_frame(state, 0), None, "{state} must not animate");
+            assert_eq!(
+                spinner_frame(state, 123_456_789),
+                None,
+                "{state} must not animate"
+            );
+        }
+    }
+
+    #[test]
+    fn spinner_frame_is_a_pure_function_of_the_wall_clock() {
+        // The status thread, the frame loop's pending flush, and the input
+        // thread's flash redraw all render the bar independently; they must
+        // agree on the frame within one SPINNER_FRAME_MS window without any
+        // shared counter state.
+        let base = 1_000_100; // not a multiple of SPINNER_FRAME_MS
+        let window = base / SPINNER_FRAME_MS;
+        assert_eq!(
+            spinner_frame("working", base),
+            Some(SPINNER_FRAMES[(window as usize) % SPINNER_FRAMES.len()])
+        );
+        // Both ends of the same window land on the same frame...
+        assert_eq!(
+            spinner_frame("working", window * SPINNER_FRAME_MS),
+            spinner_frame("working", window * SPINNER_FRAME_MS + SPINNER_FRAME_MS - 1)
+        );
+        // ...and one full revolution later the frame wraps back around.
+        assert_eq!(
+            spinner_frame("working", base),
+            spinner_frame(
+                "working",
+                base + SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u64
+            )
+        );
+    }
+
+    #[test]
+    fn state_derivation_sees_the_worker_s_fresh_push_not_the_attach_snapshot() {
+        let ctx = status_ctx_for_test(true);
+        let now = now_ms();
+        let record = {
+            let mut record = ctx.record.lock().unwrap().clone();
+            record.reported_state = Some("working".to_string());
+            // A push from a minute before attach: stale now, so the
+            // snapshot alone must not read as working.
+            record.reported_state_at_ms = Some(now.saturating_sub(60_000));
+            record
+        };
+        // No Status answer (worker briefly unreachable): snapshot stands.
+        assert_eq!(
+            session_ui_state(&overlay_reported_state(&record, None), now).0,
+            "running"
+        );
+        // The worker's live copy says the agent started working *after*
+        // attach -- the case the spinner exists for.
+        let raw = serde_json::json!({"reported_state": "working", "reported_state_at_ms": now});
+        assert_eq!(
+            session_ui_state(&overlay_reported_state(&record, Some(&raw)), now).0,
+            "working"
+        );
+        // An older worker that omits the fields leaves the snapshot alone.
+        let overlay = overlay_reported_state(&record, Some(&serde_json::json!({"cgroup": {}})));
+        assert_eq!(overlay.reported_state.as_deref(), Some("working"));
+        assert_eq!(
+            overlay.reported_state_at_ms,
+            Some(now.saturating_sub(60_000))
+        );
+    }
+
+    #[test]
+    fn status_bar_spins_only_while_the_agent_is_working() {
+        let ctx = status_ctx_for_test(true);
+        let now = now_ms();
+        {
+            let mut record = ctx.record.lock().unwrap();
+            record.reported_state = Some("working".to_string());
+            record.reported_state_at_ms = Some(now);
+        }
+        let full = status_bar_text(&ctx, 256);
+        assert!(full.contains(" WORKING"), "{full:?}");
+        assert!(
+            full.chars().any(|c| SPINNER_FRAMES.contains(&c)),
+            "a working session's bar should carry a spinner frame: {full:?}"
+        );
+        assert!(
+            !full.contains('\u{25cf}'),
+            "the static dot must yield to the spinner: {full:?}"
+        );
+
+        // Once the push goes stale the shell-engine fallback is "running"
+        // again: the bar freezes back to the static dot, no motion.
+        {
+            let mut record = ctx.record.lock().unwrap();
+            record.reported_state_at_ms = Some(now.saturating_sub(8_001));
+        }
+        let full = status_bar_text(&ctx, 256);
+        assert!(
+            full.contains("\u{25cf} RUNNING"),
+            "a stale push falls back to the static glyph: {full:?}"
+        );
+        assert!(
+            !full.chars().any(|c| SPINNER_FRAMES.contains(&c)),
+            "no spinner may survive the stale push: {full:?}"
+        );
     }
 
     #[test]

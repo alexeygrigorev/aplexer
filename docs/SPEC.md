@@ -1165,6 +1165,17 @@ process tree. Three consequences are deliberate:
 - A record with a terminal `phase` is never probed. Its `workload_pid` names
   a process that is gone, and a recycled numeric pid must not resurrect an
   agent for a dead session.
+The same detection feeds the human surfaces, under one display rule: an
+agent that the declared engine does not already name is shown, and one that
+it does name is not repeated. `a list` annotates the engine cell as
+`engine/profile -> agent`; `a status` reports it on an `agent` line; the
+attach status bar carries it between the state and the engine segment,
+stepping the live foreground annotation aside when the two name the same
+program, so an agent running behind a foreground `vim` reads
+`claude  shell -> vim`. The display costs one process-tree walk per session
+per render -- the same query-time price the JSON field already pays -- and
+is never persisted.
+
 
 The schema must support deterministic reverse lookups by:
 
