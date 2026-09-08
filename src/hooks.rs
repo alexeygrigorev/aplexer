@@ -326,13 +326,22 @@ pub fn merge_nested_hooks(doc: &mut Value, events: &[(&str, &str)], a_bin: &str)
 /// Remove every state-report hook entry from the given events. Drops
 /// emptied groups, events, and the top-level `hooks` object when we
 /// emptied them. Returns true when anything changed.
-pub fn unmerge_nested_hooks(doc: &mut Value, events: &[&str]) -> bool {
+/// Removes every `state-report` hook from a nested hooks document, keyed by
+/// the ours-by-content command match alone, across ALL event groups -- not
+/// just the events the current install tables name. The event tables change
+/// between releases (SubagentStop was unmapped from `idle` in 2026-09); an
+/// uninstall that iterated only the current names would leave a retired
+/// event's entry behind forever, pushing state from an event this version no
+/// longer believes in. Foreign commands (no `state-report` in them) are
+/// never touched, whatever the event.
+pub fn unmerge_nested_hooks(doc: &mut Value) -> bool {
     let Some(hooks) = doc.get_mut("hooks").and_then(Value::as_object_mut) else {
         return false;
     };
     let mut changed = false;
+    let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
-        let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+        let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
             continue;
         };
         let before = groups.len();
@@ -367,9 +376,9 @@ pub fn unmerge_nested_hooks(doc: &mut Value, events: &[&str]) -> bool {
         }
         let _ = before;
         if kept.is_empty() {
-            hooks.remove(*event);
+            hooks.remove(&event);
         } else {
-            hooks.insert((*event).to_string(), Value::Array(kept));
+            hooks.insert(event, Value::Array(kept));
         }
     }
     if hooks.is_empty() {
@@ -671,12 +680,12 @@ fn check_nested_file(path: &Path, events: &[(&str, &str)]) -> (bool, String) {
     }
 }
 
-fn uninstall_nested_file(path: &Path, event_names: &[&str]) -> Result<(bool, String)> {
+fn uninstall_nested_file(path: &Path) -> Result<(bool, String)> {
     if !path.exists() {
         return Ok((false, format!("{} not present", path.display())));
     }
     let mut doc = read_json_or_default(path)?;
-    if !unmerge_nested_hooks(&mut doc, event_names) {
+    if !unmerge_nested_hooks(&mut doc) {
         return Ok((false, format!("no hook in {}", path.display())));
     }
     write_if_changed(path, &render_json(&doc)?)?;
@@ -965,19 +974,17 @@ fn check_opencode(targets: &HookTargets) -> EngineInitStatus {
 }
 
 fn uninstall_claude(targets: &HookTargets) -> EngineInitStatus {
-    let names = event_names(&CLAUDE_EVENTS);
-    uninstall_nested_driver("claude", &targets.claude_settings, &names)
+    uninstall_nested_driver("claude", &targets.claude_settings)
 }
 
 fn uninstall_codex(targets: &HookTargets) -> EngineInitStatus {
-    let names = event_names(&CODEX_EVENTS);
     let mut changed_any = false;
     let mut messages = Vec::new();
     let mut paths = Vec::new();
     for dir in &targets.codex_dirs {
         let hooks_path = dir.join(CODEX_HOOKS_FILENAME);
         paths.push(hooks_path.display().to_string());
-        match uninstall_nested_file(&hooks_path, &names) {
+        match uninstall_nested_file(&hooks_path) {
             Ok((changed, message)) => {
                 changed_any |= changed;
                 messages.push(message);
@@ -1045,12 +1052,7 @@ fn uninstall_grok(targets: &HookTargets) -> EngineInitStatus {
 }
 
 fn uninstall_gemini(targets: &HookTargets) -> EngineInitStatus {
-    let names = event_names(&GEMINI_EVENTS);
-    uninstall_nested_driver(
-        "gemini",
-        std::slice::from_ref(&targets.gemini_settings),
-        &names,
-    )
+    uninstall_nested_driver("gemini", std::slice::from_ref(&targets.gemini_settings))
 }
 
 fn uninstall_opencode(targets: &HookTargets) -> EngineInitStatus {
@@ -1083,11 +1085,11 @@ fn uninstall_opencode(targets: &HookTargets) -> EngineInitStatus {
     }
 }
 
-fn uninstall_nested_driver(engine: &str, files: &[PathBuf], names: &[&str]) -> EngineInitStatus {
+fn uninstall_nested_driver(engine: &str, files: &[PathBuf]) -> EngineInitStatus {
     let mut changed_any = false;
     let mut messages = Vec::new();
     for path in files {
-        match uninstall_nested_file(path, names) {
+        match uninstall_nested_file(path) {
             Ok((changed, message)) => {
                 changed_any |= changed;
                 messages.push(message);
@@ -1284,7 +1286,7 @@ mod tests {
     #[test]
     fn unmerge_removes_only_ours_and_drops_emptied_keys() {
         let mut doc = merged(&CLAUDE_EVENTS, json!({}));
-        assert!(unmerge_nested_hooks(&mut doc, &event_names(&CLAUDE_EVENTS)));
+        assert!(unmerge_nested_hooks(&mut doc));
         // Whole `hooks` object is gone: we created every key in it.
         assert_eq!(doc, json!({}));
     }
@@ -1303,12 +1305,45 @@ mod tests {
             }
         });
         let mut doc = start;
-        assert!(unmerge_nested_hooks(&mut doc, &["Stop"]));
+        assert!(unmerge_nested_hooks(&mut doc));
         assert_eq!(
             doc["hooks"]["Stop"],
             json!([{
                 "matcher": "x",
                 "hooks": [{"type": "command", "command": "my-linter"}]
+            }])
+        );
+    }
+
+    #[test]
+    fn unmerge_sweeps_retired_events_but_leaves_foreign_hooks_there() {
+        // SubagentStop was unmapped from `idle` in 2026-09. An uninstall
+        // keyed on the current install tables would never visit its group,
+        // leaving our entry pushing idle from an event this version no
+        // longer believes in -- while a foreign program's SubagentStop hook
+        // in the same document must survive untouched.
+        let start = json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{"type": "command", "command": "a state-report idle || true"}]
+                }],
+                "SubagentStop": [{
+                    "hooks": [
+                        {"type": "command", "command": "python3 /opt/pocketshell/hooks/claude_hook.py"},
+                        {"type": "command", "command": "/usr/local/bin/a state-report idle || true"}
+                    ]
+                }]
+            }
+        });
+        let mut doc = start;
+        assert!(unmerge_nested_hooks(&mut doc));
+        assert!(doc["hooks"].get("Stop").is_none());
+        assert_eq!(
+            doc["hooks"]["SubagentStop"],
+            json!([{
+                "hooks": [
+                    {"type": "command", "command": "python3 /opt/pocketshell/hooks/claude_hook.py"}
+                ]
             }])
         );
     }
