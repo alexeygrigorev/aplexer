@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::api::{self, StartRequest};
-use crate::{absolute_override_path, absolute_xdg_path, home_dir, Paths};
+use crate::paths::{absolute_override_path, absolute_xdg_path, home_dir, Paths};
 
 fn py_err(err: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(err.to_string())

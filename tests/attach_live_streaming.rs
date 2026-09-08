@@ -354,6 +354,7 @@ fn divergence_report(host: &Rendering, worker: &Rendering) -> Option<String> {
 /// Polls both screens until they agree (the worker is always at or ahead of
 /// the host by construction, so a transient in-flight difference is waited
 /// out); on timeout, fails with the diverging rows.
+#[allow(clippy::too_many_arguments)]
 fn assert_eventual_agreement(
     client: &PtyClient,
     harness: &Harness,

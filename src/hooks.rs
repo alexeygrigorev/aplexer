@@ -696,10 +696,6 @@ fn uninstall_nested_file(path: &Path) -> Result<(bool, String)> {
 // Per-engine drivers
 // ---------------------------------------------------------------------------
 
-fn event_names<'a>(events: &[(&'a str, &'a str)]) -> Vec<&'a str> {
-    events.iter().map(|(e, _)| *e).collect()
-}
-
 fn install_claude(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
     let mut changed_any = false;
     let mut messages = Vec::new();
