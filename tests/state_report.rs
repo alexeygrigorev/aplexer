@@ -1,13 +1,16 @@
 // Integration test for `a state-report` (docs/pocketshell-integration-plan.md
 // Open question #2, "Agent-state ingestion"): a hook running inside a
 // session pushes its own semantic state, and `a watch --jsonl`'s
-// `agent.state` event must reflect it -- authoritative while fresh, falling
-// back to the PTY-recency heuristic once the staleness window elapses with
-// no PTY activity and no further push. See src/watch.rs's
-// `fresh_reported_state`/`derive_agent_state_with_source` for the exact
-// merge rule and its unit tests for the boundary cases; this test proves
-// the real end-to-end pipeline (worker RPC -> persisted session.json ->
-// `a watch`'s poll -> JSONL) rather than re-deriving that logic.
+// `agent.state` event must reflect it -- authoritative while fresh for
+// `working`/`waiting` (falling back to the PTY-recency heuristic once the
+// staleness window elapses), and for `idle` authoritative until the PTY
+// contradicts it: however long the session stays silent, a rest keeps its
+// `reported` source, and new PTY output hands control back to the
+// heuristic. See src/watch.rs's `fresh_reported_state`/
+// `derive_agent_state_with_source` for the exact merge rule and its unit
+// tests for the boundary cases; these tests prove the real end-to-end
+// pipeline (worker RPC -> persisted session.json -> `a watch`'s poll ->
+// JSONL) rather than re-deriving that logic.
 //
 // Follows the harness style of tests/rename_uniqueness.rs (direct-CLI
 // harness) and tests/transcript_live.rs (a spawned `--follow`-style
@@ -109,6 +112,10 @@ impl Harness {
     }
 
     fn start(&mut self, workspace: &Path, tag: &str) -> Value {
+        self.start_command(workspace, tag, &["/bin/sleep", "300"])
+    }
+
+    fn start_command(&mut self, workspace: &Path, tag: &str, command: &[&str]) -> Value {
         let output = self.run_ok(
             &[
                 "--json",
@@ -118,9 +125,11 @@ impl Harness {
                 "--tag",
                 tag,
                 "--",
-                "/bin/sleep",
-                "300",
-            ],
+            ]
+            .iter()
+            .chain(command.iter())
+            .copied()
+            .collect::<Vec<_>>(),
             LIVENESS_BACKSTOP,
         );
         let record: Value = serde_json::from_slice(&output.stdout).expect("start record JSON");
@@ -384,26 +393,26 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
         is_created(e, &id)
     });
 
-    // Push a value the PTY-recency heuristic could never produce by itself
-    // for a silent /bin/sleep workload (its own default is "running", never
-    // "idle") -- so a matching agent.state event unambiguously proves the
-    // push reached `a watch`, not a heuristic coincidence.
-    h.state_report(&id, "idle");
+    // Push `waiting`: a value the heuristic cannot produce for this
+    // fixture (a silent /bin/sleep with no activity sample reads
+    // "running", never "waiting"), so a matching agent.state event
+    // unambiguously proves the push reached `a watch` rather than a
+    // heuristic coincidence. (`working` would fold onto the heuristic's
+    // own "running" and emit no transition at all; `idle` no longer
+    // expires -- see the tests below.)
+    h.state_report(&id, "waiting");
 
     let reported_deadline = Instant::now() + LIVENESS_BACKSTOP;
     let reported_event = wait_for(
         &watch,
         reported_deadline,
-        "reported agent.state=idle",
+        "reported agent.state=waiting",
         |e| {
             e["metadata"]["event"] == "agent.state"
                 && e["metadata"]["session_id"] == id
-                && e["metadata"]["state"] == "idle"
+                && e["metadata"]["state"] == "waiting"
+                && e["metadata"]["state_source"] == "reported"
         },
-    );
-    assert_eq!(
-        reported_event["metadata"]["state_source"], "reported",
-        "a fresh push must be tagged state_source=reported: {reported_event:#?}"
     );
     let reported_sequence = reported_event["sequence"].as_u64().expect("sequence");
 
@@ -440,6 +449,133 @@ fn state_report_is_authoritative_then_falls_back_to_heuristic_once_stale() {
     assert!(
         states.len() >= 2,
         "expected at least the reported and fallback events: {states:#?}"
+    );
+}
+
+/// The other half of the merge rule, and the point of the 2026-09 change:
+/// unlike `working`/`waiting`, an `idle` push has no follow-up hook to
+/// refresh it -- the next push fires only when the agent works again -- so
+/// it is NOT expired by the clock. A session resting at its prompt must
+/// keep reading `idle`/`reported` however old the push gets; windowing it
+/// like the other values is what made every resting agent flip back to a
+/// bogus `running` (the shell lifecycle fallback) eight seconds after each
+/// turn ended.
+#[test]
+fn reported_idle_stays_authoritative_while_the_pty_stays_quiet() {
+    let mut h = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let watch = h.spawn_watch_all();
+    h.await_watch_ready(&watch, workspace.path());
+
+    let record = h.start(workspace.path(), "state-report-idle-rest");
+    let id = record["id"].as_str().expect("session id").to_string();
+
+    let created_deadline = Instant::now() + LIVENESS_BACKSTOP;
+    wait_for(&watch, created_deadline, "session.created", |e| {
+        is_created(e, &id)
+    });
+
+    // `idle` is a value the heuristic can never produce by itself, so a
+    // matching agent.state event unambiguously proves the push arrived.
+    h.state_report(&id, "idle");
+    let reported_deadline = Instant::now() + LIVENESS_BACKSTOP;
+    let reported_event = wait_for(
+        &watch,
+        reported_deadline,
+        "reported agent.state=idle",
+        |e| {
+            e["metadata"]["event"] == "agent.state"
+                && e["metadata"]["session_id"] == id
+                && e["metadata"]["state"] == "idle"
+                && e["metadata"]["state_source"] == "reported"
+        },
+    );
+    assert_eq!(
+        reported_event["metadata"]["state_source"], "reported",
+        "a fresh push must be tagged state_source=reported: {reported_event:#?}"
+    );
+
+    // Past the working/waiting staleness window, with the PTY silent
+    // (/bin/sleep never outputs): the rest must still be the session's
+    // latest state, and no heuristic event may supersede it. A few poll
+    // intervals past the window is long enough for a watcher that would
+    // expire the push to have spoken.
+    thread::sleep(Duration::from_millis(REPORTED_STATE_STALE_MS + 1_500));
+    let settle_deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < settle_deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let all = watch.snapshot();
+    let states = agent_state_events(&all, &id);
+    let latest = states
+        .last()
+        .expect("at least the reported idle event must exist");
+    assert_eq!(
+        latest["metadata"]["state"], "idle",
+        "the rest must still be the latest known state: {states:#?}"
+    );
+    assert_eq!(
+        latest["metadata"]["state_source"], "reported",
+        "the rest must still be `reported`, not a heuristic guess: {states:#?}"
+    );
+}
+
+/// A rest is retracted by evidence, not by time: once PTY output lands
+/// after an `idle` push, the heuristic owns the state again. This is the
+/// end-to-end form of `watch::IDLE_ACTIVITY_GRACE_MS`'s invalidation rule,
+/// driven by a workload that actually talks to its PTY.
+#[test]
+fn pty_output_after_an_idle_push_hands_control_back_to_the_heuristic() {
+    let mut h = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let watch = h.spawn_watch_all();
+    h.await_watch_ready(&watch, workspace.path());
+
+    let record = h.start_command(
+        workspace.path(),
+        "state-report-idle-output",
+        &["/bin/sh", "-c", "while :; do echo tick; sleep 1; done"],
+    );
+    let id = record["id"].as_str().expect("session id").to_string();
+
+    let created_deadline = Instant::now() + LIVENESS_BACKSTOP;
+    wait_for(&watch, created_deadline, "session.created", |e| {
+        is_created(e, &id)
+    });
+
+    h.state_report(&id, "idle");
+    let reported_deadline = Instant::now() + LIVENESS_BACKSTOP;
+    let reported_event = wait_for(
+        &watch,
+        reported_deadline,
+        "reported agent.state=idle",
+        |e| {
+            e["metadata"]["event"] == "agent.state"
+                && e["metadata"]["session_id"] == id
+                && e["metadata"]["state"] == "idle"
+                && e["metadata"]["state_source"] == "reported"
+        },
+    );
+    let reported_sequence = reported_event["sequence"].as_u64().expect("sequence");
+
+    // The session echoes every second, so within a couple of polls a tick
+    // lands beyond IDLE_ACTIVITY_GRACE_MS after the push and the heuristic
+    // -- whose "output just now" answer is `running` -- must take over.
+    let fallback_deadline = Instant::now() + LIVENESS_BACKSTOP;
+    let fallback_event = wait_for(
+        &watch,
+        fallback_deadline,
+        "heuristic agent.state after post-push output",
+        |e| {
+            e["metadata"]["event"] == "agent.state"
+                && e["metadata"]["session_id"] == id
+                && e["metadata"]["state_source"] == "heuristic"
+                && e["sequence"].as_u64().unwrap_or(0) > reported_sequence
+        },
+    );
+    assert_eq!(
+        fallback_event["metadata"]["state"], "running",
+        "fresh PTY output means activity, whatever the resting push said: {fallback_event:#?}"
     );
 }
 

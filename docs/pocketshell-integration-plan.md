@@ -529,8 +529,11 @@ Example lines:
    aplexer's own machine setup, alongside `a start`/`a launch-exec`'s
    launch ownership, rather than as a PocketShell-side concern.
    `a init` merges a `state-report` hook into every engine aplexer
-   launches — Claude `Stop`/`SubagentStop`→`idle`,
-   `Notification`→`waiting`, `UserPromptSubmit`/`SessionStart`→`working`;
+   launches — Claude `Stop`→`idle`,
+   `Notification`→`waiting`, `UserPromptSubmit`/`SessionStart`→`working`
+   (`SubagentStop` deliberately unmapped: a subagent finishing does not
+   leave the agent idle, and a mid-turn `idle` push is the one lie no
+   follow-up hook corrects);
    Codex `hooks.json` (`Stop`, `UserPromptSubmit`, `SessionStart`) plus
    legacy `notify` when absent (never clobbering a foreign program such as
    PocketShell's own handler); OpenCode plugin (`session.idle`→`idle`,

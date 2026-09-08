@@ -1590,8 +1590,10 @@ fn spinner_frame(state: &str, now_ms: u64) -> Option<char> {
 ///   `active`, silence is `quiet` -- deliberately NOT `waiting`, because
 ///   "the terminal went quiet" cannot tell a blocked agent from a long
 ///   compute step
-/// - a plain shell with no fresh push is just `running` no matter how quiet
-///   its PTY is
+/// - a plain shell that never reported any agent state is just `running`
+///   no matter how quiet its PTY is; a shell an agent has lived in (any
+///   state-report push in its history) gets the same activity words as a
+///   first-class engine once nothing is fresh
 ///
 /// Returns `(state, source)` where source is `reported`, `activity`, or
 /// `lifecycle`, so callers can qualify inferred states instead of faking
@@ -1647,7 +1649,14 @@ fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static
                     _ => (state, source),
                 };
             }
-            if record.engine == "shell" {
+            // A shell an agent has lived in (any state-report push in the
+            // record's history) is not a "plain shell": when nothing is
+            // fresh, its quiet is an agent sitting at a prompt or thinking,
+            // not a shell doing work, so it gets the same honest activity
+            // words as a first-class engine. Only a shell that never
+            // reported anything keeps the lifecycle `running` -- for a bare
+            // prompt (or `tail -f`) that really is all that is known.
+            if record.engine == "shell" && record.reported_state.is_none() {
                 return ("running", "lifecycle");
             }
             match (state, source) {
@@ -5287,9 +5296,15 @@ fn live_status(record: &SessionRecord) -> Option<Value> {
 /// after attach, which is exactly the "agent started working while I
 /// watched" case the spinner exists for. The Status answer already
 /// serializes the worker's live record (`public_session_record`), so
-/// overlay its reported-state pair onto the snapshot. A missing field
-/// (older worker) or a failed RPC (`raw` None) leaves the snapshot
-/// untouched, same degradation as the memory indicator.
+/// overlay its reported-state pair and its activity stamp onto the
+/// snapshot: the activity stamp is half of the `idle` push's validity rule
+/// (`watch::fresh_reported_state` retracts a resting push once newer PTY
+/// output appears), so deriving from the attach-time stamp would judge
+/// every post-attach rest against pre-attach output -- an agent that went
+/// back to work after attach would keep its stale `idle` claim forever
+/// from the bar's point of view. A missing field (older worker) or a
+/// failed RPC (`raw` None) leaves the snapshot untouched, same degradation
+/// as the memory indicator.
 fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> SessionRecord {
     let mut fresh = record.clone();
     let Some(raw) = raw else {
@@ -5300,6 +5315,9 @@ fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> Sessio
     }
     if let Some(ms) = raw.get("reported_state_at_ms").and_then(Value::as_u64) {
         fresh.reported_state_at_ms = Some(ms);
+    }
+    if let Some(ms) = raw.get("last_activity_ms").and_then(Value::as_u64) {
+        fresh.last_activity_ms = Some(ms);
     }
     fresh
 }
@@ -9574,7 +9592,8 @@ mod switching_tests {
     #[test]
     fn ui_state_does_not_guess_agent_semantics_for_shells_or_corpses() {
         let now: u64 = 20_000;
-        // A plain shell stays `running` however quiet its PTY is.
+        // A plain shell (no agent-state push ever) stays `running` however
+        // quiet its PTY is.
         let mut record = mk_record("/ws/state", "shell", Phase::Running);
         record.last_activity_ms = Some(now.saturating_sub(60_000));
         assert_eq!(session_ui_state(&record, now), ("running", "lifecycle"));
@@ -9591,11 +9610,19 @@ mod switching_tests {
         record.reported_state = Some("working".to_string());
         assert_eq!(session_ui_state(&record, now), ("working", "reported"));
 
-        // A stale push falls back to plain `running` for shells (no
-        // activity words: those would claim an agent the record cannot
-        // see).
+        // A stale push no longer falls back to plain `running`: a shell an
+        // agent has lived in gets the same activity words as a first-class
+        // engine once nothing is fresh. Its long-quiet PTY is an agent
+        // resting at a prompt (or thinking), not a shell doing work.
         record.reported_state_at_ms = Some(now.saturating_sub(60_000));
-        assert_eq!(session_ui_state(&record, now), ("running", "lifecycle"));
+        assert_eq!(session_ui_state(&record, now), ("quiet", "activity"));
+
+        // And an idle push with no PTY output since it landed stays
+        // authoritative however old it gets -- a rest has no follow-up
+        // push to refresh it, so expiring it on the clock is what made
+        // resting agents read RUNNING.
+        record.reported_state = Some("idle".to_string());
+        assert_eq!(session_ui_state(&record, now), ("idle", "reported"));
 
         // Non-terminal phase + dead worker = broken, regardless of what the
         // record still claims or what was last reported.
@@ -9606,7 +9633,6 @@ mod switching_tests {
         corpse.reported_state_at_ms = Some(now);
         assert_eq!(session_ui_state(&corpse, now), ("broken", "lifecycle"));
         assert!(ui_state_needs_attention("broken"));
-
         // ... but a Starting record with no worker pid yet is the shape
         // every healthy `a start` persists first, and the TTY UI must not
         // paint that as a corpse (issue #9). Age is the only thing that
@@ -9626,6 +9652,56 @@ mod switching_tests {
             session_ui_state(&creating, now + DEFAULT_STARTUP_TIMEOUT_MS),
             ("broken", "lifecycle")
         );
+    }
+
+    #[test]
+    fn overlay_reported_state_takes_the_live_activity_stamp_too() {
+        let now: u64 = 200_000;
+        let mut record = mk_record("/ws/state", "shell", Phase::Running);
+        // Attach-time snapshot: output predates the attach; nothing has
+        // been reported since.
+        record.last_activity_ms = Some(now - 30_000);
+
+        // The worker's live answer: the agent has since said `idle`, and
+        // the PTY has been silent since the push. The rest is authoritative
+        // even though the snapshot itself knows nothing of it.
+        let raw = json!({
+            "reported_state": "idle",
+            "reported_state_at_ms": now - 1_000,
+            "last_activity_ms": now - 2_000,
+        });
+        let overlaid = overlay_reported_state(&record, Some(&raw));
+        assert_eq!(
+            session_ui_state(&overlaid, now),
+            ("idle", "reported"),
+            "a rest with no output since the push is idle, however stale the attach snapshot"
+        );
+
+        // The same rest, but the live activity stamp says output arrived
+        // after it: the snapshot's old stamp must not keep the idle claim
+        // alive once the agent (or the user at the prompt) produced output.
+        let raw = json!({
+            "reported_state": "idle",
+            "reported_state_at_ms": now - 5_000,
+            "last_activity_ms": now - 500,
+        });
+        let overlaid = overlay_reported_state(&record, Some(&raw));
+        assert_eq!(
+            session_ui_state(&overlaid, now),
+            ("active", "activity"),
+            "newer live output retracts the rest even though the snapshot predates it"
+        );
+
+        // A failed Status RPC leaves the snapshot untouched...
+        let untouched = overlay_reported_state(&record, None);
+        assert_eq!(untouched.reported_state, None);
+        assert_eq!(untouched.last_activity_ms, Some(now - 30_000));
+
+        // ...and so does a worker too old to send the activity field.
+        let old_worker = json!({ "reported_state": "idle" });
+        let degraded = overlay_reported_state(&record, Some(&old_worker));
+        assert_eq!(degraded.reported_state.as_deref(), Some("idle"));
+        assert_eq!(degraded.last_activity_ms, Some(now - 30_000));
     }
 
     /// An accepted kill persists `phase: exiting` before teardown (issue
@@ -11129,9 +11205,12 @@ mod switching_tests {
             record
         };
         // No Status answer (worker briefly unreachable): snapshot stands.
+        // The push is stale, so the word is only ever an activity guess --
+        // for this occupied shell (no PTY sample at all) the heuristic's
+        // just-started arm says `active`, never a semantic `working`.
         assert_eq!(
             session_ui_state(&overlay_reported_state(&record, None), now).0,
-            "running"
+            "active"
         );
         // The worker's live copy says the agent started working *after*
         // attach -- the case the spinner exists for.
@@ -11169,15 +11248,17 @@ mod switching_tests {
             "the static dot must yield to the spinner: {full:?}"
         );
 
-        // Once the push goes stale the shell-engine fallback is "running"
-        // again: the bar freezes back to the static dot, no motion.
+        // Once the push goes stale the occupied shell falls back to the
+        // honest activity word (`active`: no PTY sample at all, so the
+        // heuristic's just-started arm) -- the bar freezes back to the
+        // static dot, no motion. Only a *reported* working push may spin.
         {
             let mut record = ctx.record.lock().unwrap();
             record.reported_state_at_ms = Some(now.saturating_sub(8_001));
         }
         let full = status_bar_text(&ctx, 256);
         assert!(
-            full.contains("\u{25cf} RUNNING"),
+            full.contains("\u{25cf} ACTIVE"),
             "a stale push falls back to the static glyph: {full:?}"
         );
         assert!(

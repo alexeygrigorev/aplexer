@@ -46,9 +46,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 /// recently", not as "the agent is idle".
 const ACTIVITY_THRESHOLD_MS: u64 = 3_000;
 
-/// How long a value pushed by `a state-report` (docs/pocketshell-
-/// integration-plan.md Open question #2) stays authoritative over the
-/// PTY-recency heuristic below, counted from
+/// How long a `working`/`waiting` value pushed by `a state-report`
+/// (docs/pocketshell-integration-plan.md Open question #2) stays
+/// authoritative over the PTY-recency heuristic below, counted from
 /// `SessionRecord::reported_state_at_ms`.
 ///
 /// Merge rule (see `fresh_reported_state`): while a push is within this
@@ -69,17 +69,34 @@ const ACTIVITY_THRESHOLD_MS: u64 = 3_000;
 /// window. The window exists as a safety net for the case that motivates
 /// "or process exit" in the first place: a hook process that reported once
 /// and then the engine was killed, crashed, or the session was torn down
-/// without a final hook firing to say so. Deliberately NOT tied to
-/// `last_activity_ms` (PocketShell's own `resolveSessionAgentState`
-/// invalidates a resting push the moment newer PTY activity appears,
-/// issue #1570) -- that rule solves a real bug there, but a pure
-/// elapsed-time window is sufficient here and simpler: once a push goes
-/// stale, control passes back to the PTY-recency heuristic, which itself
-/// reads `last_activity_ms` and will correctly report `running` if the
-/// agent is in fact still producing output. Chosen at roughly 10x `a
+/// without a final hook firing to say so. Chosen at roughly 10x `a
 /// watch`'s own `POLL_INTERVAL` so ordinary poll jitter cannot flap a
 /// fresh push back to the heuristic mid-window.
+///
+/// `idle` deliberately does NOT use this elapsed-time window. A rest has
+/// no follow-up push to refresh its timestamp -- the next hook fires only
+/// when the agent works again -- so windowing `idle` made every resting
+/// agent fall back to the heuristic REPORTED_STATE_STALE_MS after its turn
+/// ended, and the heuristic's best guess for a quiet terminal
+/// ("running" for a shell session) is exactly the "says working but
+/// actually idle" failure. An `idle` push instead stays authoritative
+/// until the PTY contradicts it; see `fresh_reported_state`.
 const REPORTED_STATE_STALE_MS: u64 = 8_000;
+
+/// How much PTY output is allowed to land *after* an `idle` push without
+/// contradicting it, counted from `reported_state_at_ms`. A Stop hook
+/// fires right as the turn's last render completes, and the hook process
+/// (`sh -c` + a client RPC) can lose that race by a beat: tail output
+/// stamped a few hundred ms after the push is still the turn ending, not
+/// the agent (or the user at a prompt) doing something new. Anything
+/// stamped later than this grace means real activity happened after the
+/// agent said it was resting, and the push stops being authoritative --
+/// the heuristic takes over and says `running`/`waiting` from actual PTY
+/// recency. (This is PocketShell issue #1570's "a resting push is
+/// invalidated the moment newer PTY activity appears", with a grace so
+/// the invalidation cannot be tripped by the very output that ended the
+/// turn.)
+const IDLE_ACTIVITY_GRACE_MS: u64 = 2_000;
 
 /// heru's `UnifiedEvent` envelope (docs/pocketshell-integration-plan.md
 /// Part 2, section 2.1 -- found in heru's real `heru/types.py`, not
@@ -162,7 +179,9 @@ fn session_kind(record: &SessionRecord) -> &'static str {
 
 /// Reads a fresh `a state-report` push off `record` and maps it onto `a
 /// watch`'s wire vocabulary, or `None` when there is nothing to trust (no
-/// push ever recorded, or it is older than `REPORTED_STATE_STALE_MS`).
+/// push ever recorded, a `working`/`waiting` push older than
+/// `REPORTED_STATE_STALE_MS`, or an `idle` push retracted by newer PTY
+/// output).
 ///
 /// `idle` and `waiting` map onto themselves -- `idle` is a genuinely new
 /// wire value this feature introduces (the PTY-recency heuristic cannot
@@ -176,13 +195,35 @@ fn session_kind(record: &SessionRecord) -> &'static str {
 fn fresh_reported_state(record: &SessionRecord, now: u64) -> Option<&'static str> {
     let state = record.reported_state.as_deref()?;
     let at = record.reported_state_at_ms?;
-    if now.saturating_sub(at) > REPORTED_STATE_STALE_MS {
-        return None;
-    }
     match state {
-        "idle" => Some("idle"),
-        "waiting" => Some("waiting"),
-        "working" => Some("running"),
+        // An `idle` push is not windowed by the clock but by the PTY: it
+        // describes "the agent finished its turn and is resting", a fact
+        // that stays true -- however long the rest -- until the terminal
+        // sees new output (the agent working again, or the user typing at
+        // a prompt). Output stamped beyond IDLE_ACTIVITY_GRACE_MS after
+        // the push retracts it; the heuristic then speaks from real PTY
+        // recency. Elapsed time alone must not expire the push: unlike
+        // working/waiting there is no follow-up push to refresh it, and
+        // letting go of it mid-rest is what made resting sessions read
+        // RUNNING.
+        "idle" => match record.last_activity_ms {
+            Some(ts) if ts > at.saturating_add(IDLE_ACTIVITY_GRACE_MS) => None,
+            _ => Some("idle"),
+        },
+        "waiting" => {
+            if now.saturating_sub(at) > REPORTED_STATE_STALE_MS {
+                None
+            } else {
+                Some("waiting")
+            }
+        }
+        "working" => {
+            if now.saturating_sub(at) > REPORTED_STATE_STALE_MS {
+                None
+            } else {
+                Some("running")
+            }
+        }
         // Defensive only: the worker validates every write
         // (WorkerRuntime::report_state), so this arm only fires against a
         // foreign/hand-edited session.json. Fall back to the heuristic
@@ -632,6 +673,58 @@ mod tests {
         assert_eq!(
             derive_agent_state_with_source(&record, 1_000),
             ("idle", "reported")
+        );
+    }
+
+    #[test]
+    fn reported_idle_outlasts_the_stale_window_while_the_pty_stays_quiet() {
+        let mut record = sample_record(Phase::Running);
+        // The rest began with output just before the push, and the PTY has
+        // been silent since. However far past the working/waiting window
+        // the poll lands, a rest has no follow-up push to refresh it --
+        // expiring it anyway is what made resting sessions read RUNNING.
+        record.last_activity_ms = Some(900);
+        record.reported_state = Some("idle".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        let much_later = 1_000 + REPORTED_STATE_STALE_MS + 60_000;
+        assert_eq!(
+            derive_agent_state_with_source(&record, much_later),
+            ("idle", "reported")
+        );
+    }
+
+    #[test]
+    fn output_landing_within_the_grace_does_not_retract_a_reported_idle() {
+        let mut record = sample_record(Phase::Running);
+        // The turn's tail render racing the hook process: stamped after
+        // the push but inside IDLE_ACTIVITY_GRACE_MS.
+        record.reported_state = Some("idle".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        record.last_activity_ms = Some(1_000 + IDLE_ACTIVITY_GRACE_MS);
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000 + IDLE_ACTIVITY_GRACE_MS),
+            ("idle", "reported")
+        );
+    }
+
+    #[test]
+    fn newer_pty_output_retracts_a_reported_idle() {
+        let mut record = sample_record(Phase::Running);
+        record.reported_state = Some("idle".to_string());
+        record.reported_state_at_ms = Some(1_000);
+        record.last_activity_ms = Some(1_000 + IDLE_ACTIVITY_GRACE_MS + 1);
+        // Fresh output: the heuristic says running (the agent is producing
+        // again, or the user just typed); either way not idle.
+        assert_eq!(
+            derive_agent_state_with_source(&record, 1_000 + IDLE_ACTIVITY_GRACE_MS + 1),
+            ("running", "heuristic")
+        );
+        // The same retracted rest, once the output has itself gone quiet:
+        // the heuristic's honest "waiting", never a stale idle claim.
+        let quiet_again = 1_000 + IDLE_ACTIVITY_GRACE_MS + 1 + ACTIVITY_THRESHOLD_MS;
+        assert_eq!(
+            derive_agent_state_with_source(&record, quiet_again),
+            ("waiting", "heuristic")
         );
     }
 

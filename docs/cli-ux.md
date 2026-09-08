@@ -73,10 +73,12 @@ The existing `a -` shortcut already has the right semantics, but `-` is an exper
 
 This job requires honest language:
 
-- `working`, `waiting`, and `idle` are shown only while a fresh `state-report` value is authoritative;
+- `working` and `waiting` are shown only while a fresh `state-report` value is authoritative;
+- `idle` is shown while a `state-report` rest is authoritative: an `idle` push has no follow-up hook to refresh it, so it stays authoritative until PTY output appears after it (beyond a small grace for the turn's tail racing the hook), not for a fixed clock window;
 - recent PTY output may be shown as `active`;
 - old PTY output may be shown as `quiet`;
 - terminal silence alone must not be called `waiting` because a compute-heavy agent may be silent while still working;
+- a plain shell that never reported agent state is `running` no matter how quiet; a shell an agent has lived in falls back to the same `active`/`quiet` activity words as a first-class engine once nothing is fresh;
 - dead workers with an active persisted phase are `broken`, not `running`.
 
 The distinction between **semantic state** and **activity heuristic** is part of the UI contract, not an implementation detail.

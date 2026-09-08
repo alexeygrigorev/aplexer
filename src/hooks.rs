@@ -82,9 +82,15 @@ pub const HOOK_ENGINES: [&str; 5] = ["claude", "codex", "grok", "gemini", "openc
 
 /// (hook event, reported state) wirings per engine. The state words are `a
 /// state-report`'s vocabulary; the event names are each engine's own.
-pub const CLAUDE_EVENTS: [(&str, &str); 5] = [
+///
+/// `SubagentStop` is deliberately absent even though Claude and Grok fire
+/// it: a subagent finishing does not leave *the agent* idle -- the main
+/// turn keeps producing output after it -- so mapping it to `idle` pushed
+/// a fresh lie mid-turn, and `idle` is the one push with no follow-up hook
+/// to correct it (see `watch::fresh_reported_state`). The main turn's
+/// `Stop` alone marks the rest.
+pub const CLAUDE_EVENTS: [(&str, &str); 4] = [
     ("Stop", "idle"),
-    ("SubagentStop", "idle"),
     ("Notification", "waiting"),
     ("UserPromptSubmit", "working"),
     ("SessionStart", "working"),
@@ -96,9 +102,8 @@ pub const CODEX_EVENTS: [(&str, &str); 3] = [
     ("SessionStart", "working"),
 ];
 /// Grok's personal-hooks dir speaks the Claude-compatible nested format.
-pub const GROK_EVENTS: [(&str, &str); 5] = [
+pub const GROK_EVENTS: [(&str, &str); 4] = [
     ("Stop", "idle"),
-    ("SubagentStop", "idle"),
     ("Notification", "waiting"),
     ("UserPromptSubmit", "working"),
     ("SessionStart", "working"),
