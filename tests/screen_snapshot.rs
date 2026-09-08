@@ -135,6 +135,31 @@ fn start_session(harness: &Harness, workspace: &Path, tag: &str) -> String {
         .to_string()
 }
 
+fn start_session_with_command(
+    harness: &Harness,
+    workspace: &Path,
+    tag: &str,
+    command: &[&str],
+) -> String {
+    let workspace = workspace.to_str().expect("utf8 workspace path");
+    let mut args = vec![
+        "start",
+        "--workspace",
+        workspace,
+        "--tag",
+        tag,
+        "--json",
+        "--",
+    ];
+    args.extend_from_slice(command);
+    let stdout = harness.run_ok(&args, Duration::from_secs(15));
+    let value: Value = serde_json::from_str(&stdout).expect("`a start` output is JSON");
+    value["id"]
+        .as_str()
+        .expect("session id in start output")
+        .to_string()
+}
+
 fn socket_path(harness: &Harness, id: &str) -> PathBuf {
     let stdout = harness.run_ok(&["status", id, "--json"], Duration::from_secs(5));
     let value: Value = serde_json::from_str(&stdout).expect("status output is JSON");
@@ -780,9 +805,25 @@ struct PtyClient {
 
 impl PtyClient {
     fn spawn(harness: &Harness, id: &str, rows: u16, cols: u16) -> Self {
+        Self::spawn_with_attach_args(harness, id, rows, cols, &[])
+    }
+
+    fn spawn_no_status(harness: &Harness, id: &str, rows: u16, cols: u16) -> Self {
+        Self::spawn_with_attach_args(harness, id, rows, cols, &["--no-status"])
+    }
+
+    fn spawn_with_attach_args(
+        harness: &Harness,
+        id: &str,
+        rows: u16,
+        cols: u16,
+        attach_args: &[&str],
+    ) -> Self {
         let (master, slave) = aplexer::open_pty(rows, cols).expect("open pty");
         let mut cmd = harness.command();
-        cmd.args(["attach", id]);
+        let mut args = vec!["attach", id];
+        args.extend_from_slice(attach_args);
+        cmd.args(args);
         cmd.stdin(Stdio::from(slave.try_clone().expect("dup slave for stdin")));
         cmd.stdout(Stdio::from(
             slave.try_clone().expect("dup slave for stdout"),
@@ -923,6 +964,25 @@ impl PtyClient {
     fn resize(&self, rows: u16, cols: u16) {
         use std::os::unix::io::AsRawFd;
         aplexer::set_winsize(self.master.as_raw_fd(), rows, cols).expect("resize the pty");
+    }
+
+    fn wait_exit(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "attach exited unsuccessfully: {status}");
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("attach did not exit within 10 seconds");
+                }
+                Err(error) => panic!("waiting for attach: {error}"),
+            }
+        }
     }
 
     /// `Ctrl-b d`, then wait for the process to actually exit.
@@ -1185,6 +1245,102 @@ fn two_real_attach_clients_see_each_others_changes() {
     device_b.detach();
     device_a.detach();
     harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+#[test]
+fn no_status_is_plain_relay_without_chrome_and_forwards_raw_input() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("no-status-input");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let script = r#"
+import os, tty
+tty.setraw(0)
+os.write(1, b"READY\n")
+wanted = 14
+data = b""
+while len(data) < wanted:
+    chunk = os.read(0, 1024)
+    if not chunk:
+        break
+    data += chunk
+os.write(1, b"RAW:" + data.hex().encode() + b"\n")
+"#;
+    let id = start_session_with_command(
+        &harness,
+        &workspace,
+        "no-status-input",
+        &["python3", "-u", "-c", script],
+    );
+
+    let mut client = PtyClient::spawn_no_status(&harness, &id, 24, 80);
+    client.wait_for(b"READY", 0, "the workload to enter raw input mode");
+    let initial = client.output();
+    assert!(
+        find_bytes(&initial, b"attached to").is_none(),
+        "--no-status wrote the attach hint/status chrome:\n{}",
+        escape(&initial)
+    );
+    assert!(
+        find_bytes(&initial, b"\x1b[1;23r").is_none(),
+        "--no-status reserved a status-bar row:\n{}",
+        escape(&initial)
+    );
+
+    // Ctrl-b x would be consumed by the normal attach key scanner. The SGR
+    // mouse report checks that the same plain-relay path forwards arbitrary
+    // terminal input bytes too.
+    client.send(b"\x02x\x1b[<64;10;10M");
+    client.wait_for(
+        b"RAW:02781b5b3c36343b31303b31304d",
+        0,
+        "the workload to receive the raw key and mouse bytes",
+    );
+    client.wait_exit();
+
+    let _ = harness.run(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
+}
+
+#[test]
+fn no_status_propagates_resize_geometry_to_the_worker() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("no-status-resize");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let script = r#"
+import os, signal, time
+
+def emit(label):
+    size = os.get_terminal_size(0)
+    os.write(1, f"{label}:{size.lines}x{size.columns}\n".encode())
+
+def resized(signum, frame):
+    emit("RESIZED")
+    raise SystemExit
+
+signal.signal(signal.SIGWINCH, resized)
+emit("INITIAL")
+while True:
+    time.sleep(1)
+"#;
+    let id = start_session_with_command(
+        &harness,
+        &workspace,
+        "no-status-resize",
+        &["python3", "-u", "-c", script],
+    );
+
+    let mut client = PtyClient::spawn_no_status(&harness, &id, 24, 80);
+    client.wait_for(b"INITIAL:24x80", 0, "the initial worker terminal geometry");
+    client.resize(31, 97);
+    client.wait_for(
+        b"RESIZED:31x97",
+        0,
+        "the worker to receive the no-status terminal resize",
+    );
+    client.wait_exit();
+
+    let _ = harness.run(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
 }
 
 /// Regression test for the *client-side* half of the scroll-region fix: the

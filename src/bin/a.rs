@@ -526,6 +526,9 @@ struct AttachArgs {
     /// Replay this many history bytes instead of the live screen
     #[arg(long)]
     history_bytes: Option<usize>,
+    /// Attach without a client status bar or client key bindings
+    #[arg(long)]
+    no_status: bool,
 }
 #[derive(Args)]
 struct SendArgs {
@@ -918,7 +921,7 @@ fn run() -> Result<()> {
         Commands::Snapshot(args) => cmd_list(&paths, args, true),
         Commands::Attach(args) => {
             let record = resolve(&paths, &args.target)?;
-            attach(&paths, &record, args.history_bytes)
+            attach(&paths, &record, args.history_bytes, args.no_status)
         }
         Commands::Send(args) => cmd_send(&paths, args, cli.json),
         Commands::Capture(args) => cmd_capture(&paths, args, cli.json),
@@ -1164,7 +1167,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         // is the session's *storage capacity* (up to DEFAULT_HISTORY_BYTES =
         // 4MB), an unrelated setting from how much of it a fresh attach
         // should actually replay onto the screen.
-        attach(paths, &ready, None)?;
+        attach(paths, &ready, None, false)?;
     }
     Ok(())
 }
@@ -2063,7 +2066,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
         // there, so `a -` can never create a second session for a pair that
         // something is still using.
         if existing.worker_phase_active() && existing.worker_alive() {
-            return attach(paths, &existing, None);
+            return attach(paths, &existing, None, false);
         }
     }
     cmd_start(
@@ -2092,7 +2095,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
 
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
-    attach(paths, &record, None)
+    attach(paths, &record, None, false)
 }
 
 /// Total wall-clock budget one `a prune` run may spend waiting for workers
@@ -8422,12 +8425,21 @@ fn attach_goodbye_line(stop: AttachStop, selector: &str, inspect_id: Option<&str
     }
 }
 
-fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -> Result<()> {
+fn attach(
+    paths: &Paths,
+    record: &SessionRecord,
+    history_bytes: Option<usize>,
+    no_status: bool,
+) -> Result<()> {
     check_attachable(record)?;
     let explicit_history = history_bytes.is_some();
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
     let input_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let display_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+    // PocketShell owns the session chrome. In this mode the host terminal is
+    // a full-screen relay: no reserved status row, redraw thread, flash hint,
+    // or Ctrl-b scanner is installed.
+    let status_enabled = display_tty && !no_status;
     // Geometry read up front (docs/terminal-state-design.md section 6.3
     // step 1), not after the handshake: sent in the Attach request itself
     // so the worker can resize the PTY and its screen model *before*
@@ -8444,7 +8456,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     };
     let worker_geometry = initial_geometry.map(|(rows, cols)| {
         (
-            if display_tty {
+            if status_enabled {
                 reserved_rows(rows)
             } else {
                 rows
@@ -8510,7 +8522,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // clamped against `MAX_SCROLLBACK_CELLS` at this terminal's width.
     let scrollback_lines = aplexer::screen::scrollback_lines_for(
         screen_cols,
-        if display_tty { history_limit() } else { 0 },
+        if status_enabled { history_limit() } else { 0 },
     );
     let workload_screen = Arc::new(Mutex::new(
         aplexer::screen::ClientScreen::try_new_with_scrollback(
@@ -8536,7 +8548,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         scroll: scroll_mode.clone(),
         overlay: key_overlay.clone(),
         mouse_owned: Arc::new(Mutex::new(None)),
-        mouse_capture: display_tty && input_tty && mouse_capture_enabled(),
+        mouse_capture: status_enabled && input_tty && mouse_capture_enabled(),
     };
 
     // Hold the host on the alternate screen for the whole attach, *before*
@@ -8550,11 +8562,13 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
             .unwrap_or_else(PoisonError::into_inner)
             .hold_host_on_alt_screen();
         let _ = write_locked(&stdout, ATTACH_ALT_SCREEN_ENTER);
-        if let Some((rows, cols)) = initial_geometry {
-            // Nothing has been relayed yet, so the model is at a boundary by
-            // construction and this always writes -- the gate is free here
-            // and costs nothing to keep uniform.
-            apply_terminal_layout(&status_ctx, rows, cols);
+        if status_enabled {
+            if let Some((rows, cols)) = initial_geometry {
+                // Nothing has been relayed yet, so the model is at a boundary by
+                // construction and this always writes -- the gate is free here
+                // and costs nothing to keep uniform.
+                apply_terminal_layout(&status_ctx, rows, cols);
+            }
         }
     }
     // Scanned before the bar is drawn: the snapshot re-emits the workload's
@@ -8571,8 +8585,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     // After the snapshot, because the snapshot is what tells the model which
     // mouse modes the workload itself wants -- and the workload's wishes
     // decide whether the client may borrow the mouse at all.
-    sync_client_mouse(&status_ctx);
-    if display_tty {
+    if status_enabled {
+        sync_client_mouse(&status_ctx);
         // The attach hint goes through the status-bar flash channel, not an
         // eprintln'd banner: a banner written before/around the snapshot is
         // what once corrupted a live TUI's input box (docs/terminal-state-
@@ -8615,6 +8629,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
     let input_switch_in_progress = switch_in_progress.clone();
     let input_status_ctx = status_ctx.clone();
     let input_want_screen = !explicit_history;
+    let input_status_enabled = status_enabled;
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buffer = [0u8; 8192];
@@ -8709,7 +8724,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         break;
                     }
                 };
-                if !input_tty {
+                if !input_tty || !input_status_enabled {
                     if send_data(&input_writer, &buffer[..n]).is_err() {
                         detach_attached_client(&input_writer, &input_active);
                         break;
@@ -8821,6 +8836,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
         let resize_active = active.clone();
         let resize_ctx = status_ctx.clone();
         let resize_initial = initial_geometry;
+        let resize_status_enabled = status_enabled;
         thread::spawn(move || {
             // Seeded with the geometry `attach()` already applied and already
             // sent in the Attach request, so this thread reacts to *changes*
@@ -8840,8 +8856,13 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // re-clamp the region to the new row count rather
                         // than dropping it (see `MarginTracker::set_rows`
                         // and design doc section 5.3's correction).
+                        let worker_rows = if resize_status_enabled {
+                            reserved_rows(rows)
+                        } else {
+                            rows
+                        };
                         if let Ok(mut m) = resize_ctx.screen.lock() {
-                            m.set_size(reserved_rows(rows), cols);
+                            m.set_size(worker_rows, cols);
                         }
                         // May defer the DECSTBM write when the relayed
                         // stream is mid-escape-sequence (issue #14). The
@@ -8851,20 +8872,22 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // whatever the host-side reservation is doing. Only
                         // the client's own row reservation waits, and only
                         // for as long as `LAYOUT_DEFER_LIMIT`.
-                        apply_terminal_layout(&resize_ctx, rows, cols);
-                        // The pager renders at the reserved geometry, so a
-                        // resize has to redraw it -- nothing else will,
-                        // because the relay is suspended.
-                        if resize_ctx.scroll.is_active() {
-                            paint_scroll_view(&resize_ctx);
-                        }
-                        // Same for the key overlay, with one extra case: the
-                        // new geometry may be one the box does not fit into
-                        // at all, and a repaint that cannot happen must take
-                        // the overlay down rather than leave a stale box over
-                        // a suspended relay.
-                        if resize_ctx.overlay.is_active() && !paint_key_overlay(&resize_ctx) {
-                            dismiss_key_overlay(&resize_ctx);
+                        if resize_status_enabled {
+                            apply_terminal_layout(&resize_ctx, rows, cols);
+                            // The pager renders at the reserved geometry, so a
+                            // resize has to redraw it -- nothing else will,
+                            // because the relay is suspended.
+                            if resize_ctx.scroll.is_active() {
+                                paint_scroll_view(&resize_ctx);
+                            }
+                            // Same for the key overlay, with one extra case: the
+                            // new geometry may be one the box does not fit into
+                            // at all, and a repaint that cannot happen must take
+                            // the overlay down rather than leave a stale box over
+                            // a suspended relay.
+                            if resize_ctx.overlay.is_active() && !paint_key_overlay(&resize_ctx) {
+                                dismiss_key_overlay(&resize_ctx);
+                            }
                         }
                         // A switch deliberately shuts down the old socket to
                         // unblock the main frame loop's read (see
@@ -8880,7 +8903,7 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         if send_control(
                             &resize_writer,
                             &AttachControl::Resize {
-                                rows: reserved_rows(rows),
+                                rows: worker_rows,
                                 cols,
                             },
                         )
@@ -8895,6 +8918,8 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 thread::sleep(Duration::from_millis(200));
             }
         });
+    }
+    if status_enabled {
         let status_active = active.clone();
         let status_last_activity = last_activity.clone();
         let thread_status_ctx = status_ctx.clone();
@@ -9055,6 +9080,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     if let Ok(mut t) = last_activity.lock() {
                         *t = Instant::now();
                     }
+                    if !status_enabled {
+                        continue;
+                    }
                     // While a client modal is up nothing may paint over it:
                     // the deferred resize, the deferred bar and the deferred
                     // `Ctrl-b r` all keep waiting, and are delivered by the
@@ -9126,38 +9154,40 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // it unconditionally keeps this match exhaustive and
                         // correct if that ever changes.
                         ServerEvent::Layout { .. } => {
-                            if status_ctx.scroll.is_typing() {
-                                // Type-through streams workload bytes to the
-                                // host, and Erase in Display ignores scroll
-                                // margins: the workload's own `CSI ... J` --
-                                // which Ink-style TUIs emit on nearly every
-                                // frame -- erases past the scroll region and
-                                // takes the reserved row, the typing bar
-                                // included. Nothing else repairs it: the
-                                // dirty check sees unchanged text and skips,
-                                // and the erased row would stay blank until
-                                // the offset or the count next changes.
-                                // Invalidate the check so this refresh
-                                // actually rewrites the row.
-                                *status_ctx
-                                    .last_drawn
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner) = None;
-                                refresh_scroll_bar(&status_ctx);
-                            } else if !status_ctx.scroll.is_active() {
-                                // Live view: re-assert the reservation and
-                                // redraw within one socket round-trip of the
-                                // bytes that caused it, instead of waiting
-                                // on the idle-gap timer. `draw_status_bar`'s
-                                // own margin re-assert (see its doc comment)
-                                // is the reservation half of this; the
-                                // redraw is the other half.
-                                draw_status_bar(&status_ctx, true);
+                            if status_enabled {
+                                if status_ctx.scroll.is_typing() {
+                                    // Type-through streams workload bytes to the
+                                    // host, and Erase in Display ignores scroll
+                                    // margins: the workload's own `CSI ... J` --
+                                    // which Ink-style TUIs emit on nearly every
+                                    // frame -- erases past the scroll region and
+                                    // takes the reserved row, the typing bar
+                                    // included. Nothing else repairs it: the
+                                    // dirty check sees unchanged text and skips,
+                                    // and the erased row would stay blank until
+                                    // the offset or the count next changes.
+                                    // Invalidate the check so this refresh
+                                    // actually rewrites the row.
+                                    *status_ctx
+                                        .last_drawn
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner) = None;
+                                    refresh_scroll_bar(&status_ctx);
+                                } else if !status_ctx.scroll.is_active() {
+                                    // Live view: re-assert the reservation and
+                                    // redraw within one socket round-trip of the
+                                    // bytes that caused it, instead of waiting
+                                    // on the idle-gap timer. `draw_status_bar`'s
+                                    // own margin re-assert (see its doc comment)
+                                    // is the reservation half of this; the
+                                    // redraw is the other half.
+                                    draw_status_bar(&status_ctx, true);
+                                }
+                                // Pager without type-through: nothing is being
+                                // written to the host, so no erase can have
+                                // reached the bar row and the pager's own tick
+                                // already maintains it.
                             }
-                            // Pager without type-through: nothing is being
-                            // written to the host, so no erase can have
-                            // reached the bar row and the pager's own tick
-                            // already maintains it.
                         }
                     }
                 }
@@ -9246,7 +9276,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                 },
             );
         }
-        draw_status_bar(&status_ctx, true); // clear wiped the reserved row; redraw now
+        if status_enabled {
+            draw_status_bar(&status_ctx, true); // clear wiped the reserved row; redraw now
+        }
         continue 'session;
     }
     active.store(false, Ordering::Relaxed);
@@ -9458,6 +9490,12 @@ mod switching_tests {
                 assert_eq!(attach.target.selector.as_deref(), Some("review"))
             }
             _ => panic!("expected `open` alias of attach"),
+        }
+
+        let args = args_of(&["attach", "review", "--no-status"]);
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Attach(attach)) => assert!(attach.no_status),
+            _ => panic!("expected `attach --no-status` command"),
         }
 
         let args = args_of(&["new", "--engine", "shell"]);
