@@ -42,7 +42,9 @@ where the recipient being mid-task means it should wait.
 
 **Pane (`--pane`).** Injected as literal terminal input into one live sibling
 session, prefixed `[aplexer message from <your-tag>]` and submitted with a
-trailing return. The sibling agent receives it as if its operator typed it.
+trailing return (the tmuxctl behavior; `--no-enter` drops the return when the
+target should compose rather than submit). The sibling agent receives it as
+if its operator typed it.
 Use only when you need the sibling to act *now* and it is (ideally) idle at
 its prompt: "stop, the contract changed", "please continue". Costs: it lands
 in the sibling's transcript, may interleave with whatever it is doing, and

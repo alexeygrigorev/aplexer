@@ -754,9 +754,14 @@ struct PaneDeliveryArgs {
     or_inbox: bool,
     #[arg(
         long,
-        help = "With --pane: suppress the '[aplexer message from ...]' frame and trailing return"
+        help = "With --pane: suppress the '[aplexer message from ...]' frame"
     )]
     raw: bool,
+    #[arg(
+        long = "no-enter",
+        help = "With --pane: do not append a trailing return. Enter is sent by default (the tmuxctl behavior) so an injected message actually submits"
+    )]
+    no_enter: bool,
 }
 
 #[derive(Args)]
@@ -4006,6 +4011,7 @@ fn deliver_pane(
     from_tag: Option<&str>,
     body: &str,
     raw: bool,
+    no_enter: bool,
 ) -> Result<()> {
     if body.len() > MAX_BODY_BYTES {
         bail!("message body exceeds the {MAX_BODY_BYTES}-byte cap");
@@ -4018,13 +4024,26 @@ fn deliver_pane(
     if !alive {
         bail!("session {tag:?} is not running; pane delivery requires a live target");
     }
-    let framed = if raw {
+    rpc_send(&record, &pane_input_bytes(body, from_tag, raw, no_enter))
+        .with_context(|| format!("inject into session {tag:?}'s PTY"))
+}
+
+/// The bytes `--pane` delivery injects: the message, framed with its sender
+/// unless `raw`, and -- by default, the tmuxctl behavior -- a trailing
+/// return, so a message typed into an agent's prompt actually submits
+/// instead of sitting there unconfirmed. `--no-enter` drops the return for
+/// the rare target that should compose rather than submit.
+fn pane_input_bytes(body: &str, from_tag: Option<&str>, raw: bool, no_enter: bool) -> Vec<u8> {
+    let mut out = if raw {
         body.as_bytes().to_vec()
     } else {
         let sender = from_tag.unwrap_or("external");
-        format!("[aplexer message from {sender}] {body}\r").into_bytes()
+        format!("[aplexer message from {sender}] {body}").into_bytes()
     };
-    rpc_send(&record, &framed).with_context(|| format!("inject into session {tag:?}'s PTY"))
+    if !no_enter {
+        out.push(b'\r');
+    }
+    out
 }
 
 fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
@@ -4055,6 +4074,7 @@ fn finish_send(
             envelope.from.tag.as_deref(),
             &envelope.body,
             pane.raw,
+            pane.no_enter,
         ) {
             Ok(()) => envelope.delivery = Delivery::Pane,
             Err(e) => {
