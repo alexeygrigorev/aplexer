@@ -3767,7 +3767,8 @@ fn cmd_hotkeys() -> Result<()> {
     println!("  Space / b  a screen at a time      u / d          half a screen");
     println!("  q, Esc     back to the live screen");
     println!();
-    println!("  While scrolling, keys go to the pager and never to the session.");
+    println!("  While scrolling, keys go to the pager and never to the session --");
+    println!("  press i to hand the keyboard to the session anyway (Esc pages again).");
     println!(
         "  History is {} lines by default (APLEXER_HISTORY_LIMIT);",
         aplexer::screen::DEFAULT_SCROLLBACK_LINES
@@ -5028,7 +5029,11 @@ fn relay_to_terminal(
         // nothing reaches the host. Checked here, under the same stdout lock
         // `enter_scroll_mode` and `show_key_overlay` flip their flags under,
         // so a chunk can never be half-written across a modal's first frame.
-        if scroll.is_active() || overlay.is_active() {
+        // Type-through is the one exception: while `i` has handed the
+        // keyboard over, the pager keeps only the bar row and the offset,
+        // and the stream flows -- typing with no echo would be worse than
+        // the reading view the user chose to give up. Esc takes it back.
+        if (scroll.is_active() && !scroll.is_typing()) || overlay.is_active() {
             return Ok(());
         }
         let src = rewritten.as_deref().unwrap_or(data);
@@ -5446,7 +5451,7 @@ const ATTACH_BINDINGS: &[AttachBinding] = &[
     AttachBinding {
         keys: "[",
         brief: Some("[ scroll"),
-        description: "scroll back through this session's output (q or Esc to leave)",
+        description: "scroll back through this session's output (i types, q or Esc leaves)",
     },
     AttachBinding {
         keys: "N / P",
@@ -6035,6 +6040,11 @@ const MOUSE_WHEEL_DOWN: u32 = 65;
 /// nothing takes `stdout` while holding `view`.
 struct ScrollMode {
     active: AtomicBool,
+    /// Type-through (`i` while the pager is up): `active` stays set -- the
+    /// pager keeps the reserved bar row and the scroll offset -- but the
+    /// relay flows and stdin forwards to the workload, so typing has its
+    /// echo and the reply is visible as it streams. Esc drops it.
+    typing: AtomicBool,
     view: Mutex<ScrollView>,
 }
 
@@ -6042,11 +6052,15 @@ impl ScrollMode {
     fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
+            typing: AtomicBool::new(false),
             view: Mutex::new(ScrollView::default()),
         }
     }
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+    fn is_typing(&self) -> bool {
+        self.typing.load(Ordering::Relaxed)
     }
 }
 
@@ -6072,6 +6086,9 @@ enum ScrollCommand {
     HalfDown,
     Top,
     Bottom,
+    /// `i`: hand the keyboard to the workload while staying in the pager
+    /// (type-through; a lone `Esc` takes it back).
+    TypeThrough,
     /// `q`, `Esc` or `Ctrl-C`: back to the live screen.
     Exit,
 }
@@ -6084,7 +6101,7 @@ enum ScrollKey {
     /// Recognized and deliberately swallowed (a non-wheel mouse report, an
     /// unbound key). **Consumed, never forwarded** -- that is the whole
     /// point of the mode: while the pager is up, no keystroke reaches the
-    /// workload.
+    /// workload (until `i` hands the keyboard over; see `TypeThrough`).
     Ignored(usize),
     /// A sequence that has begun but not finished in this buffer. The caller
     /// keeps the bytes and retries when more arrive.
@@ -6123,6 +6140,7 @@ fn scroll_keys(buf: &[u8]) -> ScrollKey {
             b'd' | 0x04 => Some(HalfDown),
             b'g' => Some(Top),
             b'G' => Some(Bottom),
+            b'i' => Some(TypeThrough),
             _ => None,
         };
         return match command {
@@ -6327,7 +6345,11 @@ fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
     }
     seq.extend_from_slice(&frame);
     if geom.reserved {
-        let text = scroll_bar_text(*view, geom.cols as usize, alt_screen);
+        let text = if ctx.scroll.is_typing() {
+            scroll_bar_typing_text(*view, geom.cols as usize)
+        } else {
+            scroll_bar_text(*view, geom.cols as usize, alt_screen)
+        };
         seq.extend_from_slice(&scroll_bar_sequence(geom, &text));
         // Recorded against the same dirty-check `refresh_scroll_bar` reads,
         // so the status tick right after a navigation does not rewrite a row
@@ -6368,7 +6390,11 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
         (screen.scrollback_available(), screen.alternate_screen())
     };
     view.available = available;
-    let text = scroll_bar_text(*view, geom.cols as usize, alt_screen);
+    let text = if ctx.scroll.is_typing() {
+        scroll_bar_typing_text(*view, geom.cols as usize)
+    } else {
+        scroll_bar_text(*view, geom.cols as usize, alt_screen)
+    };
     drop(view);
     // Dirty-checked against the same `last_drawn` the live bar uses, so this
     // tick is a no-op in the common case *and* still repairs the row when
@@ -6394,6 +6420,24 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
     )
 }
 
+/// The bar while type-through is active. The pager still owns the reserved
+/// row and its position readout stays honest, but the mode word and the hint
+/// change: the keyboard currently belongs to the session, and Esc is the way
+/// back to paging.
+fn scroll_bar_typing_text(view: ScrollView, cols: usize) -> String {
+    let full = format!(
+        "SCROLL {}/{} · TYPE — keys go to the session · Esc back to paging",
+        view.offset, view.available
+    );
+    if full.chars().count() <= cols {
+        full
+    } else if cols >= 14 {
+        format!("SCROLL {}/{} · TYPE", view.offset, view.available)
+    } else {
+        "TYPE".to_string()
+    }
+}
+
 /// Enter scroll mode and run the gesture that asked for it.
 ///
 /// `active` is flipped under the stdout lock, which is the same lock
@@ -6405,6 +6449,7 @@ fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
         if ctx.scroll.active.swap(true, Ordering::SeqCst) {
             return;
         }
+        ctx.scroll.typing.store(false, Ordering::SeqCst);
         *ctx.scroll
             .view
             .lock()
@@ -6415,6 +6460,13 @@ fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
     *ctx.last_drawn
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
+    // Before the first frame paints: for a workload that scrolls through its
+    // own DECSTBM sub-ranges, the live model's history is missing exactly the
+    // rows the user is opening the pager to find, and the worker's retained
+    // raw tail still has them (`refresh_pager_history`). Runs with
+    // `active` already set, so the relay is suspended while it works and the
+    // pager's first frame goes onto a quiet host.
+    refresh_pager_history(ctx);
     apply_scroll_command(ctx, first);
 }
 
@@ -6430,6 +6482,17 @@ fn exit_scroll_mode(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_active() {
         return;
     }
+    paint_live_screen(ctx);
+    ctx.scroll.typing.store(false, Ordering::SeqCst);
+    ctx.scroll.active.store(false, Ordering::SeqCst);
+}
+
+/// Paint the host from the live model while staying in scroll mode: the
+/// snapshot `Ctrl-b r` writes, plus the bar, with the relay still suspended
+/// throughout. `exit_scroll_mode` runs this before dropping `active`, and
+/// `enter_typing` runs it before raising `typing` -- both orderings mean a
+/// relay chunk can only ever land on the view it belongs on.
+fn paint_live_screen(ctx: &StatusBarCtx) {
     // Reads session records off disk; must not happen under the stdout lock.
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
@@ -6453,7 +6516,41 @@ fn exit_scroll_mode(ctx: &StatusBarCtx) {
     *ctx.last_drawn
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
-    ctx.scroll.active.store(false, Ordering::SeqCst);
+}
+
+/// `i` in the pager: hand the keyboard to the workload without leaving the
+/// pager -- the thing tmux copy-mode cannot do. The view repaints to the
+/// live screen first (so typing has its echo and the reply is visible as it
+/// streams), then `typing` rises under the stdout lock, which is the lock
+/// `relay_to_terminal` checks the flag under -- the relay stays suspended
+/// until the flip, so no chunk can land on the pager's view.
+fn enter_typing(ctx: &StatusBarCtx) {
+    if !ctx.scroll.is_active() || ctx.scroll.is_typing() {
+        return;
+    }
+    paint_live_screen(ctx);
+    {
+        let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+        ctx.scroll.typing.store(true, Ordering::SeqCst);
+    }
+    // The bar's wording changes with the mode; the dirty-check still holds
+    // the live bar text, so rewrite the row now rather than on the next tick.
+    refresh_scroll_bar(ctx);
+}
+
+/// Esc while typing: take the keyboard back for the pager at the same
+/// offset. `typing` drops first, under the stdout lock, and the pager frame
+/// repaints after -- a relay chunk in between can only land on the live view
+/// it was headed for anyway, and is covered by the frame immediately.
+fn exit_typing(ctx: &StatusBarCtx) {
+    if !ctx.scroll.is_typing() {
+        return;
+    }
+    {
+        let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+        ctx.scroll.typing.store(false, Ordering::SeqCst);
+    }
+    apply_scroll_command(ctx, ScrollCommand::Stay);
 }
 
 /// Resolve one navigation step against the current viewport and repaint.
@@ -6475,6 +6572,10 @@ fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
         exit_scroll_mode(ctx);
         return;
     }
+    if command == ScrollCommand::TypeThrough {
+        enter_typing(ctx);
+        return;
+    }
     let exit = {
         let mut view = ctx
             .scroll
@@ -6483,6 +6584,7 @@ fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
             .unwrap_or_else(PoisonError::into_inner);
         let (delta, downward): (isize, bool) = match command {
             ScrollCommand::Exit => unreachable!("handled above"),
+            ScrollCommand::TypeThrough => unreachable!("handled above"),
             ScrollCommand::Stay => (0, false),
             ScrollCommand::Up(n) => (n as isize, false),
             ScrollCommand::Down(n) => (-(n as isize), true),
@@ -6512,7 +6614,8 @@ fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
 /// can never reach the workload.
 ///
 /// Returns the bytes that may still be forwarded. In scroll mode that is
-/// always empty: every byte is consumed, navigation or not.
+/// empty except while type-through has handed the keyboard to the workload
+/// (`i`): every byte is otherwise consumed, navigation or not.
 ///
 /// `pending` exists because a mouse report can be split across two `read()`s
 /// exactly like the `Ctrl-b` prefix can. Outside scroll mode it is only ever
@@ -6546,6 +6649,42 @@ impl ScrollInput {
         let mut i = 0;
         while i < self.pending.len() {
             if ctx.scroll.is_active() {
+                if ctx.scroll.is_typing() {
+                    // Type-through (`i`): the keyboard belongs to the
+                    // workload now, so bytes forward verbatim. Two things
+                    // are still decoded, because neither is text the user
+                    // could mean to type: an SGR mouse report (the client
+                    // borrowed the mouse; the workload never asked for it),
+                    // and a lone-ESC chunk, which takes the keyboard back
+                    // for the pager. Anything else starting with ESC --
+                    // arrows, Home, a sequence split across reads -- is
+                    // somebody's key, not text, and forwards whole.
+                    let rest = &self.pending[i..];
+                    if rest[0] == 0x1b {
+                        if rest.len() >= 3 && &rest[..3] == b"\x1b[<" {
+                            match parse_sgr_mouse(rest) {
+                                MouseParse::Complete(_, consumed) => {
+                                    i += consumed;
+                                    continue;
+                                }
+                                MouseParse::Incomplete => break,
+                                MouseParse::NotMouse => {}
+                            }
+                        } else if rest.len() == 1 {
+                            self.pending.drain(..i + 1);
+                            exit_typing(ctx);
+                            // Whatever else was typed into this same chunk
+                            // was typed blind against a pager that is back
+                            // in charge: discard it, exactly like the bytes
+                            // that trail a pager Exit below.
+                            self.pending.clear();
+                            return out;
+                        }
+                    }
+                    out.push(self.pending[i]);
+                    i += 1;
+                    continue;
+                }
                 match scroll_keys(&self.pending[i..]) {
                     ScrollKey::Command(command, n) => {
                         i += n;
@@ -7031,6 +7170,60 @@ fn seed_client_scrollback(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .seed_history(&tail);
+}
+
+/// Rebuild the pager's history from the worker's *current* retained tail
+/// before `Ctrl-b [` (or the wheel) opens it.
+///
+/// The attach-time seed (`seed_client_scrollback`) only helps a client that
+/// attached after the output happened. A session attached from before it --
+/// `a new`, the default flow -- accumulates history through the live relay,
+/// where `vt100` is right to drop every row scrolled out of a DECSTBM
+/// sub-range; the codex TUI holds a sub-range almost constantly, so its pager
+/// opened on `SCROLL 0/0` no matter how long it had been running. Re-running
+/// the seed at entry gives the live attach the same past a fresh attach gets
+/// (`ClientScreen::refresh_scrollback` for the model-side mechanics).
+///
+/// The gate keeps every other workload exactly as it is. `subregion_seen` is
+/// false for anything that never sent a sub-range -- shells, logs, tail -f --
+/// and those sessions' live-maintained history is complete, so they pay
+/// neither the two bounded RPCs (capture + screen, ~13-40 ms of replay
+/// measured at `scrollback_seed_bytes`) nor the risk of a byte-capped replay
+/// holding fewer rows than their live scrollback already does. The alternate
+/// screen skips too: that grid has no scrollback anywhere, so there is
+/// nothing to rebuild for a full-screen application, only RPCs to spend.
+///
+/// Failure is invisible, exactly like the attach seed: a worker that has gone
+/// away or stopped answering means "page through whatever the live model
+/// has", which is the pre-refresh behavior.
+fn refresh_pager_history(ctx: &StatusBarCtx) {
+    if history_limit() == 0 {
+        return;
+    }
+    let record = ctx
+        .record
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        if screen.alternate_screen() || !screen.subregion_seen() {
+            return;
+        }
+    }
+    let Ok(tail) = rpc_capture(&record, Some(scrollback_seed_bytes())) else {
+        return;
+    };
+    if tail.is_empty() {
+        return;
+    }
+    let Ok(snapshot) = rpc_capture_screen(&record, false) else {
+        return;
+    };
+    ctx.screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .refresh_scrollback(&tail, &snapshot);
 }
 
 /// Which session a `Ctrl-b` switch chord asks for
@@ -8357,7 +8550,9 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // is the pager, not the live screen -- painting the
                         // live screen here would silently swap the user's
                         // view without giving them the keyboard back.
-                        if input_status_ctx.scroll.is_active() {
+                        if input_status_ctx.scroll.is_active()
+                            && !input_status_ctx.scroll.is_typing()
+                        {
                             paint_scroll_view(&input_status_ctx);
                         } else {
                             redraw_live_screen(&input_status_ctx);
@@ -10161,6 +10356,121 @@ mod switching_tests {
                 enter_scroll_mode(&ctx, ScrollCommand::Stay);
             }
         }
+    }
+
+    /// A failed history refresh must not take the pager down with it. The
+    /// model here has seen a DECSTBM sub-range (the gate fires) and the test
+    /// record's socket path is a regular file (every RPC fails fast), which
+    /// is exactly the "worker went away between the keystroke and the
+    /// rebuild" case: `Ctrl-b [` still opens the pager on whatever the live
+    /// model has, which is the pre-refresh behavior.
+    #[test]
+    fn pager_entry_survives_a_failed_history_refresh() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        feed_test_screen(&ctx.screen, b"\x1b[3;23r");
+        assert!(
+            ctx.screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .subregion_seen(),
+            "precondition: the gate has to fire, or this tests nothing"
+        );
+        enter_scroll_mode(&ctx, ScrollCommand::Stay);
+        assert!(ctx.scroll.is_active());
+        apply_scroll_command(&ctx, ScrollCommand::Exit);
+        assert!(!ctx.scroll.is_active());
+    }
+
+    /// `i` in the pager hands the keyboard to the workload -- the thing
+    /// tmux copy-mode cannot do: text forwards verbatim, mouse reports stay
+    /// swallowed (the client borrowed the mouse; the workload never asked
+    /// for it), and a lone Esc takes the keyboard back with the pager still
+    /// up, paging again.
+    #[test]
+    fn type_through_forwards_text_until_esc_returns_to_paging() {
+        let ctx = status_ctx_for_test(true);
+        let _null = StdoutToDevNull::new();
+        enter_scroll_mode(&ctx, ScrollCommand::Stay);
+        let mut input = ScrollInput::default();
+        assert!(
+            input.route(&ctx, b"i").is_empty(),
+            "the i that opens type-through is consumed, not sent"
+        );
+        assert!(ctx.scroll.is_typing(), "i must enter type-through");
+        assert!(ctx.scroll.is_active(), "typing must not close the pager");
+        assert_eq!(
+            input.route(&ctx, b"hi there\r"),
+            b"hi there\r".to_vec(),
+            "while typing, text goes to the workload"
+        );
+        assert!(
+            input.route(&ctx, b"\x1b[<0;3;4M").is_empty(),
+            "mouse reports stay swallowed during type-through"
+        );
+        assert!(
+            input.route(&ctx, b"\x1b").is_empty(),
+            "the Esc that ends type-through is consumed"
+        );
+        assert!(!ctx.scroll.is_typing());
+        assert!(
+            ctx.scroll.is_active(),
+            "Esc returns to paging, not to the live screen"
+        );
+        assert!(
+            input.route(&ctx, b"xx").is_empty(),
+            "once back in the pager, keys are swallowed again"
+        );
+        apply_scroll_command(&ctx, ScrollCommand::Exit);
+        assert!(!ctx.scroll.is_active());
+    }
+
+    /// The type-through bar keeps the pager's position readout (the offset is
+    /// still where the user left it) and names the mode; narrow widths
+    /// degrade without ever exceeding the row.
+    #[test]
+    fn typing_bar_names_the_mode_and_keeps_the_position() {
+        let view = ScrollView {
+            offset: 12,
+            available: 240,
+        };
+        let text = scroll_bar_typing_text(view, 120);
+        assert!(text.contains("SCROLL 12/240"), "{text:?}");
+        assert!(text.contains("TYPE"), "{text:?}");
+        assert!(text.chars().count() <= 120);
+        let medium = scroll_bar_typing_text(view, 20);
+        assert!(
+            medium.contains("TYPE") && medium.chars().count() <= 20,
+            "{medium:?}"
+        );
+        assert_eq!(scroll_bar_typing_text(view, 4), "TYPE");
+    }
+
+    #[test]
+    fn scroll_keys_binds_i_to_type_through() {
+        assert_eq!(
+            scroll_keys(b"i"),
+            ScrollKey::Command(ScrollCommand::TypeThrough, 1)
+        );
+    }
+
+    /// Pane delivery appends the return by default (the tmuxctl behavior) in
+    /// both framed and raw form, and `--no-enter` drops it in both.
+    #[test]
+    fn pane_delivery_appends_enter_by_default_and_no_enter_drops_it() {
+        assert_eq!(
+            pane_input_bytes("ship it", Some("review"), false, false),
+            b"[aplexer message from review] ship it\r"
+        );
+        assert_eq!(
+            pane_input_bytes("ship it", Some("review"), true, false),
+            b"ship it\r"
+        );
+        assert_eq!(
+            pane_input_bytes("hold", Some("review"), false, true),
+            b"[aplexer message from review] hold"
+        );
+        assert_eq!(pane_input_bytes("hold", None, true, true), b"hold");
     }
 
     /// While the client holds the mouse and the pager is *down*, mouse
@@ -12316,7 +12626,7 @@ mod switching_tests {
         "redraw_live_screen",
         "paint_scroll_view",
         "refresh_scroll_bar",
-        "exit_scroll_mode",
+        "paint_live_screen",
         "sync_client_mouse",
         "paint_key_overlay",
         "dismiss_key_overlay",
@@ -12521,7 +12831,7 @@ mod switching_tests {
         const SUSPENDED_WRITERS: &[(&str, bool)] = &[
             // (name, must build its own SCROLL_CANCEL-led sequence)
             ("paint_scroll_view", true),
-            ("exit_scroll_mode", true),
+            ("paint_live_screen", true),
             // The overlay's two frames. Either can be the first write after
             // the relay was suspended -- `paint_key_overlay` always is, and
             // `dismiss_key_overlay` is whenever nothing was repainted in

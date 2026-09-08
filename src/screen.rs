@@ -149,6 +149,18 @@ pub struct MarginTracker {
     /// is not expressible as a DECSTBM. `margins()` is the emission-facing
     /// view that filters that out; nothing outside this type reads the field.
     region: Option<(u16, u16)>,
+    /// Whether a DECSTBM sub-range has been in force at any point since this
+    /// tracker last became authoritative (construction, or the reset that
+    /// `ClientScreen::seed_history` does). Sticky by design: `vt100` drops a
+    /// row scrolled out of *any* sub-range (`grid.rs::scroll_up`), so one
+    /// sub-range anywhere in the model's lifetime means the live scrollback
+    /// may silently be missing rows, even after the workload resets its
+    /// margins. The attach client reads this to decide whether the pager's
+    /// history is worth rebuilding from the worker's raw tail before opening
+    /// (`refresh_pager_history` in `src/bin/a.rs`); a workload that never
+    /// sends a sub-range retains every row through the ordinary live path and
+    /// pays for nothing.
+    subregion_seen: bool,
 }
 
 impl MarginTracker {
@@ -159,6 +171,7 @@ impl MarginTracker {
             param_buf: Vec::new(),
             disqualified: false,
             region: None,
+            subregion_seen: false,
         }
     }
 
@@ -181,6 +194,17 @@ impl MarginTracker {
         self.region.filter(|&(top, bottom)| top < bottom)
     }
 
+    /// Whether a DECSTBM sub-range has been seen at all since the last
+    /// `reset` -- see the field's doc comment for why this is the "the live
+    /// scrollback may be missing rows" signal rather than "a sub-range is in
+    /// force right now". A full-range or bare `CSI r`, RIS, and every
+    /// malformed sequence leave it alone: they say the workload stopped (or
+    /// never started) using a region, not that the rows scrolled out while it
+    /// did are back.
+    pub fn subregion_seen(&self) -> bool {
+        self.subregion_seen
+    }
+
     /// The region as *tracked*, before that emission-time filtering -- the
     /// state this tracker carries into the next `set_rows`, which is what has
     /// to match the `vt100` grid case-for-case.
@@ -201,6 +225,7 @@ impl MarginTracker {
         self.state = MarginParseState::Ground;
         self.param_buf.clear();
         self.disqualified = false;
+        self.subregion_seen = false;
     }
 
     /// Re-fits the tracked region to a new row count, following
@@ -443,6 +468,7 @@ impl MarginTracker {
             }
         } else {
             self.region = Some((top, bottom));
+            self.subregion_seen = true;
             CsiEvent::default()
         }
     }
@@ -729,6 +755,13 @@ impl ScreenTracker {
     /// replays a raw tail, whose trailing state was never this client's.
     pub fn reset_margins(&mut self) {
         self.margins.reset();
+    }
+
+    /// Whether a DECSTBM sub-range has been seen since this tracker's margins
+    /// were last reset -- `MarginTracker::subregion_seen` delegated, read by
+    /// the attach client to gate the pager's history rebuild.
+    pub fn subregion_seen(&self) -> bool {
+        self.margins.subregion_seen()
     }
 
     /// Where the *workload* believes its cursor is, 0-based `(row, col)`.
@@ -1289,6 +1322,71 @@ impl ClientScreen {
         self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
         self.screen.reset_margins();
         self.boundary.reset();
+    }
+
+    /// Whether a DECSTBM sub-range has been seen since this client's history
+    /// became authoritative (attach, or the last `refresh_scrollback`) --
+    /// `MarginTracker::subregion_seen` delegated. This is the "the live
+    /// scrollback may be missing rows" signal: `vt100` drops a row scrolled
+    /// out of any sub-range, so a workload that ever holds one (codex TUI
+    /// streams its transcript through bottom-anchored sub-ranges) leaves the
+    /// live model with an empty pager no matter how long it runs, while a
+    /// workload that never does retains everything through the ordinary live
+    /// path.
+    pub fn subregion_seen(&self) -> bool {
+        self.screen.subregion_seen()
+    }
+
+    /// Rebuild the pager's history from a fresh tail of the worker's retained
+    /// raw bytes, then re-feed the worker's current snapshot so the grid is
+    /// the live screen again.
+    ///
+    /// This is `seed_history` + snapshot re-run on a live attach, and it
+    /// exists because the seed's region-stripping only ran at attach. A
+    /// session attached *before* its interesting output happened -- `a new`,
+    /// the default flow: the client model has been parsing since the first
+    /// frame -- accumulated its history through the live path, where vt100
+    /// behaves correctly for a real pane and drops every row that scrolls out
+    /// of a DECSTBM sub-range. The codex TUI holds a sub-range almost
+    /// constantly (289 of them in a 100 KiB sample of one real session, the
+    /// transcript scrolling through bottom-anchored ones like `CSI 10;29 r`),
+    /// so its pager opened on `SCROLL 0/0` after minutes of visible output.
+    /// Re-running the seed at pager entry gives that attach the same past a
+    /// fresh attach already gets, which is the only consistency the pager
+    /// has ever promised (`scrollback_seed_bytes` in `src/bin/a.rs`).
+    ///
+    /// Mechanics, in order: replace the inner tracker at the current geometry
+    /// and scrollback depth (`reset` -- also keeps the host alt-screen hold),
+    /// replay the region-stripped tail into the fresh grid's history
+    /// (`seed_history` -- its grid is as disposable as at attach), then feed
+    /// the worker's `CaptureScreen` snapshot -- the same paintable bytes the
+    /// attach handshake delivers -- so grid, margins, alt-screen state and
+    /// input modes describe the live screen again rather than the tail's.
+    /// Model-only throughout: nothing here reaches the host terminal.
+    ///
+    /// Two deliberate losses, both bounded and both self-healing for exactly
+    /// the workloads that reach this path: bytes that arrived between the
+    /// snapshot being fetched and the tracker swap are missing from the
+    /// rebuilt grid until the workload's next repaint (a TUI repaints within
+    /// a frame), and rows that scrolled by in that sliver are missing from
+    /// the rebuilt history for good. A sub-millisecond window over two
+    /// consecutive statements, against holding the model lock across both
+    /// RPCs -- this codebase does not hold locks across I/O.
+    ///
+    /// The gate is the caller's (`subregion_seen`, plus `alternate_screen`:
+    /// the alternate grid has no scrollback in vt100 or any real terminal, so
+    /// there is nothing to rebuild for a full-screen application). An empty
+    /// tail is rejected here rather than by the caller so the invariant is
+    /// visible next to the rebuild it protects: a seed of zero bytes would
+    /// replace whatever history the live path did retain with nothing.
+    pub fn refresh_scrollback(&mut self, tail: &[u8], snapshot: &[u8]) {
+        if tail.is_empty() {
+            return;
+        }
+        let (rows, cols) = (self.screen.rows(), self.screen.cols());
+        self.reset(rows, cols);
+        self.seed_history(tail);
+        self.feed(snapshot);
     }
 
     /// `ScreenTracker::scrolled_frame` -- the pager's view of the history,
@@ -2783,6 +2881,132 @@ mod tests {
         assert!(
             client.at_escape_boundary(),
             "the tail's half-emitted sequence must not leave the stream mid-sequence"
+        );
+    }
+
+    /// The gate for the pager-entry history rebuild: a DECSTBM sub-range
+    /// anywhere in the model's lifetime means the live scrollback may be
+    /// missing rows, and that must survive the workload later resetting its
+    /// margins -- `vt100` does not give the dropped rows back. Only an
+    /// explicit rebuild of the measurement (`reset`, which the seed path
+    /// drives) clears it, and full-screen-only traffic never sets it.
+    #[test]
+    fn margin_tracker_subrange_use_is_sticky_until_reset() {
+        let mut t = MarginTracker::new(24);
+        assert!(!t.subregion_seen());
+        t.scan(b"\x1b[3;20r");
+        assert!(t.subregion_seen());
+        t.scan(b"\x1b[1;24r");
+        assert!(
+            t.subregion_seen(),
+            "the workload resetting its region does not restore the rows dropped while it held one"
+        );
+        t.reset();
+        assert!(!t.subregion_seen());
+
+        let mut t = MarginTracker::new(24);
+        t.scan(b"\x1b[r\x1b[1;24r\x1b[?1000r");
+        assert!(
+            !t.subregion_seen(),
+            "full-screen DECSTBM and XTRESTORE are not sub-ranges"
+        );
+    }
+
+    /// A workload that never sends a sub-range keeps its whole history
+    /// through the ordinary live path -- the population the pager-entry
+    /// refresh must leave untouched (its history is already complete, and a
+    /// byte-capped replay could only shrink it).
+    #[test]
+    fn full_screen_scrolling_never_flags_subregion_use() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("SHELL-{i:02}\r\n").as_bytes());
+        }
+        assert!(client.scrollback_available() > 0);
+        assert!(!client.subregion_seen());
+    }
+
+    /// **The live-attach empty pager.** The seed test above
+    /// (`seeding_retains_lines_that_scrolled_out_of_a_scroll_region`) fixes a
+    /// *fresh* attach; this is the session that was attached all along. Its
+    /// model ate every byte through the live path, where a sub-range is
+    /// honored and rows scrolled out of one are gone -- so `a new` + a long
+    /// codex run opened the pager on `SCROLL 0/0` no matter how much had
+    /// streamed past. Re-running the seed against the worker's raw tail
+    /// (`refresh_scrollback`) restores exactly what a fresh attach would have
+    /// had, and the snapshot fed afterwards leaves the grid describing the
+    /// live screen, the workload's own region re-asserted, and the stream at
+    /// a boundary.
+    #[test]
+    fn refresh_scrollback_restores_the_history_a_scroll_region_emptied() {
+        let mut region_tail = b"\x1b[3;23r".to_vec();
+        for i in 1..=200 {
+            region_tail.extend_from_slice(format!("REGION-{i:03}\r\n").as_bytes());
+        }
+
+        let mut client = ClientScreen::try_new_with_scrollback(23, 40, 500).unwrap();
+        client.feed(&region_tail);
+        assert_eq!(
+            client.scrollback_available(),
+            0,
+            "control: the live path under a sub-range retains nothing"
+        );
+        assert!(
+            client.subregion_seen(),
+            "this workload is the one the refresh gate exists for"
+        );
+
+        // What the worker answers at pager entry: the same raw tail (DECSTBM
+        // still in it -- stripping is the seed's job, not the log's), then a
+        // snapshot painting the current screen and re-asserting the region
+        // the worker's own model holds.
+        let snapshot = b"\x1b[2J\x1b[1;1H newest row\x1b[3;23r";
+        client.refresh_scrollback(&region_tail, snapshot);
+
+        let available = client.scrollback_available();
+        assert!(
+            available > 100,
+            "replaying the tail must give the pager its past back, got {available} lines"
+        );
+        let (frame, _, _) = client.scrolled_frame(available);
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(
+            text.contains("REGION-0"),
+            "the rebuilt history must hold the rows that scrolled out of the region:\n{text}"
+        );
+        let (live_frame, _, _) = client.scrolled_frame(0);
+        let live_text = String::from_utf8_lossy(&live_frame).into_owned();
+        assert!(
+            live_text.contains("newest row"),
+            "the snapshot must leave the grid on the live screen:\n{live_text}"
+        );
+        assert_eq!(
+            client.margins(),
+            Some((3, 23)),
+            "the snapshot re-asserts the workload's own sub-range"
+        );
+        assert!(client.at_escape_boundary());
+        assert!(
+            client.subregion_seen(),
+            "still region-using after the rebuild, so the next pager entry refreshes again"
+        );
+    }
+
+    /// An empty tail must not be able to *destroy* history: a seed of zero
+    /// bytes replaces whatever the live path did retain with nothing.
+    #[test]
+    fn refresh_scrollback_rejects_an_empty_tail() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("KEEP-{i:02}\r\n").as_bytes());
+        }
+        let before = client.scrollback_available();
+        assert!(before > 0);
+        client.refresh_scrollback(b"", b"\x1b[2J\x1b[1;1Hirrelevant");
+        assert_eq!(
+            client.scrollback_available(),
+            before,
+            "nothing to seed means nothing to rebuild"
         );
     }
 
