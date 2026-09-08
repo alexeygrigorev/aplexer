@@ -204,7 +204,8 @@ const HERE_EXAMPLES: &str = r#"Examples:
 "#;
 
 const LIST_EXAMPLES: &str = r#"Examples:
-  a list                        every session, grouped by workspace (bare `a` too)
+  a list                        live sessions, grouped by workspace (bare `a` too)
+  a list --all                  include exited sessions too
   a list --running              only live sessions
   a list --sort activity        busiest workspace first; the choice is remembered
   a list --json                 machine-readable
@@ -478,6 +479,9 @@ struct ListArgs {
     /// Only live sessions
     #[arg(long)]
     running: bool,
+    /// Include exited sessions too (the list hides them by default)
+    #[arg(long)]
+    all: bool,
     /// Order workspaces in `a list` (and the `a N` numbers). Remembered
     /// until you pick another. Time sorts are newest-first.
     #[arg(long, value_enum, value_name = "KEY")]
@@ -1196,33 +1200,29 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     cmd_list_plain(paths, args)
 }
 
+/// Exited sessions are corpses: the one listed state that is neither active
+/// (`ui_state_is_active`) nor needs-attention (`ui_state_needs_attention`),
+/// and `check_attachable` refuses them outright. The terminal list hides
+/// them by default -- a workspace whose every session has exited drops out
+/// with them -- and `a list --all` brings them back. `resolve_quick_index`
+/// shares this so the numbers `a <workspace#>` understands stay the numbers
+/// the default list prints; a corpse you found via `a list --all` is
+/// addressed by tag or UUID prefix, not by its --all index.
+fn session_is_listed(record: &SessionRecord, now: u64) -> bool {
+    session_ui_state(record, now).0 != "exited"
+}
+
 /// The terminal rendering of `a list` -- see cmd_list's redirect contract.
 fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
     let mut records = list_records(paths)?;
-    if args.running {
-        records.retain(|record| record.worker_phase_active() && record.worker_alive());
-    }
-    if records.is_empty() {
-        if args.running {
-            println!("No running sessions.");
-        } else {
-            println!("No aplexer sessions yet.");
-            println!();
-            println!("Start and attach in this directory:");
-            println!("  a here                 default engine, tag main");
-            println!("  a here codex review    codex, tag review");
-            println!("  a new --engine shell   full start options, attached");
-            println!();
-            println!("Discover: a engines · a profiles · a help");
-        }
-        return Ok(());
-    }
-
     // Lineage labels: a session started from inside another session (`a
     // start` ran with its parent's APLEXER_SESSION_ID still in the
     // environment) shows where it came from -- the parent's tag while its
     // record exists, a short id once it doesn't, since the recorded lineage
-    // deliberately survives a killed or forgotten parent.
+    // deliberately survives a killed or forgotten parent. Computed over the
+    // full registry, before the corpse filter below, so a live child of an
+    // exited parent keeps the parent's tag in its `↳` label even though the
+    // parent no longer has a row of its own.
     let lineage_labels: BTreeMap<Uuid, String> = {
         let by_id: BTreeMap<Uuid, &SessionRecord> =
             records.iter().map(|record| (record.id, record)).collect();
@@ -1238,6 +1238,33 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             })
             .collect()
     };
+    let mut hidden_exited = 0usize;
+    if args.running {
+        records.retain(|record| record.worker_phase_active() && record.worker_alive());
+    } else if !args.all {
+        let before = records.len();
+        let now = now_ms();
+        records.retain(|record| session_is_listed(record, now));
+        hidden_exited = before - records.len();
+    }
+    if records.is_empty() {
+        if args.running {
+            println!("No running sessions.");
+        } else if hidden_exited > 0 {
+            println!("No live sessions -- {hidden_exited} exited hidden (`a list --all` shows them).");
+        } else {
+            println!("No aplexer sessions yet.");
+            println!();
+            println!("Start and attach in this directory:");
+            println!("  a here                 default engine, tag main");
+            println!("  a here codex review    codex, tag review");
+            println!("  a new --engine shell   full start options, attached");
+            println!();
+            println!("Discover: a engines · a profiles · a help");
+        }
+        return Ok(());
+    }
+
     let sort = load_list_sort(paths);
     let groups = group_by_workspace(records, sort);
     let home = env::var_os("HOME").map(PathBuf::from);
@@ -1421,6 +1448,16 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             )
         )
     );
+    if hidden_exited > 0 {
+        println!(
+            "{}",
+            paint(
+                color,
+                ANSI_DIM,
+                &format!("{hidden_exited} exited hidden · a list --all shows them")
+            )
+        );
+    }
     Ok(())
 }
 
@@ -2270,13 +2307,19 @@ fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> 
 
 /// Shared by the bare `a <N>` shortcut and by `resolve()` (so `a attach 1`,
 /// `a status 1`, `a kill 1`, etc. all understand the same numbers `a list`
-/// prints, not just the no-subcommand form).
+/// prints, not just the no-subcommand form). Exited sessions are skipped
+/// (session_is_listed), so the numbers track the default list's rows rather
+/// than the full registry -- a corpse found via `a list --all` is addressed
+/// by tag or UUID prefix, not by its --all index.
 fn resolve_quick_index(
     paths: &Paths,
     workspace_index: usize,
     session: Option<&str>,
 ) -> Result<SessionRecord> {
-    let groups = group_by_workspace(list_records(paths)?, load_list_sort(paths));
+    let mut records = list_records(paths)?;
+    let now = now_ms();
+    records.retain(|record| session_is_listed(record, now));
+    let groups = group_by_workspace(records, load_list_sort(paths));
     if groups.is_empty() {
         bail!("no sessions found (see `a start`)");
     }
@@ -9761,6 +9804,44 @@ mod switching_tests {
         );
     }
 
+    /// The default list's corpse filter: `exited` is the one state that is
+    /// neither active nor needs-attention, so it is the only one hidden.
+    /// The failure states a human may need to see (oom, failed, broken) and
+    /// a healthy Starting session that has not registered its worker pid
+    /// yet (issue #9's startup window) all stay listed.
+    #[test]
+    fn only_exited_sessions_drop_out_of_the_default_list() {
+        let now = now_ms();
+        let mut exited = mk_record("/ws/f", "done", Phase::Exited);
+        exited.worker_pid = None;
+        assert!(!session_is_listed(&exited, now));
+
+        let mut oom = mk_record("/ws/f", "oomed", Phase::Exited);
+        oom.worker_pid = None;
+        oom.exit = Some(aplexer::ExitInfo {
+            code: None,
+            signal: None,
+            oom_killed: true,
+            exited_at_ms: now,
+        });
+        assert!(session_is_listed(&oom, now), "oom needs attention, not a corpse");
+
+        let failed = mk_record("/ws/f", "failed", Phase::Failed);
+        assert!(session_is_listed(&failed, now));
+
+        let mut broken = mk_record("/ws/f", "broken", Phase::Running);
+        broken.worker_pid = None;
+        assert!(session_is_listed(&broken, now));
+
+        let mut creating = mk_record("/ws/f", "creating", Phase::Starting);
+        creating.worker_pid = None;
+        creating.created_at_ms = now;
+        assert!(
+            session_is_listed(&creating, now + 1),
+            "the startup window must not read as a corpse (issue #9)"
+        );
+    }
+
     #[test]
     fn overlay_reported_state_takes_the_live_activity_stamp_too() {
         let now: u64 = 200_000;
@@ -11782,6 +11863,43 @@ mod switching_tests {
         fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
         atomic_write_json(&paths.record(record.id), record).unwrap();
         (paths, state_dir, runtime_dir)
+    }
+
+    /// resolve_quick_index shares session_is_listed with the default list,
+    /// so the numbers `a 1` understands stay the numbers `a list` prints: a
+    /// corpse cannot take a row number even when it is the newest session
+    /// in its workspace, and a workspace whose only session has exited is
+    /// simply not there (the list drops it whole).
+    #[test]
+    fn quick_index_skips_exited_corpses_like_the_default_list() {
+        let now = now_ms();
+        // Newest-created-first row order (registry.rs), so unfiltered this
+        // corpse would be row 1 of the workspace.
+        let mut corpse = mk_record("/ws/only", "gone", Phase::Exited);
+        corpse.worker_pid = None;
+        corpse.created_at_ms = now + 5_000;
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut corpse);
+
+        let err = resolve_quick_index(&paths, 1, None)
+            .err()
+            .expect("a corpse-only workspace has no rows");
+        assert!(
+            format!("{err:#}").contains("no sessions found"),
+            "unexpected error: {err:#}"
+        );
+
+        // A live session behind the corpse: with the filter, index 1
+        // resolves to the live session, never to the newer corpse.
+        let mut live = mk_record("/ws/only", "main", Phase::Running);
+        live.created_at_ms = now;
+        live.socket_path = paths.socket(live.id);
+        live.history_path = paths.history(live.id);
+        fs::create_dir_all(paths.state_session(live.id)).unwrap();
+        fs::create_dir_all(paths.runtime_session(live.id)).unwrap();
+        atomic_write_json(&paths.record(live.id), &live).unwrap();
+
+        let picked = resolve_quick_index(&paths, 1, None).unwrap();
+        assert_eq!(picked.id, live.id, "the corpse took the live session's row");
     }
 
     /// `worker_alive()` deliberately falls back to the bare pid check when
