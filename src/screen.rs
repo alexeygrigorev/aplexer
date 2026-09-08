@@ -508,6 +508,12 @@ pub struct LayoutChange {
 pub struct ScreenTracker {
     parser: vt100::Parser,
     margins: MarginTracker,
+    /// Whether the stream this tracker has consumed is currently between
+    /// escape sequences. `try_set_size` consults it before injecting the
+    /// synthetic scroll-up a shrink is compensated with: glued into a
+    /// half-received sequence it would corrupt the parse instead of fixing
+    /// the resize.
+    boundary: StreamBoundary,
     /// Last-observed `alternate_screen()` value, for flip detection.
     alt_screen: bool,
     /// Retained scrollback lines this tracker was built with, so a rebuild
@@ -560,6 +566,7 @@ impl ScreenTracker {
         Ok(Self {
             parser: vt100::Parser::new(rows, cols, scrollback),
             margins: MarginTracker::new(rows),
+            boundary: StreamBoundary::new(),
             alt_screen: false,
             scrollback,
         })
@@ -659,6 +666,7 @@ impl ScreenTracker {
     /// Feed PTY bytes; returns `Some(LayoutChange)` when the workload did
     /// something the attached client must react to.
     pub fn process(&mut self, data: &[u8]) -> Option<LayoutChange> {
+        self.boundary.feed(data);
         let csi = self.margins.scan(data);
         self.parser.process(data);
         let now_alt = self.parser.screen().alternate_screen();
@@ -688,6 +696,7 @@ impl ScreenTracker {
     /// affordable. `alt_screen` is still tracked, because the seed's epilogue
     /// relies on it being current.
     pub fn seed(&mut self, data: &[u8]) {
+        self.boundary.feed(data);
         self.parser.process(data);
         self.alt_screen = self.parser.screen().alternate_screen();
     }
@@ -698,8 +707,38 @@ impl ScreenTracker {
     /// doc section 5.3's original "margins reset on resize" plan. See
     /// `MarginTracker::set_rows` for the exact rules and why the tracker has
     /// to follow the grid rather than a real terminal here.
+    ///
+    /// One place the tracker *does* have to follow a real terminal rather
+    /// than `vt100`: a shrink keeps the cursor's line on screen. A real
+    /// terminal (xterm, and tmux's vt100) scrolls the content up by exactly
+    /// the excess when the cursor sits below the new bottom row;
+    /// `vt100`'s `Grid::set_size` instead truncates rows from the bottom,
+    /// so the newest line falls off and the cursor clamps onto the row
+    /// above it -- where the workload's WINCH redraw (a shell repainting
+    /// its prompt) then overwrites what is left. Attaching to an idle shell
+    /// visibly lost its last output line this way, and every later snapshot
+    /// carried the loss. The compensation is a synthetic SU by the excess,
+    /// under two gates: no DECSTBM sub-range in force (a region holder owns
+    /// its own resize semantics, and `set_size` already follows a
+    /// bottom-anchored region), and the stream not mid-escape-sequence
+    /// (`boundary`), because an SU glued into a half-received sequence
+    /// corrupts the parse it was meant to protect. A skipped compensation
+    /// costs nothing permanent: SIGWINCH makes the workload repaint anyway,
+    /// and the next resize retries.
     pub fn try_set_size(&mut self, rows: u16, cols: u16) -> Result<()> {
         let (rows, cols) = validate_size(rows, cols)?;
+        if rows < self.rows()
+            && self.margins.margins().is_none()
+            && self.boundary.at_escape_boundary()
+        {
+            let (cursor_row, _) = self.cursor_position();
+            let excess = i32::from(cursor_row) - i32::from(rows) + 1;
+            if excess > 0 {
+                let su = format!("\x1b[{excess}S").into_bytes();
+                self.boundary.feed(&su);
+                self.parser.process(&su);
+            }
+        }
         self.parser.screen_mut().set_size(rows, cols);
         self.margins.set_rows(rows);
         Ok(())
@@ -752,9 +791,12 @@ impl ScreenTracker {
 
     /// Forget any tracked DECSTBM sub-range and any half-parsed sequence,
     /// without touching the grid. Used after `ClientScreen::seed_history`
-    /// replays a raw tail, whose trailing state was never this client's.
+    /// replays a raw tail, whose trailing state was never this client's --
+    /// which is also why the boundary tracker is reset here: the tail's
+    /// mid-sequence ending was the log's, not the live stream's.
     pub fn reset_margins(&mut self) {
         self.margins.reset();
+        self.boundary.reset();
     }
 
     /// Whether a DECSTBM sub-range has been seen since this tracker's margins
@@ -2500,6 +2542,102 @@ mod tests {
             tracker.parser.screen().cursor_position(),
             b.screen().cursor_position()
         );
+    }
+
+    /// The resize every attach performs: the worker's model shrinks one row
+    /// to make room for the status bar. `vt100` truncates from the bottom,
+    /// which drops the newest line and parks the cursor on the row above it
+    /// -- where the shell's WINCH prompt redraw then overwrites what is
+    /// left. A real terminal scrolls instead, so the tracker does too: the
+    /// cursor's line survives, the top advances, and the last line stays
+    /// last.
+    #[test]
+    fn shrinking_keeps_the_cursor_line_the_way_a_real_terminal_does() {
+        let mut t = ScreenTracker::new(24, 80);
+        let mut fill = Vec::new();
+        for i in 58..=80 {
+            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
+        }
+        fill.extend_from_slice(b"prompt$ ");
+        t.process(&fill);
+        assert!(t.contents().contains("HISTLINE-80"));
+
+        t.set_size(23, 80);
+        let after = t.contents();
+        assert!(
+            after.contains("HISTLINE-80"),
+            "the newest line must survive the shrink:\n{after}"
+        );
+        assert!(
+            !after.contains("HISTLINE-58"),
+            "the freed row comes off the top, not the bottom:\n{after}"
+        );
+        assert!(
+            after.ends_with("prompt$ "),
+            "the cursor's line stays the last line:\n{after}"
+        );
+    }
+
+    /// The compensation's two gates. With a DECSTBM sub-range in force the
+    /// workload owns the resize semantics, so the tracker does nothing. With
+    /// a half-received sequence in flight the synthetic SU must not be
+    /// injected into it -- the shrink then falls back to plain truncation,
+    /// and the pending sequence still completes correctly.
+    #[test]
+    fn shrinking_compensation_is_gated_on_regions_and_mid_sequence_streams() {
+        // Region holder: no compensation.
+        let mut t = ScreenTracker::new(24, 80);
+        let mut fill = Vec::new();
+        for i in 58..=80 {
+            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
+        }
+        t.process(&fill);
+        t.process(b"\x1b[3;20r");
+        t.set_size(23, 80);
+        let region = t.contents();
+        assert!(
+            region.contains("HISTLINE-58"),
+            "a region holder keeps vt100's own truncation behaviour -- the top \
+             row must not advance:\n{region}"
+        );
+        assert_eq!(t.margins(), Some((3, 20)));
+
+        // Mid-sequence: the guard must skip the SU and leave the pending
+        // sequence parseable.
+        let mut t = ScreenTracker::new(24, 80);
+        let mut fill = Vec::new();
+        for i in 58..=80 {
+            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
+        }
+        fill.extend_from_slice(b"prompt$ \x1b[38;5");
+        t.process(&fill);
+        t.set_size(23, 80);
+        t.process(b";1m");
+        let midseq = t.contents();
+        assert!(
+            midseq.contains("HISTLINE-80"),
+            "without compensation the newest row is simply truncated, and the \
+             partial sequence must still complete into a plain SGR:\n{midseq}"
+        );
+        assert!(
+            !midseq.contains('\u{9b}'),
+            "no glued control state may survive:\n{midseq:?}"
+        );
+    }
+
+    /// Growth never compensates: the cursor is above the new bottom, the
+    /// content stays top-anchored, and blank rows appear below -- the same
+    /// as before the fix, pinned so a future edit cannot quietly start
+    /// scrolling on grow.
+    #[test]
+    fn growing_never_scrolls_the_content() {
+        let mut t = ScreenTracker::new(10, 80);
+        t.process(b"top line\r\nsecond line");
+        t.set_size(24, 80);
+        let after = t.contents();
+        assert!(after.starts_with("top line"), "{after:?}");
+        assert!(after.contains("second line"));
+        assert_eq!(t.rows(), 24);
     }
 
     /// Regression test for the scroll region being silently dropped from the
