@@ -6561,7 +6561,18 @@ fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
 /// Refresh just the pager's bar row, so the retained-line count stays honest
 /// while the workload keeps producing output behind the pager, without
 /// repainting (and flickering) a whole screen on a timer.
+///
+/// The write policy follows the mode. With the pager owning the screen the
+/// relay is suspended, so `StreamSuspended` applies and the bytes go out
+/// unconditionally. While **type-through** (`i`) has handed the keyboard back
+/// the relay is streaming again, so the bar is client-originated output
+/// spliced into a live stream like any other: it waits for an escape boundary
+/// (`Defer`), and on a refusal arms `ctx.pending` so the frame loop retries at
+/// the next chunk. `pending` doubles as the force flag here -- a deferred bar
+/// must not be swallowed by the dirty check on the retry, because between the
+/// deferral and the retry nothing else may have changed the text.
 fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
+    let typing = ctx.scroll.is_typing();
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return false,
@@ -6580,7 +6591,7 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
         (screen.scrollback_available(), screen.alternate_screen())
     };
     view.available = available;
-    let text = if ctx.scroll.is_typing() {
+    let text = if typing {
         scroll_bar_typing_text(*view, geom.cols as usize)
     } else {
         scroll_bar_text(*view, geom.cols as usize, alt_screen)
@@ -6590,24 +6601,38 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
     // tick is a no-op in the common case *and* still repairs the row when
     // something else wrote over it -- a `Ctrl-b ?` help flash, most
     // obviously, which would otherwise sit on the bar for the rest of the
-    // time the user spends reading.
+    // time the user spends reading. A pending deferred write forces through
+    // the check: the text is by assumption unchanged (that is why the check
+    // would skip), and the row may have been erased in the meantime.
+    let force = typing && ctx.pending.load(Ordering::Relaxed);
     {
         let mut last = ctx
             .last_drawn
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let key = (text.clone(), geom.rows, geom.cols, None);
-        if last.as_ref() == Some(&key) {
+        if !force && last.as_ref() == Some(&key) {
             return false;
         }
         *last = Some(key);
     }
-    write_client_locked(
+    let policy = if typing {
+        BoundaryPolicy::Defer
+    } else {
+        BoundaryPolicy::StreamSuspended
+    };
+    let wrote = write_client_locked(
         &mut *out,
         &ctx.screen,
         &scroll_bar_sequence(geom, &text),
-        BoundaryPolicy::StreamSuspended,
-    )
+        policy,
+    );
+    if wrote {
+        ctx.pending.store(false, Ordering::Relaxed);
+    } else {
+        ctx.pending.store(true, Ordering::Relaxed);
+    }
+    wrote
 }
 
 /// The bar while type-through is active. The pager still owns the reserved
@@ -9035,7 +9060,20 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                     // `Ctrl-b r` all keep waiting, and are delivered by the
                     // repaint `exit_scroll_mode`/`dismiss_key_overlay`
                     // performs (or by the first chunk after it).
+                    //
+                    // Type-through is the exception to "nothing may paint":
+                    // the workload's bytes are being relayed to the host, so
+                    // this IS a live view and the typing bar needs the same
+                    // per-chunk maintenance the live bar gets -- a deferred
+                    // bar write flushes at this chunk boundary, and the row
+                    // the bar lives on is repaired if the workload's own
+                    // erase sequences took it out (the `Layout` arm
+                    // invalidates the dirty check for exactly that case).
                     if scroll_mode.is_active() || key_overlay.is_active() {
+                        if scroll_mode.is_typing() && !key_overlay.is_active() {
+                            flush_pending_layout(&status_ctx);
+                            refresh_scroll_bar(&status_ctx);
+                        }
                         continue;
                     }
                     // A redraw the status thread wanted while the stream was
@@ -9088,7 +9126,38 @@ fn attach(paths: &Paths, record: &SessionRecord, history_bytes: Option<usize>) -
                         // it unconditionally keeps this match exhaustive and
                         // correct if that ever changes.
                         ServerEvent::Layout { .. } => {
-                            draw_status_bar(&status_ctx, true);
+                            if status_ctx.scroll.is_typing() {
+                                // Type-through streams workload bytes to the
+                                // host, and Erase in Display ignores scroll
+                                // margins: the workload's own `CSI ... J` --
+                                // which Ink-style TUIs emit on nearly every
+                                // frame -- erases past the scroll region and
+                                // takes the reserved row, the typing bar
+                                // included. Nothing else repairs it: the
+                                // dirty check sees unchanged text and skips,
+                                // and the erased row would stay blank until
+                                // the offset or the count next changes.
+                                // Invalidate the check so this refresh
+                                // actually rewrites the row.
+                                *status_ctx
+                                    .last_drawn
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner) = None;
+                                refresh_scroll_bar(&status_ctx);
+                            } else if !status_ctx.scroll.is_active() {
+                                // Live view: re-assert the reservation and
+                                // redraw within one socket round-trip of the
+                                // bytes that caused it, instead of waiting
+                                // on the idle-gap timer. `draw_status_bar`'s
+                                // own margin re-assert (see its doc comment)
+                                // is the reservation half of this; the
+                                // redraw is the other half.
+                                draw_status_bar(&status_ctx, true);
+                            }
+                            // Pager without type-through: nothing is being
+                            // written to the host, so no erase can have
+                            // reached the bar row and the pager's own tick
+                            // already maintains it.
                         }
                     }
                 }
@@ -12827,6 +12896,119 @@ mod switching_tests {
                 aplexer::screen::DEFAULT_TERMINAL_ROWS,
                 aplexer::screen::DEFAULT_TERMINAL_COLS,
             ))
+        );
+    }
+
+    // -- The typing bar is a live-stream writer, not a suspended one -------
+    //
+    // `i` (type-through) hands the keyboard back while the pager stays up,
+    // and the relay streams workload bytes to the host again. The typing bar
+    // is then client-originated output spliced into a live stream, with the
+    // same two obligations as the live bar: never splice mid-sequence, and
+    // repair the row when the workload's Erase-in-Display -- which ignores
+    // scroll margins -- takes it out. Reproduced against a real zcodex
+    // session: after wheel-up + `i`, the workload's first `CSI ... J` wiped
+    // the bar and nothing ever rewrote it, because the frame loop `continue`d
+    // past every bar path while scroll mode was active and the status tick's
+    // dirty check saw unchanged text.
+
+    fn ctx_in_typing_mode() -> StatusBarCtx {
+        let ctx = status_ctx_for_test(true);
+        ctx.scroll.active.store(true, Ordering::SeqCst);
+        ctx.scroll.typing.store(true, Ordering::SeqCst);
+        ctx
+    }
+
+    #[test]
+    fn typing_bar_waits_for_an_escape_boundary_and_parks_until_one() {
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+        let ctx = ctx_in_typing_mode();
+        // Half a CSI sequence: the relayed stream is mid-escape, so the bar
+        // write must be refused, parked for the frame loop, and nothing may
+        // reach the terminal.
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+        let pipe = StdoutToPipe::new();
+        assert!(
+            !refresh_scroll_bar(&ctx),
+            "a mid-sequence typing-bar write must be deferred"
+        );
+        assert!(
+            pipe.take().is_empty(),
+            "a deferred typing-bar write must not reach the terminal"
+        );
+        assert!(
+            ctx.pending.load(Ordering::Relaxed),
+            "a deferred typing-bar write must be parked for the frame loop"
+        );
+        // Complete the sequence: the parked write goes out at the boundary,
+        // and `pending` (which forced the write past the dirty check) is
+        // cleared so the tick's dirty check is honest again.
+        feed_test_screen(&ctx.screen, b"m");
+        let pipe = StdoutToPipe::new();
+        assert!(refresh_scroll_bar(&ctx), "the parked write flushes");
+        let text = String::from_utf8_lossy(&pipe.take()).into_owned();
+        assert!(
+            text.contains("TYPE"),
+            "the typing wording must reach the bar row: {text:?}"
+        );
+        assert!(
+            !ctx.pending.load(Ordering::Relaxed),
+            "a delivered write must clear the parking flag"
+        );
+    }
+
+    #[test]
+    fn layout_erase_while_typing_repairs_an_unchanged_bar_row() {
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+        let ctx = ctx_in_typing_mode();
+        let pipe = StdoutToPipe::new();
+        assert!(refresh_scroll_bar(&ctx), "first draw writes the bar");
+        assert!(!pipe.take().is_empty());
+        // The dirty check must skip when nothing changed -- this is what
+        // kept the erased row blank forever before the fix: the text was
+        // unchanged, so every later refresh saw "already drawn" and stopped.
+        assert!(
+            !refresh_scroll_bar(&ctx),
+            "unchanged text must be a dirty-check skip"
+        );
+        // What the `Layout` arm does when the workload erased the screen
+        // while typing: invalidate `last_drawn`, then refresh. The text is
+        // byte-identical; the write must happen anyway, because the row the
+        // text lives on no longer holds it.
+        *ctx.last_drawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        let pipe = StdoutToPipe::new();
+        assert!(
+            refresh_scroll_bar(&ctx),
+            "an invalidated dirty check must rewrite the bar row"
+        );
+        assert!(
+            !pipe.take().is_empty(),
+            "the repair must be a real write, not a bookkeeping update"
+        );
+    }
+
+    #[test]
+    fn pager_bar_without_typing_still_writes_unconditionally() {
+        // Deliberate asymmetry, pinned so it reads as decided rather than
+        // forgotten: with the pager up but NOT typing, the relay is
+        // suspended, so there is no live stream to splice into and the bar
+        // does not wait for a boundary -- a workload stopped mid-sequence
+        // must not freeze the bar the user is actively reading against.
+        let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+        let ctx = status_ctx_for_test(true);
+        ctx.scroll.active.store(true, Ordering::SeqCst);
+        feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+        let pipe = StdoutToPipe::new();
+        assert!(
+            refresh_scroll_bar(&ctx),
+            "a stream-suspended write goes out at once"
+        );
+        assert!(!pipe.take().is_empty());
+        assert!(
+            !ctx.pending.load(Ordering::Relaxed),
+            "a stream-suspended write never parks"
         );
     }
 
