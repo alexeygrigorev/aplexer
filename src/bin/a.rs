@@ -11983,9 +11983,8 @@ mod switching_tests {
         corpse.created_at_ms = now + 5_000;
         let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut corpse);
 
-        let err = resolve_quick_index(&paths, 1, None)
-            .err()
-            .expect("a corpse-only workspace has no rows");
+        let err =
+            resolve_quick_index(&paths, 1, None).expect_err("a corpse-only workspace has no rows");
         assert!(
             format!("{err:#}").contains("no sessions found"),
             "unexpected error: {err:#}"
