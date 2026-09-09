@@ -6351,6 +6351,35 @@ struct ScrollView {
     available: usize,
 }
 
+/// Keep the pager's view anchored to its *content* while the workload
+/// streams behind it, the way tmux copy-mode does.
+///
+/// `offset` counts lines above the live screen, so on its own the view
+/// slides: every line the workload scrolls off re-bases that coordinate
+/// system at the (moved) bottom, and the page the user was reading drifts
+/// toward the live screen by exactly the number of lines that arrived since
+/// they opened it -- an agent streaming a reply drags the reader back down
+/// mid-conversation. Compensating by the growth of `available` pins the
+/// same lines under the viewport. At the retained-depth ceiling `available`
+/// stops growing while the oldest lines fall off the top; there,
+/// distance-from-the-bottom coordinates are already stable and no
+/// compensation is due (the transition into the ceiling under-compensates
+/// by the lines that filled it -- a one-event sliver, accepted).
+///
+/// `offset == 0` is the live screen and stays put by definition.
+///
+/// Every writer that refreshes the pager while bytes keep arriving --
+/// `paint_scroll_view` on navigation and resize, `refresh_scroll_bar` on
+/// the status tick -- must run this, or the tick's honest `available`
+/// update silently swallows the growth and the next paint under-compensates.
+fn reanchor_view(view: &mut ScrollView, fresh_available: usize) {
+    let grown = fresh_available.saturating_sub(view.available);
+    if view.offset > 0 && grown > 0 {
+        view.offset += grown;
+    }
+    view.available = fresh_available;
+}
+
 /// One navigation step, resolved against the viewport height by
 /// `apply_scroll_command`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6612,6 +6641,11 @@ fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
         .unwrap_or_else(PoisonError::into_inner);
     let (frame, alt_screen) = {
         let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        // Lines the workload scrolled off since the last paint re-based the
+        // offset's coordinate system; grow the offset first so the frame
+        // renders the lines the user was reading rather than newer ones
+        // (`reanchor_view`).
+        reanchor_view(&mut view, screen.scrollback_available());
         let (frame, offset, available) = screen.scrolled_frame(view.offset);
         view.offset = offset;
         view.available = available;
@@ -6679,7 +6713,10 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
         let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
         (screen.scrollback_available(), screen.alternate_screen())
     };
-    view.available = available;
+    // Not just the honest count: the growth this tick observes is growth
+    // the next paint must compensate by, and the tick is the only writer
+    // between paints when the user is only reading (`reanchor_view`).
+    reanchor_view(&mut view, available);
     let text = if typing {
         scroll_bar_typing_text(*view, geom.cols as usize)
     } else {
@@ -6771,6 +6808,23 @@ fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
     // `active` already set, so the relay is suspended while it works and the
     // pager's first frame goes onto a quiet host.
     refresh_pager_history(ctx);
+    // A fresh view says `available: 0`, but the first pager frame will find
+    // a model that may already hold pages of history (the live grid's own,
+    // or a freshly rebuilt one). Reading that backlog as lines that arrived
+    // *behind the pager* would let `reanchor_view` fling the entry gesture
+    // straight to the top of the history; the baseline belongs to the model
+    // as the pager is about to see it, not to the empty view.
+    {
+        let available = {
+            let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+            screen.scrollback_available()
+        };
+        ctx.scroll
+            .view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .available = available;
+    }
     apply_scroll_command(ctx, first);
 }
 
@@ -10736,6 +10790,54 @@ mod switching_tests {
                 );
             }
         }
+    }
+
+    /// The pager must stay anchored to its content while the workload
+    /// streams behind it. `offset` counts lines above the live screen, so
+    /// without compensation every line the agent scrolls off drags the page
+    /// the user is reading that much closer to the bottom -- a streaming
+    /// reply yanks the reader back down mid-conversation, which is the
+    /// tmux-parity complaint that opened the pager in the first place.
+    #[test]
+    fn reanchor_view_grows_the_offset_by_lines_that_arrived_behind_the_pager() {
+        let mut view = ScrollView {
+            offset: 5,
+            available: 10,
+        };
+        reanchor_view(&mut view, 17);
+        assert_eq!(
+            view.offset, 12,
+            "seven new lines must push the view seven lines further back"
+        );
+        assert_eq!(view.available, 17);
+    }
+
+    /// The live screen is the anchor itself: at offset 0 the pager shows
+    /// whatever is newest, and no compensation is due.
+    #[test]
+    fn reanchor_view_leaves_the_live_offset_at_the_bottom() {
+        let mut view = ScrollView {
+            offset: 0,
+            available: 10,
+        };
+        reanchor_view(&mut view, 25);
+        assert_eq!(view.offset, 0);
+        assert_eq!(view.available, 25);
+    }
+
+    /// `available` can also shrink under the view (a rebuild the guard
+    /// adopted, a resize); the baseline must follow it without inventing
+    /// compensation out of a negative growth. The offset is left alone --
+    /// `scrolled_frame` clamps it at render time.
+    #[test]
+    fn reanchor_view_tolerates_available_shrinking() {
+        let mut view = ScrollView {
+            offset: 5,
+            available: 10,
+        };
+        reanchor_view(&mut view, 4);
+        assert_eq!(view.offset, 5);
+        assert_eq!(view.available, 4);
     }
 
     /// An empty pager must say *why* it is empty, in both of the two ways a
