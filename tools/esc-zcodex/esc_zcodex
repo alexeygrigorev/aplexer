@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Send Esc to every live aplexer session that is running zcodex.
+
+A session qualifies when its engine is `zcodex`, or when a zcodex process
+sits in the session workload's process tree -- the common case, since
+zcodex is usually started by hand inside a plain shell session. Meant to
+run nightly at 03:00 Europe/Berlin from the `esc-zcodex.timer` systemd
+user unit; also fine to run by hand.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+
+A = os.environ.get("APLEXER_A") or shutil.which("a") or "/home/alexey/.local/bin/a"
+PROC = pathlib.Path("/proc")
+
+# Safety cap on a single tree walk; a session's subtree is a handful of
+# processes, this only stops a pathological loop from scanning all of /proc.
+MAX_PIDS = 4096
+
+
+def list_running_sessions():
+    out = subprocess.run(
+        [A, "list", "--json", "--running"], capture_output=True, text=True
+    )
+    if out.returncode != 0:
+        sys.exit(f"esc-zcodex: `a list` failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def comm(pid):
+    try:
+        return (PROC / str(pid) / "comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def zcodex_pids():
+    return {int(p) for p in os.listdir(PROC) if p.isdigit() and comm(p) == "zcodex"}
+
+
+def children(pid):
+    try:
+        data = (PROC / str(pid) / "task" / str(pid) / "children").read_text().split()
+    except OSError:
+        return []
+    return [int(c) for c in data]
+
+
+def descendants(root):
+    seen, queue = set(), [root]
+    while queue and len(seen) < MAX_PIDS:
+        pid = queue.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        queue.extend(children(pid))
+    return seen
+
+
+def is_zcodex(session, zprocs):
+    if session.get("engine") == "zcodex":
+        return True
+    root = session.get("workload_pid")
+    return bool(root) and bool(descendants(root) & zprocs)
+
+
+def label(session):
+    prefix = session["id"][:8]
+    return f"{session['workspace']}:{session['tag']} ({prefix})"
+
+
+def send_esc(session):
+    out = subprocess.run(
+        [A, "send", session["id"], "--hex", "1b"], capture_output=True, text=True
+    )
+    return out.returncode == 0, out.stderr.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list the sessions that would get Esc, send nothing",
+    )
+    parser.add_argument(
+        "--only",
+        metavar="PREFIX",
+        help="restrict the sweep to sessions whose UUID starts with PREFIX",
+    )
+    args = parser.parse_args()
+
+    zprocs = zcodex_pids()
+    sessions = list_running_sessions()
+    targets = [s for s in sessions if is_zcodex(s, zprocs)]
+    if args.only:
+        targets = [s for s in targets if s["id"].startswith(args.only)]
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{now} {len(sessions)} live sessions, {len(targets)} running zcodex")
+
+    failures = 0
+    for s in targets:
+        if args.dry_run:
+            print(f"would send Esc to {label(s)}")
+            continue
+        ok, err = send_esc(s)
+        if ok:
+            print(f"sent Esc to {label(s)}")
+        else:
+            failures += 1
+            print(f"FAILED {label(s)}: {err or '`a send` exited nonzero'}")
+
+    skipped = len(sessions) - len(targets)
+    if args.dry_run:
+        print(f"dry run: would send to {len(targets)}, skip {skipped}")
+    else:
+        print(f"sent to {len(targets) - failures}, failed {failures}, skip {skipped}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

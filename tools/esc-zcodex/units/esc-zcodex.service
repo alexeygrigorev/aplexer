@@ -1,0 +1,6 @@
+[Unit]
+Description=Send Esc to every live zcodex aplexer session
+
+[Service]
+Type=oneshot
+ExecStart=%h/git/aplexer/tools/esc-zcodex/esc_zcodex
