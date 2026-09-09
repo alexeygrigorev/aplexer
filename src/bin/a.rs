@@ -5460,19 +5460,27 @@ fn extra_agent_label(
     (agent.name() != record.engine).then_some(agent.name())
 }
 
-/// The list/status engine cell: the declared `engine/profile` plus, when
-/// detection found a different live agent, the same ` -> agent` annotation
-/// `foreground_override` established for "what's actually running here"
-/// (e.g. `shell/default -> claude`).
+/// The list/status engine cell. A plain `shell` workload that detection
+/// found an agent inside is labeled by the agent alone: `shell` is the
+/// absence of a choice, so `shell -> codex` spent the column on noise when
+/// `codex` is the fact. A declared engine keeps the `engine -> agent` form,
+/// where the base carries real information (a claude session someone
+/// started codex inside).
 fn engine_label(
     record: &SessionRecord,
     detected: Option<aplexer::agent_kind::AgentKind>,
 ) -> String {
+    let agent = extra_agent_label(record, detected);
+    if record.engine == "shell" {
+        if let Some(agent) = agent {
+            return agent.to_string();
+        }
+    }
     let base = match &record.profile {
         Some(profile) => format!("{}/{}", record.engine, profile),
         None => record.engine.clone(),
     };
-    match extra_agent_label(record, detected) {
+    match agent {
         Some(agent) => format!("{base} -> {agent}"),
         None => base,
     }
@@ -11270,14 +11278,26 @@ mod switching_tests {
             Some("codex")
         );
 
-        // The engine cell annotates the declared engine/profile with the
-        // same ` -> agent` shape the foreground override established.
+        // The engine cell shows the declared engine/profile when there is
+        // nothing detected ...
         record.engine = "shell".to_string();
         record.profile = Some("default".to_string());
         assert_eq!(engine_label(&record, None), "shell/default");
+        // ... but a shell workload running an agent is labeled by the agent
+        // alone: "shell" is the absence of a choice, not a fact worth a
+        // column.
         assert_eq!(
             engine_label(&record, Some(agent_kind::AgentKind::Claude)),
-            "shell/default -> claude"
+            "claude"
+        );
+
+        // A declared engine stays the base: there the annotation is a real
+        // override, not noise.
+        record.engine = "claude".to_string();
+        record.profile = None;
+        assert_eq!(
+            engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+            "claude -> codex"
         );
     }
 
