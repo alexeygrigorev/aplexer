@@ -1264,7 +1264,9 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         if args.running {
             println!("No running sessions.");
         } else if hidden_exited > 0 {
-            println!("No live sessions -- {hidden_exited} exited hidden (`a list --all` shows them).");
+            println!(
+                "No live sessions -- {hidden_exited} exited hidden (`a list --all` shows them)."
+            );
         } else {
             println!("No aplexer sessions yet.");
             println!();
@@ -9862,7 +9864,10 @@ mod switching_tests {
             oom_killed: true,
             exited_at_ms: now,
         });
-        assert!(session_is_listed(&oom, now), "oom needs attention, not a corpse");
+        assert!(
+            session_is_listed(&oom, now),
+            "oom needs attention, not a corpse"
+        );
 
         let failed = mk_record("/ws/f", "failed", Phase::Failed);
         assert!(session_is_listed(&failed, now));
