@@ -51,7 +51,6 @@ const MAX_SCANNED_PIDS: usize = 4096;
 pub enum AgentKind {
     Claude,
     Codex,
-    Zcodex,
     Opencode,
     Grok,
 }
@@ -62,7 +61,6 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
-            AgentKind::Zcodex => "zcodex",
             AgentKind::Opencode => "opencode",
             AgentKind::Grok => "grok",
         }
@@ -100,13 +98,15 @@ struct TokenRule {
 
 /// Rules in the same order `cgroup_agents.py` applies them, with one
 /// aplexer-local addition: `zcodex` (the codex-rs build this box runs as
-/// `…/codex-rs/target/dev-small/zcodex`) is a built-in engine variant here
-/// (`config::engine_family` maps it onto codex) but is absent from
-/// pocketshell's classifier, and without its own rule the `z` lead kills the
-/// codex whole-word match, so every zcodex session would degrade to plain
-/// shell. Order only matters in the impossible case of one string naming two
-/// agents: no string matches both `zcodex` and `codex`, since `codex` inside
-/// `zcodex` never sits at a lead boundary.
+/// `…/codex-rs/target/dev-small/zcodex`) is absent from pocketshell's
+/// classifier, and without a rule the `z` lead kills the codex whole-word
+/// match, so every zcodex session would degrade to plain shell. It classifies
+/// as `Codex`, matching how aplexer treats it everywhere else
+/// (`config::engine_family` maps the engine variant onto codex: same hooks,
+/// same `CODEX_HOME`, same wire protocol -- the binary name is the only
+/// difference). Order only matters in the impossible case of one string
+/// naming two agents: no string matches both the `zcodex` and `codex` rules,
+/// since `codex` inside `zcodex` never sits at a lead boundary.
 const TOKEN_RULES: &[TokenRule] = &[
     TokenRule {
         kind: AgentKind::Claude,
@@ -115,7 +115,7 @@ const TOKEN_RULES: &[TokenRule] = &[
         alnum_suffix: false,
     },
     TokenRule {
-        kind: AgentKind::Zcodex,
+        kind: AgentKind::Codex,
         stems: &["zcodex"],
         literal_suffixes: &[],
         alnum_suffix: false,
@@ -361,9 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn zcodex_under_bash_is_detected_as_its_own_kind() {
+    fn zcodex_under_bash_is_detected_as_codex() {
         // The shape every zcodex session on this box has: a login shell whose
-        // child is the codex-rs dev build, `comm` = `zcodex`.
+        // child is the codex-rs dev build, `comm` = `zcodex`. It is a codex
+        // variant, so it reports the codex kind.
         let (_dir, root) = proc_tree();
         write_proc(&root, 210, "bash", &["/bin/bash", "-l"], &[211]);
         write_proc(
@@ -377,7 +378,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(detect_agent(&root, 210), Some(AgentKind::Zcodex));
+        assert_eq!(detect_agent(&root, 210), Some(AgentKind::Codex));
     }
 
     #[test]
@@ -479,11 +480,8 @@ mod tests {
             ("sh -c 'claude'", Some(AgentKind::Claude)),
             ("node /home/a/.bun/bin/codex", Some(AgentKind::Codex)),
             ("codex exec", Some(AgentKind::Codex)),
-            ("zcodex", Some(AgentKind::Zcodex)),
-            (
-                "/opt/dev-small/zcodex -c key=value",
-                Some(AgentKind::Zcodex),
-            ),
+            ("zcodex", Some(AgentKind::Codex)),
+            ("/opt/dev-small/zcodex -c key=value", Some(AgentKind::Codex)),
             ("zcodex-helper", None),
             ("azcodex", None),
             ("opencode", Some(AgentKind::Opencode)),

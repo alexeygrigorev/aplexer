@@ -293,12 +293,14 @@ fn agent_appears_and_clears_as_a_fake_claude_runs_inside_a_shell_session() {
     );
 }
 
-/// zcodex (the codex-rs build this repo's sibling sessions run) must be its
-/// own detected kind, not an undetected shell: the `z` lead means the codex
+/// zcodex (the codex-rs build this repo's sibling sessions run) must detect
+/// as codex, not an undetected shell: the `z` lead means the codex
 /// whole-word rule can never fire, so without a zcodex rule every zcodex
-/// session on the box reported `agent: null`.
+/// session on the box reported `agent: null`. Zcodex is a codex variant
+/// (`config::engine_family` maps the engine onto codex), so the wire kind is
+/// the codex one.
 #[test]
-fn a_fake_zcodex_inside_a_shell_session_reports_the_zcodex_kind() {
+fn a_fake_zcodex_inside_a_shell_session_reports_the_codex_kind() {
     assert!(
         Path::new("/bin/bash").exists(),
         "/bin/bash is required by this test"
@@ -355,11 +357,11 @@ fn a_fake_zcodex_inside_a_shell_session_reports_the_zcodex_kind() {
     wait_for_file(&ready, "the fake zcodex to start inside the session");
 
     wait_until(
-        || harness.list_agent(&id) == Value::String("zcodex".into()),
-        "`a list --json` to report agent: \"zcodex\"",
+        || harness.list_agent(&id) == Value::String("codex".into()),
+        "`a list --json` to report agent: \"codex\"",
     );
-    assert_eq!(harness.snapshot_agent(&id), Value::String("zcodex".into()));
-    assert_eq!(harness.status_agent(&id), Value::String("zcodex".into()));
+    assert_eq!(harness.snapshot_agent(&id), Value::String("codex".into()));
+    assert_eq!(harness.status_agent(&id), Value::String("codex".into()));
 
     harness.run_ok(
         &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],

@@ -5453,13 +5453,16 @@ fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
 /// human surface (list rows, `a status`, the attach status bar): a session
 /// declared `engine: "claude"` that is running claude says "claude" once;
 /// a `shell` session running claude, or a `claude` session someone started
-/// codex inside, gets the detected name appended.
+/// codex inside, gets the detected name appended. The engine compares by
+/// family (`engine_family`): a `zcodex`-engine session running
+/// zcodex says codex once, because zcodex is a codex variant, not a second
+/// agent.
 fn extra_agent_label(
     record: &SessionRecord,
     detected: Option<aplexer::agent_kind::AgentKind>,
 ) -> Option<&'static str> {
     let agent = detected?;
-    (agent.name() != record.engine).then_some(agent.name())
+    (agent.name() != aplexer::engine_family(&record.engine)).then_some(agent.name())
 }
 
 /// The list/status engine cell. A plain `shell` workload that detection
@@ -11290,24 +11293,29 @@ mod switching_tests {
         assert_eq!(engine_label(&record, None), "shell/default");
         // ... but a shell workload running an agent is labeled by the agent
         // alone: "shell" is the absence of a choice, not a fact worth a
-        // column.
+        // column. A shell workload running zcodex lands here too -- the
+        // zcodex token classifies as the codex kind.
         assert_eq!(
             engine_label(&record, Some(agent_kind::AgentKind::Claude)),
             "claude"
         );
-        // A zcodex workload labels the same way -- its own kind, not codex.
         assert_eq!(
-            engine_label(&record, Some(agent_kind::AgentKind::Zcodex)),
-            "zcodex"
+            engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+            "codex"
         );
 
-        // A declared zcodex engine running zcodex is already fully named,
-        // exactly like the claude-engine/claude case above.
+        // A declared zcodex engine running zcodex is already fully named --
+        // zcodex is a codex variant, so the family comparison says codex
+        // once, exactly like the claude-engine/claude case above.
         record.engine = "zcodex".to_string();
         record.profile = None;
         assert_eq!(
-            extra_agent_label(&record, Some(agent_kind::AgentKind::Zcodex)),
+            extra_agent_label(&record, Some(agent_kind::AgentKind::Codex)),
             None
+        );
+        assert_eq!(
+            engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+            "zcodex"
         );
 
         // A declared engine stays the base: there the annotation is a real
