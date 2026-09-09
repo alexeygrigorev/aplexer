@@ -1,9 +1,0 @@
-[Unit]
-Description=Nightly Esc sweep of zcodex aplexer sessions at 03:00 Europe/Berlin
-
-[Timer]
-OnCalendar=*-*-* 03:00:00 Europe/Berlin
-Persistent=true
-
-[Install]
-WantedBy=timers.target

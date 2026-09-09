@@ -1,8 +1,8 @@
 # esc-zcodex
 
 Sends Esc to every live aplexer session that is running zcodex, every night
-at 03:00 Europe/Berlin (a systemd user timer, so it still fires after a
-reboot that skipped the slot, thanks to `Persistent=true`).
+at 03:00 Europe/Berlin (a user crontab entry). Cron has no catch-up: if the
+box is down at 03:00, that night's sweep is skipped.
 
 ## Which sessions get Esc
 
@@ -25,25 +25,22 @@ the interrupt, which is the point.
     ./esc_zcodex --only <uuid-prefix>   # sweep one session
     ./esc_zcodex               # full sweep, one Esc per target
 
-Output goes to stdout; under systemd it lands in the journal:
-
-    journalctl --user -u esc-zcodex.service
+Output goes to stdout; from cron it is appended to
+`~/.local/state/esc-zcodex.log` (see the crontab line).
 
 ## Install / uninstall
 
-    mkdir -p ~/.config/systemd/user
-    cp units/*.service units/*.timer ~/.config/systemd/user/
-    systemctl --user daemon-reload
-    systemctl --user enable --now esc-zcodex.timer
+Add two lines to the crontab (`crontab -e`) — above any `CRON_TZ=` line, so
+the entry runs in the system timezone (Europe/Berlin on this box):
 
-    systemctl --user list-timers esc-zcodex.timer   # verify next fire time
+    # esc-zcodex: nightly Esc sweep of live zcodex aplexer sessions (03:00 Berlin)
+    0 3 * * * /home/alexey/git/aplexer/tools/esc-zcodex/esc_zcodex >> /home/alexey/.local/state/esc-zcodex.log 2>&1
 
-Uninstall with `systemctl --user disable --now esc-zcodex.timer` and remove
-the two unit files.
+Verify with `crontab -l`; remove those two lines to uninstall.
 
 ## Knobs
 
 - `APLEXER_A` env var overrides the `a` binary (default: `a` on PATH, else
   `/home/alexey/.local/bin/a`).
 - Exit code is 0 when every send succeeded (or there was nothing to send),
-  1 when any `a send` failed, so a failed night is visible in the journal.
+  1 when any `a send` failed, so a failed night is visible in the log.
