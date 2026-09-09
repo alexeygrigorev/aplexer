@@ -1204,7 +1204,10 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
 /// (`ui_state_is_active`) nor needs-attention (`ui_state_needs_attention`),
 /// and `check_attachable` refuses them outright. The terminal list hides
 /// them by default -- a workspace whose every session has exited drops out
-/// with them -- and `a list --all` brings them back. `resolve_quick_index`
+/// with them -- and `a list --all` brings them back. Before rendering, the
+/// default list first sweeps what `a prune` would take outright (see
+/// `sweep_prunable_corpses`), so the hide only ever covers the shapes prune
+/// itself retains. `resolve_quick_index`
 /// shares this so the numbers `a <workspace#>` understands stay the numbers
 /// the default list prints; a corpse you found via `a list --all` is
 /// addressed by tag or UUID prefix, not by its --all index.
@@ -1214,6 +1217,16 @@ fn session_is_listed(record: &SessionRecord, now: u64) -> bool {
 
 /// The terminal rendering of `a list` -- see cmd_list's redirect contract.
 fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
+    // The default view is self-cleaning: sweep first, so a corpse a killed
+    // worker left behind is gone from the registry rather than merely
+    // hidden. Same verdict and locked removal as `a prune`; best-effort,
+    // because a list that cannot sweep (registry mid-write, a lost race)
+    // must still list. Explicit views opt out: `--all` exists to show
+    // post-mortems, and `--running` would throw the sweep's work away
+    // unseen.
+    if !args.running && !args.all {
+        let _ = sweep_prunable_corpses(paths);
+    }
     let mut records = list_records(paths)?;
     // Lineage labels: a session started from inside another session (`a
     // start` ran with its parent's APLEXER_SESSION_ID still in the
@@ -2230,6 +2243,19 @@ fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> {
 }
 
 fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
+    reap_sweep(paths, true)
+}
+
+/// The opportunistic sweep the default list runs before rendering: the same
+/// verdict and locked-removal machinery as `a prune`, minus the wait for an
+/// in-flight worker teardown. A worker that is still alive is retained here
+/// and its own teardown (or a later sweep) decides the outcome, so nothing
+/// a later `a prune` would have kept can be removed early.
+fn sweep_prunable_corpses(paths: &Paths) -> Result<PruneOutcome> {
+    reap_sweep(paths, false)
+}
+
+fn reap_sweep(paths: &Paths, wait_for_terminating: bool) -> Result<PruneOutcome> {
     let deadline = Instant::now() + PRUNE_TERMINATION_BUDGET;
     let mut outcome = PruneOutcome {
         removed: Vec::new(),
@@ -2237,7 +2263,11 @@ fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
         retained_count: 0,
     };
     for record in list_records(paths)? {
-        let record = settle_terminating_record(paths, record, deadline);
+        let record = if wait_for_terminating {
+            settle_terminating_record(paths, record, deadline)
+        } else {
+            record
+        };
         if reap_verdict(&record).is_none() {
             outcome.retained_count += 1;
             continue;
@@ -11863,6 +11893,54 @@ mod switching_tests {
         fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
         atomic_write_json(&paths.record(record.id), record).unwrap();
         (paths, state_dir, runtime_dir)
+    }
+
+    /// The default list sweeps before it renders: a corpse `a prune` would
+    /// take (worker gone, proven-empty containment) is removed from the
+    /// registry by one bare `a list`, not parked behind the hide filter.
+    /// `--all` skips the sweep -- it exists to show post-mortems.
+    #[test]
+    fn default_list_sweeps_what_prune_would_take() {
+        let now = now_ms();
+        let mut corpse = mk_record("/ws/sweep", "gone", Phase::Exited);
+        corpse.worker_pid = None;
+        corpse.workload_pid = None;
+        corpse.containment_empty = Some(true);
+        corpse.exit = Some(aplexer::ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: now,
+        });
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut corpse);
+
+        cmd_list_tty(
+            &paths,
+            ListArgs {
+                running: false,
+                all: true,
+                sort: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            paths.state_session(corpse.id).exists(),
+            "--all must not sweep; it exists to show post-mortems"
+        );
+
+        cmd_list_tty(
+            &paths,
+            ListArgs {
+                running: false,
+                all: false,
+                sort: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.state_session(corpse.id).exists(),
+            "the default list left a prunable corpse on disk"
+        );
     }
 
     /// resolve_quick_index shares session_is_listed with the default list,
