@@ -1421,14 +1421,41 @@ impl ClientScreen {
     /// tail is rejected here rather than by the caller so the invariant is
     /// visible next to the rebuild it protects: a seed of zero bytes would
     /// replace whatever history the live path did retain with nothing.
+    ///
+    /// So is a tail that rebuilds to *less* history than the model already
+    /// holds. The tail is a byte-count slice of a log, and the bytes are not
+    /// rows: an agent idling between turns spends them on a spinner --
+    /// thousands of absolute cursor addresses, not one line feed -- so the
+    /// tail a pager entry happens to catch can replay to zero retained rows
+    /// even though the log is far from empty. Adopting that rebuild would
+    /// replace real transcript with nothing mid-conversation (`SCROLL 0/0`
+    /// one entry, pages of history the next, depending on what the agent was
+    /// doing when the user scrolled). tmux never shrinks a pane's history by
+    /// re-deriving it, and neither does this: the rebuild is prepared in a
+    /// scratch model and swapped in only when it retained at least as much
+    /// as the live path currently shows. Costs one extra model allocation,
+    /// no extra replay -- the parse was always the price of knowing.
     pub fn refresh_scrollback(&mut self, tail: &[u8], snapshot: &[u8]) {
         if tail.is_empty() {
             return;
         }
         let (rows, cols) = (self.screen.rows(), self.screen.cols());
-        self.reset(rows, cols);
-        self.seed_history(tail);
-        self.feed(snapshot);
+        let depth = self.screen.scrollback_capacity();
+        let mut candidate = match Self::try_new_with_scrollback(rows, cols, depth) {
+            Ok(candidate) => candidate,
+            Err(_) => return,
+        };
+        candidate.seed_history(tail);
+        candidate.feed(snapshot);
+        if candidate.scrollback_available() < self.scrollback_available() {
+            return;
+        }
+        self.screen = candidate.screen;
+        // The tail can begin mid-escape-sequence, exactly as at attach
+        // (`seed_history` resets the copy it used; this one has not been
+        // near the seed). The host-alt hold is untouched: the rebuild wrote
+        // nothing to the host, so what the hold tracks is still true.
+        self.boundary.reset();
     }
 
     /// `ScreenTracker::scrolled_frame` -- the pager's view of the history,
@@ -3145,6 +3172,71 @@ mod tests {
             client.scrollback_available(),
             before,
             "nothing to seed means nothing to rebuild"
+        );
+    }
+
+    /// **The spinner-hour wipe.** The tail is a byte budget out of a log,
+    /// and bytes are not rows: an agent idling between turns spends the
+    /// budget on a spinner -- absolute cursor addresses, not one line feed --
+    /// so the tail a pager entry happens to catch can replay to zero
+    /// retained rows. The old rebuild reset the tracker and adopted it
+    /// anyway, so a session whose pager had pages of history one entry
+    /// opened on `SCROLL 0/0` the next, depending on what the agent was
+    /// doing when the user scrolled. A rebuild that retained less than the
+    /// live model holds must be refused, exactly like the empty tail.
+    #[test]
+    fn refresh_scrollback_never_trades_history_for_a_tail_that_replayed_to_less() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=30 {
+            client.feed(format!("KEEP-{i:02}\r\n").as_bytes());
+        }
+        let before = client.scrollback_available();
+        assert!(before > 0);
+        let mut spinner = Vec::new();
+        for _ in 0..2000 {
+            spinner.extend_from_slice(b"\x1b[1;1H*");
+        }
+        client.refresh_scrollback(&spinner, b"\x1b[2J\x1b[1;1H newest");
+        assert_eq!(
+            client.scrollback_available(),
+            before,
+            "a rebuild worth fewer rows than the model holds must be refused"
+        );
+        let (frame, _, _) = client.scrolled_frame(before);
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(
+            text.contains("KEEP-01"),
+            "the refused rebuild must leave the old history in place:\n{text}"
+        );
+    }
+
+    /// The other side of the guard: a rebuild that retained at least as much
+    /// as the model holds is adopted, so the pager's past tracks the worker's
+    /// retained tail instead of fossilizing at whatever the attach seed
+    /// captured.
+    #[test]
+    fn refresh_scrollback_adopts_a_rebuild_that_retains_at_least_as_much() {
+        let mut client = ClientScreen::try_new_with_scrollback(5, 20, 100).unwrap();
+        for i in 1..=10 {
+            client.feed(format!("OLD-{i:02}\r\n").as_bytes());
+        }
+        let before = client.scrollback_available();
+        assert!(before > 0);
+        let mut fresh_tail = Vec::new();
+        for i in 1..=40 {
+            fresh_tail.extend_from_slice(format!("NEW-{i:03}\r\n").as_bytes());
+        }
+        client.refresh_scrollback(&fresh_tail, b"\x1b[2J\x1b[1;1H newest");
+        let after = client.scrollback_available();
+        assert!(
+            after > before,
+            "a strictly better rebuild must be adopted, {before} -> {after}"
+        );
+        let (frame, _, _) = client.scrolled_frame(after);
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(
+            text.contains("NEW-001") && !text.contains("OLD-"),
+            "the adopted rebuild replaces the stale history wholesale:\n{text}"
         );
     }
 

@@ -7497,6 +7497,19 @@ fn seed_client_scrollback(
 /// screen skips too: that grid has no scrollback anywhere, so there is
 /// nothing to rebuild for a full-screen application, only RPCs to spend.
 ///
+/// The tail is fetched **whole** (`rpc_capture`'s `None`: everything the
+/// worker still retains, bounded by `DEFAULT_HISTORY_BYTES`), not at the
+/// 2 MiB attach-seed budget. A byte budget is not a row budget -- an agent
+/// idling between turns spends its bytes on a spinner that replays to zero
+/// rows -- so a budgeted tail can rebuild to *less* than the model already
+/// holds, and `refresh_scrollback` rightly refuses to adopt it: the pager
+/// would fossilize at whatever its entry happened to catch instead of
+/// tracking the transcript. The whole buffer is the most any rebuild can
+/// ever know; its parse is bounded by the worker's retention and runs once
+/// per explicit pager entry, never on the attach or `Ctrl-b` switch paths
+/// (`scrollback_seed_bytes` keeps those cheap). A refusal now costs the
+/// replay alone, never the history.
+///
 /// Failure is invisible, exactly like the attach seed: a worker that has gone
 /// away or stopped answering means "page through whatever the live model
 /// has", which is the pre-refresh behavior.
@@ -7515,7 +7528,7 @@ fn refresh_pager_history(ctx: &StatusBarCtx) {
             return;
         }
     }
-    let Ok(tail) = rpc_capture(&record, Some(scrollback_seed_bytes())) else {
+    let Ok(tail) = rpc_capture(&record, None) else {
         return;
     };
     if tail.is_empty() {
