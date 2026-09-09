@@ -1,10 +1,14 @@
 # Scrollback: scrolling through a session's recent output without blocking input
 
-Status: design, ready to implement. The recommendation is deliberately small:
-**let the host terminal's native scrollback do the scrolling, and make aplexer
-stop polluting it** (section 4). Almost all of the "implementation" is hygiene
-fixes and verification, not new scroll machinery. All function/line references
-are against commit `f46273b`.
+Status: implemented, and deliberately not the way this doc recommended. The
+shipped design keeps a client-side terminal model with retained scrollback
+(`ClientScreen` in `src/screen.rs`) and a `Ctrl-b [` pager in the tmux
+copy-mode shape — including type-through (`i`), which is how the hard
+requirement in section 1 (scrolling must never block input) is actually met —
+rather than leaning on the host terminal's native scrollback. Sections 2-3
+remain the rationale `src/screen.rs` cites for never reflowing retained
+history; line references throughout are against commit `f46273b` and are
+historical.
 
 ## 1. Problem
 

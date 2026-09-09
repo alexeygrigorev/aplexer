@@ -1,8 +1,11 @@
 # Fast in-process session switching (`Ctrl-b n/p/l/1-9`)
 
-Status: design, ready to implement. Target file is almost entirely
-`src/bin/a.rs`; **no worker or protocol changes are required** (section 4).
-All function/line references are against commit `3451c0b`.
+Status: implemented — `Ctrl-b` Left/Right/Up/Down, `n`/`p` (session),
+`N`/`P` (global), `l` (last), `1-9` (index) and `Ctrl-b n` (new session) all
+resolve through `pick_switch_target`/`resolve_switch_target` and land in
+`perform_switch` in `src/bin/a.rs`, with no worker or protocol changes,
+exactly as section 4 planned. The sections below still describe the shipped
+behavior; line references are against commit `3451c0b` and are historical.
 
 ## 1. Problem
 

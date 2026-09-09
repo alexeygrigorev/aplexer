@@ -1,6 +1,6 @@
 # Terminal-first CLI UX
 
-Status: proposed and partially implemented in PR #4.
+Status: partially implemented (PR #4); the rest of the doc remains proposed.
 
 Aplexer has two equally important consumers:
 
