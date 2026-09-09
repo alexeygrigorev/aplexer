@@ -28,7 +28,7 @@ is still based on their 2026-08-26 source snapshots; it was not re-audited in th
 
 Sources:
 
-- `docs/SPEC.md` in this repo (sections 8, 9, 15–23, 27); `src/bin/a.rs`, `src/lib.rs`,
+- `spec.md` in this repo (sections 8, 9, 15–23, 27); `src/bin/a.rs`, `src/lib.rs`,
   `src/messaging.rs`, `python/aplexer/` (the actual implementation, authoritative where it and
   the spec differ); `docs/low-bandwidth-remote-access-design.md`.
 - PocketShell (Android): `/home/alexey/git/pocketshell` — Kotlin app + host-side Python CLI in
