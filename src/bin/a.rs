@@ -11295,6 +11295,20 @@ mod switching_tests {
             engine_label(&record, Some(agent_kind::AgentKind::Claude)),
             "claude"
         );
+        // A zcodex workload labels the same way -- its own kind, not codex.
+        assert_eq!(
+            engine_label(&record, Some(agent_kind::AgentKind::Zcodex)),
+            "zcodex"
+        );
+
+        // A declared zcodex engine running zcodex is already fully named,
+        // exactly like the claude-engine/claude case above.
+        record.engine = "zcodex".to_string();
+        record.profile = None;
+        assert_eq!(
+            extra_agent_label(&record, Some(agent_kind::AgentKind::Zcodex)),
+            None
+        );
 
         // A declared engine stays the base: there the annotation is a real
         // override, not noise.

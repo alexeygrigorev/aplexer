@@ -185,20 +185,26 @@ fn wait_until(mut condition: impl FnMut() -> bool, description: &str) {
 /// `sh`, so the `claude` token has to be classified from the cmdline
 /// (`/bin/sh /…/bin/claude …`), which is the node-wrapped shape real agents
 /// present.
-fn write_fake_claude(dir: &Path) -> PathBuf {
+fn write_fake_agent(dir: &Path, name: &str) -> PathBuf {
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).expect("create fake bin dir");
-    let script = bin.join("claude");
+    let script = bin.join(name);
     fs::write(
         &script,
-        "#!/bin/sh\n\
-         # Fake `claude` for aplexer agent-detection tests.\n\
-         echo running > \"$1\"\n\
-         while [ -e \"$2\" ]; do /bin/sleep 0.05; done\n",
+        format!(
+            "#!/bin/sh\n\
+             # Fake `{name}` for aplexer agent-detection tests.\n\
+             echo running > \"$1\"\n\
+             while [ -e \"$2\" ]; do /bin/sleep 0.05; done\n"
+        ),
     )
-    .expect("write fake claude");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod fake claude");
+    .expect("write fake agent");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod fake agent");
     script
+}
+
+fn write_fake_claude(dir: &Path) -> PathBuf {
+    write_fake_agent(dir, "claude")
 }
 
 fn wait_for_file(path: &Path, description: &str) {
@@ -280,6 +286,80 @@ fn agent_appears_and_clears_as_a_fake_claude_runs_inside_a_shell_session() {
     );
     assert_eq!(harness.snapshot_agent(&id), Value::Null);
     assert_eq!(harness.status_agent(&id), Value::Null);
+
+    harness.run_ok(
+        &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],
+        Duration::from_secs(15),
+    );
+}
+
+/// zcodex (the codex-rs build this repo's sibling sessions run) must be its
+/// own detected kind, not an undetected shell: the `z` lead means the codex
+/// whole-word rule can never fire, so without a zcodex rule every zcodex
+/// session on the box reported `agent: null`.
+#[test]
+fn a_fake_zcodex_inside_a_shell_session_reports_the_zcodex_kind() {
+    assert!(
+        Path::new("/bin/bash").exists(),
+        "/bin/bash is required by this test"
+    );
+    let harness = Harness::new();
+    let workspace = harness
+        .workspace
+        .path()
+        .to_str()
+        .expect("utf8 workspace")
+        .to_owned();
+    let script = write_fake_agent(harness.workspace.path(), "zcodex");
+    let ready = harness.workspace.path().join("zcodex.ready");
+    let sentinel = harness.workspace.path().join("zcodex.keep-running");
+    fs::write(&sentinel, b"run").expect("write sentinel");
+
+    let home = format!("HOME={workspace}");
+    let stdout = harness.run_ok(
+        &[
+            "start",
+            "--workspace",
+            &workspace,
+            "--tag",
+            "zcodex-detect",
+            "--env",
+            &home,
+            "--json",
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-l",
+        ],
+        Duration::from_secs(20),
+    );
+    let started: Value = serde_json::from_str(&stdout).expect("start JSON");
+    let id = started["id"].as_str().expect("session id").to_owned();
+
+    wait_until(
+        || harness.list_agent(&id) == Value::Null,
+        "a bare shell session to report agent: null",
+    );
+
+    // `/bin/sh <script>` for the same ETXTBSY reason as `write_fake_agent`
+    // documents; the cmdline then reads `/bin/sh /…/bin/zcodex …`, the
+    // path-wrapped shape the real `…/dev-small/zcodex` presents.
+    let command = format!(
+        "/bin/sh {} {} {}",
+        script.display(),
+        ready.display(),
+        sentinel.display()
+    );
+    harness.run_ok(&["send", &id, &command, "--enter"], Duration::from_secs(10));
+    wait_for_file(&ready, "the fake zcodex to start inside the session");
+
+    wait_until(
+        || harness.list_agent(&id) == Value::String("zcodex".into()),
+        "`a list --json` to report agent: \"zcodex\"",
+    );
+    assert_eq!(harness.snapshot_agent(&id), Value::String("zcodex".into()));
+    assert_eq!(harness.status_agent(&id), Value::String("zcodex".into()));
 
     harness.run_ok(
         &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],

@@ -51,6 +51,7 @@ const MAX_SCANNED_PIDS: usize = 4096;
 pub enum AgentKind {
     Claude,
     Codex,
+    Zcodex,
     Opencode,
     Grok,
 }
@@ -61,6 +62,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Zcodex => "zcodex",
             AgentKind::Opencode => "opencode",
             AgentKind::Grok => "grok",
         }
@@ -96,13 +98,26 @@ struct TokenRule {
     alnum_suffix: bool,
 }
 
-/// Rules in the same order `cgroup_agents.py` applies them. Order only
-/// matters in the impossible case of one string naming two agents.
+/// Rules in the same order `cgroup_agents.py` applies them, with one
+/// aplexer-local addition: `zcodex` (the codex-rs build this box runs as
+/// `…/codex-rs/target/dev-small/zcodex`) is a built-in engine variant here
+/// (`config::engine_family` maps it onto codex) but is absent from
+/// pocketshell's classifier, and without its own rule the `z` lead kills the
+/// codex whole-word match, so every zcodex session would degrade to plain
+/// shell. Order only matters in the impossible case of one string naming two
+/// agents: no string matches both `zcodex` and `codex`, since `codex` inside
+/// `zcodex` never sits at a lead boundary.
 const TOKEN_RULES: &[TokenRule] = &[
     TokenRule {
         kind: AgentKind::Claude,
         stems: &["claude"],
         literal_suffixes: &["code", "-code"],
+        alnum_suffix: false,
+    },
+    TokenRule {
+        kind: AgentKind::Zcodex,
+        stems: &["zcodex"],
+        literal_suffixes: &[],
         alnum_suffix: false,
     },
     TokenRule {
@@ -346,6 +361,26 @@ mod tests {
     }
 
     #[test]
+    fn zcodex_under_bash_is_detected_as_its_own_kind() {
+        // The shape every zcodex session on this box has: a login shell whose
+        // child is the codex-rs dev build, `comm` = `zcodex`.
+        let (_dir, root) = proc_tree();
+        write_proc(&root, 210, "bash", &["/bin/bash", "-l"], &[211]);
+        write_proc(
+            &root,
+            211,
+            "zcodex",
+            &[
+                "/home/alexey/git/codex-zcode/codex-rs/target/dev-small/zcodex",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+            &[],
+        );
+
+        assert_eq!(detect_agent(&root, 210), Some(AgentKind::Zcodex));
+    }
+
+    #[test]
     fn codex_helper_path_alone_does_not_match() {
         let (_dir, root) = proc_tree();
         write_proc(&root, 300, "bash", &["/bin/bash", "-l"], &[301]);
@@ -444,6 +479,13 @@ mod tests {
             ("sh -c 'claude'", Some(AgentKind::Claude)),
             ("node /home/a/.bun/bin/codex", Some(AgentKind::Codex)),
             ("codex exec", Some(AgentKind::Codex)),
+            ("zcodex", Some(AgentKind::Zcodex)),
+            (
+                "/opt/dev-small/zcodex -c key=value",
+                Some(AgentKind::Zcodex),
+            ),
+            ("zcodex-helper", None),
+            ("azcodex", None),
             ("opencode", Some(AgentKind::Opencode)),
             ("open-code", Some(AgentKind::Opencode)),
             ("open_code", Some(AgentKind::Opencode)),
