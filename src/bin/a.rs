@@ -533,6 +533,11 @@ struct AttachArgs {
     /// Attach without a client status bar or client key bindings
     #[arg(long)]
     no_status: bool,
+    /// Attach even from inside another live aplexer session, rendering it
+    /// nested in that session's pane. Normally refused with a hint to
+    /// detach and switch instead.
+    #[arg(long)]
+    force: bool,
 }
 #[derive(Args)]
 struct SendArgs {
@@ -925,7 +930,13 @@ fn run() -> Result<()> {
         Commands::Snapshot(args) => cmd_list(&paths, args, true),
         Commands::Attach(args) => {
             let record = resolve(&paths, &args.target)?;
-            attach(&paths, &record, args.history_bytes, args.no_status)
+            attach(
+                &paths,
+                &record,
+                args.history_bytes,
+                args.no_status,
+                args.force,
+            )
         }
         Commands::Send(args) => cmd_send(&paths, args, cli.json),
         Commands::Capture(args) => cmd_capture(&paths, args, cli.json),
@@ -1171,7 +1182,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
         // is the session's *storage capacity* (up to DEFAULT_HISTORY_BYTES =
         // 4MB), an unrelated setting from how much of it a fresh attach
         // should actually replay onto the screen.
-        attach(paths, &ready, None, false)?;
+        attach(paths, &ready, None, false, false)?;
     }
     Ok(())
 }
@@ -2118,7 +2129,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
         // there, so `a -` can never create a second session for a pair that
         // something is still using.
         if existing.worker_phase_active() && existing.worker_alive() {
-            return attach(paths, &existing, None, false);
+            return attach(paths, &existing, None, false, false);
         }
     }
     cmd_start(
@@ -2147,7 +2158,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
 
 fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
-    attach(paths, &record, None, false)
+    attach(paths, &record, None, false, false)
 }
 
 /// Total wall-clock budget one `a prune` run may spend waiting for workers
@@ -8578,12 +8589,55 @@ fn attach_goodbye_line(stop: AttachStop, selector: &str, inspect_id: Option<&str
     }
 }
 
+/// Refuse to render a session inside another live aplexer session's pane.
+/// Two full-screen clients on one terminal fight over the DECSTBM margins,
+/// alternate-screen state, and the `Ctrl-b` chord, and the inner session's
+/// output replaces what the outer session's agent believes is on screen --
+/// the same reason tmux routes `switch-client` through its server. The
+/// aplexer-shaped answer is already shipped: detach (`Ctrl-]`), then let
+/// the now-outer client do the in-process `Ctrl-b` switch. The inner id
+/// comes from `discover_session_id` (the env var, or the ancestor /proc
+/// walk when an agent runs `a attach` with a scrubbed env) and is only
+/// acted on when it resolves to a live worker in *this* runtime dir, so a
+/// stale id inherited from elsewhere costs one failed record read and the
+/// common not-in-a-session attach pays one `getenv`. `--force` opts in for
+/// a deliberate peek at the cost of the nesting above.
+fn nested_attach_conflict(paths: &Paths) -> Result<()> {
+    nested_attach_conflict_for(paths, discover_session_id())
+}
+
+/// `nested_attach_conflict` with the inner session id injected, so tests
+/// never mutate process-global state.
+fn nested_attach_conflict_for(paths: &Paths, inner: Option<Uuid>) -> Result<()> {
+    let Some(inner) = inner else {
+        return Ok(());
+    };
+    let inner_record = match read_record(&paths.record(inner)) {
+        Ok(record) => record,
+        Err(_) => return Ok(()),
+    };
+    if !inner_record.worker_alive() {
+        return Ok(());
+    }
+    bail!(
+        "already inside session {}/{}, refusing to render another nested in \
+         its pane -- detach first (Ctrl-]), then switch with Ctrl-b arrows; \
+         or pass --force to attach nested anyway",
+        inner_record.workspace.display(),
+        inner_record.tag
+    )
+}
+
 fn attach(
     paths: &Paths,
     record: &SessionRecord,
     history_bytes: Option<usize>,
     no_status: bool,
+    force: bool,
 ) -> Result<()> {
+    if !force {
+        nested_attach_conflict(paths)?;
+    }
     check_attachable(record)?;
     let explicit_history = history_bytes.is_some();
     let replay_bytes = Some(history_bytes.unwrap_or(DEFAULT_ATTACH_REPLAY_BYTES));
@@ -12055,6 +12109,47 @@ mod switching_tests {
         fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
         atomic_write_json(&paths.record(record.id), record).unwrap();
         (paths, state_dir, runtime_dir)
+    }
+
+    /// `mk_record` + `seeded_registry`-style write for a second session in
+    /// an already-seeded paths triple, without `seeded_registry`'s identity
+    /// sidecar wiring (the nesting guard only does a plain `read_record`).
+    fn write_inner_record(paths: &Paths, record: &SessionRecord) {
+        fs::create_dir_all(paths.state_session(record.id)).unwrap();
+        atomic_write_json(&paths.record(record.id), record).unwrap();
+    }
+
+    #[test]
+    fn nested_attach_allowed_without_a_resolvable_live_inner_session() {
+        let mut outer = mk_record("/ws/outer", "outer", Phase::Running);
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut outer);
+        // No inner id at all: the common attach, one getenv.
+        nested_attach_conflict_for(&paths, None).unwrap();
+        // A stale or foreign id (another runtime dir, a test harness that
+        // inherited the real user's env) resolves to no record here.
+        nested_attach_conflict_for(&paths, Some(Uuid::new_v4())).unwrap();
+        // A record whose worker is gone (mk_record with the pid stripped)
+        // is a corpse, not a session to refuse for.
+        let mut corpse = mk_record("/ws/inner", "dead", Phase::Exited);
+        corpse.worker_pid = None;
+        write_inner_record(&paths, &corpse);
+        nested_attach_conflict_for(&paths, Some(corpse.id)).unwrap();
+    }
+
+    #[test]
+    fn nested_attach_refuses_a_live_inner_session_and_names_the_way_out() {
+        let mut outer = mk_record("/ws/outer", "outer", Phase::Running);
+        let (paths, _state_dir, _runtime_dir) = seeded_registry(&mut outer);
+        // mk_record pins worker_pid to our own pid, so this inner record is
+        // worker-alive by the same `a list` liveness check.
+        let inner = mk_record("/ws/inner", "peeked", Phase::Running);
+        write_inner_record(&paths, &inner);
+        let error = nested_attach_conflict_for(&paths, Some(inner.id)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("/ws/inner"), "message: {message}");
+        assert!(message.contains("peeked"), "message: {message}");
+        assert!(message.contains("Ctrl-]"), "message: {message}");
+        assert!(message.contains("--force"), "message: {message}");
     }
 
     /// The default list sweeps before it renders: a corpse `a prune` would
