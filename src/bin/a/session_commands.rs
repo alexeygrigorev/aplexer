@@ -43,7 +43,6 @@ use super::*;
 /// "main" for every arbitrary command -- `a - htop` reusing the same tag as
 /// `a -`'s plain shell would silently reattach to that shell instead of
 /// ever running htop.
-
 pub(crate) fn command_tag(word: &str) -> String {
     let base = Path::new(word)
         .file_name()

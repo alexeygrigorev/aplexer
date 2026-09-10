@@ -11,7 +11,6 @@ use super::*;
 /// "current state" by replaying a short tail of raw bytes -- in practice
 /// that tail still usually contains the shell/TUI's own recent
 /// cursor-position/clear escapes and renders close enough.
-
 pub(crate) const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 
 /// **These timers no longer decide whether a redraw is *safe*, only when one

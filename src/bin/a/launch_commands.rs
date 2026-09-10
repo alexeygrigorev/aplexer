@@ -5,7 +5,6 @@ use super::*;
 /// (pocketshell-integration-plan.md 0.3/0.4); they differ only in what they
 /// do with it (print JSON vs execvpe). Neither creates a session or spawns
 /// a worker -- pure resolution/preview.
-
 pub(crate) struct LaunchPreview {
     pub(crate) engine: String,
     pub(crate) profile: Option<String>,

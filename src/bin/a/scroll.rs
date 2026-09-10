@@ -7,7 +7,6 @@ use super::*;
 /// to write. Lock order is `stdout` -> `view` -> `screen`, which extends the
 /// existing `stdout` -> `term` -> `screen` order rather than crossing it:
 /// nothing takes `stdout` while holding `view`.
-
 pub(crate) struct ScrollMode {
     pub(crate) active: AtomicBool,
     /// Type-through (`i` while the pager is up): `active` stays set -- the
