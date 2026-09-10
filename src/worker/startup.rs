@@ -256,3 +256,176 @@ pub(super) fn read_record_under_worker_lock(paths: &Paths, id: Uuid) -> Result<S
         }
     }
 }
+
+/// Bring the session up: consume the one-shot launch environment, publish
+/// this process as the worker, bind the control socket, create the
+/// containment domain and the PTY, spawn the workload, open history, and
+/// start the runtime threads. Every resource created along the way is
+/// owned by a `StartupGuard` until the last step commits; a failure rolls
+/// them all back and persists a `Failed` record carrying the error.
+pub(super) fn bring_up(
+    paths: &Paths,
+    mut record: SessionRecord,
+    initial_size: Option<(u16, u16)>,
+) -> Result<(UnixListener, FileIdentity, Arc<WorkerRuntime>)> {
+    let id = record.id;
+    let record_path = paths.record(id);
+    let legacy_environment = LaunchEnvironment(std::mem::take(&mut record.env));
+    record.env = session_metadata_env(&legacy_environment.0);
+    let mut startup = StartupGuard::new(paths, &record);
+    let setup = (|| -> Result<(UnixListener, FileIdentity, Arc<WorkerRuntime>)> {
+        startup_checkpoint("after_worker_lock")?;
+        let launch_environment_path = paths.runtime_session(id).join("launch-environment.json");
+        let launch_environment =
+            load_launch_environment(&launch_environment_path, legacy_environment)?;
+        // Migrate a legacy record before exposing any further worker state,
+        // retaining only non-secret roots needed for transcript discovery.
+        record.worker_pid = Some(std::process::id());
+        // Placement evidence (issue #1): the fork's pre_exec setsid() gave
+        // this process a new session but left it in the ambient cgroup, so
+        // whatever manager owns that cgroup can still kill this session
+        // wholesale. Record where we actually are while we can still read
+        // it -- after a manager-wide kill the path is gone and the failure
+        // is unprovable, exactly the incident's `yolo` post-mortem problem.
+        record.worker_cgroup = crate::placement::read_process_cgroup(std::process::id());
+        record.updated_at_ms = now_ms();
+        startup.failure_record = record.clone();
+        atomic_write_json(&record_path, &record)?;
+        startup_checkpoint("after_worker_record")?;
+
+        let socket_path = paths.socket(id);
+        if socket_path.exists() {
+            fs::remove_file(&socket_path).context("remove stale control socket")?;
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("bind {}", socket_path.display()))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let socket_identity = trusted_socket_identity(&socket_path)?;
+        startup_checkpoint("after_control_socket")?;
+
+        let requested_size = initial_size.unwrap_or((24, 80));
+        let (rows, cols) = screen::validate_size(requested_size.0, requested_size.1)?;
+        let cgroup = Cgroup::create(id, &record.limits, || {
+            startup.cgroup_setup_started = true;
+        })?;
+        startup.cgroup = cgroup.clone();
+        // Unlimited sessions (the common case: no memory/pids/cpu limits) have
+        // no cgroup, so this second record write would persist byte-identical
+        // containment fields plus a fresh timestamp -- a full fsync + parent
+        // fsync for no new information (benchmark PLAN P0.3). Skip the write
+        // and keep the already-persisted worker_pid record as the durable
+        // state; the in-memory failure record is still updated for rollback.
+        if cgroup.is_some() {
+            record.containment_cgroup =
+                cgroup.as_ref().map(|cgroup| cgroup.locator().to_path_buf());
+            record.containment_cgroup_identity =
+                cgroup.as_ref().map(|cgroup| cgroup.identity().clone());
+            startup.failure_record = record.clone();
+            atomic_write_json(&record_path, &record)?;
+        } else {
+            startup.failure_record = record.clone();
+        }
+        startup_checkpoint("after_cgroup")?;
+        let (master_read, slave) = open_pty(rows, cols)?;
+        let master_write = master_read.try_clone()?;
+        let child_result = spawn_workload(
+            &record,
+            &launch_environment.0,
+            master_read.as_raw_fd(),
+            slave,
+            cgroup.as_ref(),
+        );
+        // Launch values are one-shot: overwrite them as soon as spawn has
+        // either succeeded or failed, never retaining them in the accept
+        // loop or its background threads.
+        drop(launch_environment);
+        let child = child_result?;
+        let pid = child.id();
+        // Claim the leader before any code path can wait on it. The reaper
+        // thread does not exist yet, but the claim is what documents (and
+        // enforces) that `run_child_waiter` owns this pid's exit status.
+        own_child_pid(pid);
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        startup.child = Some(Arc::clone(&child_slot));
+        record.workload_pid = Some(pid);
+        // Launch-time cgroup validation (issue #1): read where the workload
+        // leader actually landed and, for a limited session, check that
+        // against the scope systemd was asked to create for it. The
+        // pre_exec cgroup.procs write is supposed to make a mismatch
+        // impossible; if the two sources of truth ever disagree, say so in
+        // worker.log instead of silently trusting the persisted locator.
+        record.workload_cgroup = crate::placement::read_process_cgroup(pid);
+        if let (Some(cgroup), Some(actual)) = (cgroup.as_ref(), record.workload_cgroup.as_deref()) {
+            let expected = cgroup.proc_path();
+            if actual != expected {
+                eprintln!(
+                    "warning: workload pid {pid} is in cgroup {actual}, not the recorded \
+                     containment scope {expected}; resource limits may not apply to the \
+                     workload's real location"
+                );
+            }
+        }
+        startup.failure_record = record.clone();
+        // Publish the leader and cgroup locator before any injected or real
+        // post-spawn failure. The launcher must never have to infer a
+        // containment domain from an unpersisted in-memory PID.
+        atomic_write_json(&record_path, &record)?;
+        after_workload_spawn_checkpoint(pid)?;
+
+        startup_checkpoint("before_history_open")?;
+        validate_existing_history_node(&record.history_path)?;
+        let history = History::open(record.history_path.clone(), record.history_bytes)?;
+        startup_checkpoint("before_output_hub")?;
+        let output = OutputHub::new(history, rows, cols, paths.screen_txt(id))?;
+        record.phase = Phase::Running;
+        record.updated_at_ms = now_ms();
+        record.error = None;
+        startup.failure_record = record.clone();
+        let runtime = Arc::new(WorkerRuntime {
+            id,
+            paths: paths.clone(),
+            record_path: record_path.clone(),
+            runtime_session_dir: paths.runtime_session(id),
+            socket_path,
+            record: Mutex::new(record.clone()),
+            pty_write: Mutex::new(Some(Arc::new(master_write))),
+            workload: Mutex::new(WorkloadState {
+                running: true,
+                pgid: pid as i32,
+            }),
+            terminal: Mutex::new(TerminalState {
+                rows,
+                cols,
+                clients: HashMap::new(),
+                next_client_id: 1,
+                activity_clock: 0,
+            }),
+            cgroup: Mutex::new(cgroup),
+            kill_gate: Mutex::new(()),
+            output,
+            record_persistence_error: Mutex::new(None),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            last_activity_ms: AtomicU64::new(0),
+        });
+        start_worker_threads(
+            Arc::clone(&runtime),
+            master_read,
+            Arc::clone(&child_slot),
+            || {
+                atomic_write_json(&record_path, &record)?;
+                startup_checkpoint("after_running_record")
+            },
+        )?;
+        Ok((listener, socket_identity, runtime))
+    })();
+    match setup {
+        Ok(value) => {
+            startup.disarm();
+            Ok(value)
+        }
+        Err(error) => {
+            startup.rollback(&error);
+            Err(error)
+        }
+    }
+}

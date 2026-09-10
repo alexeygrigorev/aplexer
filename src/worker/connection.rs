@@ -2,6 +2,7 @@
 //! check, and the dispatch of every non-streaming operation.
 
 use super::*;
+use serde_json::Value;
 
 pub(super) fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Result<()> {
     stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
@@ -48,39 +49,7 @@ pub(super) fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRunti
             &mut stream,
             &Response::ok(id, json!({"pong":true,"id":worker_session_id})),
         )?,
-        Operation::Status => {
-            // One clone (inside public_session_record), not a second one to
-            // get the record out of its mutex first.
-            let mut value = {
-                let record = lock(&runtime.record)?;
-                serde_json::to_value(public_session_record(&record))?
-            };
-            if let Some(error) = runtime.output.history_persistence_error() {
-                value["history_persistence_error"] = json!(error);
-            }
-            if let Some(error) = lock(&runtime.record_persistence_error)?.clone() {
-                value["record_persistence_error"] = json!(error);
-            }
-            if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
-                value["cgroup"] = cgroup.stats();
-            }
-            // Live-only, never persisted (see foreground_command's doc
-            // comment on WorkerRuntime -- deliberately not a SessionRecord
-            // field): what's actually in the foreground of the pty right
-            // now, which can differ from `engine`/`command` the moment the
-            // workload execs or forks something new (e.g. a plain `shell`
-            // session where the user manually ran another program). Merged
-            // into the Status response the same way `cgroup` is above,
-            // rather than added to the persisted record, so this never
-            // costs a disk write and an old client's `serde_json` simply
-            // ignores the unrecognized field.
-            if let Some(fd) = lock(&runtime.pty_write)?.as_ref().map(|f| f.as_raw_fd()) {
-                if let Some(cmd) = foreground_command(fd) {
-                    value["foreground_command"] = json!(cmd);
-                }
-            }
-            write_json(&mut stream, &Response::ok(id, value))?;
-        }
+        Operation::Status => write_json(&mut stream, &Response::ok(id, status_value(&runtime)?))?,
         Operation::Send { bytes } => {
             let next = read_frame(&mut stream)?.ok_or_else(|| anyhow!("missing data frame"))?;
             if next.kind != FrameKind::Data || next.payload.len() != bytes {
@@ -152,4 +121,41 @@ pub(super) fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRunti
         },
     }
     Ok(())
+}
+
+/// The Status payload: the public record plus the live-only facts a
+/// persisted record cannot carry (persistence errors, cgroup stats, the
+/// foreground command).
+fn status_value(runtime: &WorkerRuntime) -> Result<Value> {
+    // One clone (inside public_session_record), not a second one to
+    // get the record out of its mutex first.
+    let mut value = {
+        let record = lock(&runtime.record)?;
+        serde_json::to_value(public_session_record(&record))?
+    };
+    if let Some(error) = runtime.output.history_persistence_error() {
+        value["history_persistence_error"] = json!(error);
+    }
+    if let Some(error) = lock(&runtime.record_persistence_error)?.clone() {
+        value["record_persistence_error"] = json!(error);
+    }
+    if let Some(cgroup) = lock(&runtime.cgroup)?.as_ref() {
+        value["cgroup"] = cgroup.stats();
+    }
+    // Live-only, never persisted (see foreground_command's doc
+    // comment on WorkerRuntime -- deliberately not a SessionRecord
+    // field): what's actually in the foreground of the pty right
+    // now, which can differ from `engine`/`command` the moment the
+    // workload execs or forks something new (e.g. a plain `shell`
+    // session where the user manually ran another program). Merged
+    // into the Status response the same way `cgroup` is above,
+    // rather than added to the persisted record, so this never
+    // costs a disk write and an old client's `serde_json` simply
+    // ignores the unrecognized field.
+    if let Some(fd) = lock(&runtime.pty_write)?.as_ref().map(|f| f.as_raw_fd()) {
+        if let Some(cmd) = foreground_command(fd) {
+            value["foreground_command"] = json!(cmd);
+        }
+    }
+    Ok(value)
 }

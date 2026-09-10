@@ -135,3 +135,79 @@ pub(super) fn recover_control_socket(
     let socket_identity = trusted_socket_identity(&runtime.socket_path)?;
     Ok((listener, socket_identity, replacement_lock, lock_identity))
 }
+
+/// Serve control connections for the rest of the worker's life. The
+/// lifecycle thread ends the process; this loop only returns on an accept
+/// failure that is not resource pressure. Each idle interval re-checks that
+/// the socket path still names this worker's listener and rebinds it if
+/// cleanup software removed the runtime directory (`recover_control_socket`).
+pub(super) fn serve_control_socket(
+    mut listener: UnixListener,
+    mut control_socket_identity: FileIdentity,
+    mut _worker_lock: FileLock,
+    mut worker_lock_identity: FileIdentity,
+    runtime: Arc<WorkerRuntime>,
+) -> Result<()> {
+    let mut accept_retry = ACCEPT_RETRY_INITIAL;
+    loop {
+        match poll_control_connection(&listener, CONTROL_SOCKET_CHECK_INTERVAL) {
+            Ok(Some((stream, _))) => {
+                accept_retry = ACCEPT_RETRY_INITIAL;
+                let Some(permit) = try_acquire_connection(&runtime.active_connections) else {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                };
+                let runtime = runtime.clone();
+                let spawn = thread::Builder::new()
+                    .name("aplexer-client".into())
+                    .spawn(move || {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, runtime) {
+                            eprintln!("aplexer connection: {error:#}");
+                        }
+                    });
+                if let Err(error) = spawn {
+                    eprintln!("aplexer worker: spawn client thread: {error}");
+                }
+            }
+            Ok(None) => {
+                if !control_socket_matches_identity(&runtime.socket_path, control_socket_identity) {
+                    match recover_control_socket(&runtime, worker_lock_identity) {
+                        Ok((
+                            replacement,
+                            replacement_socket_identity,
+                            replacement_lock,
+                            replacement_lock_identity,
+                        )) => {
+                            listener = replacement;
+                            control_socket_identity = replacement_socket_identity;
+                            if let Some(replacement_lock) = replacement_lock {
+                                _worker_lock = replacement_lock;
+                            }
+                            worker_lock_identity = replacement_lock_identity;
+                            eprintln!(
+                                "aplexer worker: recovered control socket {}",
+                                runtime.socket_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "aplexer worker: control socket recovery deferred: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if transient_accept_error(&error) => {
+                eprintln!(
+                    "aplexer worker: transient control accept failure: {error}; retrying in {}ms",
+                    accept_retry.as_millis()
+                );
+                thread::sleep(accept_retry);
+                accept_retry = accept_retry.saturating_mul(2).min(ACCEPT_RETRY_MAX);
+            }
+            Err(error) => return Err(error).context("accept control connection"),
+        }
+    }
+}
