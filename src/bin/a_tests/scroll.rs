@@ -610,6 +610,26 @@ fn parse_sgr_mouse_malformed_after_prefix_is_not_mouse_not_incomplete() {
     assert_eq!(parse_sgr_mouse(b"\x1b[<0;10;5X"), MouseParse::NotMouse);
 }
 
+/// A report that never terminates must stop being "incomplete" at some
+/// point, or the router holds the bytes -- and, in type-through, the
+/// keyboard -- forever. The generic CSI decoder already bounds itself the
+/// same way.
+#[test]
+fn parse_sgr_mouse_gives_up_on_an_unterminated_run_of_digits() {
+    let mut run = b"\x1b[<".to_vec();
+    run.extend(std::iter::repeat_n(b'1', SGR_MOUSE_MAX_LEN));
+    assert_eq!(parse_sgr_mouse(&run), MouseParse::NotMouse);
+    assert_eq!(
+        scroll_keys(&run),
+        ScrollKey::Ignored(1),
+        "the pager's decoder must step past it rather than wait"
+    );
+    // Just under the bound is still a report that may finish arriving.
+    let mut short = b"\x1b[<64;".to_vec();
+    short.extend(std::iter::repeat_n(b'1', 10));
+    assert_eq!(parse_sgr_mouse(&short), MouseParse::Incomplete);
+}
+
 #[test]
 fn parse_sgr_mouse_split_across_two_reads_reassembles() {
     // Mirrors the Ctrl-b split-read tests above: a caller buffering

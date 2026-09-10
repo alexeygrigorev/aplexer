@@ -31,11 +31,19 @@ pub(crate) enum MouseParse {
     Complete(MouseReport, usize),
 }
 
+/// The longest run of bytes still read as a report that has not finished
+/// arriving. A real report is at most `ESC [ <` plus three fields of a few
+/// digits each, well under this; past it the bytes are a stray `ESC [ <`
+/// followed by digits, and the same bound the generic CSI decoder applies
+/// (`scroll_keys`) stops the caller buffering them forever.
+pub(crate) const SGR_MOUSE_MAX_LEN: usize = 32;
+
 /// Pure parser for `ESC [ < Cb ; Cx ; Cy [Mm]` at the start of `buf`
 /// (docs/clickable-status-bar-design.md section 2/4.4). Never panics on
 /// malformed input; malformed-but-prefix-matching input that can't
 /// possibly resolve (non-digit where a number is expected, once the `<`
-/// has been seen) is reported `NotMouse` rather than `Incomplete`, so a
+/// has been seen, or a run longer than `SGR_MOUSE_MAX_LEN` without a
+/// terminator) is reported `NotMouse` rather than `Incomplete`, so a
 /// caller doesn't buffer forever waiting for a `M`/`m` that will never
 /// come.
 #[allow(dead_code)]
@@ -96,6 +104,11 @@ pub(crate) fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
         }
     }
     // Ran out of buffer with no terminator yet, but every byte seen so far
-    // was a valid digit/`;` -- genuinely incomplete, keep buffering.
-    MouseParse::Incomplete
+    // was a valid digit/`;` -- genuinely incomplete, keep buffering, up to
+    // the bound.
+    if buf.len() > SGR_MOUSE_MAX_LEN {
+        MouseParse::NotMouse
+    } else {
+        MouseParse::Incomplete
+    }
 }
