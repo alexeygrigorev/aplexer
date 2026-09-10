@@ -21,10 +21,14 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod start;
-mod startup_cleanup;
+mod startup_containment;
+mod startup_guard;
+mod worker_reaper;
 
 pub use start::*;
-use startup_cleanup::*;
+use startup_containment::*;
+use startup_guard::*;
+use worker_reaper::*;
 
 use crate::agent_kind::{detect_agent, AgentKind, DEFAULT_PROC_ROOT};
 use crate::{

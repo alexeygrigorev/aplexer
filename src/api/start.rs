@@ -7,6 +7,15 @@
 
 use super::*;
 
+mod connect;
+mod supersede;
+mod tag;
+
+pub(super) use connect::connect_startup_control;
+use connect::*;
+use supersede::*;
+pub use tag::pick_fresh_tag;
+
 #[derive(Debug, Clone)]
 pub struct StartRequest {
     pub workspace: PathBuf,
@@ -35,245 +44,6 @@ pub struct StartRequest {
     /// `a here` means create-or-attach), and it is decided under the registry
     /// lock, so the caller cannot race another start into its suffix.
     pub fresh: bool,
-}
-
-pub(super) fn connect_startup_control(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
-    if timeout.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "startup control connection deadline expired",
-        ));
-    }
-    let path_bytes = path.as_os_str().as_bytes();
-    CString::new(path_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if path_bytes.len() >= address.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "socket path is too long",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            path_bytes.as_ptr(),
-            address.sun_path.as_mut_ptr().cast::<u8>(),
-            path_bytes.len(),
-        );
-    }
-    let address_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_bytes.len() + 1)
-        as libc::socklen_t;
-    let raw_fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-        )
-    };
-    if raw_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let connected = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&raw const address).cast::<libc::sockaddr>(),
-            address_len,
-        )
-    };
-    if connected != 0 {
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EISCONN) => {}
-            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
-                let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
-                let mut poll_fd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                loop {
-                    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-                    if ready > 0 {
-                        break;
-                    }
-                    if ready == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("connect {} timed out", path.display()),
-                        ));
-                    }
-                    let poll_error = io::Error::last_os_error();
-                    if poll_error.kind() != io::ErrorKind::Interrupted {
-                        return Err(poll_error);
-                    }
-                }
-                let mut socket_error: libc::c_int = 0;
-                let mut socket_error_len = std::mem::size_of_val(&socket_error) as libc::socklen_t;
-                if unsafe {
-                    libc::getsockopt(
-                        fd.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        (&raw mut socket_error).cast::<libc::c_void>(),
-                        &raw mut socket_error_len,
-                    )
-                } != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                if socket_error != 0 {
-                    return Err(io::Error::from_raw_os_error(socket_error));
-                }
-            }
-            // Linux AF_UNIX uses EAGAIN for a full listen backlog. Returning
-            // immediately lets the outer startup loop retry without ever
-            // blocking past its absolute deadline.
-            _ => return Err(error),
-        }
-    }
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
-}
-
-/// A pathname and a persisted phase are not readiness evidence. Complete a
-/// framed request/response round trip and require the worker to identify the
-/// exact session the launcher just spawned.
-fn probe_worker_ready(
-    record: &SessionRecord,
-    expected_id: Uuid,
-    timeout: Duration,
-) -> Result<bool> {
-    let mut stream = match connect_startup_control(&record.socket_path, timeout) {
-        Ok(stream) => stream,
-        Err(_) => return Ok(false),
-    };
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let request = Request::new(expected_id, Operation::Ping);
-    let request_id = request.request_id.clone();
-    if write_json(&mut stream, &request).is_err() {
-        return Ok(false);
-    }
-    let frame = match read_frame(&mut stream) {
-        Ok(Some(frame)) => frame,
-        Ok(None) | Err(_) => return Ok(false),
-    };
-    let result = response_result(frame, &request_id).context("worker readiness Ping failed")?;
-    if result.get("pong").and_then(Value::as_bool) != Some(true) {
-        bail!("worker readiness response omitted pong");
-    }
-    let reported_id = result
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("worker readiness response omitted session id"))?
-        .parse::<Uuid>()
-        .context("parse worker readiness session id")?;
-    if reported_id != expected_id {
-        bail!("worker readiness response identified session {reported_id}, expected {expected_id}");
-    }
-    Ok(true)
-}
-
-fn archive_superseded_session(paths: &Paths, id: Uuid) -> Result<PathBuf> {
-    let retired_root = paths.state_root.join(RETIRED_SESSIONS_DIR);
-    ensure_private_dir(&retired_root)?;
-    let source = paths.state_session(id);
-    let archived = retired_root.join(id.to_string());
-    if archived.try_exists()? {
-        bail!(
-            "cannot retire superseded session {id}: archive {} already exists",
-            archived.display()
-        );
-    }
-    fs::rename(&source, &archived).with_context(|| {
-        format!(
-            "atomically retire superseded session {id} from {} to {}",
-            source.display(),
-            archived.display()
-        )
-    })?;
-    if let Err(error) = (|| -> Result<()> {
-        File::open(paths.state_root.join("sessions"))?.sync_all()?;
-        File::open(&retired_root)?.sync_all()?;
-        Ok(())
-    })() {
-        return match restore_superseded_session(paths, id, &archived) {
-            Ok(()) => Err(error).context("sync retired predecessor transaction"),
-            Err(restore_error) => Err(anyhow!(
-                "sync retired predecessor transaction: {error:#}; restore also failed: {restore_error:#}"
-            )),
-        };
-    }
-    Ok(archived)
-}
-
-/// Retire the predecessor that `start_session` decided it could take the
-/// `workspace+tag` from, re-deciding against the record as it stands on disk
-/// right now.
-///
-/// The verdict formed before the spawn is advisory by construction: a worker
-/// startup can take seconds, and `reap_verdict` is built out of live probes
-/// (`/proc` liveness for the worker and the workload leader, and the
-/// kernel's own view of a recorded cgroup), none of which the registry lock
-/// freezes. It holds off other aplexer commands, not the world: a recycled
-/// pid can make a dead `workload_pid` read alive again, and a containment
-/// domain the caller could not inspect a moment ago may answer now. So
-/// re-read and re-run the same predicate before destroying anything -- the
-/// same rule `a prune`'s `reap_session_state` follows, for the same reason.
-///
-/// Refusing here is a start FAILURE, not a silent downgrade: the caller
-/// rolls the freshly started replacement back rather than leaving two
-/// durable records claiming one selector.
-fn archive_reclaimed_predecessor(paths: &Paths, existing: &SessionRecord) -> Result<PathBuf> {
-    let current = read_session_record(paths, existing.id).with_context(|| {
-        format!(
-            "re-read superseded session {} before retiring it",
-            existing.id
-        )
-    })?;
-    if reap_verdict(&current).is_none() {
-        bail!(
-            "superseded session {} is live again (state: {}); refusing to retire it",
-            current.id,
-            current.observed_state()
-        );
-    }
-    archive_superseded_session(paths, existing.id)
-}
-
-fn restore_superseded_session(paths: &Paths, id: Uuid, archived: &Path) -> Result<()> {
-    let destination = paths.state_session(id);
-    fs::rename(archived, &destination).with_context(|| {
-        format!(
-            "restore superseded session {id} from {} to {}",
-            archived.display(),
-            destination.display()
-        )
-    })?;
-    File::open(paths.state_root.join("sessions"))?.sync_all()?;
-    if let Some(parent) = archived.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn cleanup_superseded_archive(path: &Path) -> Result<()> {
-    #[cfg(feature = "startup-test-hooks")]
-    if std::env::var_os("APLEXER_TEST_FAIL_SUPERSEDED_CLEANUP").is_some() {
-        bail!("injected superseded-session cleanup failure");
-    }
-    fs::remove_dir_all(path).with_context(|| format!("remove archive {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
 }
 
 /// Forces the fast-workload startup interleaving that `start_session`'s
@@ -424,44 +194,6 @@ fn auto_removed_completion(mut record: SessionRecord) -> SessionRecord {
 fn resolve_parent_session(paths: &Paths) -> Option<Uuid> {
     let parent = crate::discover_session_id()?;
     read_session_record(paths, parent).map(|_| parent).ok()
-}
-
-/// The tag a `--fresh` start should claim: the requested base itself while
-/// nothing live holds it, otherwise the first `<base>-2`, `<base>-3`, …
-/// suffix no live session holds either. "Live" here means exactly what the
-/// supersede check in `start_session` refuses to take -- a holder
-/// `reap_verdict` would hand over does not count, so a dead `main-2` is
-/// reclaimed under its own name rather than skipped. `None` means no
-/// candidate fits `validate_tag` any more, which for a valid base can only
-/// be the 64-byte length cap.
-pub fn pick_fresh_tag(records: &[SessionRecord], workspace: &Path, base: &str) -> Option<String> {
-    // Any live holder counts, not just the first record with the pair: a
-    // rename that took a dead holder's name leaves the corpse next to the
-    // live session (issue #13), and `--fresh` must read that pair as taken.
-    let live_holder = |tag: &str| {
-        records
-            .iter()
-            .filter(|r| r.workspace == workspace && r.tag == tag)
-            .any(|r| crate::reap_verdict(r).is_none())
-    };
-    // Suffixes start at 2: a bare `main` plus `main-2` reads as "the main
-    // one and its first sibling", not as an off-by-one list. A base that
-    // already ends in `-<number>` (or cannot be suffixed numerically at all)
-    // simply continues from the next integer.
-    let mut candidate = base.to_string();
-    while live_holder(&candidate) {
-        candidate = match candidate.rsplit_once('-').and_then(|(stem, n)| {
-            let next = n.parse::<u64>().ok()?.checked_add(1)?;
-            Some(format!("{stem}-{next}"))
-        }) {
-            Some(next) => next,
-            None => format!("{base}-2"),
-        };
-        if validate_tag(&candidate).is_err() {
-            return None;
-        }
-    }
-    Some(candidate)
 }
 
 /// The one public start entry point: the launch itself
@@ -870,242 +602,150 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
 }
 
 #[cfg(test)]
-mod fresh_tag_tests {
+mod startup_acceptance_tests {
     use super::*;
+    use crate::ExitInfo;
 
-    /// A record liveness is decided by pid probes (`reap_verdict`), so a
-    /// "live" holder only needs a pid that exists -- the test process's own
-    /// -- and a reclaimable one needs no pids plus an empty-containment
-    /// shape, exactly like `mod reclaim_tests`' zombie fixture.
-    fn record(workspace: &str, tag: &str, worker_pid: Option<u32>) -> SessionRecord {
-        let mut record = SessionRecord::fixture(workspace, tag);
-        record.worker_pid = worker_pid;
+    pub(super) fn startup_record(
+        phase: Phase,
+        exit: Option<ExitInfo>,
+        containment_empty: Option<bool>,
+    ) -> SessionRecord {
+        let mut record = SessionRecord::fixture("/ws", "main");
+        record.phase = phase;
+        record.worker_pid = Some(1);
+        record.containment_empty = containment_empty;
+        record.exit = exit;
         record
     }
 
-    fn live(workspace: &str, tag: &str) -> SessionRecord {
-        record(workspace, tag, Some(std::process::id()))
+    /// `(description, phase, exit, containment_empty, expected_accept)`.
+    type AcceptanceCase = (&'static str, Phase, Option<ExitInfo>, Option<bool>, bool);
+
+    pub(super) fn clean_exit() -> Option<ExitInfo> {
+        Some(ExitInfo {
+            code: Some(0),
+            signal: None,
+            oom_killed: false,
+            exited_at_ms: 2,
+        })
     }
 
-    fn dead(workspace: &str, tag: &str) -> SessionRecord {
-        record(workspace, tag, None)
-    }
-
+    /// Exhaustive matrix for the accept condition applied to an exited
+    /// worker's durable record. Every clause of
+    /// `exited_worker_completed_startup` is exercised in both directions:
+    /// deleting any one of the three conjuncts turns at least one `false` row
+    /// green, which is what makes this table load-bearing rather than
+    /// decorative.
     #[test]
-    fn free_base_is_used_verbatim() {
-        let ws = Path::new("/ws");
-        assert_eq!(pick_fresh_tag(&[], ws, "main"), Some("main".into()));
-    }
-
-    #[test]
-    fn live_base_moves_to_the_next_free_suffix() {
-        let ws = Path::new("/ws");
-        let records = vec![live("/ws", "main")];
-        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-2".into()));
-    }
-
-    #[test]
-    fn suffix_walk_skips_taken_numbers() {
-        let ws = Path::new("/ws");
-        let records = vec![live("/ws", "main"), live("/ws", "main-2")];
-        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-3".into()));
-    }
-
-    #[test]
-    fn reclaimable_holder_keeps_the_requested_tag() {
-        // A dead `main` is not "someone else's session": the ordinary
-        // reclaim path takes the exact name, so `--fresh` must not skip it.
-        let ws = Path::new("/ws");
-        let records = vec![dead("/ws", "main")];
-        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main".into()));
-    }
-
-    #[test]
-    fn reclaimable_suffix_is_taken_under_its_own_name() {
-        let ws = Path::new("/ws");
-        let records = vec![live("/ws", "main"), dead("/ws", "main-2")];
-        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main-2".into()));
-    }
-
-    #[test]
-    fn other_workspaces_do_not_count() {
-        let ws = Path::new("/ws");
-        let records = vec![live("/elsewhere", "main"), live("/elsewhere", "main-2")];
-        assert_eq!(pick_fresh_tag(&records, ws, "main"), Some("main".into()));
-    }
-
-    #[test]
-    fn base_with_trailing_number_increments_from_it() {
-        let ws = Path::new("/ws");
-        let records = vec![live("/ws", "review-2")];
-        assert_eq!(
-            pick_fresh_tag(&records, ws, "review-2"),
-            Some("review-3".into())
-        );
-    }
-
-    #[test]
-    fn saturated_numeric_suffix_restarts_from_the_base() {
-        // `n + 1` on a parsed u64 suffix overflowed for `x-18446744073709551615`;
-        // an unsuffixable candidate falls back to `<base>-2` like any other.
-        let ws = Path::new("/ws");
-        let base = format!("x-{}", u64::MAX);
-        let records = vec![live("/ws", &base)];
-        assert_eq!(
-            pick_fresh_tag(&records, ws, &base),
-            Some(format!("{base}-2"))
-        );
-    }
-
-    #[test]
-    fn length_capped_base_reports_no_candidate() {
-        let ws = Path::new("/ws");
-        let base = "a".repeat(64);
-        let records = vec![live("/ws", &base)];
-        assert_eq!(pick_fresh_tag(&records, ws, &base), None);
-    }
-}
-
-#[cfg(test)]
-mod reclaim_tests {
-    use super::*;
-    use crate::{atomic_write_json, ContainmentReap};
-
-    /// A registry containing exactly one record, with its paths wired to the
-    /// throwaway state/runtime roots so `read_session_record`'s identity
-    /// checks accept it.
-    fn seeded_registry(
-        record: &mut SessionRecord,
-    ) -> (Paths, tempfile::TempDir, tempfile::TempDir) {
-        let state_dir = tempfile::tempdir().unwrap();
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            runtime_root: runtime_dir.path().to_path_buf(),
-            state_root: state_dir.path().to_path_buf(),
-            config_file: state_dir.path().join("config.toml"),
-        };
-        paths.ensure().unwrap();
-        record.socket_path = paths.socket(record.id);
-        record.history_path = paths.history(record.id);
-        fs::create_dir_all(paths.state_session(record.id)).unwrap();
-        fs::create_dir_all(paths.runtime_session(record.id)).unwrap();
-        atomic_write_json(&paths.record(record.id), record).unwrap();
-        (paths, state_dir, runtime_dir)
-    }
-
-    /// The reported zombie shape: worker dead, `phase` stuck at `running`,
-    /// nothing left running.
-    fn zombie_record() -> SessionRecord {
-        SessionRecord::fixture("/ws/zombie", "zt")
-    }
-
-    /// A reclaimable predecessor is retired by the ordinary archive
-    /// transaction: durable state moves to `retired-sessions/<id>`, nothing
-    /// is deleted yet, so the caller can still restore it.
-    #[test]
-    fn a_reclaimable_predecessor_is_archived_not_destroyed() {
-        let mut record = zombie_record();
-        let (paths, _state, _runtime) = seeded_registry(&mut record);
-        assert!(reap_verdict(&record).is_some());
-
-        let archived = archive_reclaimed_predecessor(&paths, &record).expect("archive predecessor");
-        assert!(archived.join("session.json").exists(), "archive is empty");
-        assert!(!paths.state_session(record.id).exists());
-
-        restore_superseded_session(&paths, record.id, &archived).expect("restore predecessor");
-        assert!(paths.record(record.id).exists());
-    }
-
-    /// The verdict `start_session` forms before it spawns is stale by
-    /// construction: worker startup takes time, and `reap_verdict` is built
-    /// from live probes the registry lock does not freeze (`/proc` liveness
-    /// and the kernel's view of a cgroup). So the record is re-read and
-    /// re-judged immediately before it is retired.
-    ///
-    /// Driven here through the fact that can genuinely change under a held
-    /// registry lock: the workload leader pid coming back alive (a recycled
-    /// pid). The caller's copy still says "dead, reclaimable"; disk says a
-    /// process is running; the retire must refuse and leave the predecessor
-    /// exactly where it was.
-    #[test]
-    fn retiring_a_predecessor_re_reads_the_record_before_destroying_it() {
-        let stale = zombie_record();
-        let mut on_disk = stale.clone();
-        let mut leader = Command::new("sleep").arg("30").spawn().unwrap();
-        on_disk.workload_pid = Some(leader.id());
-        let (paths, _state, _runtime) = seeded_registry(&mut on_disk);
-
-        // What the caller believes, formed before the spawn.
-        assert_eq!(
-            reap_verdict(&stale),
-            Some(ContainmentReap::NoRemainingHandle)
-        );
-
-        let error = archive_reclaimed_predecessor(&paths, &stale)
-            .expect_err("retire must refuse a predecessor that is live on disk");
-        let error = format!("{error:#}");
-        assert!(error.contains("is live again"), "{error}");
-        assert!(error.contains(&stale.id.to_string()), "{error}");
-        assert!(
-            paths.record(stale.id).exists(),
-            "a refused retire still moved the predecessor's durable state"
-        );
-        assert!(
-            !paths
-                .state_root
-                .join(RETIRED_SESSIONS_DIR)
-                .join(stale.id.to_string())
-                .exists(),
-            "a refused retire stranded the predecessor in the archive"
-        );
-        assert!(
-            leader.try_wait().unwrap().is_none(),
-            "the retire path must never signal anything"
-        );
-
-        // Same record, leader gone: reclaimable again. Proves the refusal
-        // came from the re-read and not from a blanket refusal.
-        leader.kill().unwrap();
-        leader.wait().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::process_alive(on_disk.workload_pid.unwrap()) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+    pub(super) fn exited_worker_startup_acceptance_matrix() {
+        let cases: &[AcceptanceCase] = &[
+            // The fast-workload shape the readiness Ping can never observe:
+            // ran to completion, recorded its exit, proved containment empty.
+            (
+                "exited with exit info and proven-empty containment",
+                Phase::Exited,
+                clean_exit(),
+                Some(true),
+                true,
+            ),
+            // Terminal phase, but nothing proves the workload ever ran.
+            (
+                "exited without exit info",
+                Phase::Exited,
+                None,
+                Some(true),
+                false,
+            ),
+            // The only shape the `exit.is_some()` conjunct guards on its own.
+            (
+                "exiting without exit info",
+                Phase::Exiting,
+                None,
+                Some(true),
+                false,
+            ),
+            // Pinned decision: symmetric with the readiness arm's
+            // `Running | Exiting | Exited`, currently unreachable in practice.
+            (
+                "exiting with exit info and proven-empty containment",
+                Phase::Exiting,
+                clean_exit(),
+                Some(true),
+                true,
+            ),
+            // A worker that vanished mid-run never became ready, whatever
+            // exit info happens to be on the record.
+            (
+                "running with exit info",
+                Phase::Running,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The exact initial record `start_session` writes before the
+            // worker registers itself.
+            (
+                "starting, as start_session first writes it",
+                Phase::Starting,
+                None,
+                Some(false),
+                false,
+            ),
+            // Same phase, but with every other clause satisfied, so this row
+            // isolates the phase guard rather than riding on `exit`.
+            (
+                "starting with exit info and proven-empty containment",
+                Phase::Starting,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The worker's own recorded failure is never laundered into a
+            // completed session here.
+            (
+                "failed with exit info and proven-empty containment",
+                Phase::Failed,
+                clean_exit(),
+                Some(true),
+                false,
+            ),
+            // The safety clause: a terminal record whose containment domain
+            // is NOT proven empty may have an escaped descendant, so
+            // reporting startup success would be exactly the laundering this
+            // predicate exists to prevent.
+            (
+                "exited with exit info but containment not proven empty",
+                Phase::Exited,
+                clean_exit(),
+                Some(false),
+                false,
+            ),
+            // Legacy/absent proof is not proof. Unreachable for a record
+            // written by the worker this call spawned, but the predicate
+            // must not silently widen if that ever stops holding.
+            (
+                "exited with exit info but no containment field",
+                Phase::Exited,
+                clean_exit(),
+                None,
+                false,
+            ),
+        ];
+        // Collect every mismatch instead of stopping at the first, so
+        // deleting a conjunct names the whole set of rows it breaks.
+        let mut mismatches = Vec::new();
+        for (name, phase, exit, containment_empty, expected) in cases {
+            let record = startup_record(phase.clone(), exit.clone(), *containment_empty);
+            let actual = exited_worker_completed_startup(&record);
+            if actual != *expected {
+                mismatches.push(format!("{name}: expected {expected}, got {actual}"));
+            }
         }
-        archive_reclaimed_predecessor(&paths, &stale).expect("archive once the leader is gone");
-        assert!(!paths.state_session(stale.id).exists());
-    }
-
-    /// The fence itself, without a spawn: a record in the spawn-to-worker-lock
-    /// gap (`phase: starting, worker_pid: null`) reads as `worker_alive:
-    /// false` and is otherwise perfectly reclaimable, so only the worker
-    /// lock stands between a live spawn and having its state taken.
-    #[test]
-    fn a_pre_pid_record_is_fenced_by_its_worker_lock() {
-        let mut record = zombie_record();
-        record.phase = Phase::Starting;
-        let (paths, _state, _runtime) = seeded_registry(&mut record);
-        assert!(!record.worker_alive());
-        assert!(reap_verdict(&record).is_some());
-
-        let held = FileLock::exclusive(&paths.worker_lock(record.id), true).unwrap();
-        assert!(matches!(
-            fence_pre_pid_worker(&paths, &record).unwrap(),
-            PrePidFence::WorkerHoldsLock(_)
-        ));
-        drop(held);
-        assert!(matches!(
-            fence_pre_pid_worker(&paths, &record).unwrap(),
-            PrePidFence::Fenced(Some(_))
-        ));
-
-        // Past the gap, the pid is the authority and no fence is taken --
-        // otherwise every ordinary reclaim would contend on a lock the live
-        // worker legitimately holds.
-        let mut registered = record.clone();
-        registered.worker_pid = Some(std::process::id());
-        assert!(matches!(
-            fence_pre_pid_worker(&paths, &registered).unwrap(),
-            PrePidFence::Fenced(None)
-        ));
+        assert!(
+            mismatches.is_empty(),
+            "exited-worker acceptance matrix regressed:\n  {}",
+            mismatches.join("\n  ")
+        );
     }
 }
