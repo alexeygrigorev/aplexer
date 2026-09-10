@@ -288,7 +288,7 @@ fn cleanup_superseded_archive(path: &Path) -> Result<()> {
 /// pinning it; default and release builds do not contain this path.
 #[cfg(feature = "startup-test-hooks")]
 fn await_worker_exit_before_readiness_poll(
-    startup: &mut StartupGuard<'_>,
+    startup: &mut LaunchGuard<'_>,
     paths: &Paths,
     id: Uuid,
 ) -> Result<()> {
@@ -590,7 +590,7 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
         })?;
         reclaim = Some(verdict);
     }
-    let mut startup = StartupGuard::new(paths, id);
+    let mut startup = LaunchGuard::new(paths, id);
     let result = (|| -> Result<SessionRecord> {
         ensure_private_dir(&paths.state_session(id))?;
         ensure_private_dir(&paths.runtime_session(id))?;

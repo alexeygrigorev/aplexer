@@ -53,17 +53,20 @@ pub(super) fn worker_reaper_loop(receiver: mpsc::Receiver<Child>) {
     }
 }
 
-/// Owns every artifact created for a session until its worker is ready.
-/// Normal error paths call `rollback` so cleanup failures can be reported;
-/// `Drop` is the panic/early-return safety net.
-pub(super) struct StartupGuard<'a> {
+/// Owns every artifact the launcher created for a session until its worker
+/// is ready. Normal error paths call `rollback` so cleanup failures can be
+/// reported; `Drop` is the panic/early-return safety net. Named for the
+/// launcher side so it cannot be confused with the worker's own
+/// `worker::StartupGuard`, which owns the resources the worker process
+/// creates during its bring-up.
+pub(super) struct LaunchGuard<'a> {
     pub(super) paths: &'a Paths,
     pub(super) id: Uuid,
     pub(super) child: Option<Child>,
     pub(super) armed: bool,
 }
 
-impl<'a> StartupGuard<'a> {
+impl<'a> LaunchGuard<'a> {
     pub(super) fn new(paths: &'a Paths, id: Uuid) -> Self {
         Self {
             paths,
@@ -174,7 +177,7 @@ impl<'a> StartupGuard<'a> {
     }
 }
 
-impl Drop for StartupGuard<'_> {
+impl Drop for LaunchGuard<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.rollback() {
             eprintln!(
