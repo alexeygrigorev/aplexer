@@ -1450,6 +1450,25 @@ fn handle_attach(
         )?;
         write_frame(&mut *out, FrameKind::Data, &initial)?;
     }
+    // The handshake writes above still run under the worker-wide deadline, so
+    // a peer that stops reading mid-handshake cannot hold a connection slot
+    // forever. An established attach must not: its client routinely stops
+    // reading for a while (a background tab, a slow link, a slept laptop),
+    // and coalescing (MAX_SUBSCRIBER_QUEUED_BYTES) exists precisely to make
+    // that survivable. But coalescing only bounds the hub queue -- once the
+    // socket buffer itself (~200 KB) fills behind a paused client, a residual
+    // SO_SNDTIMEO fails the streaming writer's write() after
+    // CLIENT_IO_TIMEOUT of zero drain, the worker closes the socket, and the
+    // client is silently disconnected the moment its terminal wakes
+    // ("Connection to ... lost") -- observed on busy codex sessions, whose
+    // continuous TUI repaints fill the buffer fastest. Silence in both
+    // directions is a normal state of a long-lived attach; the read deadline
+    // below is already cleared for the same reason. A dead client is still
+    // detected without it: writes fail with EPIPE/ECONNRESET once the peer's
+    // socket closes, and the reader loop sees EOF.
+    lock(&writer)?
+        .set_write_timeout(None)
+        .context("clear attach streaming write deadline")?;
     let output_writer = writer.clone();
     let output_runtime = runtime.clone();
     thread::spawn(move || {
