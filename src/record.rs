@@ -392,15 +392,15 @@ impl SessionRecord {
             Ok(Some(identity)) if identity.pid == pid => identity,
             Ok(Some(_)) | Ok(None) | Err(_) => return true,
         };
-        let Ok(boot_id) = linux_boot_id() else {
-            return true;
-        };
-        if identity.boot_id != boot_id {
-            return false;
-        }
-        match process_start_time_ticks(pid) {
-            Ok(start_time) => start_time == identity.start_time_ticks,
-            Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => false,
+        match verify_worker_identity(&identity) {
+            Ok(WorkerIdentity::Verified) => true,
+            Ok(
+                WorkerIdentity::Gone
+                | WorkerIdentity::DifferentBoot
+                | WorkerIdentity::PidReused { .. },
+            ) => false,
+            // Uncertainty fails closed: never let prune/tag replacement
+            // delete a live worker over an unreadable probe.
             Err(_) => true,
         }
     }
@@ -637,6 +637,39 @@ pub(crate) struct ProcessIdentity {
 
 pub(crate) const WORKER_IDENTITY_FILE: &str = "worker.identity.json";
 
+/// How the process at a recorded identity's pid compares with that identity
+/// right now.
+pub(crate) enum WorkerIdentity {
+    /// Same boot, same start time: the recorded worker itself.
+    Verified,
+    /// No process holds that pid any more.
+    Gone,
+    /// Recorded during a different boot; whatever holds the pid is unrelated.
+    DifferentBoot,
+    /// Same boot, but the pid was recycled by a later process.
+    PidReused { recorded: u64, current: u64 },
+}
+
+/// The one boot-id and start-time comparison behind `worker_alive` and
+/// `signal_recorded_worker`, so the two cannot drift on what "the same
+/// worker" means. `Err` is "could not tell" (an unreadable boot id or a
+/// `/proc` read failure other than the process being gone); callers decide
+/// which way that fails.
+pub(crate) fn verify_worker_identity(identity: &ProcessIdentity) -> Result<WorkerIdentity> {
+    if linux_boot_id()? != identity.boot_id {
+        return Ok(WorkerIdentity::DifferentBoot);
+    }
+    match process_start_time_ticks(identity.pid) {
+        Ok(current) if current == identity.start_time_ticks => Ok(WorkerIdentity::Verified),
+        Ok(current) => Ok(WorkerIdentity::PidReused {
+            recorded: identity.start_time_ticks,
+            current,
+        }),
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => Ok(WorkerIdentity::Gone),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn read_worker_identity(record: &SessionRecord) -> Result<Option<ProcessIdentity>> {
     let parent = record
         .history_path
@@ -740,31 +773,15 @@ pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()>
     let Some(pid) = record.worker_pid else {
         return Ok(());
     };
-    let parent = record
-        .history_path
-        .parent()
-        .ok_or_else(|| anyhow!("session {} has no state directory", record.id))?;
-    let identity_path = parent.join(WORKER_IDENTITY_FILE);
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&identity_path)
-        .with_context(|| {
-            format!(
-                "session {} has no trustworthy recorded worker identity; refusing to signal pid {}",
-                record.id, pid
-            )
-        })?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "session {} has an untrusted worker identity file; refusing to signal pid {}",
-            record.id,
-            pid
-        );
-    }
-    let identity: ProcessIdentity = serde_json::from_reader(file)
-        .with_context(|| format!("parse {}", identity_path.display()))?;
+    let untrusted = || {
+        format!(
+            "session {} has no trustworthy recorded worker identity; refusing to signal pid {}",
+            record.id, pid
+        )
+    };
+    let identity = read_worker_identity(record)
+        .with_context(untrusted)?
+        .ok_or_else(|| anyhow!(untrusted()))?;
     if identity.pid != pid {
         bail!(
             "session {} recorded worker pid {}, but its identity belongs to pid {}; refusing to signal",
@@ -781,27 +798,23 @@ pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()>
             return Err(error).with_context(|| format!("open pidfd for worker pid {pid}"));
         }
     };
-    let current_boot_id = linux_boot_id()?;
-    if current_boot_id != identity.boot_id {
-        bail!(
+    // Verified only after the pidfd pins the process, so an exit and pid
+    // reuse between the check and the signal cannot redirect it.
+    match verify_worker_identity(&identity)? {
+        WorkerIdentity::Verified => {}
+        WorkerIdentity::Gone => return Ok(()),
+        WorkerIdentity::DifferentBoot => bail!(
             "worker pid {} for session {} was recorded during a different boot; refusing to signal",
             pid,
             record.id
-        );
-    }
-    let current_start_time = match process_start_time_ticks(pid) {
-        Ok(start_time) => start_time,
-        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if current_start_time != identity.start_time_ticks {
-        bail!(
+        ),
+        WorkerIdentity::PidReused { recorded, current } => bail!(
             "worker pid {} for session {} has been reused (recorded start {}, current start {}); refusing to signal",
             pid,
             record.id,
-            identity.start_time_ticks,
-            current_start_time
-        );
+            recorded,
+            current
+        ),
     }
 
     let rc = unsafe {
