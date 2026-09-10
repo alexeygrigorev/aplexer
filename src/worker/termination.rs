@@ -169,17 +169,32 @@ pub(super) static CHILD_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
 /// every helper wait in the process to stay safe; refusing to ever name -1
 /// removes the class of bug instead of arguing about it.
 ///
-/// The worker's other self-waited children (the `systemd-run` scope anchor
-/// and the `systemctl` query helpers in `Cgroup::create`) are all spawned
-/// *and* waited during startup, before `start_worker_threads` creates the
-/// reaper thread, so they can never be observed by it. They are registered
-/// anyway, so the invariant does not silently depend on that ordering.
+/// The invariant the rest of the worker keeps: **no self-waited child is
+/// spawned after the reaper is armed** (`install_child_reaper_handler`,
+/// the last step of `start_worker_threads`). The workload leader and the
+/// `systemd-run` scope anchor and `systemctl` query helpers of
+/// `Cgroup::create` are all spawned during startup, before that point.
+/// Their *waits* may finish later -- `reap_helper_child_async` waits on a
+/// detached thread -- and that is safe, because a pid stays registered
+/// here until its owner's wait has returned. What would not be safe is a
+/// spawn after arming: between `Command::spawn` returning and
+/// `own_child_pid` registering the pid, a SIGCHLD-driven sweep could reap
+/// the new child first. `own_child_pid` checks the invariant in debug
+/// builds.
 pub(super) static OWNED_CHILD_PIDS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+/// Set once the SIGCHLD-driven reaper is armed; see `OWNED_CHILD_PIDS`.
+static REAPER_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Claim `pid` before anything can wait on it. Must be called on the
 /// spawning thread, between `Command::spawn` returning and the pid becoming
-/// reachable by the reaper.
+/// reachable by the reaper -- which is only possible while the reaper is
+/// not yet armed (see `OWNED_CHILD_PIDS`).
 pub(crate) fn own_child_pid(pid: u32) {
+    debug_assert!(
+        !REAPER_ARMED.load(Ordering::SeqCst),
+        "self-waited child {pid} spawned after the descendant reaper was armed"
+    );
     if let Ok(mut owned) = OWNED_CHILD_PIDS.lock() {
         owned.insert(pid);
     }
@@ -256,6 +271,7 @@ pub(super) fn install_child_reaper_handler() -> Result<RawFd> {
             return Err(io::Error::from_raw_os_error(rc)).context("unblock SIGCHLD");
         }
     }
+    REAPER_ARMED.store(true, Ordering::SeqCst);
     Ok(event_fd)
 }
 
