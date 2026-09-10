@@ -1317,6 +1317,13 @@ pub struct ClientScreen {
     /// When set, bytes written to the host have alt-screen DECSET/DECRST
     /// stripped so the attach client can own the host's alternate screen.
     host_alt: Option<HostAltHold>,
+    /// Set once `relay` has repositioned the host ahead of a character that
+    /// is about to wrap, until that character completes: the guard must not
+    /// fire again on its UTF-8 continuation bytes, and if it turns out to be
+    /// a zero-width combining mark the host's pending wrap has to be put
+    /// back. A field rather than a local because the lead byte can be the
+    /// last byte of a PTY read.
+    wrap_guarded: bool,
 }
 
 /// A chunk on its way to the host, with the client's own bytes spliced in at
@@ -1368,6 +1375,7 @@ impl ClientScreen {
         Ok(Self {
             screen: ScreenTracker::try_new_with_scrollback(rows, cols, scrollback)?,
             host_alt: None,
+            wrap_guarded: false,
         })
     }
 
@@ -1404,6 +1412,7 @@ impl ClientScreen {
         self.screen.seed(&without_scroll_regions(data));
         self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
         self.screen.reset_margins();
+        self.wrap_guarded = false;
     }
 
     /// Whether a DECSTBM sub-range has been seen since this client's history
@@ -1632,13 +1641,9 @@ impl ClientScreen {
 
         let mut rewrite = Rewrite::new(data);
         let mut i = 0usize;
-        // Set once the host has been repositioned ahead of a character that
-        // is about to wrap, so the guard cannot fire again on that
-        // character's UTF-8 continuation bytes.
-        let mut wrap_guarded = false;
 
         while i < data.len() {
-            if !wrap_guarded && self.wrap_would_walk(data[i]) {
+            if !self.wrap_guarded && self.wrap_would_walk(data[i]) {
                 // The model will wrap this character to column 1 of the row
                 // it is already on (it is outside the sub-range, so it clamps
                 // instead of scrolling); the host, one row taller, would wrap
@@ -1646,7 +1651,7 @@ impl ClientScreen {
                 // putting it where the model is about to be.
                 let row = self.screen.cursor_position().0;
                 rewrite.splice(i, format!("\x1b[{};1H", row + 1).as_bytes());
-                wrap_guarded = true;
+                self.wrap_guarded = true;
             }
 
             let end = i + self.run_len(data, i);
@@ -1669,7 +1674,7 @@ impl ClientScreen {
                 rewrite.splice(i, &self.clamp_repair());
             }
 
-            if wrap_guarded && at_boundary {
+            if self.wrap_guarded && at_boundary {
                 if self.pending_wrap_on_last_row() {
                     // The character attached to the preceding cell -- a
                     // zero-width combining mark -- instead of wrapping, so the
@@ -1678,7 +1683,7 @@ impl ClientScreen {
                     // `cursor_state_formatted` (inside `cursor_restore`) can.
                     rewrite.splice(i, &self.screen.cursor_restore());
                 }
-                wrap_guarded = false;
+                self.wrap_guarded = false;
             }
 
             // Mechanism 3: close the reservation window in the stream itself.
@@ -1835,6 +1840,7 @@ impl ClientScreen {
         if let Some(hold) = self.host_alt.as_mut() {
             hold.reset();
         }
+        self.wrap_guarded = false;
     }
 
     pub fn margins(&self) -> Option<(u16, u16)> {
@@ -3876,6 +3882,33 @@ mod boundary_tests {
         );
         rig.assert_agrees("after a multi-byte wrap off the workload's last row");
         rig.assert_bar_intact("by a multi-byte wrap");
+    }
+
+    /// The wrap guard fires on a character's lead byte, before the character
+    /// can be known to be zero-width. When it turns out to be a combining
+    /// mark (`U+0301`, `\xcc\x81`) the model stays in pending wrap, and the
+    /// host's pending wrap -- which the guard's reposition cancelled -- has
+    /// to be put back. Across a chunk boundary too: `relay` runs once per
+    /// PTY read, and the lead byte can be a read's last byte.
+    #[test]
+    fn relay_restores_a_pending_wrap_a_combining_mark_did_not_use() {
+        for chunks in [&[&b"\xcc\x81"[..]][..], &[&b"\xcc"[..], &b"\x81"[..]][..]] {
+            let mut rig = RelayRig::new(24, 20);
+            rig.relay(b"\x1b[5;15r\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+            for chunk in chunks {
+                rig.relay(chunk);
+            }
+            assert_eq!(
+                rig.workload.screen().cursor_position(),
+                (22, 20),
+                "the combining mark attached to the last cell instead of wrapping"
+            );
+            rig.assert_agrees("after a combining mark in pending wrap");
+            // ...and the next character wraps on both sides.
+            rig.relay(b"X");
+            rig.assert_agrees("after the character following the combining mark");
+            rig.assert_bar_intact("by a combining mark");
+        }
     }
 
     /// The reported user-visible symptom, end to end: after a wrap has put
