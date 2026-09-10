@@ -372,15 +372,9 @@ pub fn open_pty(rows: u16, cols: u16) -> Result<(File, File)> {
         cleanup_master();
         return Err(e).context("open PTY slave");
     }
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        libc::ioctl(master, libc::TIOCSWINSZ, &ws);
-    }
+    // The initial size is best-effort; the worker applies the attaching
+    // client's real size with `set_winsize` as soon as it knows it.
+    let _ = set_winsize(master, rows, cols);
     Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
 }
 
