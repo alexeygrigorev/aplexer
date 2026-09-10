@@ -1,132 +1,133 @@
 use super::*;
 
-pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
-    let record = resolve(paths, &target)?;
-    // Process existence and control-plane reachability are separate facts:
-    // a wedged worker can still have a live pid, while a successfully reached
-    // worker is stronger evidence than a stale persisted pid. Preserve both
-    // instead of folding them into one optimistic `worker_alive` bit, and
-    // surface the actual RPC failure so recovery tooling has evidence to act
-    // on rather than a mysteriously stale record.
-    let (raw, worker_reachable, rpc_error) = match rpc_simple(&record, Operation::Status, None) {
-        Ok(raw) => (raw, true, None),
-        Err(error) => (
-            serde_json::to_value(public_session_record(&record)).unwrap_or(Value::Null),
-            false,
-            Some(format!("{error:#}")),
-        ),
-    };
-    let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
-    let cgroup_stats = raw.get("cgroup").cloned();
-    let history_persistence_error = raw
-        .get("history_persistence_error")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let record_persistence_error = raw
-        .get("record_persistence_error")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    // Live-only (see foreground_command in lib.rs / Operation::Status):
-    // never persisted to session.json, so this is only available while the
-    // worker is reachable -- absent on a dead/unreachable session, same as
-    // cgroup_stats above.
-    let foreground_command = raw
-        .get("foreground_command")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let worker_alive = current.worker_alive();
-    if json_output {
-        let mut value = serde_json::to_value(public_session_record(&current))?;
-        if let Some(stats) = cgroup_stats {
-            value["cgroup"] = stats;
+pub(crate) struct StatusData {
+    pub(crate) current: SessionRecord,
+    pub(crate) raw: Value,
+    pub(crate) worker_reachable: bool,
+    pub(crate) rpc_error: Option<String>,
+    pub(crate) cgroup_stats: Option<Value>,
+    pub(crate) history_persistence_error: Option<String>,
+    pub(crate) record_persistence_error: Option<String>,
+    pub(crate) foreground_command: Option<String>,
+}
+
+impl StatusData {
+    fn load(record: SessionRecord) -> Self {
+        // Process existence and control-plane reachability are separate facts:
+        // a wedged worker can still have a live pid, while a successfully
+        // reached worker is stronger evidence than a stale persisted pid.
+        let (raw, worker_reachable, rpc_error) = match rpc_simple(&record, Operation::Status, None)
+        {
+            Ok(raw) => (raw, true, None),
+            Err(error) => (
+                serde_json::to_value(public_session_record(&record)).unwrap_or(Value::Null),
+                false,
+                Some(format!("{error:#}")),
+            ),
+        };
+        let current: SessionRecord = serde_json::from_value(raw.clone()).unwrap_or(record);
+        let cgroup_stats = raw.get("cgroup").cloned();
+        let history_persistence_error = raw
+            .get("history_persistence_error")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let record_persistence_error = raw
+            .get("record_persistence_error")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let foreground_command = raw
+            .get("foreground_command")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Self {
+            worker_reachable,
+            rpc_error,
+            cgroup_stats,
+            history_persistence_error,
+            record_persistence_error,
+            foreground_command,
+            current,
+            raw,
         }
-        if let Some(fg) = &foreground_command {
-            value["foreground_command"] = json!(fg);
+    }
+
+    fn worker_alive(&self) -> bool {
+        self.current.worker_alive()
+    }
+
+    pub(crate) fn json_value(&self) -> Result<Value> {
+        let mut value = serde_json::to_value(public_session_record(&self.current))?;
+        if let Some(stats) = &self.cgroup_stats {
+            value["cgroup"] = stats.clone();
         }
-        if let Some(error) = &history_persistence_error {
+        if let Some(foreground) = &self.foreground_command {
+            value["foreground_command"] = json!(foreground);
+        }
+        if let Some(error) = &self.history_persistence_error {
             value["history_persistence_error"] = json!(error);
         }
-        if let Some(error) = &record_persistence_error {
+        if let Some(error) = &self.record_persistence_error {
             value["record_persistence_error"] = json!(error);
         }
-        value["worker_alive"] = json!(worker_alive);
-        // The same derived fact the human branch prints as `state:` and
-        // every `a list --json`/`a snapshot` row carries, from the same
-        // helper so the three can never disagree: a SIGKILLed worker
-        // leaves `phase` at "running" forever, so a machine consumer of
-        // `status` reading `phase` alone could not tell a zombie record
-        // from a live session -- while the same command was telling a
-        // human "broken".
+        value["worker_alive"] = json!(self.worker_alive());
         value["state"] = json!(derived_liveness(
-            &current.phase,
-            worker_alive,
-            current.created_at_ms
+            &self.current.phase,
+            self.worker_alive(),
+            self.current.created_at_ms
         ));
-        // Which agent is running inside the session's workload tree right
-        // now, from the same query-time detection every `a list --json` row
-        // carries (`api::record_agent`). Always present; `null` when no
-        // agent is detectable.
-        value["agent"] = json!(aplexer::api::record_agent(&current));
-        // Same derived placement facts every `a list --json`/`a snapshot`
-        // row carries, from the same helper so no two commands can
-        // disagree about whether a session shares the per-user manager's
-        // failure domain (issue #1).
+        value["agent"] = json!(aplexer::api::record_agent(&self.current));
         value["worker_placement"] =
-            aplexer::placement::placement_summary(current.worker_cgroup.as_deref());
+            aplexer::placement::placement_summary(self.current.worker_cgroup.as_deref());
         value["workload_placement"] =
-            aplexer::placement::placement_summary(current.workload_cgroup.as_deref());
-        value["worker_reachable"] = json!(worker_reachable);
-        if let Some(error) = &rpc_error {
+            aplexer::placement::placement_summary(self.current.workload_cgroup.as_deref());
+        value["worker_reachable"] = json!(self.worker_reachable);
+        if let Some(error) = &self.rpc_error {
             value["rpc_error"] = json!(error);
         }
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if io::stdout().is_terminal() {
-        cmd_status_tty(
-            paths,
-            &current,
-            &raw,
-            worker_reachable,
-            rpc_error.as_deref(),
-            history_persistence_error.as_deref(),
-            record_persistence_error.as_deref(),
-        )?;
-    } else {
+        Ok(value)
+    }
+
+    fn print_json(&self) -> Result<()> {
+        println!("{}", serde_json::to_string_pretty(&self.json_value()?)?);
+        Ok(())
+    }
+
+    fn print_plain(&self) {
+        let current = &self.current;
         println!("id: {}", current.id);
         println!("selector: {}", current.selector());
         println!(
             "state: {}",
-            derived_liveness(&current.phase, worker_alive, current.created_at_ms)
+            derived_liveness(&current.phase, self.worker_alive(), current.created_at_ms)
         );
-        let ep = match &current.profile {
-            Some(p) => format!("{}/{p}", current.engine),
+        let engine_profile = match &current.profile {
+            Some(profile) => format!("{}/{}", current.engine, profile),
             None => current.engine.clone(),
         };
-        // Filtered the same way the attach status bar filters it
-        // (`foreground_override`): omit a bare interactive shell or a
-        // foreground command that's just the engine's own launch command
-        // running as expected, so this line matches what `a status` calls
-        // out as "different from what you started."
-        match foreground_override(&current, &raw) {
-            Some(fg) => println!("engine: {ep} (foreground: {fg})"),
-            None => println!("engine: {ep}"),
+        // Match the attach status bar's foreground filtering so a bare
+        // interactive shell or the engine's own launch command is not
+        // mislabeled as a surprising foreground process.
+        match foreground_override(current, &self.raw) {
+            Some(foreground) => println!("engine: {engine_profile} (foreground: {foreground})"),
+            None => println!("engine: {engine_profile}"),
         }
         println!(
             "worker_pid: {}",
             current
                 .worker_pid
-                .map(|v| v.to_string())
+                .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "-".into())
         );
-        println!("worker_alive: {worker_alive}");
-        println!("worker_reachable: {worker_reachable}");
-        if let Some(error) = rpc_error {
+        println!("worker_alive: {}", self.worker_alive());
+        println!("worker_reachable: {}", self.worker_reachable);
+        if let Some(error) = &self.rpc_error {
             println!("rpc_error: {error}");
         }
         println!(
             "workload_pid: {}",
             current
                 .workload_pid
-                .map(|v| v.to_string())
+                .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "-".into())
         );
         println!(
@@ -134,28 +135,39 @@ pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -
             current
                 .command
                 .iter()
-                .map(|v| shell_quote(v))
+                .map(|value| shell_quote(value))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        if let Some(exit) = current.exit {
+        if let Some(exit) = &current.exit {
             println!(
                 "exit: code={:?} signal={:?} oom_killed={}",
                 exit.code, exit.signal, exit.oom_killed
             );
         }
-        if let Some(stats) = cgroup_stats {
+        if let Some(stats) = &self.cgroup_stats {
             println!("cgroup: {stats}");
         }
-        if let Some(error) = current.error {
+        if let Some(error) = &current.error {
             println!("error: {error}");
         }
-        if let Some(error) = history_persistence_error {
+        if let Some(error) = &self.history_persistence_error {
             println!("history_persistence_error: {error}");
         }
-        if let Some(error) = record_persistence_error {
+        if let Some(error) = &self.record_persistence_error {
             println!("record_persistence_error: {error}");
         }
+    }
+}
+
+pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
+    let status = StatusData::load(resolve(paths, &target)?);
+    if json_output {
+        status.print_json()?;
+    } else if io::stdout().is_terminal() {
+        cmd_status_tty(paths, &status)?;
+    } else {
+        status.print_plain();
     }
     Ok(())
 }
@@ -165,15 +177,13 @@ pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -
 /// source, and exactly one next action chosen from lifecycle/reachability/
 /// containment evidence rather than a generic "try these commands" list.
 /// The redirected rendering above stays byte-identical to the pre-UX format.
-pub(crate) fn cmd_status_tty(
-    paths: &Paths,
-    current: &SessionRecord,
-    raw: &Value,
-    worker_reachable: bool,
-    rpc_error: Option<&str>,
-    history_persistence_error: Option<&str>,
-    record_persistence_error: Option<&str>,
-) -> Result<()> {
+fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
+    let current = &status.current;
+    let raw = &status.raw;
+    let worker_reachable = status.worker_reachable;
+    let rpc_error = status.rpc_error.as_deref();
+    let history_persistence_error = status.history_persistence_error.as_deref();
+    let record_persistence_error = status.record_persistence_error.as_deref();
     let now = now_ms();
     let (mut state, mut source) = session_ui_state(current, now);
     // A live worker that will not answer is its own condition -- more

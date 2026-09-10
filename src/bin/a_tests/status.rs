@@ -86,6 +86,34 @@ fn cgroup_capability_requires_delegation_but_is_optional_when_missing() {
 }
 
 #[test]
+fn status_json_value_preserves_runtime_diagnostics() {
+    let current = mk_record("/ws", "status", Phase::Running);
+    let status = StatusData {
+        current,
+        raw: json!({
+            "cgroup": {"memory": "64M"},
+            "foreground_command": "vim",
+        }),
+        worker_reachable: false,
+        rpc_error: Some("connection refused".into()),
+        cgroup_stats: Some(json!({"memory": "64M"})),
+        history_persistence_error: Some("history warning".into()),
+        record_persistence_error: Some("record warning".into()),
+        foreground_command: Some("vim".into()),
+    };
+
+    let value = status.json_value().unwrap();
+    assert_eq!(value["state"], "running");
+    assert_eq!(value["worker_alive"], true);
+    assert_eq!(value["worker_reachable"], false);
+    assert_eq!(value["rpc_error"], "connection refused");
+    assert_eq!(value["foreground_command"], "vim");
+    assert_eq!(value["cgroup"]["memory"], "64M");
+    assert_eq!(value["history_persistence_error"], "history warning");
+    assert_eq!(value["record_persistence_error"], "record warning");
+}
+
+#[test]
 fn status_bar_sanitizes_record_fields_and_flash_messages() {
     let ctx = status_ctx_for_test(true);
     {
@@ -503,4 +531,3 @@ fn summary_regions_single_session_still_renders_one_region() {
     assert_eq!(text, "1:only*");
     assert_eq!(regions.len(), 1);
 }
-
