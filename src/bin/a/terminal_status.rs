@@ -213,13 +213,19 @@ pub(crate) fn engine_label(
             return agent.to_string();
         }
     }
-    let base = match &record.profile {
-        Some(profile) => format!("{}/{}", record.engine, profile),
-        None => record.engine.clone(),
-    };
+    let base = engine_profile(record);
     match agent {
         Some(agent) => format!("{base} -> {agent}"),
         None => base,
+    }
+}
+
+/// `engine/profile`, or the bare engine for a session started without a
+/// profile -- the one spelling every human surface uses.
+pub(crate) fn engine_profile(record: &SessionRecord) -> String {
+    match &record.profile {
+        Some(profile) => format!("{}/{}", record.engine, profile),
+        None => record.engine.clone(),
     }
 }
 

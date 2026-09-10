@@ -217,10 +217,7 @@ pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     let live = cached_live_status(ctx, record.id);
     let home = env::var_os("HOME").map(PathBuf::from);
     let ws = display_workspace(&record.workspace, home.as_deref());
-    let mut ep = match &record.profile {
-        Some(p) => format!("{}/{}", record.engine, p),
-        None => record.engine.clone(),
-    };
+    let mut ep = engine_profile(&record);
     let raw = live.raw;
     // Which agent is live in this session right now -- the same query-time
     // detection every JSON surface carries (`api::record_agent`). When it

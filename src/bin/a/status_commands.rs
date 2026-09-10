@@ -100,10 +100,7 @@ impl StatusData {
             "state: {}",
             derived_liveness(&current.phase, self.worker_alive(), current.created_at_ms)
         );
-        let engine_profile = match &current.profile {
-            Some(profile) => format!("{}/{}", current.engine, profile),
-            None => current.engine.clone(),
-        };
+        let engine_profile = engine_profile(current);
         // Match the attach status bar's foreground filtering so a bare
         // interactive shell or the engine's own launch command is not
         // mislabeled as a surprising foreground process.
@@ -198,10 +195,7 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
         &current.workspace,
         env::var_os("HOME").as_deref().map(Path::new),
     );
-    let engine = match &current.profile {
-        Some(profile) => format!("{}/{}", current.engine, profile),
-        None => current.engine.clone(),
-    };
+    let engine = engine_profile(current);
 
     let (glyph, glyph_color) = state_glyph(state);
     println!(

@@ -60,11 +60,7 @@ pub(crate) fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
             let connector = paint(color, ANSI_GRAY, connector_raw);
             let idx = paint(color, ANSI_DIM, &format!("{:>2}", i + 1));
             let tag = paint(color, ANSI_BOLD, &format!("{:<14}", r.tag));
-            let ep = match &r.profile {
-                Some(p) => format!("{}/{}", r.engine, p),
-                None => r.engine.clone(),
-            };
-            let ep = paint(color, ANSI_DIM, &format!("{:<16}", ep));
+            let ep = paint(color, ANSI_DIM, &format!("{:<16}", engine_profile(r)));
             let state = derived_liveness(&r.phase, alive_of(r), r.created_at_ms);
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));
