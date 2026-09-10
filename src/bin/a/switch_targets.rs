@@ -41,6 +41,19 @@ pub(crate) fn is_attachable(r: &SessionRecord) -> bool {
     check_attachable(r).is_ok()
 }
 
+/// The indices of a ring of `len` visited from `start` by +1 (or -1 with
+/// `backwards`) with wraparound: every other index once, then `start`
+/// itself last. Empty for an empty ring.
+fn ring_walk(start: usize, len: usize, backwards: bool) -> impl Iterator<Item = usize> {
+    (1..=len).map(move |step| {
+        if backwards {
+            (start + len - step) % len
+        } else {
+            (start + step) % len
+        }
+    })
+}
+
 /// Walks `group` from `current_id`'s position (or position 0 if the current
 /// session isn't in this group -- e.g. it was killed underneath us) by +1
 /// (`prev = false`) or -1 (`prev = true`) with wraparound, skipping
@@ -51,23 +64,11 @@ pub(crate) fn walk_group(
     current_id: Uuid,
     prev: bool,
 ) -> Option<SessionRecord> {
-    let len = group.len();
-    if len == 0 {
-        return None;
-    }
     let start = group.iter().position(|r| r.id == current_id).unwrap_or(0);
-    for step in 1..=len {
-        let idx = if prev {
-            (start + len - step) % len
-        } else {
-            (start + step) % len
-        };
-        let candidate = &group[idx];
-        if candidate.id != current_id && is_attachable(candidate) {
-            return Some(candidate.clone());
-        }
-    }
-    None
+    ring_walk(start, group.len(), prev)
+        .map(|index| &group[index])
+        .find(|candidate| candidate.id != current_id && is_attachable(candidate))
+        .cloned()
 }
 
 /// The session a workspace is *entered* at by `Ctrl-b Down`/`Up`: the one
@@ -145,8 +146,7 @@ pub(crate) fn pick_switch_target(
             // skipped, so this is always a real move; a workspace with
             // nothing attachable left in it is stepped over rather than
             // becoming an error the user has to press through.
-            let len = groups.len();
-            if len == 0 {
+            if groups.is_empty() {
                 bail!("no sessions to switch to");
             }
             let backwards = target == SwitchTarget::PrevWorkspace;
@@ -154,12 +154,7 @@ pub(crate) fn pick_switch_target(
                 .iter()
                 .position(|(ws, _)| ws == current_workspace)
                 .unwrap_or(0);
-            for step in 1..=len {
-                let index = if backwards {
-                    (start + len - step) % len
-                } else {
-                    (start + step) % len
-                };
+            for index in ring_walk(start, groups.len(), backwards) {
                 let (workspace, group) = &groups[index];
                 // Comparing the path (not the index) is what makes the
                 // "current workspace not in the list" case -- it was just
