@@ -910,7 +910,10 @@ fn compact_cursor(cursor: &mut Cursor, retained_ids: &BTreeSet<Uuid>) {
     cursor.exceptions.retain(|id| retained_ids.contains(id));
 }
 
-/// Records `ids` exactly as acknowledged for `consumer_id`. The mailbox lock
+/// Records `ids` exactly as acknowledged for `consumer_id` and returns the
+/// ones the mailbox still holds, in request order. An id whose message was
+/// pruned (or never existed here) is not recorded -- there is nothing to
+/// hide -- and is left out so the caller can say so. The mailbox lock
 /// prevents append/GC from changing the retained set during the update; the
 /// per-consumer lock prevents two acknowledgements from overwriting each
 /// other. Lock order is always mailbox then cursor.
@@ -919,7 +922,7 @@ pub fn ack_messages(
     canonical_workspace: &Path,
     consumer_id: Uuid,
     ids: &[Uuid],
-) -> Result<()> {
+) -> Result<Vec<Uuid>> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
     let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
@@ -927,12 +930,15 @@ pub fn ack_messages(
     let mut cursor = read_cursor_file(&path)?;
     let retained_ids = retained_message_ids(&mp.msgs_dir)?;
     compact_cursor(&mut cursor, &retained_ids);
+    let mut acked = Vec::new();
     for id in ids {
-        if retained_ids.contains(id) && !cursor.is_acked(*id) {
+        if retained_ids.contains(id) && !acked.contains(id) {
             cursor.exceptions.insert(*id);
+            acked.push(*id);
         }
     }
-    atomic_write_json(&path, &cursor)
+    atomic_write_json(&path, &cursor)?;
+    Ok(acked)
 }
 
 /// Known tags for a workspace (design doc section 2.3), from session
@@ -2144,5 +2150,25 @@ mod tests {
             .unwrap()
             .unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn ack_returns_only_the_ids_the_mailbox_holds() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-ack-report-workspace");
+        let consumer_id = Uuid::from_u128(100);
+        let known = Uuid::from_u128(1);
+        let unknown = Uuid::from_u128(2);
+        write_test_message(&paths, workspace, known);
+
+        let acked = ack_messages(&paths, workspace, consumer_id, &[unknown, known, known]).unwrap();
+        assert_eq!(acked, vec![known]);
+        let cursor = read_cursor(&paths, workspace, consumer_id).unwrap();
+        assert!(cursor.is_acked(known));
+        assert!(!cursor.is_acked(unknown));
+        // Acknowledging again is idempotent and still reports the id.
+        let again = ack_messages(&paths, workspace, consumer_id, &[known]).unwrap();
+        assert_eq!(again, vec![known]);
     }
 }

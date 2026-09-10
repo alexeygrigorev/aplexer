@@ -446,11 +446,27 @@ pub(crate) fn cmd_message_ack(
     } else {
         args.message_ids
     };
-    ack_messages(paths, &workspace, consumer_id, &ids)?;
+    let acked = ack_messages(paths, &workspace, consumer_id, &ids)?;
+    let unknown: Vec<Uuid> = ids
+        .iter()
+        .filter(|id| !acked.contains(id))
+        .copied()
+        .collect();
     if json_output {
-        println!("{}", json!({"acked": ids}));
+        println!("{}", json!({"acked": acked, "unknown": unknown}));
     } else {
-        println!("acked {} message(s)", ids.len());
+        println!("acked {} message(s)", acked.len());
+        if !unknown.is_empty() {
+            eprintln!(
+                "a: {} id(s) not in this mailbox (pruned, or never here): {}",
+                unknown.len(),
+                unknown
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     Ok(())
 }
