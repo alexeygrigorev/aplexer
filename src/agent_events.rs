@@ -248,14 +248,13 @@ fn claude_final_messages(payload: &Value) -> Vec<String> {
     out
 }
 
-fn claude_tool_result_event(engine: &str, block: &Value) -> UnifiedEvent {
+fn claude_tool_result_event(block: &Value) -> UnifiedEvent {
     let tool_output = match block.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(v) if !v.is_null() => v.to_string(),
         _ => String::new(),
     };
     let mut e = ev("tool_result");
-    e.engine = engine.to_string();
     e.role = Some("user".to_string());
     e.tool_output = Some(tool_output);
     if let Some(id) = str_field(block, "tool_use_id") {
@@ -264,9 +263,8 @@ fn claude_tool_result_event(engine: &str, block: &Value) -> UnifiedEvent {
     e
 }
 
-fn claude_user_text_event(engine: &str, text: &str) -> UnifiedEvent {
+fn claude_user_text_event(text: &str) -> UnifiedEvent {
     let mut e = ev("message");
-    e.engine = engine.to_string();
     e.role = Some("user".to_string());
     e.content = text.to_string();
     e
@@ -274,7 +272,7 @@ fn claude_user_text_event(engine: &str, text: &str) -> UnifiedEvent {
 
 /// Ported `_claude_impl.py::live_events`, PLUS the real-shape `"user"`
 /// unwrap (tool_result AND user text -- PocketShell needs both).
-fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
+fn claude_wire_events(payload: &Value) -> Vec<UnifiedEvent> {
     let unwrapped = claude_unwrap(payload);
     let event_type = unwrapped.get("type").and_then(|t| t.as_str());
     let mut out = Vec::new();
@@ -285,7 +283,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
                     if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                         if !text.is_empty() {
                             let mut e = ev("message");
-                            e.engine = engine.to_string();
                             e.role = Some("assistant".to_string());
                             e.content = text.to_string();
                             out.push(e);
@@ -299,7 +296,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                     if let Some(name) = str_field(block, "name") {
                         let mut e = ev("tool_call");
-                        e.engine = engine.to_string();
                         e.role = Some("assistant".to_string());
                         e.tool_name = Some(name);
                         e.tool_input = block
@@ -319,23 +315,22 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
                 _ => String::new(),
             };
             let mut e = ev("tool_result");
-            e.engine = engine.to_string();
             e.role = Some("user".to_string());
             e.tool_output = Some(tool_output);
             out.push(e);
         }
         Some("user") => match unwrapped.get("message").and_then(|m| m.get("content")) {
             Some(Value::String(s)) if !s.is_empty() => {
-                out.push(claude_user_text_event(engine, s));
+                out.push(claude_user_text_event(s));
             }
             Some(Value::Array(blocks)) => {
                 for block in blocks {
                     match block.get("type").and_then(|t| t.as_str()) {
-                        Some("tool_result") => out.push(claude_tool_result_event(engine, block)),
+                        Some("tool_result") => out.push(claude_tool_result_event(block)),
                         Some("text") => {
                             if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
-                                    out.push(claude_user_text_event(engine, text));
+                                    out.push(claude_user_text_event(text));
                                 }
                             }
                         }
@@ -348,7 +343,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
         Some("assistant") => {
             for message in claude_final_messages(unwrapped) {
                 let mut e = ev("message");
-                e.engine = engine.to_string();
                 e.role = Some("assistant".to_string());
                 e.content = message;
                 out.push(e);
@@ -357,7 +351,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
         Some("result") => {
             for message in claude_final_messages(unwrapped) {
                 let mut e = ev("message");
-                e.engine = engine.to_string();
                 e.role = Some("assistant".to_string());
                 e.content = message;
                 out.push(e);
@@ -367,7 +360,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
                 int_meta(&mut meta, "input_tokens", usage);
                 int_meta(&mut meta, "output_tokens", usage);
                 let mut e = ev("usage");
-                e.engine = engine.to_string();
                 e.usage_delta = meta;
                 out.push(e);
             }
@@ -381,7 +373,6 @@ fn claude_wire_events(engine: &str, payload: &Value) -> Vec<UnifiedEvent> {
             if let Some(message) = message {
                 if !message.is_empty() {
                     let mut e = ev("error");
-                    e.engine = engine.to_string();
                     e.error = Some(message.to_string());
                     out.push(e);
                 }
@@ -466,7 +457,6 @@ fn codex_native_events(payload: &Value) -> Vec<UnifiedEvent> {
                 let text = parts.join("\n\n");
                 if !text.is_empty() {
                     let mut e = ev("message");
-                    e.engine = "codex".to_string();
                     e.role = Some(role.to_string());
                     e.content = text;
                     out.push(e);
@@ -475,7 +465,6 @@ fn codex_native_events(payload: &Value) -> Vec<UnifiedEvent> {
         }
         Some("custom_tool_call") => {
             let mut e = ev("tool_call");
-            e.engine = "codex".to_string();
             e.role = Some("assistant".to_string());
             e.tool_name = str_field(item, "name");
             e.tool_input = item
@@ -493,7 +482,6 @@ fn codex_native_events(payload: &Value) -> Vec<UnifiedEvent> {
             let text = parts.join("\n\n");
             if !text.is_empty() {
                 let mut e = ev("tool_result");
-                e.engine = "codex".to_string();
                 e.tool_output = Some(text);
                 out.push(e);
             }
@@ -580,7 +568,6 @@ fn grok_native_events(payload: &Value) -> Vec<UnifiedEvent> {
         "user_message_chunk" => {
             if let Some(text) = grok_chunk_text(update) {
                 let mut e = ev("message");
-                e.engine = "grok".to_string();
                 e.role = Some("user".to_string());
                 e.content = text;
                 out.push(e);
@@ -589,7 +576,6 @@ fn grok_native_events(payload: &Value) -> Vec<UnifiedEvent> {
         "agent_message_chunk" => {
             if let Some(text) = grok_chunk_text(update) {
                 let mut e = ev("message");
-                e.engine = "grok".to_string();
                 e.role = Some("assistant".to_string());
                 e.content = text;
                 out.push(e);
@@ -597,7 +583,6 @@ fn grok_native_events(payload: &Value) -> Vec<UnifiedEvent> {
         }
         "tool_call" => {
             let mut e = ev("tool_call");
-            e.engine = "grok".to_string();
             e.role = Some("assistant".to_string());
             e.tool_name = str_field(update, "title").or_else(|| Some("tool".into()));
             e.tool_input = update.get("rawInput").map(|v| match v {
@@ -622,7 +607,6 @@ fn grok_native_events(payload: &Value) -> Vec<UnifiedEvent> {
                 return out;
             }
             let mut e = ev("tool_result");
-            e.engine = "grok".to_string();
             e.tool_output = Some(output);
             if let Some(id) = str_field(update, "toolCallId") {
                 e.metadata.insert("tool_call_id".into(), json!(id));
@@ -692,14 +676,13 @@ fn wire_format_for(engine: &str) -> Result<WireFormat> {
     }
 }
 
-fn translate(
-    format: WireFormat,
-    engine: &str,
-    payload: &Value,
-) -> (Vec<UnifiedEvent>, Option<String>) {
+/// Events and any continuation id in one payload. Events come back
+/// without an engine: the reader stamps the session's own engine id, which
+/// for a variant engine differs from the family that parsed it.
+fn translate(format: WireFormat, payload: &Value) -> (Vec<UnifiedEvent>, Option<String>) {
     match format {
         WireFormat::Claude => (
-            claude_wire_events(engine, payload),
+            claude_wire_events(payload),
             claude_wire_continuation(payload),
         ),
         WireFormat::CodexNative => (
@@ -887,7 +870,7 @@ fn peek_continuation(engine: &str, path: &Path) -> Option<String> {
         let Some(payload) = assembler.feed(&line).payload else {
             continue;
         };
-        let (_events, continuation) = translate(format, engine, &payload);
+        let (_events, continuation) = translate(format, &payload);
         if continuation.is_some() {
             return continuation;
         }
@@ -1216,7 +1199,7 @@ impl NativeLogReader {
             return;
         };
         let ts = row_timestamp(self.format, &payload);
-        let (drafted, _continuation) = translate(self.format, &self.engine, &payload);
+        let (drafted, _continuation) = translate(self.format, &payload);
         for mut event in drafted {
             event.timestamp = ts.clone();
             event.raw = payload_to_raw(&payload);
@@ -1394,7 +1377,7 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}}"#,
         )
         .unwrap();
-        let events = claude_wire_events("claude", &payload);
+        let events = claude_wire_events(&payload);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "message");
         assert_eq!(events[0].content, "hi");
@@ -1407,7 +1390,7 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Bash","input":{"command":"ls"}}}}"#,
         )
         .unwrap();
-        let events = claude_wire_events("claude", &payload);
+        let events = claude_wire_events(&payload);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "tool_call");
         assert_eq!(events[0].tool_name.as_deref(), Some("Bash"));
@@ -1420,7 +1403,7 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"output text"}]}}"#,
         )
         .unwrap();
-        let events = claude_wire_events("claude", &payload);
+        let events = claude_wire_events(&payload);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "tool_result");
         assert_eq!(events[0].tool_output.as_deref(), Some("output text"));
@@ -1432,7 +1415,7 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"please review"}]}}"#,
         )
         .unwrap();
-        let events = claude_wire_events("claude", &payload);
+        let events = claude_wire_events(&payload);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "message");
         assert_eq!(events[0].role.as_deref(), Some("user"));
