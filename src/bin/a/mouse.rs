@@ -1,12 +1,10 @@
 /// One button press/release reported by xterm's SGR extended mouse mode
 /// (`CSI ?1006h`, paired with `CSI ?1000h` click tracking) --
 /// docs/clickable-status-bar-design.md section 2. `col`/`row` are 1-based,
-/// matching the wire format, so callers subtract 1 to index into
-/// `BarRegion` column ranges or compare against `TermGeom.rows`.
-///
-/// **Not yet wired into `InputScanner`/`attach()`** -- see the design doc
-/// section 7 for why this is landing as a standalone, unit-tested primitive
-/// ahead of the riskier live-input-thread integration.
+/// matching the wire format, so a caller subtracts 1 before comparing
+/// against `TermGeom.rows`. Decoded by `scroll_keys` (the pager's wheel)
+/// and `ScrollInput::route` (the wheel that opens the pager, and the
+/// reports swallowed while the client holds the mouse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MouseReport {
     pub(crate) button: u32,
@@ -23,7 +21,6 @@ pub(crate) struct MouseReport {
 /// "looks like the start of one but the buffer ends before `M`/`m`" -- the
 /// signal a live scanner needs to keep buffering across `read()` calls, the
 /// same role `pending_ctrl_b` plays for the one-byte `Ctrl-b` prefix.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MouseParse {
     NotMouse,
@@ -46,7 +43,6 @@ pub(crate) const SGR_MOUSE_MAX_LEN: usize = 32;
 /// terminator) is reported `NotMouse` rather than `Incomplete`, so a
 /// caller doesn't buffer forever waiting for a `M`/`m` that will never
 /// come.
-#[allow(dead_code)]
 pub(crate) fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
     const PREFIX: &[u8] = b"\x1b[<";
     if buf.len() < PREFIX.len() {

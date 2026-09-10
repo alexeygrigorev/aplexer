@@ -267,8 +267,7 @@ pub(crate) fn workspace_summary(paths: &Paths, record: &SessionRecord) -> String
             }
             // Running-ish states are the expected background; anything else
             // (a reported wait, a death, a broken worker) is worth seeing
-            // while attached. The same rule `workspace_summary_regions`
-            // mirrors for the click map.
+            // while attached.
             if !matches!(state, "running" | "working" | "active" | "quiet") {
                 part.push_str(&format!("({state})"));
             }
