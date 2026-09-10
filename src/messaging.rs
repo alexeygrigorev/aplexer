@@ -763,6 +763,12 @@ fn load_open_message_file(
             expected_workspace.display()
         );
     }
+    if matches!(envelope.to, Recipient::Broadcast { broadcast: false }) {
+        bail!(
+            "mailbox message {} is addressed to {{\"broadcast\": false}}, which is nobody",
+            envelope.id
+        );
+    }
     Ok(envelope)
 }
 
@@ -2197,5 +2203,22 @@ mod tests {
         set_modified_secs(&marker, now_secs() - OPPORTUNISTIC_GC_INTERVAL_SECS - 1);
         maybe_gc(&paths, workspace).unwrap();
         assert!(list_messages(&paths, workspace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_loader_rejects_a_false_broadcast() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-false-broadcast-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let mut message = test_message(workspace, Uuid::from_u128(1));
+        message.to = Recipient::Broadcast { broadcast: false };
+        write_message_file(&mp, &message);
+        let error = list_messages(&paths, workspace)
+            .expect_err("a recipient that matches nobody must not load");
+        assert!(
+            format!("{error:#}").contains("which is nobody"),
+            "unexpected error: {error:#}"
+        );
     }
 }
