@@ -1272,12 +1272,14 @@ pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcRepor
 pub fn maybe_gc(paths: &Paths, canonical_workspace: &Path) -> Result<()> {
     let mp = ensure_workspace(paths, canonical_workspace)?;
     let marker = mp.workspace_dir.join(".gc_marker");
-    let due = fs::metadata(&marker)
+    // A marker mtime in the future (clock step, restored backup) must not
+    // make every call sweep: saturate the age at zero instead of erroring.
+    let due = modified_secs(&marker)
         .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.elapsed().ok())
-        .map(|elapsed| elapsed.as_secs() > OPPORTUNISTIC_GC_INTERVAL_SECS)
-        .unwrap_or(true);
+        .flatten()
+        .is_none_or(|modified| {
+            now_secs().saturating_sub(modified) > OPPORTUNISTIC_GC_INTERVAL_SECS
+        });
     if due {
         gc_workspace(paths, canonical_workspace)?;
         let _ = fs::write(&marker, now_secs().to_string());
@@ -2170,5 +2172,30 @@ mod tests {
         // Acknowledging again is idempotent and still reports the id.
         let again = ack_messages(&paths, workspace, consumer_id, &[known]).unwrap();
         assert_eq!(again, vec![known]);
+    }
+
+    #[test]
+    fn opportunistic_gc_waits_out_a_future_marker_mtime() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(root.path());
+        let workspace = Path::new("/tmp/aplexer-gc-marker-workspace");
+        let mp = ensure_workspace(&paths, workspace).unwrap();
+        let mut expired = test_message(workspace, Uuid::from_u128(1));
+        expired.created_at = now_secs() - DEFAULT_TTL_SECS - 60;
+        write_message_file(&mp, &expired);
+        let marker = mp.workspace_dir.join(".gc_marker");
+        fs::write(&marker, b"").unwrap();
+        set_modified_secs(&marker, now_secs() + 3600);
+
+        maybe_gc(&paths, workspace).unwrap();
+        assert_eq!(
+            list_messages(&paths, workspace).unwrap().len(),
+            1,
+            "a recent (if future-dated) sweep must not be repeated on every call"
+        );
+
+        set_modified_secs(&marker, now_secs() - OPPORTUNISTIC_GC_INTERVAL_SECS - 1);
+        maybe_gc(&paths, workspace).unwrap();
+        assert!(list_messages(&paths, workspace).unwrap().is_empty());
     }
 }
