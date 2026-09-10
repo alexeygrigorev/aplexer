@@ -145,17 +145,19 @@ pub fn record_agent(record: &SessionRecord) -> Option<AgentKind> {
 }
 
 pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
-    let mut records = list_records(paths)?;
-    if running {
-        records.retain(|r| r.worker_phase_active() && r.worker_alive());
-    }
+    let records = list_records(paths)?;
     let mut enriched = Vec::with_capacity(records.len());
     // One clock for the whole snapshot, so two rows created in the same
     // instant cannot land on opposite sides of the startup window.
     let now = crate::now_ms();
     for record in &records {
-        let mut value = serde_json::to_value(public_session_record(record))?;
+        // One liveness probe per row: it reads the identity sidecar and
+        // `/proc`, and both the `running` filter and the row need it.
         let worker_alive = record.worker_alive();
+        if running && !(record.worker_phase_active() && worker_alive) {
+            continue;
+        }
+        let mut value = serde_json::to_value(public_session_record(record))?;
         value["worker_alive"] = json!(worker_alive);
         // The derived liveness fact, identical to `a status`'s `state:`
         // line (see `observed_state`). Machine consumers were previously

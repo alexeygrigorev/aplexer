@@ -198,6 +198,10 @@ struct TerminalState {
 }
 
 struct WorkerRuntime {
+    /// The session this worker serves. Immutable for the worker's life, so
+    /// no caller needs to clone the whole record out of its mutex to
+    /// learn it (every connection used to).
+    id: Uuid,
     paths: Paths,
     record_path: std::path::PathBuf,
     runtime_session_dir: std::path::PathBuf,
@@ -268,16 +272,15 @@ impl WorkerRuntime {
             }
         }
     }
-    /// Refuse every later durable write (see `OutputHub::finalized`) and
-    /// return the session id the caller removes the state dir under. Both
+    /// Refuse every later durable write (see `OutputHub::finalized`). Both
     /// locks are held while the flag is set so a writer that already holds
     /// either one finishes before the flag is observed, and any later
     /// writer observes it.
-    fn mark_finalized(&self) -> Result<Uuid> {
+    fn mark_finalized(&self) -> Result<()> {
         let _hub = lock(&self.output.inner)?;
-        let record = lock(&self.record)?;
+        let _record = lock(&self.record)?;
         self.output.finalized.store(true, Ordering::SeqCst);
-        Ok(record.id)
+        Ok(())
     }
     fn send(&self, data: &[u8]) -> Result<()> {
         if !lock(&self.workload)?.running {
@@ -594,11 +597,12 @@ impl WorkerRuntime {
     fn rename(&self, workspace: std::path::PathBuf, tag: String) -> Result<SessionRecord> {
         validate_tag(&tag)?;
         let workspace = canonical_workspace(&workspace)?;
-        let id = lock(&self.record)?.id;
         let _registry = registry_lock_within(&self.paths, RENAME_REGISTRY_WAIT)?;
         let conflicts: Vec<SessionRecord> = list_records(&self.paths)?
             .into_iter()
-            .filter(|record| record.id != id && record.workspace == workspace && record.tag == tag)
+            .filter(|record| {
+                record.id != self.id && record.workspace == workspace && record.tag == tag
+            })
             .collect();
         // Every conflict must be reclaimable-dead, or the rename refuses:
         // a live holder -- live worker, live workload leader, or a
@@ -1100,6 +1104,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
         record.error = None;
         startup.failure_record = record.clone();
         let runtime = Arc::new(WorkerRuntime {
+            id,
             paths: paths.clone(),
             record_path: record_path.clone(),
             runtime_session_dir: paths.runtime_session(id),
@@ -1350,7 +1355,7 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
         return Ok(());
     }
     let id = request.request_id.clone();
-    let worker_session_id = runtime.record()?.id;
+    let worker_session_id = runtime.id;
     match request.session_id {
         Some(expected) if expected == worker_session_id => {}
         Some(expected) => {
@@ -1379,7 +1384,12 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
             &Response::ok(id, json!({"pong":true,"id":worker_session_id})),
         )?,
         Operation::Status => {
-            let mut value = serde_json::to_value(public_session_record(&runtime.record()?))?;
+            // One clone (inside public_session_record), not a second one to
+            // get the record out of its mutex first.
+            let mut value = {
+                let record = lock(&runtime.record)?;
+                serde_json::to_value(public_session_record(&record))?
+            };
             if let Some(error) = runtime.output.history_persistence_error() {
                 value["history_persistence_error"] = json!(error);
             }

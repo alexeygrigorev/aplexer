@@ -96,15 +96,15 @@ pub(super) fn wait_for_lifecycle_wake(
 /// pid is about to be gone, and `a prune` reaps that shape -- but the
 /// operator should be able to see why a session they ended is still listed.
 fn remove_finished_state(runtime: &WorkerRuntime) {
-    let id = match runtime.mark_finalized() {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("aplexer worker: fence writes before removing finished session: {error:#}");
-            return;
-        }
-    };
-    if let Err(error) = fs::remove_dir_all(runtime.paths.state_session(id)) {
-        eprintln!("aplexer worker: remove finished session {id} state: {error:#}");
+    if let Err(error) = runtime.mark_finalized() {
+        eprintln!("aplexer worker: fence writes before removing finished session: {error:#}");
+        return;
+    }
+    if let Err(error) = fs::remove_dir_all(runtime.paths.state_session(runtime.id)) {
+        eprintln!(
+            "aplexer worker: remove finished session {} state: {error:#}",
+            runtime.id
+        );
     }
 }
 

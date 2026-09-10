@@ -1034,6 +1034,7 @@ pub(super) mod tests {
             error: None,
         };
         WorkerRuntime {
+            id: record.id,
             paths: Paths {
                 runtime_root: dir.path().join("runtime"),
                 state_root: dir.path().join("state"),
@@ -1118,8 +1119,7 @@ pub(super) mod tests {
         assert!(runtime.record_path.exists());
         assert!(dir.path().join("history.bin").exists());
 
-        let id = runtime.mark_finalized().unwrap();
-        assert_eq!(id, runtime.record().unwrap().id);
+        runtime.mark_finalized().unwrap();
         fs::remove_dir_all(&state_dir).unwrap();
         fs::remove_file(dir.path().join("history.bin")).unwrap();
 
