@@ -6,7 +6,7 @@
 // every function in this file that can put bytes on the host terminal
 // is enumerated here, with how it is allowed to do so.
 
-/// Every function in src/bin/a.rs, outside this test module, that calls
+/// Every function in the `src/bin/a/` production modules that calls
 /// `write_all` -- i.e. that reaches the terminal without going through
 /// the funnel -- and the reason it is allowed to. A new one fails
 /// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`.
