@@ -553,16 +553,12 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
                 existing.observed_state()
             );
         };
-        _superseded_fence = match fence_pre_pid_worker(paths, existing).with_context(|| {
-            format!("cannot fence session {}'s pre-PID worker", existing.id)
-        })? {
-            PrePidFence::Fenced(lock) => lock,
-            PrePidFence::WorkerHoldsLock(lock_path) => bail!(
-                "workspace+tag already belongs to session {}, whose worker still holds {}; rename it or choose a different tag",
-                existing.id,
-                lock_path.display()
-            ),
-        };
+        _superseded_fence = fence_or_refuse(paths, existing).with_context(|| {
+            format!(
+                "workspace+tag already belongs to session {}; rename it or choose a different tag",
+                existing.id
+            )
+        })?;
         reclaim = Some(verdict);
     }
     let mut startup = StartupGuard::new(paths, id);

@@ -432,6 +432,23 @@ pub(crate) fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Res
     }
 }
 
+/// `fence_pre_pid_worker` for a caller that cannot proceed against a held
+/// lock: the fence to keep alive (if one was needed), or an error naming
+/// the session and the lock its worker holds. Callers add what they were
+/// refusing to do as context. Public so `a prune`'s own fence can adopt it.
+pub fn fence_or_refuse(paths: &Paths, record: &SessionRecord) -> Result<Option<FileLock>> {
+    match fence_pre_pid_worker(paths, record)
+        .with_context(|| format!("cannot fence session {}'s pre-PID worker", record.id))?
+    {
+        PrePidFence::Fenced(lock) => Ok(lock),
+        PrePidFence::WorkerHoldsLock(lock_path) => bail!(
+            "session {} still has a worker holding {}",
+            record.id,
+            lock_path.display()
+        ),
+    }
+}
+
 /// Forget a session record without signalling any process.
 ///
 /// The one implementation of `a forget`: the force gate, the live-worker
@@ -459,19 +476,8 @@ pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Valu
             current.id
         );
     }
-    let _startup_absence_lock = match fence_pre_pid_worker(paths, &current).with_context(|| {
-        format!(
-            "cannot fence session {}'s pre-PID worker; refusing to forget it",
-            current.id
-        )
-    })? {
-        PrePidFence::Fenced(lock) => lock,
-        PrePidFence::WorkerHoldsLock(lock_path) => bail!(
-            "session {} still has a worker holding {}; refusing to forget it",
-            current.id,
-            lock_path.display()
-        ),
-    };
+    let _startup_absence_lock = fence_or_refuse(paths, &current)
+        .with_context(|| format!("refusing to forget session {}", current.id))?;
 
     let containment_proven_empty = current.containment_proven_empty();
     // Durable state first, runtime dir second -- the order `a prune` uses

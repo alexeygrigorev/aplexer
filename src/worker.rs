@@ -1,4 +1,4 @@
-use crate::api::{fence_pre_pid_worker, PrePidFence};
+use crate::api::fence_or_refuse;
 use crate::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
@@ -625,16 +625,12 @@ impl WorkerRuntime {
         let _fences = conflicts
             .iter()
             .map(|record| {
-                match fence_pre_pid_worker(&self.paths, record).with_context(|| {
-                    format!("cannot fence session {}'s pre-PID worker", record.id)
-                })? {
-                    PrePidFence::Fenced(lock) => Ok(lock),
-                    PrePidFence::WorkerHoldsLock(lock_path) => bail!(
-                        "workspace+tag already belongs to session {}, whose worker still holds {}; rename it or choose a different tag",
-                        record.id,
-                        lock_path.display()
-                    ),
-                }
+                fence_or_refuse(&self.paths, record).with_context(|| {
+                    format!(
+                        "workspace+tag already belongs to session {}; rename it or choose a different tag",
+                        record.id
+                    )
+                })
             })
             .collect::<Result<Vec<Option<FileLock>>>>()?;
         self.update_record(|r| {
