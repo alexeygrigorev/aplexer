@@ -563,7 +563,6 @@ impl Cgroup {
     fn recovered_path(&self, deadline: Instant) -> Result<&Path> {
         check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
         verify_recorded_cgroup_identity(Some(&self.identity))?;
-        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
         Ok(&self.path)
     }
     pub fn signal_all_until(&self, signal: i32, deadline: Instant) -> Result<()> {
@@ -649,21 +648,17 @@ pub fn cleanup_recorded_cgroup_until(
     grace: Duration,
     deadline: Instant,
 ) -> Result<()> {
+    // Validation does locator and identity I/O before anything below checks
+    // the clock; every later step checks it on entry itself.
     check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
     let Some(path) = validate_recorded_cgroup(id, locator, identity)? else {
-        check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
         return Ok(());
     };
-    check_cgroup_cleanup_deadline(deadline, "validating recorded cgroup")?;
 
     if signal == libc::SIGKILL {
-        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
         kill_cgroup_path_until(&path, deadline)?;
-        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
     } else {
-        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup")?;
         signal_cgroup_path_until(&path, signal, deadline)?;
-        check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup")?;
         let grace_deadline = Instant::now()
             .checked_add(grace)
             .ok_or_else(|| anyhow!("cgroup cleanup grace deadline overflow"))?
@@ -678,9 +673,7 @@ pub fn cleanup_recorded_cgroup_until(
             thread::sleep(Duration::from_millis(25).min(grace_deadline - now));
         }
         if cgroup_path_populated_until(&path, deadline)? {
-            check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
             kill_cgroup_path_until(&path, deadline)?;
-            check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
         }
     }
 
@@ -688,9 +681,7 @@ pub fn cleanup_recorded_cgroup_until(
         // Older cgroup-v2 mounts may not expose cgroup.kill. Repeat the
         // identity-pinned cgroup.procs fallback so a member that forked
         // between the first read and signal cannot escape cleanup.
-        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
         kill_cgroup_path_until(&path, deadline)?;
-        check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;
         sleep_until_cgroup_deadline(deadline, "proving recorded cgroup empty")?;
     }
     Ok(())
