@@ -166,13 +166,8 @@ pub(crate) fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
     };
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
-    let snapshot = {
-        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = screen.snapshot();
-        screen.filter_host(&snapshot).unwrap_or(snapshot)
-    };
     let mut seq = SCROLL_CANCEL.to_vec();
-    seq.extend_from_slice(&snapshot);
+    seq.extend_from_slice(&host_snapshot(&ctx.screen));
     if geom.reserved {
         seq.extend_from_slice(format!("\x1b[1;{}r", geom.rows - 1).as_bytes());
     }
@@ -247,38 +242,14 @@ pub(crate) fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
 /// Take the overlay down, put the screen back, and let the relay resume.
 /// Returns whether there was an overlay to take down.
 ///
-/// The restore is `ClientScreen::snapshot` -- the same repaint `Ctrl-b r` and
-/// `exit_scroll_mode` write, and deliberately not a saved rectangle of cells.
-/// A rectangle would be a photograph of the screen as it was when the box
-/// went up; the model has been fed every byte that arrived since, so the
-/// snapshot is the screen as it *is*. The bar is rewritten in the same
-/// sequence because the snapshot's `ED2` blanks its reserved row.
+/// The restore is `paint_live_screen` -- the same model repaint the pager's
+/// exit writes, for the same reason (see its doc comment) -- and it runs
+/// before `active` drops, so no chunk can land on the box.
 pub(crate) fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
     if !ctx.overlay.is_active() {
         return false;
     }
-    let bar = status_bar_render(ctx);
-    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
-    let (snapshot, restore, margins) = {
-        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = screen.snapshot();
-        let snapshot = screen.filter_host(&snapshot).unwrap_or(snapshot);
-        (snapshot, screen.cursor_restore(), screen.margins())
-    };
-    let mut seq = SCROLL_CANCEL.to_vec();
-    seq.extend_from_slice(&snapshot);
-    if let Some((geom, text)) = bar {
-        seq.extend_from_slice(&status_bar_sequence(geom, &text, margins, &restore));
-    }
-    write_client_locked(
-        &mut *out,
-        &ctx.screen,
-        &seq,
-        BoundaryPolicy::StreamSuspended,
-    );
-    *ctx.last_drawn
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = None;
+    paint_live_screen(ctx);
     ctx.overlay.active.store(false, Ordering::SeqCst);
     true
 }

@@ -407,11 +407,7 @@ pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> 
         return None;
     }
     ctx.pending_refresh.store(false, Ordering::Relaxed);
-    let mut seq = {
-        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = screen.snapshot();
-        screen.filter_host(&snapshot).unwrap_or(snapshot)
-    };
+    let mut seq = host_snapshot(&ctx.screen);
     if let Some((geom, text)) = status_bar_render(ctx) {
         // Gated once, above, for the whole sequence: the bar rides on the
         // snapshot's boundary.
@@ -420,6 +416,34 @@ pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> 
         }
     }
     Some(seq)
+}
+
+/// The live screen as the host should be repainted with it:
+/// `ClientScreen::snapshot` -- grid, cursor, input modes, margins -- with
+/// the workload's alt-screen switches kept off the wire (`filter_host`).
+/// Every full repaint the client makes starts from this: `Ctrl-b r`, the
+/// pager's exit and type-through entry, and the key overlay going up or
+/// down.
+pub(crate) fn host_snapshot(screen: &Arc<Mutex<aplexer::screen::ClientScreen>>) -> Vec<u8> {
+    let mut screen = screen.lock().unwrap_or_else(PoisonError::into_inner);
+    let snapshot = screen.snapshot();
+    screen.filter_host(&snapshot).unwrap_or(snapshot)
+}
+
+/// `host_snapshot` followed by the status bar, whose reserved row the
+/// snapshot's ED2 just blanked, with the workload's cursor and pen put back
+/// absolutely from the model. `bar` is `status_bar_render`'s answer, taken
+/// before the caller took the stdout lock.
+pub(crate) fn live_screen_sequence(ctx: &StatusBarCtx, bar: Option<(TermGeom, String)>) -> Vec<u8> {
+    let mut seq = host_snapshot(&ctx.screen);
+    if let Some((geom, text)) = bar {
+        let (restore, margins) = {
+            let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+            (screen.cursor_restore(), screen.margins())
+        };
+        seq.extend_from_slice(&status_bar_sequence(geom, &text, margins, &restore));
+    }
+    seq
 }
 
 /// Geometry plus the rendered bar text, or `None` when the terminal has no

@@ -398,25 +398,22 @@ pub(crate) fn exit_scroll_mode(ctx: &StatusBarCtx) {
     ctx.scroll.active.store(false, Ordering::SeqCst);
 }
 
-/// Paint the host from the live model while staying in scroll mode: the
-/// snapshot `Ctrl-b r` writes, plus the bar, with the relay still suspended
-/// throughout. `exit_scroll_mode` runs this before dropping `active`, and
-/// `enter_typing` runs it before raising `typing` -- both orderings mean a
-/// relay chunk can only ever land on the view it belongs on.
+/// Paint the host from the live model while a client modal still has the
+/// relay suspended: the snapshot `Ctrl-b r` writes, plus the bar.
+/// `exit_scroll_mode` runs this before dropping `active`, `enter_typing`
+/// before raising `typing`, and `dismiss_key_overlay` before dropping the
+/// overlay's `active` -- every ordering means a relay chunk can only ever
+/// land on the view it belongs on.
+///
+/// The repaint is deliberately the *model*, not a saved rectangle of cells:
+/// the model has been fed every byte that arrived while the modal was up,
+/// so this is the screen as it *is*, not a photograph of the one the modal
+/// covered.
 pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
-    let (snapshot, restore, margins) = {
-        let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = screen.snapshot();
-        let snapshot = screen.filter_host(&snapshot).unwrap_or(snapshot);
-        (snapshot, screen.cursor_restore(), screen.margins())
-    };
     let mut seq = SCROLL_CANCEL.to_vec();
-    seq.extend_from_slice(&snapshot);
-    if let Some((geom, text)) = bar {
-        seq.extend_from_slice(&status_bar_sequence(geom, &text, margins, &restore));
-    }
+    seq.extend_from_slice(&live_screen_sequence(ctx, bar));
     write_client_locked(
         &mut *out,
         &ctx.screen,
