@@ -495,13 +495,18 @@ pub fn forget_session(paths: &Paths, selector: &str, force: bool) -> Result<Valu
     };
 
     let containment_proven_empty = current.containment_proven_empty();
+    // Durable state first, runtime dir second -- the order `a prune` uses
+    // and the order the worker's own startup relies on: it acquires the
+    // worker lock (in the runtime dir) and only then reads the record, so
+    // a worker that recreates the runtime dir after this removal finds the
+    // record already gone and refuses to come up.
+    fs::remove_dir_all(paths.state_session(current.id))
+        .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
     match fs::remove_dir_all(paths.runtime_session(current.id)) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("remove forgotten session runtime state"),
     }
-    fs::remove_dir_all(paths.state_session(current.id))
-        .with_context(|| format!("remove forgotten session {} durable state", current.id))?;
 
     // The record is gone, so this warning is the only remaining trace that
     // uncontained workload processes may still be running. It goes to stderr

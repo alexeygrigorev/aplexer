@@ -869,6 +869,31 @@ fn load_launch_environment(
     }
 }
 
+/// The durable record, read only once the worker lock is held.
+///
+/// Every destroyer of a pre-PID session (`a forget`, `a prune`, `a start`'s
+/// reclaim) fences the worker through that lock and removes the durable
+/// state while holding it. A record read *before* the lock could therefore
+/// be stale: the destroyer unlinks the runtime dir, this worker recreates
+/// it and acquires a fresh lock inode unopposed, and its first record
+/// write resurrects a session that had just been forgotten. Read after the
+/// lock, a record that is gone means the session no longer exists -- fail
+/// the start and take the runtime dir this lock lives in back out, so the
+/// refusal leaves nothing behind either.
+fn read_record_under_worker_lock(paths: &Paths, id: Uuid) -> Result<SessionRecord> {
+    match read_session_record(paths, id) {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            if crate::registry::record_is_not_written_yet(&error) {
+                let _ = fs::remove_dir_all(paths.runtime_session(id));
+            }
+            Err(error).with_context(|| {
+                format!("session {id} has no durable record; refusing to start its worker")
+            })
+        }
+    }
+}
+
 /// Runs the worker for session `id`.
 ///
 /// `initial_size`, when given, is the (rows, cols) to open the workload's
@@ -904,11 +929,11 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
     enable_child_subreaper()?;
     let paths = Paths::discover()?;
     let record_path = paths.record(id);
-    let mut record = read_session_record(&paths, id)?;
     ensure_private_dir(&paths.runtime_session(id))?;
     let mut _worker_lock = FileLock::exclusive(&paths.worker_lock(id), true)
         .with_context(|| format!("worker for {id} is already running"))?;
     let mut worker_lock_identity = trusted_lock_identity(&paths.worker_lock(id))?;
+    let mut record = read_record_under_worker_lock(&paths, id)?;
     let legacy_environment = LaunchEnvironment(std::mem::take(&mut record.env));
     record.env = session_metadata_env(&legacy_environment.0);
     let mut startup = StartupGuard::new(&paths, &record);
