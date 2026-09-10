@@ -535,13 +535,19 @@ pub(crate) struct LegacyHistory {
     present: bool,
 }
 
-pub(crate) fn read_legacy_history_tail(path: &Path, limit: usize) -> Result<LegacyHistory> {
-    let Some(mut file) = open_optional_history_file(path, "legacy history", false)? else {
-        return Ok(LegacyHistory {
+impl LegacyHistory {
+    fn absent() -> Self {
+        Self {
             tail: Vec::new(),
             total_len: 0,
             present: false,
-        });
+        }
+    }
+}
+
+pub(crate) fn read_legacy_history_tail(path: &Path, limit: usize) -> Result<LegacyHistory> {
+    let Some(mut file) = open_optional_history_file(path, "legacy history", false)? else {
+        return Ok(LegacyHistory::absent());
     };
     let total_len = file.metadata()?.len();
     let count = total_len.min(limit as u64);
@@ -603,31 +609,17 @@ impl History {
         validate_history_bytes(cap)?;
         let (recovered, marker_present) = recover_v2_history(&path, cap)?;
         let had_v2 = recovered.is_some();
-        let legacy = if recovered.is_none() {
-            Some(read_legacy_history_tail(&path, cap)?)
-        } else {
-            None
+        // The v2 store is authoritative when present; only without it does
+        // the raw legacy file supply the tail and the stream position.
+        let legacy = match &recovered {
+            Some(_) => LegacyHistory::absent(),
+            None => read_legacy_history_tail(&path, cap)?,
         };
-        let (bytes, observed_end, persisted, legacy_present, legacy_total_len) =
-            if let Some(recovered) = recovered {
-                let stream_end = recovered.commit.stream_end;
-                (
-                    recovered.tail.iter().copied().collect(),
-                    stream_end,
-                    Some(recovered),
-                    false,
-                    0,
-                )
-            } else {
-                let legacy = legacy.expect("legacy state is loaded without v2 metadata");
-                (
-                    legacy.tail.iter().copied().collect(),
-                    legacy.total_len,
-                    None,
-                    legacy.present,
-                    legacy.total_len,
-                )
-            };
+        let (tail, observed_end) = match &recovered {
+            Some(recovered) => (&recovered.tail, recovered.commit.stream_end),
+            None => (&legacy.tail, legacy.total_len),
+        };
+        let bytes = tail.iter().copied().collect();
         let mut history = Self {
             path,
             cap,
@@ -636,32 +628,30 @@ impl History {
             dirty: false,
             observed_end,
             durable_end: observed_end,
-            compatibility_end: if legacy_present { observed_end } else { 0 },
-            compatibility_len: if legacy_present { legacy_total_len } else { 0 },
+            compatibility_end: if legacy.present { observed_end } else { 0 },
+            compatibility_len: legacy.total_len,
             compatibility_known: !had_v2,
-            persisted,
+            persisted: recovered,
             marker_published: marker_present,
             #[cfg(test)]
             data_bytes_written: 0,
             #[cfg(test)]
             append_failure: None,
         };
-        if had_v2 && !marker_present {
-            let commit = &history
-                .persisted
-                .as_ref()
-                .expect("v2 recovery has a committed generation")
-                .commit;
-            history.marker_published = publish_history_marker(&history.path, commit)?;
+        if let Some(persisted) = &history.persisted {
+            if !marker_present {
+                history.marker_published =
+                    publish_history_marker(&history.path, &persisted.commit)?;
+            }
         }
         let needs_capacity_migration = history
             .persisted
             .as_ref()
             .is_some_and(|persisted| persisted.commit.capacity != cap as u64);
-        if legacy_present && legacy_total_len > cap as u64 {
+        if legacy.present && legacy.total_len > cap as u64 {
             history.repair_legacy_compatibility()?;
         }
-        if legacy_present || needs_capacity_migration {
+        if legacy.present || needs_capacity_migration {
             history.publish_compaction()?;
         }
         if had_v2 {
