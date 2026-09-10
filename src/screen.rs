@@ -1520,6 +1520,14 @@ impl ClientScreen {
         self.screen.scrolled_frame(offset)
     }
 
+    /// `scrolled_frame`, with the frame passed through `filter_host` --
+    /// the bytes to actually write to the host terminal.
+    pub fn host_scrolled_frame(&mut self, offset: usize) -> (Vec<u8>, usize, usize) {
+        let (frame, offset, available) = self.scrolled_frame(offset);
+        let frame = self.filter_host(&frame).unwrap_or(frame);
+        (frame, offset, available)
+    }
+
     /// How many lines of history are available to page back through.
     pub fn scrollback_available(&mut self) -> usize {
         self.screen.scrollback_available()
@@ -1884,6 +1892,13 @@ impl ClientScreen {
     /// trip to the worker.
     pub fn snapshot(&self) -> Vec<u8> {
         self.screen.snapshot()
+    }
+
+    /// `snapshot`, passed through `filter_host` -- the bytes to actually
+    /// write to the host terminal to repaint it from this model.
+    pub fn host_snapshot(&mut self) -> Vec<u8> {
+        let snapshot = self.snapshot();
+        self.filter_host(&snapshot).unwrap_or(snapshot)
     }
 
     #[cfg(test)]
@@ -3515,6 +3530,13 @@ mod tests {
         assert!(
             client.snapshot().windows(8).any(|w| w == b"\x1b[?1049h"),
             "the model must still see the workload's alt-screen enter"
+        );
+        assert!(
+            !client
+                .host_snapshot()
+                .windows(8)
+                .any(|w| w == b"\x1b[?1049h"),
+            "the host-bound snapshot must not switch the host's screen"
         );
     }
 
