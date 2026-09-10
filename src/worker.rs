@@ -1650,13 +1650,40 @@ fn handle_attach(
             }
             FrameKind::End => break,
             FrameKind::Json => {
-                let control: AttachControl = serde_json::from_slice(&frame.payload)?;
+                let control: AttachControl = match serde_json::from_slice(&frame.payload) {
+                    Ok(control) => control,
+                    Err(error) => {
+                        // A protocol violation ends the attach, but the
+                        // client is told why before the socket closes
+                        // instead of seeing a bare EOF.
+                        let message = format!("malformed attach control frame: {error}");
+                        if let Ok(mut out) = writer.lock() {
+                            let _ = write_json(
+                                &mut *out,
+                                &ServerEvent::Error {
+                                    message: message.clone(),
+                                },
+                            );
+                        }
+                        bail!(message);
+                    }
+                };
+                // Control requests are best-effort and the attach outlives
+                // them (the PTY may be closing, the geometry may be
+                // rejected); the protocol has no non-terminal error frame,
+                // so the refusal goes to worker.log rather than vanishing.
                 match control {
                     AttachControl::Resize { rows, cols } => {
-                        let _ = runtime.resize_client(client_id, rows, cols);
+                        if let Err(error) = runtime.resize_client(client_id, rows, cols) {
+                            eprintln!(
+                                "aplexer attach: resize to {rows}x{cols} rejected: {error:#}"
+                            );
+                        }
                     }
                     AttachControl::Signal { signal } => {
-                        let _ = runtime.signal_from_client(client_id, signal);
+                        if let Err(error) = runtime.signal_from_client(client_id, signal) {
+                            eprintln!("aplexer attach: signal {signal} rejected: {error:#}");
+                        }
                     }
                     AttachControl::Detach => break,
                 }
