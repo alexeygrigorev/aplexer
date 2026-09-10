@@ -1121,6 +1121,13 @@ impl HostAltHold {
         *self = Self::default();
     }
 
+    /// True when `data` would come out of `push` byte-for-byte: nothing is
+    /// held from an earlier chunk and nothing in this one can start a
+    /// sequence.
+    fn passes_through(&self, data: &[u8]) -> bool {
+        self.state == HoldState::Ground && !data.contains(&0x1b)
+    }
+
     fn push(&mut self, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         for &byte in data {
@@ -1545,10 +1552,15 @@ impl ClientScreen {
 
     /// Rewrite `data` for the host terminal: drop alt-screen enter/exit so
     /// they cannot pop the host back to the primary screen (and its
-    /// pre-attach scrollback). `None` means the hold is off and `data` can
-    /// be written as-is.
+    /// pre-attach scrollback). `None` means `data` can be written as-is --
+    /// the hold is off, or nothing in the chunk could need rewriting (no
+    /// `ESC` in it and no sequence held over from the previous one), which
+    /// is bulk output and is not copied.
     pub fn filter_host(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        self.host_alt.as_mut().map(|hold| hold.push(data))
+        self.host_alt
+            .as_mut()
+            .filter(|hold| !hold.passes_through(data))
+            .map(|hold| hold.push(data))
     }
 
     /// Feed bytes that are being written to the host terminal *verbatim* --
@@ -3488,6 +3500,17 @@ mod tests {
             client.filter_host(b"\x1b[?1049ltext"),
             Some(b"text".to_vec())
         );
+        assert_eq!(
+            client.filter_host(b"plain text needs no copy"),
+            None,
+            "a chunk with nothing to rewrite goes out as-is"
+        );
+        // A sequence held over from the previous chunk still has to be
+        // completed, whatever the next chunk holds.
+        assert_eq!(client.filter_host(b"\x1b[?1049"), Some(Vec::new()));
+        assert_eq!(client.filter_host(b"l"), Some(Vec::new()));
+        assert_eq!(client.filter_host(b"\x1b[?1049"), Some(Vec::new()));
+        assert_eq!(client.filter_host(b"hXYZ"), Some(b"XYZ".to_vec()));
         client.feed(b"\x1b[?1049h");
         assert!(
             client.snapshot().windows(8).any(|w| w == b"\x1b[?1049h"),
