@@ -229,16 +229,10 @@ pub(crate) fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> 
     let Some(verdict) = reap_verdict(&current) else {
         return Ok(ReapResult::Retained);
     };
-    let _startup_absence_lock = if current.worker_phase_active() && current.worker_pid.is_none() {
-        let lock_path = paths.worker_lock(current.id);
-        match FileLock::exclusive(&lock_path, true) {
-            Ok(lock) => Some(lock),
-            // Held: a worker exists for this record even though it has not
-            // registered a pid yet. Not ours to remove.
-            Err(_) => return Ok(ReapResult::Retained),
-        }
-    } else {
-        None
+    // Held, or unfenceable: a worker may exist for this record even though
+    // it has not registered a pid yet. Not ours to remove.
+    let Ok(_startup_absence_lock) = aplexer::api::fence_or_refuse(paths, &current) else {
+        return Ok(ReapResult::Retained);
     };
     fs::remove_dir_all(paths.state_session(id))
         .with_context(|| format!("remove stale session {id} durable state"))?;
