@@ -788,47 +788,10 @@ impl StartupGuard {
         }
 
         // Once the tracked leader has been waited, every remaining process
-        // is an adopted child and may safely be reaped here. Repeat signaling
-        // to close the final fork-vs-scan window without confusing zombies
-        // for live processes.
-        loop {
-            if let Err(error) = reap_adopted_children() {
-                cleanup_failures.push(format!("reap startup descendants: {error:#}"));
-            }
-            match descendant_pids(std::process::id()) {
-                Ok(remaining) if remaining.is_empty() => break,
-                Ok(_) if Instant::now() >= deadline => {
-                    cleanup_failures.push("timed out proving startup descendants empty".into());
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    cleanup_failures.push(format!("inspect startup descendants: {error:#}"));
-                    break;
-                }
-            }
-            if let Err(error) = signal_descendants(std::process::id(), libc::SIGKILL) {
-                cleanup_failures.push(format!("kill remaining startup descendants: {error:#}"));
-                break;
-            }
-            thread::sleep(DESCENDANT_POLL_INTERVAL);
-        }
-
-        if let Some(cgroup) = &self.cgroup {
-            loop {
-                match cgroup.populated() {
-                    Ok(false) => break,
-                    Ok(true) if Instant::now() >= deadline => {
-                        cleanup_failures.push("timed out proving startup cgroup empty".into());
-                        break;
-                    }
-                    Ok(true) => thread::sleep(DESCENDANT_POLL_INTERVAL),
-                    Err(error) => {
-                        cleanup_failures.push(format!("inspect startup cgroup: {error:#}"));
-                        break;
-                    }
-                }
-            }
+        // is an adopted child and may safely be reaped while the domain is
+        // killed again until it is observed empty.
+        if let Err(error) = kill_until_empty(self.cgroup.as_ref(), deadline) {
+            cleanup_failures.push(format!("prove startup containment empty: {error:#}"));
         }
         if self.cgroup_setup_started && self.cgroup.is_none() {
             cleanup_failures.push(

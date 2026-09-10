@@ -19,34 +19,54 @@ pub(super) enum LifeEvent {
     },
 }
 
-/// A waiter failure means nobody owns the tracked Child any longer. Before
-/// the subreaper is allowed to exit, repeatedly kill, reap, and inspect its
-/// complete containment domain. Only an observed empty domain is proof.
-pub(super) fn cleanup_after_lifecycle_failure(runtime: &WorkerRuntime) -> Result<()> {
-    let _serialized = lock(&runtime.kill_gate)?;
-    let cgroup = lock(&runtime.cgroup)?.clone();
-    let deadline = Instant::now() + DESCENDANT_KILL_TIMEOUT;
+/// Kill, reap, and inspect a containment domain until it is observed empty
+/// or `deadline` passes. Repeating the kill closes the fork-vs-scan window;
+/// reaping between passes keeps zombies from reading as live members. Only
+/// an observed empty domain is proof, so a deadline is an error, never a
+/// quiet success.
+///
+/// The caller must already have waited on every child it owns itself (the
+/// workload leader in particular): `reap_adopted_children` names `-1`, and
+/// would otherwise hand that leader's exit status to a thread that
+/// discards it.
+pub(super) fn kill_until_empty(cgroup: Option<&Cgroup>, deadline: Instant) -> Result<()> {
     loop {
-        if let Some(cgroup) = &cgroup {
-            cgroup
+        match cgroup {
+            Some(cgroup) => cgroup
                 .kill_all_until(deadline)
-                .context("kill failed lifecycle cgroup")?;
-        } else {
-            signal_descendants(std::process::id(), libc::SIGKILL)
-                .context("kill failed lifecycle descendants")?;
-        }
-        reap_adopted_children().context("reap failed lifecycle descendants")?;
-        if !runtime.workload_populated()? {
-            if let Ok(mut state) = runtime.workload.lock() {
-                state.running = false;
+                .context("kill containment cgroup")?,
+            None => {
+                signal_descendants(std::process::id(), libc::SIGKILL)
+                    .context("kill contained descendants")?;
             }
+        }
+        reap_adopted_children().context("reap contained descendants")?;
+        let populated = match cgroup {
+            Some(cgroup) => cgroup.populated()?,
+            None => !descendant_pids(std::process::id())?.is_empty(),
+        };
+        if !populated {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("timed out proving failed lifecycle containment empty");
+            bail!("timed out proving containment empty");
         }
         thread::sleep(DESCENDANT_POLL_INTERVAL);
     }
+}
+
+/// A waiter failure means nobody owns the tracked Child any longer. Before
+/// the subreaper is allowed to exit, repeatedly kill, reap, and inspect its
+/// complete containment domain (`kill_until_empty`).
+pub(super) fn cleanup_after_lifecycle_failure(runtime: &WorkerRuntime) -> Result<()> {
+    let _serialized = lock(&runtime.kill_gate)?;
+    let cgroup = lock(&runtime.cgroup)?.clone();
+    kill_until_empty(cgroup.as_ref(), Instant::now() + DESCENDANT_KILL_TIMEOUT)
+        .context("failed lifecycle containment")?;
+    if let Ok(mut state) = runtime.workload.lock() {
+        state.running = false;
+    }
+    Ok(())
 }
 
 pub(super) enum LifecycleWake {
