@@ -243,10 +243,26 @@ pub(crate) fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     checks.push(path_check("runtime_root", &paths.runtime_root));
     checks.push(path_check("state_root", &paths.state_root));
     let sample = paths.socket(Uuid::nil());
-    checks.push(json!({"name":"unix_socket_path","ok":sample.as_os_str().len()<108,"detail":sample.display().to_string()}));
+    let sample_fits = sample.as_os_str().len() < 108;
+    checks.push(json!({
+        "name": "unix_socket_path",
+        "ok": sample_fits,
+        "detail": sample.display().to_string(),
+    }));
     checks.push(cgroup_limits_check(probe_cgroup_limits()));
     checks.push(launch_placement_check(paths));
-    match Config::load(paths){Ok(config)=>checks.push(json!({"name":"config","ok":true,"detail":format!("{} engines, {} profiles",config.engines.len(),config.profiles.len())})),Err(e)=>checks.push(json!({"name":"config","ok":false,"detail":format!("{e:#}")}))}
+    checks.push(match Config::load(paths) {
+        Ok(config) => json!({
+            "name": "config",
+            "ok": true,
+            "detail": format!(
+                "{} engines, {} profiles",
+                config.engines.len(),
+                config.profiles.len()
+            ),
+        }),
+        Err(e) => json!({"name": "config", "ok": false, "detail": format!("{e:#}")}),
+    });
     match list_records(paths) {
         Ok(records) => {
             let record_count = records.len();
