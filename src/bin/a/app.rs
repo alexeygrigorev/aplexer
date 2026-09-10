@@ -52,6 +52,8 @@ mod rpc;
 mod scroll;
 #[path = "session_commands.rs"]
 mod session_commands;
+#[path = "status_bar.rs"]
+mod status_bar;
 #[path = "switching.rs"]
 mod switching;
 #[path = "system.rs"]
@@ -72,6 +74,7 @@ pub(crate) use list_tty::*;
 pub(crate) use rpc::*;
 pub(crate) use scroll::*;
 pub(crate) use session_commands::*;
+pub(crate) use status_bar::*;
 pub(crate) use switching::*;
 pub(crate) use system::*;
 pub(crate) use terminal::*;
