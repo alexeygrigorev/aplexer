@@ -418,9 +418,10 @@ pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> 
 /// pager's exit and type-through entry, and the key overlay going up or
 /// down.
 pub(crate) fn host_snapshot(screen: &Arc<Mutex<aplexer::screen::ClientScreen>>) -> Vec<u8> {
-    let mut screen = screen.lock().unwrap_or_else(PoisonError::into_inner);
-    let snapshot = screen.snapshot();
-    screen.filter_host(&snapshot).unwrap_or(snapshot)
+    screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .host_snapshot()
 }
 
 /// `host_snapshot` followed by the status bar, whose reserved row the

@@ -42,9 +42,12 @@ pub(crate) fn apply_resize(config: &ResizeThreadConfig, rows: u16, cols: u16) {
     } else {
         rows
     };
-    if let Ok(mut model) = config.status.screen.lock() {
-        model.set_size(worker_rows, cols);
-    }
+    config
+        .status
+        .screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_size(worker_rows, cols);
 
     if config.status_enabled {
         // The layout write may defer until the relayed stream reaches an

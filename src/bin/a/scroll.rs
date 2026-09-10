@@ -206,10 +206,9 @@ pub(crate) fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
         // renders the lines the user was reading rather than newer ones
         // (`reanchor_view`).
         reanchor_view(&mut view, screen.scrollback_available());
-        let (frame, offset, available) = screen.scrolled_frame(view.offset);
+        let (frame, offset, available) = screen.host_scrolled_frame(view.offset);
         view.offset = offset;
         view.available = available;
-        let frame = screen.filter_host(&frame).unwrap_or(frame);
         (frame, screen.alternate_screen())
     };
     let mut seq = SCROLL_CANCEL.to_vec();
