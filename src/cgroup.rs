@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::{
-    ensure_sigchld_compatible_for_child_management, linux_boot_id, CgroupIdentity, Limits,
+    ensure_sigchld_compatible_for_child_management, linux_boot_id, pidfd_open, CgroupIdentity,
+    Limits,
 };
 
 pub(crate) const MAX_CGROUP_RECOVERY_MEMBERS: usize = 4096;
@@ -860,18 +861,15 @@ pub(crate) fn signal_cgroup_path_until(path: &Path, signal: i32, deadline: Insta
     let mut members = Vec::with_capacity(candidates.len());
     for pid in candidates {
         check_cgroup_cleanup_deadline(deadline, "pinning recorded cgroup members")?;
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                continue;
+        // `read_cgroup_pids_until` admits only positive pids.
+        let pidfd = match pidfd_open(pid as u32) {
+            Ok(pidfd) => pidfd,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("open pidfd for cgroup member {pid}"))
             }
-            return Err(error).with_context(|| format!("open pidfd for cgroup member {pid}"));
-        }
-        members.push(CgroupMemberHandle {
-            pid,
-            pidfd: unsafe { File::from_raw_fd(fd) },
-        });
+        };
+        members.push(CgroupMemberHandle { pid, pidfd });
     }
 
     // A pidfd pins process identity; this second membership snapshot ensures
