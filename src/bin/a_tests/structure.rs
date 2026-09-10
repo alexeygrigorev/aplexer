@@ -100,6 +100,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("../a/key_overlay.rs"),
     "\n",
+    include_str!("../a/launch_commands.rs"),
+    "\n",
     include_str!("../a/attach.rs"),
     "\n",
     include_str!("../a/attach_input.rs"),

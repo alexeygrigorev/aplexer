@@ -46,6 +46,8 @@ mod diagnostics;
 mod input_scanner;
 #[path = "key_overlay.rs"]
 mod key_overlay;
+#[path = "launch_commands.rs"]
+mod launch_commands;
 #[path = "lifecycle_commands.rs"]
 mod lifecycle_commands;
 #[path = "list_helpers.rs"]
@@ -85,6 +87,7 @@ pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
 pub(crate) use input_scanner::*;
 pub(crate) use key_overlay::*;
+pub(crate) use launch_commands::*;
 pub(crate) use lifecycle_commands::*;
 pub(crate) use list_helpers::*;
 pub(crate) use list_plain::*;
