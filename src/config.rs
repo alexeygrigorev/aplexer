@@ -265,16 +265,18 @@ pub(crate) fn discover_profiles() -> BTreeMap<String, ProfileConfig> {
             if id.is_empty() {
                 continue;
             }
-            let mut env = BTreeMap::new();
-            env.insert(rule.env_var.to_string(), dir.display().to_string());
-            out.insert(
-                id,
+            // A directory whose name and markers satisfy more than one
+            // rule belongs to the first rule that claims it; a later rule
+            // must not silently re-attribute it to another engine.
+            out.entry(id).or_insert_with(|| {
+                let mut env = BTreeMap::new();
+                env.insert(rule.env_var.to_string(), dir.display().to_string());
                 ProfileConfig {
                     engine: Some(rule.engine.to_string()),
                     env,
                     ..ProfileConfig::default()
-                },
-            );
+                }
+            });
         }
     }
     out
