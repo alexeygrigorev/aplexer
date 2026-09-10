@@ -55,7 +55,7 @@ lookup, and survives `cd`. `a message send` resolves its sender identity from
 these variables; `--from <tag>` (resolved against live sessions in the
 workspace) is the fallback for a human driving the CLI from an unrelated
 terminal. If neither is available, sends are still allowed with sender
-recorded as `{"tag": null, "external": true}` — a human poking at the mailbox
+recorded as `{"external": true}` (absent fields are omitted) — a human poking at the mailbox
 is a legitimate participant.
 
 ### 2.2 Who is the recipient?
