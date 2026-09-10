@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -439,10 +439,9 @@ pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<Mes
     // those messages.
     let migration_lock = messages_root.join(format!(".{stable_key}.migration.lock"));
     let _migration = FileLock::exclusive(&migration_lock, false)?;
-    if !mp.workspace_dir.exists()
-        && legacy_mp.workspace_dir != mp.workspace_dir
-        && legacy_mp.workspace_dir.exists()
-    {
+    let legacy_present =
+        legacy_mp.workspace_dir != mp.workspace_dir && legacy_mp.workspace_dir.exists();
+    if legacy_present && !mp.workspace_dir.exists() {
         let _legacy_mailbox = FileLock::exclusive(&mailbox_lock_path(&legacy_mp), false)?;
         verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
         fs::rename(&legacy_mp.workspace_dir, &mp.workspace_dir).with_context(|| {
@@ -452,17 +451,15 @@ pub fn ensure_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<Mes
                 mp.workspace_dir.display()
             )
         })?;
-    } else {
+    } else if legacy_present {
         initialize_workspace_dir(&mp, canonical_workspace)?;
-        if legacy_mp.workspace_dir != mp.workspace_dir && legacy_mp.workspace_dir.exists() {
-            let _stable_mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
-            let _legacy_mailbox = FileLock::exclusive(&mailbox_lock_path(&legacy_mp), false)?;
-            verify_workspace_metadata(&mp.workspace_dir, canonical_workspace)?;
-            verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
-            ensure_private_dir(&legacy_mp.msgs_dir)?;
-            ensure_private_dir(&legacy_mp.cursors_dir)?;
-            merge_legacy_mailbox(&mp, &legacy_mp, canonical_workspace)?;
-        }
+        let _stable_mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+        let _legacy_mailbox = FileLock::exclusive(&mailbox_lock_path(&legacy_mp), false)?;
+        verify_workspace_metadata(&mp.workspace_dir, canonical_workspace)?;
+        verify_workspace_metadata(&legacy_mp.workspace_dir, canonical_workspace)?;
+        ensure_private_dir(&legacy_mp.msgs_dir)?;
+        ensure_private_dir(&legacy_mp.cursors_dir)?;
+        merge_legacy_mailbox(&mp, &legacy_mp, canonical_workspace)?;
     }
     initialize_workspace_dir(&mp, canonical_workspace)?;
     Ok(mp)
@@ -983,24 +980,14 @@ fn mailbox_entries(
     Ok(entries)
 }
 
-fn remove_mailbox_entry(
-    entries: &mut Vec<MailboxEntry>,
-    index: usize,
-    total: &mut u64,
-) -> Result<bool> {
-    match fs::remove_file(&entries[index].path) {
-        Ok(()) => {
-            let entry = entries.remove(index);
-            *total = total.saturating_sub(entry.size);
-            Ok(true)
+/// Unlinks one mailbox message; false when it was already gone.
+fn remove_mailbox_entry(entry: &MailboxEntry) -> Result<bool> {
+    match fs::remove_file(&entry.path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove mailbox message {}", entry.path.display()))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let entry = entries.remove(index);
-            *total = total.saturating_sub(entry.size);
-            Ok(false)
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("remove mailbox message {}", entries[index].path.display())),
     }
 }
 
@@ -1015,42 +1002,47 @@ fn prune_workspace_locked(
     max_bytes: u64,
     expire: bool,
 ) -> Result<GcReport> {
-    let mut entries = mailbox_entries(mp, expected_workspace, expire)?;
+    let is_protected = |entry: &MailboxEntry| protected.is_some_and(|path| entry.path == path);
+    let mut entries: VecDeque<MailboxEntry> =
+        mailbox_entries(mp, expected_workspace, expire)?.into();
     let mut total: u64 = entries.iter().map(|entry| entry.size).sum();
     let mut removed = 0usize;
     let mut directory_changed = false;
+    let mut evict = |entry: &MailboxEntry, total: &mut u64| -> Result<()> {
+        let deleted = remove_mailbox_entry(entry)?;
+        *total = total.saturating_sub(entry.size);
+        removed += usize::from(deleted);
+        directory_changed |= deleted;
+        Ok(())
+    };
 
     if expire {
         let now = now_secs();
-        let mut index = 0;
-        while index < entries.len() {
-            let is_protected = protected.is_some_and(|path| entries[index].path == path);
-            let expired = entries[index]
+        let mut kept = VecDeque::with_capacity(entries.len());
+        for entry in entries {
+            let expired = entry
                 .created_at
                 .is_some_and(|created_at| now.saturating_sub(created_at) > DEFAULT_TTL_SECS);
-            if !is_protected && expired {
-                let deleted = remove_mailbox_entry(&mut entries, index, &mut total)?;
-                removed += usize::from(deleted);
-                directory_changed |= deleted;
+            if expired && !is_protected(&entry) {
+                evict(&entry, &mut total)?;
             } else {
-                index += 1;
+                kept.push_back(entry);
             }
         }
+        entries = kept;
     }
 
+    // Oldest first: entries are in id order, so the victim is the front
+    // unless that is the protected message, in which case the one behind it.
     while entries.len() > max_messages || total > max_bytes {
-        let Some(index) = entries
-            .iter()
-            .position(|entry| protected.is_none_or(|protected| entry.path != protected))
-        else {
+        let Some(index) = entries.iter().position(|entry| !is_protected(entry)) else {
             bail!(
                 "mailbox quota cannot retain the protected message ({} messages, {total} bytes)",
                 entries.len()
             );
         };
-        let deleted = remove_mailbox_entry(&mut entries, index, &mut total)?;
-        removed += usize::from(deleted);
-        directory_changed |= deleted;
+        let entry = entries.remove(index).expect("index came from this deque");
+        evict(&entry, &mut total)?;
     }
 
     if directory_changed {
