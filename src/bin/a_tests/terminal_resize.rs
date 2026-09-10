@@ -18,8 +18,10 @@ fn typing_bar_waits_for_an_escape_boundary_and_parks_until_one() {
         !refresh_scroll_bar(&ctx),
         "a mid-sequence typing-bar write must be deferred"
     );
+    // fd 1 is process-wide, so the harness's own progress lines can land
+    // in the pipe too; what must be absent is anything escape-shaped.
     assert!(
-        pipe.take().is_empty(),
+        !pipe.take().contains(&0x1b),
         "a deferred typing-bar write must not reach the terminal"
     );
     assert!(

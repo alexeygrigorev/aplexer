@@ -17,11 +17,19 @@
 /// process's real fd 1 to `/dev/null` for the guard's lifetime (and
 /// restoring the original fd on drop) makes the write land somewhere
 /// harmless instead.
+///
+/// Holds `FD1_GUARD` for its lifetime, like every other fd 1 redirection:
+/// two of these interleaving is how one test's `dup(1)` came to save the
+/// write end of another test's already-drained pipe, restore it as the
+/// process's stdout, and hand the harness an EPIPE on its next progress
+/// line.
 struct StdoutToDevNull {
     saved_fd: i32,
+    _fd1: std::sync::MutexGuard<'static, ()>,
 }
 impl StdoutToDevNull {
     fn new() -> Self {
+        let fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
         let saved_fd = unsafe { libc::dup(1) };
         assert!(saved_fd >= 0, "dup(1) failed");
         let devnull = std::ffi::CString::new("/dev/null").unwrap();
@@ -30,7 +38,10 @@ impl StdoutToDevNull {
         let rc = unsafe { libc::dup2(devnull_fd, 1) };
         unsafe { libc::close(devnull_fd) };
         assert!(rc >= 0, "dup2 to /dev/null failed");
-        Self { saved_fd }
+        Self {
+            saved_fd,
+            _fd1: fd1,
+        }
     }
 }
 impl Drop for StdoutToDevNull {
@@ -200,7 +211,6 @@ fn draw_status_bar_reasserts_the_workload_scroll_region_not_its_own() {
 /// region in force on the host until some unrelated text change happened.
 #[test]
 fn draw_status_bar_dirty_check_notices_a_workload_margin_change() {
-    let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
     let _guard = StdoutToDevNull::new();
     let ctx = status_ctx_for_test(true);
     assert!(
@@ -826,7 +836,6 @@ fn live_screen_refresh_defers_mid_escape_sequence() {
 
 #[test]
 fn draw_status_bar_dirty_check_reports_skip_vs_real_write() {
-    let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
     let _guard = StdoutToDevNull::new();
     let ctx = status_ctx_for_test(true);
     // Nothing drawn yet: even a non-forced call must actually write
