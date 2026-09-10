@@ -4353,6 +4353,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("a/scroll.rs"),
     "\n",
+    include_str!("a/scroll_input.rs"),
+    "\n",
     include_str!("a/switching.rs"),
     "\n",
     include_str!("a/input_scanner.rs"),

@@ -52,6 +52,8 @@ mod list_tty;
 mod rpc;
 #[path = "scroll.rs"]
 mod scroll;
+#[path = "scroll_input.rs"]
+mod scroll_input;
 #[path = "session_commands.rs"]
 mod session_commands;
 #[path = "status_bar.rs"]
@@ -76,6 +78,7 @@ pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
 pub(crate) use rpc::*;
 pub(crate) use scroll::*;
+pub(crate) use scroll_input::*;
 pub(crate) use session_commands::*;
 pub(crate) use status_bar::*;
 pub(crate) use switching::*;
