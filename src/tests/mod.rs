@@ -5,6 +5,7 @@ mod config;
 mod history;
 mod paths;
 mod persist;
+mod placement;
 mod process;
 mod protocol;
 mod record;
