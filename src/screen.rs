@@ -1286,7 +1286,7 @@ fn without_scroll_regions(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         } else {
             // Parameter bytes cannot contain ESC, so resuming at `end` cannot
             // skip past the start of another sequence.
-            i = end.max(i + 2);
+            i = end;
         }
     }
     match out {
