@@ -246,10 +246,7 @@ pub fn system_scope_escape_decision() -> Result<bool> {
     if !crate::placement::system_scope_requested() {
         return Ok(false);
     }
-    match probe_system_scope_backend() {
-        Ok(()) => Ok(true),
-        Err(error) => Err(error),
-    }
+    probe_system_scope_backend().map(|()| true)
 }
 
 /// Rewrite `worker` (already carrying the worker program and its initial
@@ -417,6 +414,12 @@ fn verify_delegated_controllers(path: &Path, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
+/// The kernel's `oom_kill` count for a cgroup; a scope without the memory
+/// controller (or one already collected) has no such counter and reads 0.
+fn oom_kill_count(path: &Path) -> u64 {
+    read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0)
+}
+
 impl Cgroup {
     // A worker's own ambient cgroup (inherited from whatever spawned `a start`,
     // e.g. a tmux pane or SSH session) is never a safe place to nest a
@@ -499,7 +502,7 @@ impl Cgroup {
             Ok(path) => path,
             Err(error) => return Err(cleanup_anchor_after_failure(&mut anchor, error)),
         };
-        let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);
+        let initial_oom_kill = oom_kill_count(&path);
         Ok(Some(Self {
             path,
             identity,
@@ -554,17 +557,20 @@ impl Cgroup {
             .map_err(|_| anyhow!("systemd-run anchor lock poisoned"))?;
         release_anchor_slot(&mut slot, release_anchor_child)
     }
-    pub fn signal_all_until(&self, signal: i32, deadline: Instant) -> Result<()> {
+    /// The path, once the live kernel domain has been re-pinned to the one
+    /// this cgroup was created in: the precondition for every destructive
+    /// pass over its members.
+    fn recovered_path(&self, deadline: Instant) -> Result<&Path> {
         check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
         verify_recorded_cgroup_identity(Some(&self.identity))?;
         check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
-        signal_cgroup_path_until(&self.path, signal, deadline)
+        Ok(&self.path)
+    }
+    pub fn signal_all_until(&self, signal: i32, deadline: Instant) -> Result<()> {
+        signal_cgroup_path_until(self.recovered_path(deadline)?, signal, deadline)
     }
     pub fn kill_all_until(&self, deadline: Instant) -> Result<()> {
-        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
-        verify_recorded_cgroup_identity(Some(&self.identity))?;
-        check_cgroup_cleanup_deadline(deadline, "validating live cgroup identity")?;
-        kill_cgroup_path_until(&self.path, deadline)
+        kill_cgroup_path_until(self.recovered_path(deadline)?, deadline)
     }
     pub fn populated(&self) -> Result<bool> {
         live_cgroup_populated_with(&self.identity, || {
@@ -572,8 +578,7 @@ impl Cgroup {
         })
     }
     pub fn oom_killed(&self) -> bool {
-        read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0)
-            > self.initial_oom_kill
+        oom_kill_count(&self.path) > self.initial_oom_kill
     }
     /// Live telemetry for a still-running cgroup. A workload's own OOM kill
     /// only shows up in the session record's `exit` field once the tracked
@@ -587,8 +592,7 @@ impl Cgroup {
                 .ok()
                 .and_then(|text| text.trim().parse().ok())
         };
-        let oom_kill_total =
-            read_counter(&self.path.join("memory.events"), "oom_kill").unwrap_or(0);
+        let oom_kill_total = oom_kill_count(&self.path);
         serde_json::json!({
             "memory_current": read_value("memory.current"),
             "memory_peak": read_value("memory.peak"),
