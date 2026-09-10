@@ -136,56 +136,83 @@ pub(super) fn handle_attach(
     lock(&writer)?
         .set_write_timeout(None)
         .context("clear attach streaming write deadline")?;
-    let output_writer = writer.clone();
-    let output_runtime = runtime.clone();
-    thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            let result = (|| -> Result<bool> {
-                let mut out = lock(&output_writer)?;
-                match event {
-                    OutputEvent::Data(data) => {
-                        write_frame(&mut *out, FrameKind::Data, &data)?;
-                        Ok(true)
-                    }
-                    OutputEvent::Layout(change) => {
-                        // Old clients' serde_json::from_slice::<ServerEvent>
-                        // would hard-fail on an unrecognized `event` tag --
-                        // only forward this to subscribers that opted in by
-                        // attaching with want_screen (design doc section
-                        // 6.3); drop it otherwise.
-                        if want_screen {
-                            write_json(
-                                &mut *out,
-                                &ServerEvent::Layout {
-                                    alt_screen: change.alt_screen,
-                                    margins_reset: change.margins_reset,
-                                    erase_reset: change.erase_reset,
-                                },
-                            )?;
-                        }
-                        Ok(true)
-                    }
-                    OutputEvent::Exit(exit) => {
-                        write_json(&mut *out, &ServerEvent::Exit { exit })?;
-                        Ok(false)
-                    }
-                    OutputEvent::Error(message) => {
-                        write_json(&mut *out, &ServerEvent::Error { message })?;
-                        Ok(false)
-                    }
-                }
-            })();
-            if !matches!(result, Ok(true)) {
-                break;
-            }
-        }
-        output_runtime.output.unsubscribe(subscription);
-        if let Ok(out) = output_writer.lock() {
-            let _ = out.shutdown(std::net::Shutdown::Both);
-        }
+    thread::spawn({
+        let writer = Arc::clone(&writer);
+        let runtime = Arc::clone(&runtime);
+        move || pump_output(writer, runtime, rx, subscription, want_screen)
     });
+    pump_input(&mut reader, &runtime, &writer, client_id)?;
+    let _ = reader.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+/// The output half of an established attach: relay every hub event to the
+/// client until a terminal event or a failed write, then release the
+/// subscription and close the socket so the input half sees EOF too.
+fn pump_output(
+    writer: Arc<Mutex<UnixStream>>,
+    runtime: Arc<WorkerRuntime>,
+    rx: OutputReceiver,
+    subscription: u64,
+    want_screen: bool,
+) {
+    while let Ok(event) = rx.recv() {
+        let result = (|| -> Result<bool> {
+            let mut out = lock(&writer)?;
+            match event {
+                OutputEvent::Data(data) => {
+                    write_frame(&mut *out, FrameKind::Data, &data)?;
+                    Ok(true)
+                }
+                OutputEvent::Layout(change) => {
+                    // Old clients' serde_json::from_slice::<ServerEvent>
+                    // would hard-fail on an unrecognized `event` tag --
+                    // only forward this to subscribers that opted in by
+                    // attaching with want_screen (design doc section
+                    // 6.3); drop it otherwise.
+                    if want_screen {
+                        write_json(
+                            &mut *out,
+                            &ServerEvent::Layout {
+                                alt_screen: change.alt_screen,
+                                margins_reset: change.margins_reset,
+                                erase_reset: change.erase_reset,
+                            },
+                        )?;
+                    }
+                    Ok(true)
+                }
+                OutputEvent::Exit(exit) => {
+                    write_json(&mut *out, &ServerEvent::Exit { exit })?;
+                    Ok(false)
+                }
+                OutputEvent::Error(message) => {
+                    write_json(&mut *out, &ServerEvent::Error { message })?;
+                    Ok(false)
+                }
+            }
+        })();
+        if !matches!(result, Ok(true)) {
+            break;
+        }
+    }
+    runtime.output.unsubscribe(subscription);
+    if let Ok(out) = writer.lock() {
+        let _ = out.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// The input half of an established attach: workload input, resize and
+/// signal controls, and the explicit detach, until EOF, a closed workload,
+/// or a protocol violation (reported to the client, then an error).
+fn pump_input(
+    reader: &mut UnixStream,
+    runtime: &WorkerRuntime,
+    writer: &Arc<Mutex<UnixStream>>,
+    client_id: u64,
+) -> Result<()> {
     loop {
-        let frame = match read_frame(&mut reader) {
+        let frame = match read_frame(reader) {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(_) => break,
@@ -238,7 +265,6 @@ pub(super) fn handle_attach(
             }
         }
     }
-    let _ = reader.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
