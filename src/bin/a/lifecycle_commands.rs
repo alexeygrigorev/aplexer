@@ -62,15 +62,17 @@ pub(crate) fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
 pub(crate) fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
-    kill_grace_duration(args.grace_ms)?;
-    let rpc = rpc_simple(
+    let grace = kill_grace_duration(args.grace_ms)?;
+    let rpc = rpc_call_within(
         &record,
         Operation::Kill {
             signal,
             grace_ms: args.grace_ms,
         },
         None,
-    );
+        aplexer::api::kill_response_timeout(grace),
+    )
+    .map(|(_, result)| result);
     if let Err(error) = rpc {
         let worker_alive = record.worker_alive();
         // A missing socket file, or a leftover socket with no listener

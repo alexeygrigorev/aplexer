@@ -9,6 +9,18 @@ pub(crate) fn rpc_call(
     operation: Operation,
     data: Option<&[u8]>,
 ) -> Result<(UnixStream, Value)> {
+    rpc_call_within(record, operation, data, CONTROL_RPC_TIMEOUT)
+}
+
+/// `rpc_call` whose reply may legitimately take longer than the control
+/// deadline: `Kill` answers only after the grace window and the SIGKILL
+/// sweep (`api::kill_response_timeout`).
+pub(crate) fn rpc_call_within(
+    record: &SessionRecord,
+    operation: Operation,
+    data: Option<&[u8]>,
+    response_timeout: Duration,
+) -> Result<(UnixStream, Value)> {
     let mut stream = connect(record)?;
     let request = Request::new(record.id, operation);
     let id = request.request_id.clone();
@@ -16,12 +28,10 @@ pub(crate) fn rpc_call(
     if let Some(bytes) = data {
         write_frame(&mut stream, FrameKind::Data, bytes)?;
     }
-    let frame = read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed connection"))?;
-    let response: Response = frame_json(frame)?;
-    if response.request_id != id {
-        bail!("response request id mismatch");
-    }
-    let result = response.into_result()?;
+    stream
+        .set_read_timeout(Some(response_timeout))
+        .context("set control response deadline")?;
+    let result = read_response(&mut stream, &id)?;
     Ok((stream, result))
 }
 
