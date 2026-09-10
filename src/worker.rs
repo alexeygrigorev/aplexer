@@ -1393,23 +1393,26 @@ fn handle_connection(mut stream: UnixStream, runtime: Arc<WorkerRuntime>) -> Res
     Ok(())
 }
 
-fn handle_attach(
-    mut reader: UnixStream,
-    runtime: Arc<WorkerRuntime>,
-    request_id: String,
+/// Everything an attach needs before its handshake can be answered: the
+/// validated geometry, the hub subscription (already wrapped in its
+/// cleanup guard, so a later failure here releases it), and the writer
+/// half of the socket. Kept as one fallible step so `handle_attach` can
+/// turn any refusal into a `Response::error` the client actually sees --
+/// a bare early `?` here used to close the socket before any response
+/// frame, and every cause ("too many attached clients", an oversized
+/// geometry, a closed PTY) reached the client as "missing attach response".
+fn establish_attach(
+    runtime: &Arc<WorkerRuntime>,
+    reader: &UnixStream,
     history_bytes: Option<usize>,
     want_screen: bool,
     rows: Option<u16>,
     cols: Option<u16>,
-) -> Result<()> {
+) -> Result<(AttachGuard, Vec<u8>, OutputReceiver, UnixStream)> {
     let geometry = match (rows, cols) {
         (Some(rows), Some(cols)) => Some(screen::validate_size(rows, cols)?),
         _ => None,
     };
-    // An established attach is intentionally long-lived. Before this point,
-    // the handshake used the worker-wide deadline so a peer cannot reserve a
-    // connection slot forever with a partial frame.
-    reader.set_read_timeout(None)?;
     // Geometry-first (design doc section 6.1): resize the PTY and the
     // screen model to the client's real terminal size *before* rendering
     // the snapshot below, so there is no wrong-size frame followed by a
@@ -1425,6 +1428,45 @@ fn handle_attach(
         AttachPayload::Tail(history_bytes)
     };
     let (client_id, subscription, initial, rx) = runtime.attach_client(payload, geometry)?;
+    let guard = AttachGuard {
+        runtime: Arc::clone(runtime),
+        client_id,
+        subscription,
+    };
+    let writer = reader
+        .try_clone()
+        .context("clone attach socket for output")?;
+    Ok((guard, initial, rx, writer))
+}
+
+fn handle_attach(
+    mut reader: UnixStream,
+    runtime: Arc<WorkerRuntime>,
+    request_id: String,
+    history_bytes: Option<usize>,
+    want_screen: bool,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<()> {
+    let (attach_guard, initial, rx, writer_stream) =
+        match establish_attach(&runtime, &reader, history_bytes, want_screen, rows, cols) {
+            Ok(established) => established,
+            Err(error) => {
+                // Still under the handshake's worker-wide write deadline, so
+                // a peer that stopped reading cannot hold its slot with this.
+                write_json(
+                    &mut reader,
+                    &Response::error(request_id, format!("{error:#}")),
+                )?;
+                return Ok(());
+            }
+        };
+    let client_id = attach_guard.client_id;
+    let subscription = attach_guard.subscription;
+    // An established attach is intentionally long-lived. Before this point,
+    // the handshake used the worker-wide deadline so a peer cannot reserve a
+    // connection slot forever with a partial frame.
+    reader.set_read_timeout(None)?;
     // Best-effort: attach is the "someone looked at this" event used by
     // `a list --sort accessed`. A persist failure must not refuse the
     // attach; the next successful attach (or a later record write that
@@ -1452,12 +1494,7 @@ fn handle_attach(
             });
         }
     }
-    let _attach_guard = AttachGuard {
-        runtime: runtime.clone(),
-        client_id,
-        subscription,
-    };
-    let writer_stream = reader.try_clone()?;
+    let _attach_guard = attach_guard;
     let writer = Arc::new(Mutex::new(writer_stream));
     {
         let mut out = lock(&writer)?;

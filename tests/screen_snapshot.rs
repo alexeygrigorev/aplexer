@@ -647,11 +647,19 @@ fn rejected_attach_does_not_keep_its_requested_geometry() {
         ),
     )
     .unwrap();
-    match read_frame(&mut rejected) {
-        Ok(None) => {}
-        Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {}
-        other => panic!("over-capacity attach was not rejected: {other:?}"),
-    }
+    // The refusal is an explicit error response (tests/attach_refusal.rs
+    // pins its text); what matters here is that it must not have kept the
+    // rejected client's geometry.
+    let response: Response = frame_json(
+        read_frame(&mut rejected)
+            .expect("read over-capacity attach response")
+            .expect("over-capacity attach must be answered, not dropped"),
+    )
+    .expect("over-capacity attach response is a JSON frame");
+    assert!(
+        !response.ok,
+        "over-capacity attach was not rejected: {response:?}"
+    );
 
     harness.run_ok(
         &[
