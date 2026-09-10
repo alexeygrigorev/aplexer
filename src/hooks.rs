@@ -157,9 +157,14 @@ pub fn is_state_report_command(command: &str) -> bool {
 
 /// Whether a command reports the expected state (used for precise
 /// per-event status: a `Stop` hooked to `working` would be a wiring bug,
-/// not an installed stop hook).
+/// not an installed stop hook). The state must be the argument right
+/// after `state-report`: a binary path that happens to contain "idle"
+/// does not make every hook an idle hook.
 fn reports_state(command: &str, state: &str) -> bool {
-    is_state_report_command(command) && command.contains(state)
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words
+        .windows(2)
+        .any(|pair| pair[0] == "state-report" && pair[1] == state)
 }
 
 /// Resolve the `a` binary path to embed in generated hooks: the running
@@ -1552,5 +1557,18 @@ mod tests {
             fs::metadata(&dangling_target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn reports_state_matches_the_state_argument_not_the_path() {
+        let cmd = state_report_command("/home/u/idle-tools/a", "working");
+        assert!(reports_state(&cmd, "working"));
+        assert!(!reports_state(&cmd, "idle"), "{cmd}");
+        assert!(!reports_state(
+            "/home/u/idle-tools/a status || true",
+            "idle"
+        ));
+        assert!(reports_state("a state-report idle", "idle"));
+        assert!(!reports_state("a state-report", "idle"));
     }
 }
