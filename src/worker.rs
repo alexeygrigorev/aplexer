@@ -699,19 +699,21 @@ fn resize_screen_and_pty(
     Ok(())
 }
 
+/// The worker's lock-poisoning policy for shared state: fail the operation.
+///
+/// A poisoned mutex means a thread panicked while the state was
+/// mid-update, so the record, the PTY handle, the client registry, the
+/// hub's history-and-screen model, or the kill gate may be inconsistent;
+/// every caller propagates the error (an RPC answers with it, a background
+/// thread logs it) rather than acting on state it cannot trust. The one
+/// deliberate exception is the per-subscriber queue in `hub.rs`
+/// (`SubscriberShared::poisoned_lock`): that state belongs to exactly one
+/// attached client, its worst inconsistency is a dropped chunk for that
+/// client, and a panic on one client's writer thread must not take every
+/// other client's queue -- or the PTY reader that fans out to them -- down
+/// with it.
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| anyhow!("worker lock poisoned"))
-}
-
-fn record_history_persistence_error(inner: &mut HubInner, error: impl std::fmt::Display) -> String {
-    let message = format!("{error:#}");
-    inner.history_persistence_error = Some(message.clone());
-    inner.history_retry_at = Instant::now() + inner.history_retry_delay;
-    inner.history_retry_delay = inner
-        .history_retry_delay
-        .saturating_mul(2)
-        .min(HISTORY_RETRY_MAX);
-    message
 }
 
 /// Owns every resource created before the worker's accept loop is committed.

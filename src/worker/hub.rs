@@ -96,6 +96,22 @@ pub(super) struct HubInner {
     pub(super) terminal: Option<OutputEvent>,
 }
 
+/// Note a failed history write and schedule the next attempt with capped
+/// exponential backoff; returns the message Status reports meanwhile.
+pub(super) fn record_history_persistence_error(
+    inner: &mut HubInner,
+    error: impl std::fmt::Display,
+) -> String {
+    let message = format!("{error:#}");
+    inner.history_persistence_error = Some(message.clone());
+    inner.history_retry_at = Instant::now() + inner.history_retry_delay;
+    inner.history_retry_delay = inner
+        .history_retry_delay
+        .saturating_mul(2)
+        .min(HISTORY_RETRY_MAX);
+    message
+}
+
 pub(super) fn output_event_queued_bytes(event: &OutputEvent) -> usize {
     match event {
         OutputEvent::Data(data) => data.len(),
@@ -120,6 +136,8 @@ pub(super) struct SubscriberShared {
 }
 
 impl SubscriberShared {
+    /// Per-subscriber state ignores poisoning on purpose; see the worker's
+    /// `lock` for the policy and why this queue is the one exception.
     pub(super) fn poisoned_lock(&self) -> std::sync::MutexGuard<'_, SubscriberState> {
         self.state
             .lock()
