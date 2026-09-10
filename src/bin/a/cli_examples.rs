@@ -4,6 +4,7 @@
 pub(crate) const ROOT_EXAMPLES: &str = r#"Examples:
   a                                      sessions at a glance (bare `a` == `a list`)
   a -                                    create-or-attach session "main" right here
+  a -review                              create-or-attach session "review" right here
   a - codex review                       create-or-attach codex, tagged "review"
   a new                                  always-create a fresh session here, attached
   a new --engine codex --tag refactor    create with start's full options, attached
@@ -40,6 +41,7 @@ pub(crate) const HERE_EXAMPLES: &str = r#"Examples:
   a here codex review           create-or-attach codex, tagged "review"
   a here coz                    a configured shortcut: engine+profile in one word
   a here htop                   not a known engine, so runs htop literally
+  a -review                     `a here` with the tag named after the dash
 "#;
 
 pub(crate) const LIST_EXAMPLES: &str = r#"Examples:

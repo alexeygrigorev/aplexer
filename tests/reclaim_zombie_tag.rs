@@ -104,7 +104,13 @@ impl Harness {
     fn quick_launch(&self, workspace: &TempDir, rest: &[&str]) -> Output {
         let mut args = vec!["-"];
         args.extend_from_slice(rest);
-        let mut command = self.command(&args);
+        self.launch_from(workspace, &args)
+    }
+
+    /// The same create-or-attach run with an arbitrary first word, for the
+    /// tmuxctl dash-suffix form (`a -review`).
+    fn launch_from(&self, workspace: &TempDir, args: &[&str]) -> Output {
+        let mut command = self.command(args);
         command
             .current_dir(workspace.path())
             .stdin(Stdio::null())
@@ -749,4 +755,42 @@ fn quick_launch_refuses_a_workspace_tag_whose_workload_is_still_alive() {
         process_alive(session.workload_pid),
         "`a -` signalled a workload it was refused permission to replace"
     );
+}
+
+/// `a -review` -- tmuxctl's dash-suffix idiom -- creates-or-attaches the
+/// workspace's "review" session instead of `a -`'s "main", while the words
+/// after the tag still pick engine/shortcut/command. The create half runs
+/// the command literally under the named tag; the attach half must find
+/// the live session rather than error or create a sibling.
+#[test]
+fn dash_tag_launch_creates_then_reattaches_the_named_session() {
+    let harness = Harness::new();
+    let workspace = TempDir::new().expect("workspace tempdir");
+
+    let created = harness.launch_from(&workspace, &["-review", "/bin/sleep", "300"]);
+    assert!(
+        created.status.success(),
+        "`a -review` failed to create the tagged session: stderr={}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let rows = harness.rows_for(&workspace, "review");
+    assert_eq!(rows.len(), 1, "`a -review` created wrong rows: {rows:?}");
+    assert_eq!(rows[0]["state"], "running", "{}", rows[0]);
+    let id = rows[0]["id"].as_str().expect("session id").to_string();
+    let _cleanup = ProcessCleanup(vec![
+        rows[0]["worker_pid"].as_i64().unwrap() as i32,
+        rows[0]["workload_pid"].as_i64().unwrap() as i32,
+    ]);
+
+    let reattached = harness.launch_from(&workspace, &["-review"]);
+    assert!(
+        reattached.status.success(),
+        "`a -review` refused to reattach to its own live session: stderr={}",
+        String::from_utf8_lossy(&reattached.stderr)
+    );
+    let rows = harness.rows_for(&workspace, "review");
+    assert_eq!(rows.len(), 1, "reattach created a sibling: {rows:?}");
+    assert_eq!(rows[0]["id"], id.as_str(), "{}", rows[0]);
+
+    harness.run_ok(&["kill", &id, "--signal", "KILL", "--grace-ms", "0"]);
 }

@@ -36,6 +36,13 @@ use super::*;
 ///   a - clz review       tag "review", engine claude, profile zlaude
 ///   a - htop             tag "htop" (defaults to the command name), runs `htop` literally
 ///
+/// The dash can also carry the tag itself -- tmuxctl's `-suffix` idiom,
+/// rewritten to `--tag` in main()'s rewrite_quick_attach_args -- which
+/// pins the session name while the remaining words still pick the engine:
+///
+///   a -review            tag "review", default engine
+///   a -review claude     tag "review", engine claude
+///
 /// Re-running the same shortcut reattaches to a live matching session
 /// instead of erroring, like tmuxctl's own create_or_attach.
 /// Default tag for a literal-command quick-launch: the command's own base
@@ -70,40 +77,50 @@ pub(crate) fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<(
     let config = Config::load(paths)?;
     // See the precedence note on the doc comment above: real engine id,
     // then shortcut id, then literal command.
-    let (tag, engine, profile, command): (String, Option<String>, Option<String>, Vec<OsString>) =
-        match args.rest.as_slice() {
-            [] => ("main".to_string(), None, None, vec![]),
-            [engine] if config.engines.contains_key(engine) => {
-                (engine.clone(), Some(engine.clone()), None, vec![])
-            }
-            [engine, tag] if config.engines.contains_key(engine) => {
-                (tag.clone(), Some(engine.clone()), None, vec![])
-            }
-            [word] if config.shortcuts.contains_key(word) => {
-                let shortcut = &config.shortcuts[word];
-                (
-                    word.clone(),
-                    Some(shortcut.engine.clone()),
-                    shortcut.profile.clone(),
-                    vec![],
-                )
-            }
-            [word, tag] if config.shortcuts.contains_key(word) => {
-                let shortcut = &config.shortcuts[word];
-                (
-                    tag.clone(),
-                    Some(shortcut.engine.clone()),
-                    shortcut.profile.clone(),
-                    vec![],
-                )
-            }
-            words => (
-                command_tag(&words[0]),
-                None,
-                None,
-                words.iter().map(OsString::from).collect(),
-            ),
-        };
+    let (derived_tag, engine, profile, command): (
+        String,
+        Option<String>,
+        Option<String>,
+        Vec<OsString>,
+    ) = match args.rest.as_slice() {
+        [] => ("main".to_string(), None, None, vec![]),
+        [engine] if config.engines.contains_key(engine) => {
+            (engine.clone(), Some(engine.clone()), None, vec![])
+        }
+        [engine, tag] if config.engines.contains_key(engine) => {
+            (tag.clone(), Some(engine.clone()), None, vec![])
+        }
+        [word] if config.shortcuts.contains_key(word) => {
+            let shortcut = &config.shortcuts[word];
+            (
+                word.clone(),
+                Some(shortcut.engine.clone()),
+                shortcut.profile.clone(),
+                vec![],
+            )
+        }
+        [word, tag] if config.shortcuts.contains_key(word) => {
+            let shortcut = &config.shortcuts[word];
+            (
+                tag.clone(),
+                Some(shortcut.engine.clone()),
+                shortcut.profile.clone(),
+                vec![],
+            )
+        }
+        words => (
+            command_tag(&words[0]),
+            None,
+            None,
+            words.iter().map(OsString::from).collect(),
+        ),
+    };
+    // An explicit tag -- `a -review`, rewritten to `--tag review` in main()
+    // -- names the session directly, tmuxctl's dash-suffix idiom; the words
+    // after it still decide engine vs shortcut vs literal command exactly
+    // as they do for bare `a -` (`a -review claude` = session "review",
+    // engine claude).
+    let tag = args.tag.unwrap_or(derived_tag);
     if let Some(existing) = list_records(paths)?
         .into_iter()
         .find(|r| r.workspace == workspace && r.tag == tag)

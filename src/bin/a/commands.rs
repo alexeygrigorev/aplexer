@@ -74,29 +74,51 @@ pub(crate) fn run() -> Result<()> {
 /// first argument is inspected, and only when it's non-empty and all
 /// digits -- none of `a`'s real subcommand names collide with that.
 pub(crate) fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
-    // (hidden subcommand name, how many leading args to drop before it --
-    // the "-" marker itself carries no information once rewritten, but a
-    // quick-attach index like "1" is itself the first real argument).
+    // (hidden subcommand name, how many leading args to drop before it,
+    // flags injected between the hidden name and the remaining args --
+    // a quick-attach index like "1" is itself the first real argument,
+    // but `a -review` must smuggle its tag past the positional-only
+    // QuickLaunchArgs surface as a flag).
     let rewrite = match args.get(1).map(String::as_str) {
         // `a -` / `a - claude` / `a - claude review` / `a - <command...>`,
         // the same "-" marks-current-directory idiom tmuxctl's `t` uses for
         // create-or-attach, adapted to aplexer's engine/tag model in
         // cmd_quick_launch.
-        Some("-") => Some(("quick-launch", 2)),
+        Some("-") => Some(("quick-launch", 2, Vec::new())),
+        // `a -review` / `a -review claude` -- tmuxctl's dash-suffix idiom
+        // (see is_dash_tag_arg), create-or-attach this workspace's
+        // `<tag>` session, with the rest parsed exactly like `a -`'s.
+        // Skip 2: the program name and the `-review` word itself, which
+        // re-enters as the injected `--tag review`.
+        Some(first) if is_dash_tag_arg(first) => Some((
+            "quick-launch",
+            2,
+            vec!["--tag".to_string(), first[1..].to_string()],
+        )),
         // `a <N>` / `a <N> <M>` / `a <N> <tag>` -- see rewrite doc below.
         Some(first) if !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) => {
-            Some(("quick-attach", 1))
+            Some(("quick-attach", 1, Vec::new()))
         }
         _ => None,
     };
-    let Some((hidden_name, skip)) = rewrite else {
+    let Some((hidden_name, skip, inject)) = rewrite else {
         return args;
     };
-    let mut rewritten = Vec::with_capacity(args.len() + 1);
+    let mut rewritten = Vec::with_capacity(args.len() + 1 + inject.len());
     rewritten.push(args[0].clone());
     rewritten.push(hidden_name.to_string());
+    rewritten.extend(inject);
     rewritten.extend(args.into_iter().skip(skip));
     rewritten
+}
+
+/// Whether a first argument means tmuxctl's dash-suffix create-or-attach
+/// (`a -review` -> the session tagged `review` in this workspace): one
+/// dash, then a non-empty word. Long options stay flags, and so do the
+/// two short flags clap auto-generates for the root command (`-h`, `-V`)
+/// -- they predate this idiom and `a -h` must keep printing help.
+fn is_dash_tag_arg(arg: &str) -> bool {
+    arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") && arg != "-h" && arg != "-V"
 }
 
 /// The tag the terminal-first vocabulary creates and resolves by default:

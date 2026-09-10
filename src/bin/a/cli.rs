@@ -43,7 +43,7 @@ pub(crate) enum Commands {
     /// `a new` for start's full flag surface.
     #[command(
         about = "Create-or-attach in the current workspace (typed-out form of `a -`)",
-        long_about = "Create-or-attach in the current workspace -- the typed-out form of\n`a -`: `a here [engine [tag]]`, or `a here <command...>` to run a literal\ncommand. Takes the same words `a -` takes, not flags; use `a new` for\nstart's full flag surface.",
+        long_about = "Create-or-attach in the current workspace -- the typed-out form of\n`a -`: `a here [engine [tag]]`, or `a here <command...>` to run a literal\ncommand. Takes the same words `a -` takes, not flags; use `a new` for\nstart's full flag surface. `a -<tag>` (e.g. `a -review`) is the same\ncreate-or-attach with the tag named after the dash.",
         after_help = HERE_EXAMPLES
     )]
     Here(QuickLaunchArgs),
