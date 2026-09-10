@@ -249,33 +249,29 @@ pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         None => glyph.to_string(),
     };
     let state = format!("{glyph} {}", state_word.to_uppercase());
+    let tag = &record.tag;
+    let sibling_segment = if siblings.is_empty() {
+        String::new()
+    } else {
+        format!("  |  {siblings}")
+    };
 
-    let mut full = format!("{ws}:{}  {state}{agent_segment}  {ep}", record.tag);
-    if let Some(mem) = &mem {
-        full.push_str(&format!("  mem {mem}"));
-    }
-    if !siblings.is_empty() {
-        full.push_str("  |  ");
-        full.push_str(&siblings);
-    }
-    full.push_str("  |  ^b ?");
-
-    let mut medium = format!("{}  {state}{agent_segment}  {ep}", record.tag);
-    if !siblings.is_empty() {
-        medium.push_str("  |  ");
-        medium.push_str(&siblings);
-    }
-    medium.push_str("  |  ^b ?");
-
-    let compact = format!("{}  {state}{agent_segment}  ^b ?", record.tag);
-    let minimum = format!("{state}  ^b ?");
-
-    let rendered = [full, medium, compact]
-        .into_iter()
-        .map(|candidate| sanitize_terminal_text(&candidate))
-        .find(|candidate| terminal_display_width(candidate) <= cols)
-        .unwrap_or_else(|| sanitize_terminal_text(&minimum));
-    pad_or_truncate(&rendered, cols)
+    // Widest first; `fit_bar_text` renders each only until one fits.
+    let full = || {
+        let mem = mem
+            .as_ref()
+            .map(|mem| format!("  mem {mem}"))
+            .unwrap_or_default();
+        format!("{ws}:{tag}  {state}{agent_segment}  {ep}{mem}{sibling_segment}  |  ^b ?")
+    };
+    let medium = || format!("{tag}  {state}{agent_segment}  {ep}{sibling_segment}  |  ^b ?");
+    let compact = || format!("{tag}  {state}{agent_segment}  ^b ?");
+    let candidates: [&dyn Fn() -> String; 3] = [&full, &medium, &compact];
+    fit_bar_text(
+        cols,
+        candidates.into_iter().map(|render| render()),
+        &format!("{state}  ^b ?"),
+    )
 }
 
 /// Redraws the reserved bottom row in place: jump to the last row, clear it,

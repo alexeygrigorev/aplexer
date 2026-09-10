@@ -539,14 +539,13 @@ pub(crate) fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
     if !ctx.mouse_capture {
         return false;
     }
-    let (want, seq) = {
-        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        if screen.workload_wants_mouse() {
-            (false, screen.workload_mouse_sequence())
-        } else {
-            (true, CLIENT_MOUSE_ENABLE.to_vec())
-        }
-    };
+    // Decided before anything is built: this runs on every status tick,
+    // and the answer is almost always "already where it should be".
+    let want = !ctx
+        .screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .workload_wants_mouse();
     {
         let owned = ctx
             .mouse_owned
@@ -556,6 +555,14 @@ pub(crate) fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
             return false;
         }
     }
+    let seq = if want {
+        CLIENT_MOUSE_ENABLE.to_vec()
+    } else {
+        ctx.screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .workload_mouse_sequence()
+    };
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let policy = if ctx.scroll.is_active() {
         BoundaryPolicy::StreamSuspended
