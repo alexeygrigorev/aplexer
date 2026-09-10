@@ -363,6 +363,60 @@ pub(crate) fn cleanup_anchor_after_failure(
     }
 }
 
+/// `systemd-run` for the delegated workload scope: `Delegate=yes` plus one
+/// unit property per requested limit, with a placeholder `sleep infinity`
+/// holding the scope open until the real workload moves in.
+fn workload_scope_command(
+    systemd_run: PathBuf,
+    bus_flag: &str,
+    unit: &str,
+    limits: &Limits,
+    sleep: &Path,
+) -> Command {
+    let mut command = systemd_run_scope(systemd_run, bus_flag, unit, false);
+    command.arg("-p").arg("Delegate=yes");
+    if let Some(value) = limits.memory_bytes {
+        command.arg("-p").arg(format!("MemoryMax={value}"));
+        // Without a swap cap, hitting MemoryMax doesn't OOM-kill the
+        // workload -- it swaps unboundedly instead, which both defeats
+        // the purpose of a memory limit and risks host-wide I/O
+        // pressure that *would* leak into unrelated sessions. A
+        // memory-limited session gets no swap; a configurable swap
+        // allowance is not yet exposed by the CLI.
+        command.arg("-p").arg("MemorySwapMax=0");
+    }
+    if let Some(value) = limits.pids {
+        command.arg("-p").arg(format!("TasksMax={value}"));
+    }
+    if let Some(quota) = limits.cpu_quota_us {
+        let period = limits.cpu_period_us.unwrap_or(100_000);
+        let percent = ((quota as f64 / period as f64) * 100.0).ceil().max(1.0) as u64;
+        command.arg("-p").arg(format!("CPUQuota={percent}%"));
+    }
+    command
+        .arg("--")
+        .arg(sleep)
+        .arg("infinity")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// A scope without the controller a requested limit needs cannot enforce
+/// it; limits fail closed rather than silently not applying.
+fn verify_delegated_controllers(path: &Path, limits: &Limits) -> Result<()> {
+    for (requested, file, controller) in [
+        (limits.memory_bytes.is_some(), "memory.max", "memory"),
+        (limits.pids.is_some(), "pids.max", "pids"),
+    ] {
+        if requested && !path.join(file).exists() {
+            bail!("systemd did not delegate the {controller} controller; limits fail closed");
+        }
+    }
+    Ok(())
+}
+
 impl Cgroup {
     // A worker's own ambient cgroup (inherited from whatever spawned `a start`,
     // e.g. a tmux pane or SSH session) is never a safe place to nest a
@@ -420,34 +474,7 @@ impl Cgroup {
         let systemctl = trusted_system_helper("systemctl")?;
         let sleep = trusted_system_helper("sleep")?;
         let unit = format!("aplexer-workload-{id}");
-        let mut command = systemd_run_scope(systemd_run, bus_flag, &unit, false);
-        command.arg("-p").arg("Delegate=yes");
-        if let Some(value) = limits.memory_bytes {
-            command.arg("-p").arg(format!("MemoryMax={value}"));
-            // Without a swap cap, hitting MemoryMax doesn't OOM-kill the
-            // workload -- it swaps unboundedly instead, which both defeats
-            // the purpose of a memory limit and risks host-wide I/O
-            // pressure that *would* leak into unrelated sessions. A
-            // memory-limited session gets no swap; a configurable swap
-            // allowance is not yet exposed by the CLI.
-            command.arg("-p").arg("MemorySwapMax=0");
-        }
-        if let Some(value) = limits.pids {
-            command.arg("-p").arg(format!("TasksMax={value}"));
-        }
-        if let Some(quota) = limits.cpu_quota_us {
-            let period = limits.cpu_period_us.unwrap_or(100_000);
-            let percent = ((quota as f64 / period as f64) * 100.0).ceil().max(1.0) as u64;
-            command.arg("-p").arg(format!("CPUQuota={percent}%"));
-        }
-        command
-            .arg("--")
-            .arg(sleep)
-            .arg("infinity")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut anchor = command
+        let mut anchor = workload_scope_command(systemd_run, bus_flag, &unit, limits, &sleep)
             .spawn()
             .context("spawn systemd-run anchor; limits fail closed")?;
         // The worker waits on this pid itself (`release_anchor_child`), so
@@ -465,27 +492,13 @@ impl Cgroup {
             &systemctl,
             bus_flag,
             Duration::from_secs(5),
-        ) {
+        )
+        .context("limits fail closed")
+        .and_then(|path| verify_delegated_controllers(&path, limits).map(|()| path))
+        {
             Ok(path) => path,
-            Err(error) => {
-                return Err(cleanup_anchor_after_failure(
-                    &mut anchor,
-                    error.context("limits fail closed"),
-                ));
-            }
+            Err(error) => return Err(cleanup_anchor_after_failure(&mut anchor, error)),
         };
-        if limits.memory_bytes.is_some() && !path.join("memory.max").exists() {
-            return Err(cleanup_anchor_after_failure(
-                &mut anchor,
-                anyhow!("systemd did not delegate the memory controller; limits fail closed"),
-            ));
-        }
-        if limits.pids.is_some() && !path.join("pids.max").exists() {
-            return Err(cleanup_anchor_after_failure(
-                &mut anchor,
-                anyhow!("systemd did not delegate the pids controller; limits fail closed"),
-            ));
-        }
         let initial_oom_kill = read_counter(&path.join("memory.events"), "oom_kill").unwrap_or(0);
         Ok(Some(Self {
             path,
