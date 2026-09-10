@@ -5,12 +5,11 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::api::{self, StartRequest};
-use crate::paths::{absolute_override_path, absolute_xdg_path, home_dir, Paths};
+use crate::paths::Paths;
 
 fn py_err(err: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
@@ -21,41 +20,11 @@ fn paths(
     runtime_dir: Option<&str>,
     config: Option<&str>,
 ) -> anyhow::Result<Paths> {
-    let uid = unsafe { libc::geteuid() };
-    let runtime_root = if let Some(value) = runtime_dir {
-        absolute_override_path(PathBuf::from(value), "runtime_dir")?
-    } else if let Some(value) = env::var_os("APLEXER_RUNTIME_DIR") {
-        absolute_override_path(PathBuf::from(value), "APLEXER_RUNTIME_DIR")?
-    } else if let Some(value) = env::var_os("XDG_RUNTIME_DIR") {
-        absolute_xdg_path(PathBuf::from(value), "XDG_RUNTIME_DIR")?.join("aplexer")
-    } else {
-        PathBuf::from(format!("/tmp/aplexer-{uid}"))
-    };
-    let state_root = if let Some(value) = state_dir {
-        absolute_override_path(PathBuf::from(value), "state_dir")?
-    } else if let Some(value) = env::var_os("APLEXER_STATE_DIR") {
-        absolute_override_path(PathBuf::from(value), "APLEXER_STATE_DIR")?
-    } else if let Some(value) = env::var_os("XDG_STATE_HOME") {
-        absolute_xdg_path(PathBuf::from(value), "XDG_STATE_HOME")?.join("aplexer")
-    } else {
-        home_dir()?.join(".local/state/aplexer")
-    };
-    let config_file = if let Some(value) = config {
-        absolute_override_path(PathBuf::from(value), "config")?
-    } else if let Some(value) = env::var_os("APLEXER_CONFIG") {
-        absolute_override_path(PathBuf::from(value), "APLEXER_CONFIG")?
-    } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
-        absolute_xdg_path(PathBuf::from(value), "XDG_CONFIG_HOME")?.join("aplexer/config.toml")
-    } else {
-        home_dir()?.join(".config/aplexer/config.toml")
-    };
-    let paths = Paths {
-        runtime_root,
-        state_root,
-        config_file,
-    };
-    paths.ensure()?;
-    Ok(paths)
+    Paths::discover_with(
+        runtime_dir.map(Path::new),
+        state_dir.map(Path::new),
+        config.map(Path::new),
+    )
 }
 
 #[pyfunction]

@@ -21,22 +21,40 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Result<Self> {
+        Self::discover_with(None, None, None)
+    }
+
+    /// [`Paths::discover`] with explicit overrides that take precedence
+    /// over the `APLEXER_*` and XDG environment (the Python bindings'
+    /// keyword arguments). A relative override resolves against the
+    /// current directory, like its `APLEXER_*` counterpart.
+    pub fn discover_with(
+        runtime: Option<&Path>,
+        state: Option<&Path>,
+        config: Option<&Path>,
+    ) -> Result<Self> {
         let uid = unsafe { libc::geteuid() };
-        let runtime_root = if let Some(value) = env::var_os("APLEXER_RUNTIME_DIR") {
+        let runtime_root = if let Some(value) = runtime {
+            absolute_override_path(value.to_path_buf(), "runtime_dir")?
+        } else if let Some(value) = env::var_os("APLEXER_RUNTIME_DIR") {
             absolute_override_path(PathBuf::from(value), "APLEXER_RUNTIME_DIR")?
         } else if let Some(value) = env::var_os("XDG_RUNTIME_DIR") {
             absolute_xdg_path(PathBuf::from(value), "XDG_RUNTIME_DIR")?.join("aplexer")
         } else {
             PathBuf::from(format!("/tmp/aplexer-{uid}"))
         };
-        let state_root = if let Some(value) = env::var_os("APLEXER_STATE_DIR") {
+        let state_root = if let Some(value) = state {
+            absolute_override_path(value.to_path_buf(), "state_dir")?
+        } else if let Some(value) = env::var_os("APLEXER_STATE_DIR") {
             absolute_override_path(PathBuf::from(value), "APLEXER_STATE_DIR")?
         } else if let Some(value) = env::var_os("XDG_STATE_HOME") {
             absolute_xdg_path(PathBuf::from(value), "XDG_STATE_HOME")?.join("aplexer")
         } else {
             home_dir()?.join(".local/state/aplexer")
         };
-        let config_file = if let Some(value) = env::var_os("APLEXER_CONFIG") {
+        let config_file = if let Some(value) = config {
+            absolute_override_path(value.to_path_buf(), "config")?
+        } else if let Some(value) = env::var_os("APLEXER_CONFIG") {
             absolute_override_path(PathBuf::from(value), "APLEXER_CONFIG")?
         } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
             absolute_xdg_path(PathBuf::from(value), "XDG_CONFIG_HOME")?.join("aplexer/config.toml")
