@@ -231,6 +231,12 @@ pub(crate) fn attach(
             status: status_ctx.clone(),
         });
     }
+    // Whatever the frame loop returns -- including an error -- the
+    // shutdown below runs in this order, so `?` waits until it has. An early
+    // return dropped the signal bridge *before* the terminal guards (reverse
+    // declaration order), restoring the prior TERM/HUP disposition while the
+    // host was still on the alternate screen in raw mode, and never re-raised
+    // a caught signal at all.
     let session_outcome = run_session_loop(
         reader,
         SessionLoopConfig {
@@ -249,9 +255,7 @@ pub(crate) fn attach(
             term: term.clone(),
             scrollback_lines,
         },
-    )?;
-    let session_ended = session_outcome.session_ended;
-    let worker_error = session_outcome.worker_error;
+    );
     active.store(false, Ordering::Relaxed);
     if let Ok(stream) = writer.lock() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -266,6 +270,9 @@ pub(crate) fn attach(
             libc::raise(signal);
         }
     }
+    let session_outcome = session_outcome?;
+    let session_ended = session_outcome.session_ended;
+    let worker_error = session_outcome.worker_error;
     if display_tty {
         // After restoration, so the message lands on a clean cooked
         // terminal: what happened to the session, not just that the client
