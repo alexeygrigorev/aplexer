@@ -1221,14 +1221,19 @@ pub fn paginate(events: Vec<UnifiedEvent>, query: &TranscriptQuery) -> Vec<Unifi
 }
 
 /// The initial page: everything currently in the file, reduced to what the
-/// query asks for as it streams past.
+/// query asks for as it streams past. A one-shot page takes an
+/// unterminated last line as-is; a page that will be followed leaves it for
+/// the tail loop, so a row split mid-string is parsed whole once the
+/// writer finishes it rather than being joined across two polls.
 fn snapshot_page(
     reader: &mut NativeLogReader,
     record: &SessionRecord,
     query: &TranscriptQuery,
 ) -> Result<Vec<UnifiedEvent>> {
     let mut page = VecDeque::new();
-    reader.read_into(record, true, &mut |event| admit(&mut page, query, event))?;
+    reader.read_into(record, !query.follow, &mut |event| {
+        admit(&mut page, query, event)
+    })?;
     Ok(page.into())
 }
 
@@ -1770,5 +1775,44 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "yo");
         assert_eq!(events[0].sequence, 1);
+    }
+
+    #[test]
+    fn followed_snapshot_leaves_a_partial_row_for_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let (head, tail) = (
+            r#"{"type":"user","message":{"role":"user","content":"hi "#,
+            "there\"}}\n",
+        );
+        std::fs::write(&path, head).unwrap();
+        let record = dummy_record("claude");
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        let query = TranscriptQuery {
+            follow: true,
+            ..Default::default()
+        };
+        assert!(snapshot_page(&mut reader, &record, &query)
+            .unwrap()
+            .is_empty());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+        let events = reader.read_available(&record, false).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "hi there");
+
+        // A one-shot page still takes the unterminated tail as it stands.
+        std::fs::write(&path, head).unwrap();
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        let once = snapshot_page(&mut reader, &record, &TranscriptQuery::default()).unwrap();
+        assert!(once.is_empty(), "an unterminated string is not a row");
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        let once = snapshot_page(&mut reader, &record, &TranscriptQuery::default()).unwrap();
+        assert_eq!(once.len(), 1);
     }
 }
