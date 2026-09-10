@@ -42,6 +42,8 @@ mod commands;
 mod diagnostics;
 #[path = "input_scanner.rs"]
 mod input_scanner;
+#[path = "key_overlay.rs"]
+mod key_overlay;
 #[path = "list_helpers.rs"]
 mod list_helpers;
 #[path = "list_plain.rs"]
@@ -73,6 +75,7 @@ pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
 pub(crate) use input_scanner::*;
+pub(crate) use key_overlay::*;
 pub(crate) use list_helpers::*;
 pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
