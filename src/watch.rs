@@ -299,13 +299,7 @@ fn exit_reason(exit: Option<&ExitInfo>) -> &'static str {
 }
 
 fn common_metadata(record: &SessionRecord, generation: u64) -> BTreeMap<String, Value> {
-    let mut metadata = BTreeMap::new();
-    metadata.insert("session_id".into(), json!(record.id.to_string()));
-    metadata.insert(
-        "workspace".into(),
-        json!(record.workspace.display().to_string()),
-    );
-    metadata.insert("tag".into(), json!(record.tag.clone()));
+    let mut metadata = UnifiedEvent::session_metadata(record);
     metadata.insert("generation".into(), json!(generation));
     metadata
 }
@@ -467,11 +461,81 @@ fn transition_events(
     events
 }
 
-fn emit(out: &mut impl Write, event: &UnifiedEvent) -> Result<()> {
-    let line = serde_json::to_string(event)?;
-    writeln!(out, "{line}")?;
-    out.flush()?;
-    Ok(())
+impl UnifiedEvent {
+    /// The session identity every aplexer-produced event carries in
+    /// `metadata`: `session_id`, `workspace`, `tag`.
+    pub fn session_metadata(record: &SessionRecord) -> BTreeMap<String, Value> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("session_id".into(), json!(record.id.to_string()));
+        metadata.insert(
+            "workspace".into(),
+            json!(record.workspace.display().to_string()),
+        );
+        metadata.insert("tag".into(), json!(record.tag));
+        metadata
+    }
+
+    /// Writes one line -- the JSON envelope, or the compact human
+    /// rendering -- and flushes, so a consumer tailing the stream sees
+    /// each event as soon as it exists.
+    pub fn emit(&self, out: &mut impl Write, json_output: bool) -> Result<()> {
+        if json_output {
+            writeln!(out, "{}", serde_json::to_string(self)?)?;
+        } else {
+            writeln!(out, "{}", self.render_human())?;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Compact one-line human rendering, used when `--json` is not passed
+    /// -- matches the existing dual JSON/human convention (`a launch-spec`,
+    /// `a status`, ...) rather than always forcing raw JSONL on a human
+    /// reader.
+    pub fn render_human(&self) -> String {
+        match self.kind {
+            "message" => format!(
+                "[{}] {}",
+                self.role.as_deref().unwrap_or(&self.engine),
+                self.content
+            ),
+            "tool_call" => format!(
+                "[tool_call] {}{}",
+                self.tool_name.as_deref().unwrap_or("?"),
+                self.tool_input
+                    .as_deref()
+                    .map(|i| format!(" {i}"))
+                    .unwrap_or_default()
+            ),
+            "tool_result" => format!(
+                "[tool_result] {}{}",
+                self.tool_name.as_deref().unwrap_or(""),
+                self.tool_output
+                    .as_deref()
+                    .map(|o| format!(" {}", truncate(o, 300)))
+                    .unwrap_or_default()
+            ),
+            "usage" => format!("[usage] {:?}", self.usage_delta),
+            "error" => format!("[error] {}", self.error.as_deref().unwrap_or("")),
+            "continuation" => format!(
+                "[continuation] {}",
+                self.continuation_id.as_deref().unwrap_or("")
+            ),
+            other => format!("[{other}] {}", self.content),
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
 }
 
 /// Runs `a watch --jsonl` until interrupted (Ctrl-C / SIGINT). There is no
@@ -529,20 +593,16 @@ pub fn run(paths: &Paths, all: bool, workspace: Option<&Path>) -> Result<()> {
             .collect();
         for id in deleted_ids {
             if let Some(ks) = known.remove(&id) {
-                emit(
-                    &mut stdout,
-                    &make_deleted_event(&ks.record, generation, &mut sequence),
-                )?;
+                make_deleted_event(&ks.record, generation, &mut sequence)
+                    .emit(&mut stdout, true)?;
             }
         }
 
         for record in current {
             match known.get_mut(&record.id) {
                 None => {
-                    emit(
-                        &mut stdout,
-                        &make_created_event(&record, generation, &mut sequence),
-                    )?;
+                    make_created_event(&record, generation, &mut sequence)
+                        .emit(&mut stdout, true)?;
                     let mut ks = KnownSession {
                         record: record.clone(),
                         derived_state: "starting",
@@ -551,7 +611,7 @@ pub fn run(paths: &Paths, all: bool, workspace: Option<&Path>) -> Result<()> {
                     for event in
                         transition_events(&mut ks, &record, now, generation, &mut sequence, true)
                     {
-                        emit(&mut stdout, &event)?;
+                        event.emit(&mut stdout, true)?;
                     }
                     known.insert(record.id, ks);
                 }
@@ -559,7 +619,7 @@ pub fn run(paths: &Paths, all: bool, workspace: Option<&Path>) -> Result<()> {
                     for event in
                         transition_events(ks, &record, now, generation, &mut sequence, false)
                     {
-                        emit(&mut stdout, &event)?;
+                        event.emit(&mut stdout, true)?;
                     }
                     ks.record = record;
                 }

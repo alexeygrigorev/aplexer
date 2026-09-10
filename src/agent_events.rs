@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -718,75 +718,15 @@ fn row_timestamp(format: WireFormat, payload: &Value) -> String {
 fn stamp_session(event: &mut UnifiedEvent, record: &SessionRecord) {
     event
         .metadata
-        .insert("session_id".into(), json!(record.id.to_string()));
-    event.metadata.insert(
-        "workspace".into(),
-        json!(record.workspace.display().to_string()),
-    );
-    event.metadata.insert("tag".into(), json!(record.tag));
+        .extend(UnifiedEvent::session_metadata(record));
     if let Some(profile) = &record.profile {
         event.metadata.insert("profile".into(), json!(profile));
     }
 }
 
-fn emit(out: &mut impl Write, event: &UnifiedEvent, json_output: bool) -> Result<()> {
-    if json_output {
-        writeln!(out, "{}", serde_json::to_string(event)?)?;
-    } else {
-        writeln!(out, "{}", render_human(event))?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// Compact one-line human rendering, used when `--json` is not passed --
-/// matches the existing dual JSON/human convention (`a launch-spec`,
-/// `a status`, ...) rather than always forcing raw JSONL on a human reader.
+/// Compact one-line human rendering (`UnifiedEvent::render_human`).
 pub fn render_human(event: &UnifiedEvent) -> String {
-    match event.kind {
-        "message" => format!(
-            "[{}] {}",
-            event.role.as_deref().unwrap_or(&event.engine),
-            event.content
-        ),
-        "tool_call" => format!(
-            "[tool_call] {}{}",
-            event.tool_name.as_deref().unwrap_or("?"),
-            event
-                .tool_input
-                .as_deref()
-                .map(|i| format!(" {i}"))
-                .unwrap_or_default()
-        ),
-        "tool_result" => format!(
-            "[tool_result] {}{}",
-            event.tool_name.as_deref().unwrap_or(""),
-            event
-                .tool_output
-                .as_deref()
-                .map(|o| format!(" {}", truncate(o, 300)))
-                .unwrap_or_default()
-        ),
-        "usage" => format!("[usage] {:?}", event.usage_delta),
-        "error" => format!("[error] {}", event.error.as_deref().unwrap_or("")),
-        "continuation" => format!(
-            "[continuation] {}",
-            event.continuation_id.as_deref().unwrap_or("")
-        ),
-        other => format!("[{other}] {}", event.content),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
+    event.render_human()
 }
 
 // ---------------------------------------------------------------------
@@ -1271,7 +1211,7 @@ pub fn run_transcript(
     let mut stdout = std::io::stdout();
     let page = snapshot_page(&mut reader, record, &query)?;
     for event in &page {
-        if emit(&mut stdout, event, json_output).is_err() {
+        if event.emit(&mut stdout, json_output).is_err() {
             return Ok(());
         }
     }
@@ -1292,7 +1232,7 @@ pub fn run_transcript(
         };
         let page = paginate(more, &follow_query);
         for event in &page {
-            if emit(&mut stdout, event, json_output).is_err() {
+            if event.emit(&mut stdout, json_output).is_err() {
                 return Ok(());
             }
             after = Some(event.sequence);
@@ -1351,8 +1291,12 @@ mod tests {
 
     #[test]
     fn human_truncation_respects_utf8_boundaries() {
-        let value = format!("{}é", "x".repeat(299));
-        assert_eq!(truncate(&value, 300), format!("{}...", "x".repeat(299)));
+        let mut event = ev("tool_result");
+        event.tool_output = Some(format!("{}é", "x".repeat(299)));
+        assert_eq!(
+            render_human(&event),
+            format!("[tool_result]  {}...", "x".repeat(299))
+        );
     }
     use std::io::Write;
 
