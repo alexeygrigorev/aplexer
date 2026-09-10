@@ -468,22 +468,25 @@ pub(crate) fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
         for v in values {
-            println!(
-                "{:<16} {:<9} {}",
-                v["name"].as_str().unwrap(),
-                if v["available"].as_bool().unwrap() {
-                    "available"
-                } else {
-                    "missing"
-                },
-                v["command"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|x| shell_quote(x.as_str().unwrap()))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
+            let name = v["name"]
+                .as_str()
+                .ok_or_else(|| anyhow!("engine entry without a name: {v}"))?;
+            let available = if v["available"].as_bool().unwrap_or(false) {
+                "available"
+            } else {
+                "missing"
+            };
+            let command = v["command"]
+                .as_array()
+                .map(|argv| {
+                    argv.iter()
+                        .filter_map(Value::as_str)
+                        .map(shell_quote)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            println!("{name:<16} {available:<9} {command}");
         }
     }
     Ok(())

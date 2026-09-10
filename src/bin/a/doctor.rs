@@ -369,10 +369,13 @@ pub(crate) fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
             } else {
                 "FAIL"
             };
+            let name = check["name"]
+                .as_str()
+                .ok_or_else(|| anyhow!("doctor check without a name: {check}"))?;
             println!(
                 "{:<5} {:<20} {}",
                 label,
-                check["name"].as_str().unwrap(),
+                name,
                 check["detail"].as_str().unwrap_or("")
             );
         }
