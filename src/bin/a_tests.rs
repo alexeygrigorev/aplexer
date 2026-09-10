@@ -4351,6 +4351,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("a/attach_input.rs"),
     "\n",
+    include_str!("a/attach_session.rs"),
+    "\n",
     include_str!("a/attach_threads.rs"),
     "\n",
     include_str!("a/system.rs"),

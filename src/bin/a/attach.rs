@@ -44,7 +44,7 @@ pub(crate) fn attach(
         )
     });
     let handshake = establish(record, replay_bytes, !explicit_history, worker_geometry)?;
-    let mut reader = handshake.reader;
+    let reader = handshake.reader;
     let stdout = Arc::new(Mutex::new(io::stdout()));
     let _raw = if input_tty {
         Some(RawMode::enter(libc::STDIN_FILENO)?)
@@ -231,244 +231,27 @@ pub(crate) fn attach(
             status: status_ctx.clone(),
         });
     }
-    // Whether the session ended while we were attached to it (worker sent
-    // End/Exit) as opposed to the client leaving first -- drives the
-    // honest goodbye line after terminal restoration. `worker_error` is the
-    // `ServerEvent::Error` arm: neither a detach nor a clean workload exit.
-    let mut session_ended = false;
-    let mut worker_error = false;
-    'session: loop {
-        loop {
-            let frame = match read_frame(&mut reader) {
-                Ok(Some(f)) => f,
-                Ok(None) => break,
-                Err(e)
-                    if e.downcast_ref::<io::Error>()
-                        .map(|x| {
-                            matches!(
-                                x.kind(),
-                                io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
-                            )
-                        })
-                        .unwrap_or(false) =>
-                {
-                    break
-                }
-                Err(e) => return Err(e),
-            };
-            match frame.kind {
-                FrameKind::Data => {
-                    relay_to_terminal(
-                        &workload_screen,
-                        &stdout,
-                        &scroll_mode,
-                        &key_overlay,
-                        &frame.payload,
-                    )?;
-                    if let Ok(mut t) = last_activity.lock() {
-                        *t = Instant::now();
-                    }
-                    if !status_enabled {
-                        continue;
-                    }
-                    // While a client modal is up nothing may paint over it:
-                    // the deferred resize, the deferred bar and the deferred
-                    // `Ctrl-b r` all keep waiting, and are delivered by the
-                    // repaint `exit_scroll_mode`/`dismiss_key_overlay`
-                    // performs (or by the first chunk after it).
-                    //
-                    // Type-through is the exception to "nothing may paint":
-                    // the workload's bytes are being relayed to the host, so
-                    // this IS a live view and the typing bar needs the same
-                    // per-chunk maintenance the live bar gets -- a deferred
-                    // bar write flushes at this chunk boundary, and the row
-                    // the bar lives on is repaired if the workload's own
-                    // erase sequences took it out (the `Layout` arm
-                    // invalidates the dirty check for exactly that case).
-                    if scroll_mode.is_active() || key_overlay.is_active() {
-                        if scroll_mode.is_typing() && !key_overlay.is_active() {
-                            flush_pending_layout(&status_ctx);
-                            refresh_scroll_bar(&status_ctx);
-                        }
-                        continue;
-                    }
-                    // A redraw the status thread wanted while the stream was
-                    // mid-sequence (or mid-frame) waits here rather than being
-                    // written at an unsafe offset. This is the only place a
-                    // continuously-streaming workload's bar gets refreshed at
-                    // all, and it is by construction a chunk boundary that the
-                    // model has just confirmed is also an escape boundary --
-                    // see `draw_status_bar`'s boundary gate.
-                    //
-                    // The deferred *resize* goes first: a bar redraw is laid
-                    // out against `TermGeom`, so reasserting the new scroll
-                    // region before drawing keeps the two consistent within
-                    // the same chunk instead of one chunk apart.
-                    flush_pending_layout(&status_ctx);
-                    if status_ctx.pending_refresh.load(Ordering::Relaxed) {
-                        redraw_live_screen(&status_ctx);
-                    } else if status_ctx.pending.load(Ordering::Relaxed) {
-                        draw_status_bar(&status_ctx, true);
-                    }
-                }
-                FrameKind::End => {
-                    session_ended = !detached_by_client.load(Ordering::Relaxed);
-                    break;
-                }
-                FrameKind::Json => {
-                    let event: ServerEvent = serde_json::from_slice(&frame.payload)?;
-                    match event {
-                        ServerEvent::Exit { .. } => {
-                            session_ended = true;
-                            break;
-                        }
-                        ServerEvent::Error { message } => {
-                            eprintln!("[aplexer: {message}]");
-                            worker_error = true;
-                            break;
-                        }
-                        // The workload reset margins or flipped alt-screen
-                        // state (docs/terminal-state-design.md section 7):
-                        // re-assert the status-bar reservation and redraw
-                        // within one socket round-trip of the bytes that
-                        // caused it, instead of waiting on the idle-gap
-                        // timer. `draw_status_bar`'s own margin re-assert
-                        // (see its doc comment) is the reservation half of
-                        // this; the redraw is the other half. Only ever
-                        // received when this attach opted in via
-                        // `want_screen` (the worker gates it -- see
-                        // `handle_attach`), so this arm is unreachable on
-                        // the `--history-bytes` raw-tail path, but handling
-                        // it unconditionally keeps this match exhaustive and
-                        // correct if that ever changes.
-                        ServerEvent::Layout { .. } => {
-                            if status_enabled {
-                                if status_ctx.scroll.is_typing() {
-                                    // Type-through streams workload bytes to the
-                                    // host, and Erase in Display ignores scroll
-                                    // margins: the workload's own `CSI ... J` --
-                                    // which Ink-style TUIs emit on nearly every
-                                    // frame -- erases past the scroll region and
-                                    // takes the reserved row, the typing bar
-                                    // included. Nothing else repairs it: the
-                                    // dirty check sees unchanged text and skips,
-                                    // and the erased row would stay blank until
-                                    // the offset or the count next changes.
-                                    // Invalidate the check so this refresh
-                                    // actually rewrites the row.
-                                    *status_ctx
-                                        .last_drawn
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner) = None;
-                                    refresh_scroll_bar(&status_ctx);
-                                } else if !status_ctx.scroll.is_active() {
-                                    // Live view: re-assert the reservation and
-                                    // redraw within one socket round-trip of the
-                                    // bytes that caused it, instead of waiting
-                                    // on the idle-gap timer. `draw_status_bar`'s
-                                    // own margin re-assert (see its doc comment)
-                                    // is the reservation half of this; the
-                                    // redraw is the other half.
-                                    draw_status_bar(&status_ctx, true);
-                                }
-                                // Pager without type-through: nothing is being
-                                // written to the host, so no erase can have
-                                // reached the bar row and the pager's own tick
-                                // already maintains it.
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // The frame loop broke: either the session ended/we detached, or
-        // the input thread killed the old stream to hand us a switch.
-        let outcome = take_pending_switch(&pending_switch, &switch_in_progress);
-        let Some(outcome) = outcome else { break };
-
-        let switched_to = outcome.record.clone();
-        *shared_record.lock().unwrap_or_else(PoisonError::into_inner) = outcome.record;
-        reader = outcome.reader; // old stream dropped (closed) here
-
-        // A and B have independent terminal state. Neutralize every buffer
-        // and input mode A's snapshot/live stream may have enabled before
-        // replaying B's snapshot: a default-mode B deliberately emits no
-        // mouse-off or primary-screen transition of its own. B's snapshot
-        // follows immediately and re-enables exactly the modes it owns.
-        // Raw termios belongs to this client rather than either session, so
-        // it remains in force across the switch.
-        //
-        // Geometry is read before `stdout` is taken, keeping the
-        // `stdout` -> `term` -> `screen` order `write_locked` documents.
-        let geom = term.lock().map(|g| *g).unwrap_or(TermGeom {
-            rows: 0,
-            cols: 0,
-            reserved: false,
-        });
-        // The new session's screen is its own: drop the previous one's model
-        // (its margins, its half-parsed sequences, its cursor) and learn the
-        // new one's from its snapshot payload, under the same lock as the
-        // write so the status thread can never redraw against a model that
-        // disagrees with what the terminal has been sent.
-        let (screen_rows, screen_cols) = if geom.rows > 0 {
-            (reserved_rows(geom.rows), geom.cols)
-        } else {
-            (
-                aplexer::screen::DEFAULT_TERMINAL_ROWS,
-                aplexer::screen::DEFAULT_TERMINAL_COLS,
-            )
-        };
-        // The reset and the seed are done here rather than through
-        // `feed_and_write`'s `reset_to`, because the retained history has to
-        // be primed *between* them: reset (drop A's model and its history),
-        // seed (give B's model B's past), then paint B's screen on top. Done
-        // the other way round the seed's rows would land above nothing, or
-        // below B's current screen.
-        {
-            let mut screen = workload_screen
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            screen.reset(screen_rows, screen_cols);
-        }
-        if scrollback_lines > 0 {
-            seed_client_scrollback(&workload_screen, &switched_to);
-        }
-        let _ = feed_and_write(
-            &stdout,
-            &workload_screen,
-            TERMINAL_RESET_SEQUENCE,
-            &outcome.history,
-            None,
-        );
-        // TERMINAL_RESET_SEQUENCE turned every mouse mode off, so whoever
-        // owned the mouse before the switch owns nothing now.
-        *status_ctx
-            .mouse_owned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        sync_client_mouse(&status_ctx);
-        if let Ok(mut t) = last_activity.lock() {
-            *t = Instant::now();
-        }
-
-        // B's PTY may still be sized for its previous client (or the
-        // 24x80 default). The resize thread won't resend an unchanged
-        // terminal size (its `last` cache), so push the current geometry
-        // explicitly.
-        if geom.rows > 0 {
-            let _ = send_control(
-                &writer,
-                &AttachControl::Resize {
-                    rows: reserved_rows(geom.rows),
-                    cols: geom.cols,
-                },
-            );
-        }
-        if status_enabled {
-            draw_status_bar(&status_ctx, true); // clear wiped the reserved row; redraw now
-        }
-        continue 'session;
-    }
+    let session_outcome = run_session_loop(
+        reader,
+        SessionLoopConfig {
+            status_enabled,
+            writer: writer.clone(),
+            stdout: stdout.clone(),
+            workload_screen: workload_screen.clone(),
+            scroll_mode: scroll_mode.clone(),
+            key_overlay: key_overlay.clone(),
+            status: status_ctx.clone(),
+            last_activity: last_activity.clone(),
+            detached_by_client: detached_by_client.clone(),
+            pending_switch: pending_switch.clone(),
+            switch_in_progress: switch_in_progress.clone(),
+            shared_record: shared_record.clone(),
+            term: term.clone(),
+            scrollback_lines,
+        },
+    )?;
+    let session_ended = session_outcome.session_ended;
+    let worker_error = session_outcome.worker_error;
     active.store(false, Ordering::Relaxed);
     if let Ok(stream) = writer.lock() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
