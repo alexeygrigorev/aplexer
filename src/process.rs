@@ -150,6 +150,9 @@ pub(crate) fn session_id_in_proc_environ(pid: u32) -> Option<Uuid> {
 /// hardened procfs, a racing exit) leaves the answer at the signalable
 /// result, so a live process is never mistaken for a dead one.
 pub fn process_alive(pid: u32) -> bool {
+    if !is_signalable_pid(pid) {
+        return false;
+    }
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     let signalable = rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     signalable && !process_is_zombie(pid)
@@ -263,7 +266,18 @@ pub(crate) fn linux_boot_id() -> Result<String> {
     Ok(owned)
 }
 
+/// Whether `pid` can name one process to `kill(2)`/`pidfd_open(2)`. Pid 0
+/// means "my process group" to `kill`, and anything above `i32::MAX` wraps
+/// to a negative `pid_t`, which addresses a whole group (or every process)
+/// instead of the persisted pid it came from.
+fn is_signalable_pid(pid: u32) -> bool {
+    pid != 0 && pid <= i32::MAX as u32
+}
+
 pub(crate) fn pidfd_open(pid: u32) -> io::Result<File> {
+    if !is_signalable_pid(pid) {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
     if fd < 0 {
         Err(io::Error::last_os_error())

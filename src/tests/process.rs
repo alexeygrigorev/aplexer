@@ -104,6 +104,20 @@ fn zombie_detection_requires_an_empty_thread_group() {
     );
 }
 
+/// A persisted worker pid is fed straight to these probes. Pid 0 asks
+/// `kill(2)` about the caller's own process group and a pid above
+/// `i32::MAX` wraps to a negative `pid_t`, so both used to answer "alive"
+/// for something that is not the recorded process at all.
+#[test]
+fn pids_that_cannot_name_one_process_are_dead() {
+    for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+        assert!(!process_alive(pid), "pid {pid} must not read as alive");
+        let error = pidfd_open(pid).expect_err("no pidfd for an unaddressable pid");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "pid {pid}");
+    }
+    assert!(process_alive(std::process::id()));
+}
+
 /// A live process must never be mistaken for a zombie by the state read.
 #[test]
 fn process_alive_still_reports_a_running_child_as_alive() {
