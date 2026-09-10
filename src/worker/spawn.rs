@@ -333,7 +333,7 @@ pub(super) fn persist_activity_checkpoint(
     persisted_activity_ms: &mut u64,
 ) -> Result<()> {
     let current = runtime.last_activity_ms.load(Ordering::Relaxed);
-    if current == 0 || current == *persisted_activity_ms {
+    if current == 0 || current == *persisted_activity_ms || runtime.output.finalized() {
         return Ok(());
     }
     runtime.update_record(|record| record.last_activity_ms = Some(current))?;

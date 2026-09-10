@@ -266,6 +266,17 @@ pub(super) struct OutputHub {
     /// doc section 5.5) -- immutable, so no need to route it through the
     /// lock.
     pub(super) screen_txt_path: std::path::PathBuf,
+    /// Set by `WorkerRuntime::mark_finalized` the moment the lifecycle
+    /// decides to remove the session's durable state, under both the hub
+    /// lock and the record lock. Every durable writer -- history flushes
+    /// here, record updates in `WorkerRuntime::update_record` -- checks it
+    /// under the same lock it writes under, so nothing that starts after
+    /// the flag is set can recreate the removed directory. Without it the
+    /// periodic flush thread kept running for the connection-drain window
+    /// after `remove_dir_all` (`atomic_write_*` recreates parents), leaving
+    /// a `session.json` with `phase: exiting` and a dead worker pid behind
+    /// for every clean exit `a list` then showed as broken until `a prune`.
+    pub(super) finalized: AtomicBool,
 }
 impl OutputHub {
     pub(super) fn new(
@@ -286,7 +297,12 @@ impl OutputHub {
                 terminal: None,
             }),
             screen_txt_path,
+            finalized: AtomicBool::new(false),
         })
+    }
+    /// Whether the session's durable state is being (or has been) removed.
+    pub(super) fn finalized(&self) -> bool {
+        self.finalized.load(Ordering::SeqCst)
     }
     pub(super) fn append(&self, data: &[u8]) -> Result<()> {
         let mut inner = lock(&self.inner)?;
@@ -394,6 +410,10 @@ impl OutputHub {
     }
     pub(super) fn flush_history(&self, force: bool) -> Result<()> {
         let mut inner = lock(&self.inner)?;
+        // Checked under the lock the flush writes under (see `finalized`).
+        if self.finalized() {
+            return Ok(());
+        }
         if !force && Instant::now() < inner.history_retry_at {
             return Ok(());
         }
@@ -959,18 +979,16 @@ pub(super) mod tests {
         )));
     }
 
-    #[test]
-    pub(super) fn failed_record_persistence_does_not_publish_and_idle_activity_retries() {
-        let dir = tempfile::tempdir().unwrap();
-        let id = Uuid::new_v4();
-        let record_path = dir.path().join("session.json");
-        // Atomic rename onto a directory deterministically fails after the
-        // candidate was serialized, exercising the publish boundary.
-        fs::create_dir(&record_path).unwrap();
+    /// A `WorkerRuntime` over a throwaway hub, with its durable record at
+    /// `record_path` and every other path under `dir`.
+    pub(super) fn test_runtime(
+        dir: &tempfile::TempDir,
+        record_path: std::path::PathBuf,
+    ) -> WorkerRuntime {
         let record = SessionRecord {
             parent_session: None,
             schema_version: SCHEMA_VERSION,
-            id,
+            id: Uuid::new_v4(),
             workspace: dir.path().to_path_buf(),
             tag: "before".into(),
             engine: "shell".into(),
@@ -1000,7 +1018,7 @@ pub(super) mod tests {
             exit: None,
             error: None,
         };
-        let runtime = WorkerRuntime {
+        WorkerRuntime {
             paths: Paths {
                 runtime_root: dir.path().join("runtime"),
                 state_root: dir.path().join("state"),
@@ -1024,11 +1042,21 @@ pub(super) mod tests {
             }),
             cgroup: Mutex::new(None),
             kill_gate: Mutex::new(()),
-            output: test_hub(&dir),
+            output: test_hub(dir),
             record_persistence_error: Mutex::new(None),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity_ms: AtomicU64::new(0),
-        };
+        }
+    }
+
+    #[test]
+    pub(super) fn failed_record_persistence_does_not_publish_and_idle_activity_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let record_path = dir.path().join("session.json");
+        // Atomic rename onto a directory deterministically fails after the
+        // candidate was serialized, exercising the publish boundary.
+        fs::create_dir(&record_path).unwrap();
+        let runtime = test_runtime(&dir, record_path);
 
         assert!(runtime
             .update_record(|candidate| candidate.tag = "after".into())
@@ -1050,6 +1078,60 @@ pub(super) mod tests {
         assert_eq!(persisted_activity_ms, 123);
         assert_eq!(runtime.record().unwrap().last_activity_ms, Some(123));
         assert!(runtime.record_persistence_error.lock().unwrap().is_none());
+    }
+
+    /// The clean-exit resurrection: `run_lifecycle` removes the state dir,
+    /// then drains connections for up to 3 s before exiting, and in that
+    /// window the periodic flush thread and a late attach both wrote into
+    /// the removed directory (`atomic_write_*` recreates parents), leaving
+    /// a `phase: exiting` record with a dead worker pid for `a list` to
+    /// show as broken until `a prune`. Pins that once the lifecycle marks
+    /// the session finalized, neither the record writer nor the history
+    /// flusher recreates anything -- whether the write is an activity
+    /// checkpoint, an attach stamp, or a forced flush.
+    #[test]
+    pub(super) fn finalized_session_refuses_every_later_durable_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state-session");
+        let runtime = test_runtime(&dir, state_dir.join("session.json"));
+        // Sanity: before finalization the same writers land on disk.
+        runtime
+            .update_record(|record| record.tag = "live".into())
+            .expect("record write before finalization");
+        runtime.output.append(b"output").unwrap();
+        runtime.output.flush_history(true).unwrap();
+        assert!(runtime.record_path.exists());
+        assert!(dir.path().join("history.bin").exists());
+
+        let id = runtime.mark_finalized().unwrap();
+        assert_eq!(id, runtime.record().unwrap().id);
+        fs::remove_dir_all(&state_dir).unwrap();
+        fs::remove_file(dir.path().join("history.bin")).unwrap();
+
+        let error = runtime
+            .update_record(|record| record.last_accessed_ms = Some(now_ms()))
+            .expect_err("a finalized session must refuse record writes");
+        assert!(format!("{error:#}").contains("finalized"), "{error:#}");
+        assert!(
+            runtime.record_persistence_error.lock().unwrap().is_none(),
+            "a refused post-finalization write is not a persistence failure"
+        );
+        runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+        let mut persisted_activity_ms = 0;
+        persist_activity_checkpoint(&runtime, &mut persisted_activity_ms)
+            .expect("the activity checkpoint quietly skips a finalized session");
+        runtime.output.append(b"late output").unwrap();
+        runtime.output.flush_history(false).unwrap();
+        runtime.output.flush_history(true).unwrap();
+
+        assert!(
+            !state_dir.exists(),
+            "a durable write after finalization resurrected the state dir"
+        );
+        assert!(
+            !dir.path().join("history.bin").exists(),
+            "a history flush after finalization resurrected the history file"
+        );
     }
 
     #[test]

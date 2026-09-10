@@ -83,6 +83,31 @@ pub(super) fn wait_for_lifecycle_wake(
     }
 }
 
+/// Remove a cleanly finished session's durable state, after fencing every
+/// later durable write (`WorkerRuntime::mark_finalized`): the periodic
+/// flush thread and any in-flight connection keep running through the
+/// connection-drain window below, and `atomic_write_*` recreates parent
+/// directories, so an unfenced write would resurrect the directory with a
+/// `phase: exiting` record and a dead worker pid.
+///
+/// A removal that could not happen (a read-only state dir, a vanished
+/// mount) is reported rather than exited on silently. Nothing is lost when
+/// it fails: the record left behind still says the worker was running, its
+/// pid is about to be gone, and `a prune` reaps that shape -- but the
+/// operator should be able to see why a session they ended is still listed.
+fn remove_finished_state(runtime: &WorkerRuntime) {
+    let id = match runtime.mark_finalized() {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("aplexer worker: fence writes before removing finished session: {error:#}");
+            return;
+        }
+    };
+    if let Err(error) = fs::remove_dir_all(runtime.paths.state_session(id)) {
+        eprintln!("aplexer worker: remove finished session {id} state: {error:#}");
+    }
+}
+
 pub(super) fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<LifeEvent>) {
     let mut pty_eof = false;
     let mut child_exit: Option<(Option<i32>, Option<i32>)> = None;
@@ -214,25 +239,7 @@ pub(super) fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<Life
         if let Some(c) = cg.take() {
             c.cleanup();
         }
-        // Report a removal that could not happen (a read-only state dir, a
-        // vanished mount) rather than exiting silently on it. Nothing is
-        // lost when it fails: the record left behind still says the worker
-        // was running, its pid is about to be gone, and `a prune` reaps that
-        // shape -- but the operator should be able to see why a session they
-        // ended is still listed.
-        match runtime.record() {
-            Ok(record) => {
-                if let Err(error) = fs::remove_dir_all(runtime.paths.state_session(record.id)) {
-                    eprintln!(
-                        "aplexer worker: remove finished session {} state: {error:#}",
-                        record.id
-                    );
-                }
-            }
-            Err(error) => eprintln!(
-                "aplexer worker: read record before removing finished session state: {error:#}"
-            ),
-        }
+        remove_finished_state(&runtime);
     } else {
         if let Err(history_error) = runtime.output.flush_history(true) {
             let message = format!("persist final history: {history_error:#}");
@@ -329,17 +336,7 @@ pub(super) fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<Life
         // Ctrl-D are the same "gone from `a list`" outcome as the fast
         // path. Any remaining `fatal` keeps the evidence.
         if fatal.is_none() && !oom && !keep_exited {
-            if let Ok(record) = runtime.record() {
-                match fs::remove_dir_all(runtime.paths.state_session(record.id)) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        eprintln!(
-                            "aplexer worker: remove finished session {} state: {error:#}",
-                            record.id
-                        );
-                    }
-                }
-            }
+            remove_finished_state(&runtime);
         }
     }
     // The workload is gone and the final record/history are persisted;

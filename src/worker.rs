@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -220,6 +220,15 @@ impl WorkerRuntime {
         F: FnOnce(&mut SessionRecord),
     {
         let mut record = lock(&self.record)?;
+        // Checked under the record lock (see `OutputHub::finalized`): a
+        // write that got here first has already landed before the removal,
+        // and one that gets here later must not recreate the state dir.
+        if self.output.finalized() {
+            bail!(
+                "session {} is finalized; its durable record has been removed",
+                record.id
+            );
+        }
         // Persist a candidate before publishing it. Otherwise a failed Rename
         // can leak into live Status and an unrelated later activity write can
         // commit that rejected selector outside the registry lock.
@@ -237,6 +246,17 @@ impl WorkerRuntime {
                 Err(error)
             }
         }
+    }
+    /// Refuse every later durable write (see `OutputHub::finalized`) and
+    /// return the session id the caller removes the state dir under. Both
+    /// locks are held while the flag is set so a writer that already holds
+    /// either one finishes before the flag is observed, and any later
+    /// writer observes it.
+    fn mark_finalized(&self) -> Result<Uuid> {
+        let _hub = lock(&self.output.inner)?;
+        let record = lock(&self.record)?;
+        self.output.finalized.store(true, Ordering::SeqCst);
+        Ok(record.id)
     }
     fn send(&self, data: &[u8]) -> Result<()> {
         if !lock(&self.workload)?.running {
