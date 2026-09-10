@@ -110,19 +110,6 @@ fn unsupported_config_version_is_reported_before_unknown_fields() {
     assert!(!message.contains("unknown field"), "{message}");
 }
 
-impl Drop for DelegatedCgroup {
-    fn drop(&mut self) {
-        self.drain_members();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.path.exists() && Instant::now() < deadline {
-            if fs::remove_dir(&self.path).is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
 /// A config file that exists but cannot be read is an error, never the
 /// built-in defaults. The old `exists()` gate was false on EACCES too, so
 /// an unreadable file loaded silently as "no config". ENOTDIR (a regular

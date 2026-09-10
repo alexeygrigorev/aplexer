@@ -106,3 +106,16 @@ impl DelegatedCgroup {
         }
     }
 }
+
+impl Drop for DelegatedCgroup {
+    fn drop(&mut self) {
+        self.drain_members();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.path.exists() && Instant::now() < deadline {
+            if fs::remove_dir(&self.path).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
