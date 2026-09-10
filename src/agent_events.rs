@@ -56,9 +56,9 @@ use crate::{atomic_write_json, engine_family, now_ms, SessionRecord};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -1066,14 +1066,20 @@ pub struct TranscriptQuery {
     pub max_line_bytes: Option<usize>,
 }
 
+/// Read buffer for streaming a native log; lines are handed out one at a
+/// time so a multi-hundred-megabyte transcript never sits in memory whole.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
 struct NativeLogReader {
     path: PathBuf,
     engine: String,
     format: WireFormat,
     assembler: JsonAssembler,
     sequence: u64,
+    /// File offset of the first byte not yet consumed as a complete line.
+    /// An unterminated trailing line is left behind this offset while
+    /// following, and simply re-read once the writer finishes it.
     byte_offset: u64,
-    pending: String,
     max_line_bytes: Option<usize>,
 }
 
@@ -1086,7 +1092,6 @@ impl NativeLogReader {
             assembler: JsonAssembler::default(),
             sequence: 0,
             byte_offset: 0,
-            pending: String::new(),
             max_line_bytes,
         })
     }
@@ -1095,105 +1100,136 @@ impl NativeLogReader {
         self.assembler = JsonAssembler::default();
         self.sequence = 0;
         self.byte_offset = 0;
-        self.pending.clear();
     }
 
-    /// Read newly appended complete lines. `consume_tail` is true for a
-    /// one-shot snapshot (last line may lack a trailing newline) and false
-    /// for `--follow` (wait for a newline so a mid-write row is not parsed
-    /// as truncated JSON).
+    /// Read newly appended complete lines into a vector; see `read_into`.
     fn read_available(
         &mut self,
         record: &SessionRecord,
         consume_tail: bool,
     ) -> Result<Vec<UnifiedEvent>> {
+        let mut events = Vec::new();
+        self.read_into(record, consume_tail, &mut |event| events.push(event))?;
+        Ok(events)
+    }
+
+    /// Stream newly appended lines through `sink`, one line in memory at a
+    /// time. `consume_tail` is true for a one-shot snapshot (the last line
+    /// may lack a trailing newline) and false for `--follow` (wait for the
+    /// newline so a mid-write row is not parsed as truncated JSON).
+    fn read_into(
+        &mut self,
+        record: &SessionRecord,
+        consume_tail: bool,
+        sink: &mut dyn FnMut(UnifiedEvent),
+    ) -> Result<()> {
         let mut file =
             File::open(&self.path).with_context(|| format!("read {}", self.path.display()))?;
-        let len = file.metadata()?.len();
-        if len < self.byte_offset {
+        if file.metadata()?.len() < self.byte_offset {
             self.reset();
         }
         file.seek(SeekFrom::Start(self.byte_offset))?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        if buf.is_empty() && self.pending.is_empty() {
-            return Ok(Vec::new());
-        }
-        let chunk = String::from_utf8_lossy(&buf);
-        let mut data = std::mem::take(&mut self.pending);
-        data.push_str(&chunk);
-
-        let has_trailing_newline = data.ends_with('\n') || data.ends_with('\r');
-        let mut lines: Vec<&str> = data.split('\n').collect();
-        let remainder = if !has_trailing_newline && !consume_tail {
-            lines.pop().unwrap_or("").to_string()
-        } else {
-            if let Some(last) = lines.last() {
-                if last.is_empty() {
-                    lines.pop();
-                }
+        let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("read {}", self.path.display()))?;
+            if read == 0 {
+                return Ok(());
             }
-            String::new()
-        };
-        let consumed = data.len() - remainder.len();
-        self.byte_offset += consumed as u64;
-        self.pending = remainder;
-
-        let mut events = Vec::new();
-        for line in lines {
-            let line = line.trim_end_matches('\r');
+            let terminated = line.last() == Some(&b'\n');
+            if !terminated && !consume_tail {
+                return Ok(());
+            }
+            self.byte_offset += read as u64;
+            if terminated {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
             if line.is_empty() {
                 continue;
             }
-            if let Some(max) = self.max_line_bytes {
-                let byte_len = line.len();
-                if byte_len > max {
-                    let mut e = ev("error");
-                    e.engine = self.engine.clone();
-                    e.error = Some(format!("{LINE_TRUNCATION_SENTINEL}{byte_len}"));
-                    e.sequence = self.sequence;
-                    self.sequence += 1;
-                    e.timestamp = iso8601_utc(now_ms());
-                    stamp_session(&mut e, record);
-                    events.push(e);
-                    continue;
-                }
-            }
-            let Some(payload) = self.assembler.feed(line) else {
-                continue;
-            };
-            let ts = row_timestamp(self.format, &payload);
-            let (drafted, _continuation) = translate(self.format, &self.engine, &payload);
-            for mut event in drafted {
-                event.engine = self.engine.clone();
-                event.sequence = self.sequence;
-                self.sequence += 1;
-                event.timestamp = ts.clone();
-                event.raw = payload_to_raw(&payload);
-                stamp_session(&mut event, record);
-                events.push(event);
+            self.process_line(&line, record, sink);
+        }
+    }
+
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        record: &SessionRecord,
+        sink: &mut dyn FnMut(UnifiedEvent),
+    ) {
+        if let Some(max) = self.max_line_bytes {
+            if line.len() > max {
+                let mut e = ev("error");
+                e.error = Some(format!("{LINE_TRUNCATION_SENTINEL}{}", line.len()));
+                e.timestamp = iso8601_utc(now_ms());
+                sink(self.finish(e, record));
+                return;
             }
         }
-        Ok(events)
+        let Some(payload) = self.assembler.feed(&String::from_utf8_lossy(line)) else {
+            return;
+        };
+        let ts = row_timestamp(self.format, &payload);
+        let (drafted, _continuation) = translate(self.format, &self.engine, &payload);
+        for mut event in drafted {
+            event.timestamp = ts.clone();
+            event.raw = payload_to_raw(&payload);
+            sink(self.finish(event, record));
+        }
+    }
+
+    /// Stamps the reader-owned fields every emitted event carries: engine,
+    /// sequence number, and the session's identity.
+    fn finish(&mut self, mut event: UnifiedEvent, record: &SessionRecord) -> UnifiedEvent {
+        event.engine = self.engine.clone();
+        event.sequence = self.sequence;
+        self.sequence += 1;
+        stamp_session(&mut event, record);
+        event
     }
 }
 
-pub fn paginate(mut events: Vec<UnifiedEvent>, query: &TranscriptQuery) -> Vec<UnifiedEvent> {
-    if let Some(kind) = &query.kind {
-        events.retain(|e| e.kind == kind);
+/// Incremental `paginate`: admits `event` to `page` when the query's
+/// kind/after/before filters accept it, keeping at most the last `last`
+/// admitted events -- so a snapshot of a huge transcript retains only the
+/// page it will print.
+fn admit(page: &mut VecDeque<UnifiedEvent>, query: &TranscriptQuery, event: UnifiedEvent) {
+    if query.kind.as_deref().is_some_and(|kind| event.kind != kind)
+        || query.after.is_some_and(|after| event.sequence <= after)
+        || query.before.is_some_and(|before| event.sequence >= before)
+    {
+        return;
     }
-    if let Some(after) = query.after {
-        events.retain(|e| e.sequence > after);
+    page.push_back(event);
+    if query.last.is_some_and(|last| page.len() > last) {
+        page.pop_front();
     }
-    if let Some(before) = query.before {
-        events.retain(|e| e.sequence < before);
+}
+
+pub fn paginate(events: Vec<UnifiedEvent>, query: &TranscriptQuery) -> Vec<UnifiedEvent> {
+    let mut page = VecDeque::new();
+    for event in events {
+        admit(&mut page, query, event);
     }
-    if let Some(n) = query.last {
-        if events.len() > n {
-            events = events.split_off(events.len() - n);
-        }
-    }
-    events
+    page.into()
+}
+
+/// The initial page: everything currently in the file, reduced to what the
+/// query asks for as it streams past.
+fn snapshot_page(
+    reader: &mut NativeLogReader,
+    record: &SessionRecord,
+    query: &TranscriptQuery,
+) -> Result<Vec<UnifiedEvent>> {
+    let mut page = VecDeque::new();
+    reader.read_into(record, true, &mut |event| admit(&mut page, query, event))?;
+    Ok(page.into())
 }
 
 /// One-shot page, or a page followed by a live tail of the same file.
@@ -1205,8 +1241,7 @@ pub fn run_transcript(
 ) -> Result<()> {
     let mut reader = NativeLogReader::open(&record.engine, path, query.max_line_bytes)?;
     let mut stdout = std::io::stdout();
-    let snapshot = reader.read_available(record, true)?;
-    let page = paginate(snapshot, &query);
+    let page = snapshot_page(&mut reader, record, &query)?;
     for event in &page {
         if emit(&mut stdout, event, json_output).is_err() {
             return Ok(());
@@ -1679,5 +1714,61 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].content, "yo");
         assert_eq!(second[0].sequence, 1);
+    }
+
+    #[test]
+    fn follow_reader_holds_a_partial_line_until_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let (head, tail) = (
+            r#"{"type":"user","message":{"role":"user","content":"hi "#,
+            "there\"}}\n",
+        );
+        std::fs::write(&path, head).unwrap();
+        let record = dummy_record("claude");
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        assert!(reader.read_available(&record, false).unwrap().is_empty());
+        assert!(reader.read_available(&record, false).unwrap().is_empty());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+        let events = reader.read_available(&record, false).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "hi there");
+        assert_eq!(events[0].sequence, 0);
+    }
+
+    #[test]
+    fn reader_offset_counts_file_bytes_not_lossy_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let mut first = br#"{"type":"user","message":{"role":"user","content":"a"#.to_vec();
+        first.extend_from_slice(b"\xff\xfe");
+        first.extend_from_slice(b"b\"}}\n");
+        std::fs::write(&path, &first).unwrap();
+        let record = dummy_record("claude");
+        let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
+        let events = reader.read_available(&record, true).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "a\u{fffd}\u{fffd}b");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                concat!(
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"yo"}]}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let events = reader.read_available(&record, false).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "yo");
+        assert_eq!(events[0].sequence, 1);
     }
 }
