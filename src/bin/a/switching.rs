@@ -197,31 +197,27 @@ pub(crate) fn workspace_summary_regions(
 /// old one is touched, so any failure (resolution, `check_attachable`, or
 /// `establish` itself) leaves the attachment to the current session
 /// completely undisturbed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn perform_switch(
-    paths: &Paths,
-    target: SwitchTarget,
-    replay_bytes: Option<usize>,
-    want_screen: bool,
-    term: &Arc<Mutex<TermGeom>>,
-    shared_record: &Arc<Mutex<SessionRecord>>,
-    last_session: &Arc<Mutex<Option<Uuid>>>,
-    writer: &Arc<Mutex<UnixStream>>,
-    pending_switch: &Arc<Mutex<Option<SwitchOutcome>>>,
-    switch_in_progress: &Arc<AtomicBool>,
-) -> Result<()> {
-    let current = shared_record
+pub(crate) fn perform_switch(config: &InputThreadConfig, target: SwitchTarget) -> Result<()> {
+    let paths = &config.status.paths;
+    let current = config
+        .status
+        .record
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let last = *last_session.lock().unwrap_or_else(PoisonError::into_inner);
+    let last = *config
+        .last_session
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Current terminal geometry (docs/fast-session-switching-design.md
     // section 5.2 / docs/terminal-state-design.md section 10.2): passed
     // into the Attach so the new session's snapshot renders at the right
     // size immediately, rather than relying solely on the post-switch
     // explicit Resize send below. Read before resolution because
     // `SwitchTarget::New` also hands it to the worker it starts.
-    let geometry = term
+    let geometry = config
+        .status
+        .term
         .lock()
         .ok()
         .map(|g| *g)
@@ -240,26 +236,31 @@ pub(crate) fn perform_switch(
         return Ok(()); // switching to yourself: silent no-op
     }
     check_attachable(&next)?;
-    switch_in_progress.store(true, Ordering::Relaxed);
+    config.switch_in_progress.store(true, Ordering::Relaxed);
     let result = (|| -> Result<()> {
-        let handshake = establish(&next, replay_bytes, want_screen, geometry)?;
+        let handshake = establish(&next, config.replay_bytes, config.want_screen, geometry)?;
         let reader = handshake.reader;
         let history = handshake.initial;
-        let writer_clone = reader.try_clone()?; // before mutating anything
-                                                // Repoint every forwarding thread (input, resize) at B, then retire
-                                                // A's stream. From this instant keystrokes land in B.
+        // Cloned before anything is mutated.
+        let writer_clone = reader.try_clone()?;
+        // Repoint every forwarding thread (input, resize) at B, then retire
+        // A's stream. From this instant keystrokes land in B.
         let old = {
-            let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut w = config.writer.lock().unwrap_or_else(PoisonError::into_inner);
             std::mem::replace(&mut *w, writer_clone)
         };
-        *pending_switch
+        *config
+            .pending_switch
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(SwitchOutcome {
             record: next.clone(),
             reader,
             history,
         });
-        *last_session.lock().unwrap_or_else(PoisonError::into_inner) = Some(current.id);
+        *config
+            .last_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(current.id);
         // Polite detach from A, then shutdown so the main loop's blocked
         // read_frame on A's socket returns immediately. shutdown() is
         // socket-wide, so it also unblocks the reader fd cloned from this
@@ -269,7 +270,7 @@ pub(crate) fn perform_switch(
         let _ = old.shutdown(std::net::Shutdown::Both);
         Ok(())
     })();
-    switch_in_progress.store(false, Ordering::Relaxed);
+    config.switch_in_progress.store(false, Ordering::Relaxed);
     result
 }
 

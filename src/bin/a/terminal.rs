@@ -461,16 +461,10 @@ pub(crate) fn redraw_live_screen_after_layout(ctx: &StatusBarCtx) -> bool {
 /// (docs/terminal-state-design.md section 9's steady-state parse budget);
 /// paying it a second time in the client is the price of the client no longer
 /// writing blind into someone else's byte stream.
-pub(crate) fn relay_to_terminal(
-    screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
-    stdout: &Arc<Mutex<io::Stdout>>,
-    scroll: &Arc<ScrollMode>,
-    overlay: &Arc<KeyOverlay>,
-    data: &[u8],
-) -> io::Result<()> {
-    let mut out = stdout.lock().unwrap_or_else(PoisonError::into_inner);
+pub(crate) fn relay_to_terminal(ctx: &StatusBarCtx, data: &[u8]) -> io::Result<()> {
+    let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     {
-        let mut s = screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut s = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
         let rewritten = s.relay(data);
         // A client modal -- the pager, or the `Ctrl-b` key overlay -- owns
         // the screen: the model still consumes every byte (that is what grows
@@ -483,7 +477,7 @@ pub(crate) fn relay_to_terminal(
         // keyboard over, the pager keeps only the bar row and the offset,
         // and the stream flows -- typing with no echo would be worse than
         // the reading view the user chose to give up. Esc takes it back.
-        if scroll.owns_host() || overlay.is_active() {
+        if ctx.scroll.owns_host() || ctx.overlay.is_active() {
             return Ok(());
         }
         let src = rewritten.as_deref().unwrap_or(data);

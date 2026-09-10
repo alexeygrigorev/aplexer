@@ -2,21 +2,17 @@ use super::*;
 
 /// Runtime state used by the frame loop after attach setup is complete. The
 /// loop owns the active reader and session transitions; the surrounding
-/// attach function owns terminal guards and thread lifetime.
+/// attach function owns terminal guards and thread lifetime. Everything
+/// about the host terminal -- stdout, the model, the modals, the record --
+/// is reached through `status`, the one context every thread shares.
 pub(crate) struct SessionLoopConfig {
     pub(crate) status_enabled: bool,
     pub(crate) writer: Arc<Mutex<UnixStream>>,
-    pub(crate) stdout: Arc<Mutex<io::Stdout>>,
-    pub(crate) workload_screen: Arc<Mutex<aplexer::screen::ClientScreen>>,
-    pub(crate) scroll_mode: Arc<ScrollMode>,
-    pub(crate) key_overlay: Arc<KeyOverlay>,
     pub(crate) status: StatusBarCtx,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
     pub(crate) detached_by_client: Arc<AtomicBool>,
     pub(crate) pending_switch: Arc<Mutex<Option<SwitchOutcome>>>,
     pub(crate) switch_in_progress: Arc<AtomicBool>,
-    pub(crate) shared_record: Arc<Mutex<SessionRecord>>,
-    pub(crate) term: Arc<Mutex<TermGeom>>,
     pub(crate) scrollback_lines: usize,
 }
 
@@ -103,13 +99,7 @@ fn read_session_frames(
 }
 
 fn handle_data_frame(config: &SessionLoopConfig, payload: &[u8]) -> Result<()> {
-    relay_to_terminal(
-        &config.workload_screen,
-        &config.stdout,
-        &config.scroll_mode,
-        &config.key_overlay,
-        payload,
-    )?;
+    relay_to_terminal(&config.status, payload)?;
     if let Ok(mut time) = config.last_activity.lock() {
         *time = Instant::now();
     }
@@ -120,9 +110,10 @@ fn handle_data_frame(config: &SessionLoopConfig, payload: &[u8]) -> Result<()> {
     // While a client modal is up nothing may paint over it. Type-through is
     // the exception: workload bytes are being relayed, so the typing bar
     // still gets the same per-chunk maintenance as the live bar.
-    if config.scroll_mode.is_active() || config.key_overlay.is_active() {
-        if config.scroll_mode.is_typing() && !config.key_overlay.is_active() {
-            maintain_pager_bar(&config.status);
+    let status = &config.status;
+    if status.scroll.is_active() || status.overlay.is_active() {
+        if status.scroll.is_typing() && !status.overlay.is_active() {
+            maintain_pager_bar(status);
         }
         return Ok(());
     }
@@ -186,46 +177,41 @@ fn apply_session_switch(
     reader: &mut UnixStream,
     config: &SessionLoopConfig,
 ) {
+    let status = &config.status;
     let switched_to = switch.record.clone();
-    *config
-        .shared_record
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = switch.record;
+    *status.record.lock().unwrap_or_else(PoisonError::into_inner) = switch.record;
     *reader = switch.reader;
 
     // A and B have independent terminal state. Reset every buffer and input
     // mode A may have enabled before replaying B's snapshot. Raw termios
     // belongs to this client, so it remains in force across the switch.
-    let geometry = config.term.lock().map(|geom| *geom).unwrap_or(TermGeom {
+    let geometry = status.term.lock().map(|geom| *geom).unwrap_or(TermGeom {
         rows: 0,
         cols: 0,
         reserved: false,
     });
     let (screen_rows, screen_cols) = switch_screen_geometry(geometry);
-    {
-        let mut screen = config
-            .workload_screen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        screen.reset(screen_rows, screen_cols);
-    }
+    status
+        .screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .reset(screen_rows, screen_cols);
     if config.scrollback_lines > 0 {
-        seed_client_scrollback(&config.workload_screen, &switched_to);
+        seed_client_scrollback(&status.screen, &switched_to);
     }
     let _ = feed_and_write(
-        &config.stdout,
-        &config.workload_screen,
+        &status.stdout,
+        &status.screen,
         SWITCH_RESET_SEQUENCE,
         &switch.history,
         None,
     );
 
-    *config
-        .status
+    *status
         .mouse_owned
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
-    sync_client_mouse(&config.status);
+    sync_client_mouse(status);
     if let Ok(mut time) = config.last_activity.lock() {
         *time = Instant::now();
     }
@@ -243,8 +229,8 @@ fn apply_session_switch(
         // outside the status thread that fetches: the relay is idle here
         // (B's first frame has not been read yet), and the alternative is a
         // bar that fills in its siblings and memory a tick later.
-        refresh_live_status(&config.status);
-        draw_status_bar(&config.status, true);
+        refresh_live_status(status);
+        draw_status_bar(status, true);
     }
 }
 

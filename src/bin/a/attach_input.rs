@@ -3,6 +3,8 @@ use super::*;
 /// State shared by the stdin thread while an attach is active. Keeping the
 /// thread's inputs together makes the attach orchestrator responsible only
 /// for wiring the runtime, while this module owns the input state machine.
+/// The paths, geometry and record a switch needs are reached through
+/// `status`, the one context every thread shares.
 pub(crate) struct InputThreadConfig {
     pub(crate) input_tty: bool,
     pub(crate) status_enabled: bool,
@@ -11,9 +13,6 @@ pub(crate) struct InputThreadConfig {
     pub(crate) writer: Arc<Mutex<UnixStream>>,
     pub(crate) active: Arc<AtomicBool>,
     pub(crate) detached: Arc<AtomicBool>,
-    pub(crate) paths: Paths,
-    pub(crate) term: Arc<Mutex<TermGeom>>,
-    pub(crate) record: Arc<Mutex<SessionRecord>>,
     pub(crate) last_session: Arc<Mutex<Option<Uuid>>>,
     pub(crate) pending_switch: Arc<Mutex<Option<SwitchOutcome>>>,
     pub(crate) switch_in_progress: Arc<AtomicBool>,
@@ -220,19 +219,7 @@ fn handle_input_action(
             // swap. Creation and connection happen before the current stream
             // is touched, so an error leaves the user where they were.
             exit_scroll_mode(&config.status);
-            let result = perform_switch(
-                &config.paths,
-                target,
-                config.replay_bytes,
-                config.want_screen,
-                &config.term,
-                &config.record,
-                &config.last_session,
-                &config.writer,
-                &config.pending_switch,
-                &config.switch_in_progress,
-            );
-            if let Err(error) = result {
+            if let Err(error) = perform_switch(config, target) {
                 flash_status(&config.status, format!("{error:#}"));
             }
             true
