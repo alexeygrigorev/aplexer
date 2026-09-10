@@ -40,6 +40,8 @@ pub use paths::{canonical_workspace, ensure_private_dir, Paths};
 mod persist;
 pub use persist::{atomic_write_bytes, atomic_write_json, FileLock};
 
+mod pidfd;
+
 #[cfg(feature = "python")]
 mod python;
 

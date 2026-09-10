@@ -7,6 +7,7 @@
 //! -- that a failed launch runs before it reports the original error.
 
 use super::*;
+use crate::pidfd::{Deadline, PidHandle};
 
 // The worker's contained descendant sweep is bounded at two seconds. Leave
 // another second for signal delivery, startup unwind, and record/fsync work.
@@ -311,111 +312,21 @@ pub(super) fn terminate_and_reap_startup_child(
     }
 }
 
-pub(super) struct StartupDescendant {
-    pub(super) pid: u32,
-    pub(super) start_time_ticks: u64,
-    pub(super) pidfd: File,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CleanupDeadline(Instant);
-
-impl CleanupDeadline {
-    pub(super) fn after(duration: Duration) -> Self {
-        Self(Instant::now() + duration)
-    }
-
-    pub(super) fn check(self, operation: &str) -> Result<()> {
-        if Instant::now() >= self.0 {
-            bail!("timed out {operation}");
-        }
-        Ok(())
-    }
-
-    pub(super) fn sleep_poll(self, operation: &str) -> Result<()> {
-        self.check(operation)?;
-        let remaining = self.0.saturating_duration_since(Instant::now());
-        thread::sleep(STARTUP_REAP_POLL.min(remaining));
-        self.check(operation)
-    }
-}
-
-pub(super) fn open_startup_descendant(
-    pid: u32,
-    deadline: CleanupDeadline,
-) -> Result<Option<StartupDescendant>> {
-    deadline.check("opening startup process handle")?;
-    let start_time_ticks = match process_start_time_ticks(pid) {
-        Ok(value) => value,
-        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("identify descendant {pid}")),
-    };
-    deadline.check("opening startup process handle")?;
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
-        }
-        return Err(error).with_context(|| format!("open pidfd for descendant {pid}"));
-    }
-    let pidfd = unsafe { File::from_raw_fd(fd) };
-    deadline.check("opening startup process handle")?;
-    match process_start_time_ticks(pid) {
-        Ok(current) if current == start_time_ticks => {
-            deadline.check("opening startup process handle")?;
-            Ok(Some(StartupDescendant {
-                pid,
-                start_time_ticks,
-                pidfd,
-            }))
-        }
-        Ok(_) => bail!("descendant {pid} changed identity while opening its pidfd"),
-        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("recheck descendant {pid} identity")),
-    }
-}
-
-pub(super) fn signal_startup_descendant_raw(
-    descendant: &StartupDescendant,
-    signal: i32,
-) -> Result<()> {
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            descendant.pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error).with_context(|| format!("signal descendant {}", descendant.pid))
-    }
-}
+pub(super) type StartupDescendant = PidHandle;
 
 pub(super) fn signal_startup_descendant(
     descendant: &StartupDescendant,
     signal: i32,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<()> {
     deadline.check("signalling startup process tree")?;
-    signal_startup_descendant_raw(descendant, signal)?;
+    descendant.signal(signal)?;
     deadline.check("signalling startup process tree")
 }
 
-pub(super) fn pidfd_exited(
-    descendant: &StartupDescendant,
-    deadline: CleanupDeadline,
-) -> Result<bool> {
+pub(super) fn pidfd_exited(descendant: &StartupDescendant, deadline: Deadline) -> Result<bool> {
     let mut pollfd = libc::pollfd {
-        fd: descendant.pidfd.as_raw_fd(),
+        fd: descendant.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
@@ -431,7 +342,7 @@ pub(super) fn pidfd_exited(
             }
             bail!(
                 "unexpected pidfd poll events for descendant {}: {:#x}",
-                descendant.pid,
+                descendant.pid(),
                 pollfd.revents
             );
         }
@@ -444,7 +355,7 @@ pub(super) fn pidfd_exited(
 
 pub(super) fn process_state_and_start_time(
     pid: u32,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<Option<(char, u64)>> {
     deadline.check("reading startup process state")?;
     let stat_path = format!("/proc/{pid}/stat");
@@ -473,73 +384,31 @@ pub(super) fn process_state_and_start_time(
 
 pub(super) fn startup_descendant_quiescent(
     descendant: &StartupDescendant,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<bool> {
     if pidfd_exited(descendant, deadline)? {
         return Ok(true);
     }
-    match process_state_and_start_time(descendant.pid, deadline)? {
-        Some((_, start_time_ticks)) if start_time_ticks != descendant.start_time_ticks => {
+    match process_state_and_start_time(descendant.pid(), deadline)? {
+        Some((_, start_time_ticks)) if start_time_ticks != descendant.start_time_ticks() => {
             bail!(
                 "descendant {} changed identity while its pidfd remained live",
-                descendant.pid
+                descendant.pid()
             )
         }
         Some((state, _)) => Ok(matches!(state, 'T' | 't' | 'Z' | 'X' | 'x')),
         None if pidfd_exited(descendant, deadline)? => Ok(true),
         None => bail!(
             "descendant {} disappeared from /proc while its pidfd remained live",
-            descendant.pid
+            descendant.pid()
         ),
     }
-}
-
-/// Reads children belonging to every thread in `pid`. Children forked by a
-/// non-leader thread do not necessarily appear in the thread-group leader's
-/// `children` file.
-pub(super) fn direct_startup_children(pid: u32, deadline: CleanupDeadline) -> Result<Vec<u32>> {
-    deadline.check("scanning startup process tree")?;
-    let tasks_path = format!("/proc/{pid}/task");
-    let tasks = match fs::read_dir(&tasks_path) {
-        Ok(tasks) => tasks,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("read {tasks_path}")),
-    };
-    let mut children = HashSet::new();
-    for task in tasks {
-        deadline.check("scanning startup process tree")?;
-        let task = task.with_context(|| format!("enumerate {tasks_path}"))?;
-        let Some(tid) = task
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let path = format!("/proc/{pid}/task/{tid}/children");
-        deadline.check("scanning startup process tree")?;
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("read {path}")),
-        };
-        for value in text.split_whitespace() {
-            deadline.check("scanning startup process tree")?;
-            children.insert(
-                value
-                    .parse::<u32>()
-                    .with_context(|| format!("parse child pid from {path}"))?,
-            );
-        }
-    }
-    deadline.check("scanning startup process tree")?;
-    Ok(children.into_iter().collect())
 }
 
 pub(super) fn ensure_startup_worker_stopped(
     pid: u32,
     start_time_ticks: u64,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<()> {
     match process_state_and_start_time(pid, deadline)? {
         Some((_, current)) if current != start_time_ticks => {
@@ -554,31 +423,19 @@ pub(super) fn ensure_startup_worker_stopped(
     }
 }
 
+/// The stopped worker's live descendant tree, bounded by `max_descendants`
+/// and `deadline`; the worker must still be stopped on both sides of the
+/// walk, or the tree it describes is already stale.
 pub(super) fn startup_descendant_pids(
     root: u32,
     root_start_time: u64,
     max_descendants: usize,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<Vec<u32>> {
     deadline.check("scanning startup process tree")?;
     ensure_startup_worker_stopped(root, root_start_time, deadline)?;
-    let mut pending = VecDeque::from([root]);
-    let mut seen = HashSet::from([root]);
-    let mut descendants = Vec::new();
-    while let Some(parent) = pending.pop_front() {
-        deadline.check("scanning startup process tree")?;
-        for child in direct_startup_children(parent, deadline)? {
-            if seen.insert(child) {
-                if descendants.len() >= max_descendants {
-                    bail!(
-                        "startup process tree exceeds safe descendant limit of {max_descendants}"
-                    );
-                }
-                descendants.push(child);
-                pending.push_back(child);
-            }
-        }
-    }
+    let descendants = crate::pidfd::descendant_pids_until(root, deadline, max_descendants)
+        .context("scan startup process tree")?;
     ensure_startup_worker_stopped(root, root_start_time, deadline)?;
     Ok(descendants)
 }
@@ -586,7 +443,7 @@ pub(super) fn startup_descendant_pids(
 pub(super) fn wait_for_worker_stopped(
     pid: u32,
     start_time_ticks: u64,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<()> {
     loop {
         match process_state_and_start_time(pid, deadline)? {
@@ -600,9 +457,10 @@ pub(super) fn wait_for_worker_stopped(
             Some(_) => {}
             None => bail!("startup worker {pid} disappeared before containment was inspected"),
         }
-        deadline.sleep_poll(&format!(
-            "stopping startup worker {pid} for containment inspection"
-        ))?;
+        deadline.sleep_poll(
+            STARTUP_REAP_POLL,
+            &format!("stopping startup worker {pid} for containment inspection"),
+        )?;
     }
 }
 
@@ -610,7 +468,7 @@ pub(super) fn stop_and_pin_startup_descendants(
     root: u32,
     root_start_time: u64,
     max_descendants: usize,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
     descendants: &mut BTreeMap<u32, StartupDescendant>,
 ) -> Result<()> {
     loop {
@@ -623,12 +481,12 @@ pub(super) fn stop_and_pin_startup_descendants(
             if descendants.len() >= max_descendants {
                 bail!("startup process tree exceeds safe pidfd limit of {max_descendants}");
             }
-            if let Some(descendant) = open_startup_descendant(pid, deadline)? {
+            if let Some(descendant) = PidHandle::open(pid, Some(deadline))? {
                 // Check before the destructive signal, then record the handle
                 // before checking again. If the deadline crosses during the
                 // syscall, the caller still owns everything it must resume.
                 deadline.check("stopping startup worker descendants")?;
-                signal_startup_descendant_raw(&descendant, libc::SIGSTOP)?;
+                descendant.signal(libc::SIGSTOP)?;
                 descendants.insert(pid, descendant);
                 deadline.check("stopping startup worker descendants")?;
                 discovered_new = true;
@@ -644,7 +502,7 @@ pub(super) fn stop_and_pin_startup_descendants(
             if all_stopped {
                 break;
             }
-            deadline.sleep_poll("quiescing startup worker descendants")?;
+            deadline.sleep_poll(STARTUP_REAP_POLL, "quiescing startup worker descendants")?;
         }
 
         // Once every process known so far is stopped, a pass that discovers no
@@ -658,7 +516,7 @@ pub(super) fn stop_and_pin_startup_descendants(
 
 pub(super) fn wait_for_descendant_exit(
     descendants: &BTreeMap<u32, StartupDescendant>,
-    deadline: CleanupDeadline,
+    deadline: Deadline,
 ) -> Result<()> {
     loop {
         let mut all_exited = true;
@@ -669,11 +527,14 @@ pub(super) fn wait_for_descendant_exit(
         if all_exited {
             return Ok(());
         }
-        deadline.sleep_poll("waiting for startup worker descendants to exit")?;
+        deadline.sleep_poll(
+            STARTUP_REAP_POLL,
+            "waiting for startup worker descendants to exit",
+        )?;
     }
 }
 
-pub(super) fn safe_startup_descendant_capacity(deadline: CleanupDeadline) -> Result<usize> {
+pub(super) fn safe_startup_descendant_capacity(deadline: Deadline) -> Result<usize> {
     deadline.check("preflighting startup containment resources")?;
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
@@ -728,17 +589,17 @@ pub(super) fn kill_stopped_startup_tree(
     // KILL. The retained session record remains the evidence for any process
     // that was racing discovery when recovery became necessary.
     for descendant in descendants.values() {
-        if let Err(error) = signal_startup_descendant_raw(descendant, libc::SIGKILL) {
+        if let Err(error) = descendant.signal(libc::SIGKILL) {
             failures.push(format!(
                 "kill stopped startup descendant {}: {error:#}",
-                descendant.pid
+                descendant.pid()
             ));
         }
     }
-    if let Err(error) = signal_startup_descendant_raw(worker, libc::SIGKILL) {
+    if let Err(error) = worker.signal(libc::SIGKILL) {
         failures.push(format!(
             "kill stopped startup worker {}: {error:#}",
-            worker.pid
+            worker.pid()
         ));
     }
     if failures.is_empty() {
@@ -755,24 +616,24 @@ pub(super) fn resume_stopped_startup_tree(
     // Resume the subreaper first so it can immediately continue the normal
     // TERM-driven rollback path. Then release each pinned child. Every signal
     // uses a pidfd, so recovery can never target a recycled numeric PID.
-    if let Err(error) = signal_startup_descendant_raw(worker, libc::SIGCONT) {
+    if let Err(error) = worker.signal(libc::SIGCONT) {
         return kill_stopped_startup_tree(worker, descendants).with_context(|| {
             format!(
                 "resume startup worker {} failed ({error:#}); fallback KILL also failed",
-                worker.pid
+                worker.pid()
             )
         });
     }
     let mut failures = Vec::new();
     for descendant in descendants.values() {
-        if let Err(error) = signal_startup_descendant_raw(descendant, libc::SIGCONT) {
+        if let Err(error) = descendant.signal(libc::SIGCONT) {
             // The worker is running its requested TERM rollback again. If an
             // individual child cannot be continued, remove that stopped
             // child through its same identity-pinned handle.
-            if let Err(kill_error) = signal_startup_descendant_raw(descendant, libc::SIGKILL) {
+            if let Err(kill_error) = descendant.signal(libc::SIGKILL) {
                 failures.push(format!(
                     "resume startup descendant {} failed ({error:#}); fallback KILL failed: {kill_error:#}",
-                    descendant.pid
+                    descendant.pid()
                 ));
             }
         }
@@ -788,7 +649,7 @@ pub(super) fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) 
     // All discovery, handle acquisition, signalling, and waits share this one
     // deadline. A large/forking tree cannot multiply the timeout by phases or
     // by the number of processes it creates.
-    let deadline = CleanupDeadline::after(STARTUP_CONTAINMENT_TIMEOUT);
+    let deadline = Deadline::after(STARTUP_CONTAINMENT_TIMEOUT);
     let worker_pid = child.id();
     deadline.check("reading startup containment record")?;
     let record = read_record(record_path).context("read startup containment record")?;
@@ -804,19 +665,20 @@ pub(super) fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) 
     // Opening a worker pidfd and exercising pidfd_send_signal(2) with signal
     // zero proves both required syscalls and permissions before SIGSTOP can
     // make any member of the tree dependent on our recovery path.
-    let worker = open_startup_descendant(worker_pid, deadline)?.ok_or_else(|| {
+    let worker = PidHandle::open(worker_pid, Some(deadline))?.ok_or_else(|| {
         anyhow!("startup worker {worker_pid} exited before containment preflight")
     })?;
     signal_startup_descendant(&worker, 0, deadline)
         .context("preflight pidfd signalling support")?;
-    let worker_start_time = worker.start_time_ticks;
+    let worker_start_time = worker.start_time_ticks();
     let mut descendants = BTreeMap::new();
     let mut worker_stopped = false;
     let mut worker_destroyed = false;
 
     let cleanup = (|| -> Result<()> {
         deadline.check("stopping startup worker for containment inspection")?;
-        signal_startup_descendant_raw(&worker, libc::SIGSTOP)
+        worker
+            .signal(libc::SIGSTOP)
             .with_context(|| format!("stop startup worker {worker_pid}"))?;
         worker_stopped = true;
         deadline.check("stopping startup worker for containment inspection")?;
@@ -845,7 +707,7 @@ pub(super) fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) 
                 recorded_cgroup_identity.as_ref(),
                 libc::SIGKILL,
                 Duration::ZERO,
-                deadline.0,
+                deadline.instant(),
             )
             .context("empty recorded startup cgroup")?;
         }
@@ -876,7 +738,7 @@ pub(super) fn hard_cleanup_startup_child(child: &mut Child, record_path: &Path) 
                     return Err(error).with_context(|| format!("reap startup worker {worker_pid}"));
                 }
             }
-            deadline.sleep_poll("reaping startup worker after SIGKILL")?;
+            deadline.sleep_poll(STARTUP_REAP_POLL, "reaping startup worker after SIGKILL")?;
         }
     })();
 
@@ -902,25 +764,8 @@ mod startup_cleanup_tests {
     use crate::ExitInfo;
 
     #[test]
-    pub(super) fn pidfd_preflight_can_pin_and_probe_current_process() {
-        let deadline = CleanupDeadline::after(Duration::from_secs(1));
-        let handle = open_startup_descendant(std::process::id(), deadline)
-            .expect("open current-process pidfd")
-            .expect("current process is present");
-        signal_startup_descendant(&handle, 0, deadline).expect("probe pidfd_send_signal");
-    }
-
-    #[test]
-    pub(super) fn expired_cleanup_deadline_stops_work_before_procfs_io() {
-        let deadline = CleanupDeadline(Instant::now());
-        let error = direct_startup_children(std::process::id(), deadline)
-            .expect_err("expired scan must fail");
-        assert!(error.to_string().contains("timed out"));
-    }
-
-    #[test]
     pub(super) fn descriptor_budget_is_finite_and_preserves_headroom() {
-        let deadline = CleanupDeadline::after(Duration::from_secs(1));
+        let deadline = Deadline::after(Duration::from_secs(1));
         let capacity = safe_startup_descendant_capacity(deadline).expect("descriptor budget");
         assert!((1..=STARTUP_MAX_DESCENDANTS).contains(&capacity));
         assert!(capacity <= STARTUP_MAX_DESCENDANTS);
