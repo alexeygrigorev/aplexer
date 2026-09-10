@@ -47,15 +47,19 @@ pub(crate) const HISTORY_BANK_COUNT: u8 = 2;
 pub(crate) const HISTORY_COMMIT_COUNT: u8 = 2;
 const HISTORY_HASH_CHUNK_BYTES: usize = 64 * 1024;
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex, the one encoding every on-disk checksum and key uses.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
 }
 
 pub(crate) fn history_sidecar_path(path: &Path, kind: &str, slot: u8) -> PathBuf {
@@ -471,7 +475,7 @@ pub(crate) fn recover_history_candidate(
         }
         remaining -= read;
     }
-    if format!("{:x}", hasher.clone().finalize()) != commit.data_sha256 {
+    if hex_encode(&hasher.clone().finalize()) != commit.data_sha256 {
         bail!("history data checksum mismatch");
     }
     Ok(RecoveredHistory {
@@ -913,7 +917,7 @@ impl History {
             capacity: self.cap as u64,
             committed_len,
             stream_end: self.observed_end,
-            data_sha256: format!("{:x}", hasher.clone().finalize()),
+            data_sha256: hex_encode(&hasher.clone().finalize()),
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;
@@ -981,7 +985,7 @@ impl History {
             capacity: self.cap as u64,
             committed_len: snapshot.len() as u64,
             stream_end: self.observed_end,
-            data_sha256: format!("{:x}", hasher.clone().finalize()),
+            data_sha256: hex_encode(&hasher.clone().finalize()),
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;

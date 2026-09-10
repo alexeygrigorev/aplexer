@@ -7,6 +7,7 @@
 //! for session metadata (spec.md 14.1). No process owns this state; any
 //! process may read, append, or prune it.
 
+use crate::history::hex_encode;
 use crate::{
     atomic_write_bytes, atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock,
     Paths,
@@ -65,10 +66,7 @@ pub fn now_secs() -> u64 {
 /// two sessions in the same workspace can never straddle two mailboxes.
 pub fn workspace_key(canonical_workspace: &Path) -> String {
     let digest = Sha256::digest(canonical_workspace.as_os_str().as_bytes());
-    digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_encode(&digest[..16])
 }
 
 /// Key emitted before mailbox keys were specified as truncated SHA-256.
