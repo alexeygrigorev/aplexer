@@ -215,7 +215,7 @@ fn apply_session_switch(
     let _ = feed_and_write(
         &config.stdout,
         &config.workload_screen,
-        TERMINAL_RESET_SEQUENCE,
+        SWITCH_RESET_SEQUENCE,
         &switch.history,
         None,
     );

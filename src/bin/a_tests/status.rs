@@ -442,6 +442,33 @@ fn terminal_reset_disables_every_snapshot_input_mode_variant() {
     }
 }
 
+/// A switch resets the outgoing session's input modes but must leave the
+/// two host modes alone: `?1049l` is stripped by the alt-screen hold, but
+/// `?1007h` is not, and writing the full detach sequence between sessions
+/// re-enabled `alternateScroll` -- the wheel typing arrow keys into the
+/// agent -- for the rest of the attach whenever the client did not hold
+/// the mouse.
+#[test]
+fn switch_reset_keeps_the_hosts_own_modes() {
+    assert!(
+        TERMINAL_RESET_SEQUENCE.starts_with(ATTACH_ALT_SCREEN_EXIT),
+        "the switch sequence is derived as the detach sequence's tail"
+    );
+    let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let ctx = status_ctx_for_test(true);
+    let pipe = StdoutToPipe::new();
+    feed_and_write(&ctx.stdout, &ctx.screen, SWITCH_RESET_SEQUENCE, b"", None).unwrap();
+    let text = String::from_utf8_lossy(&pipe.take()).into_owned();
+    assert!(
+        !text.contains("\x1b[?1007h") && !text.contains("\x1b[?1049l"),
+        "a switch must not touch the host's alt-screen hold or alternateScroll: {text:?}"
+    );
+    assert!(
+        text.contains("\x1b[?1000l") && text.contains("\x1b[?2004l") && text.contains("\x1b[2J"),
+        "a switch must still reset the outgoing session's input modes and screen: {text:?}"
+    );
+}
+
 fn sample_groups() -> Vec<(PathBuf, Vec<SessionRecord>)> {
     let ws_a = "/ws/a";
     let ws_b = "/ws/b";

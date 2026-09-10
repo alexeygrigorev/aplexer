@@ -533,6 +533,10 @@ pub(crate) fn feed_and_write(
 /// the status bar) just sits in the user's terminal after attach() returns.
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
+///
+/// Leads with the client's own two host modes -- `ATTACH_ALT_SCREEN_EXIT`,
+/// the exact undo of `ATTACH_ALT_SCREEN_ENTER` -- which belong to the attach
+/// as a whole, not to any one session; `SWITCH_RESET_SEQUENCE` is the rest.
 pub(crate) const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[?1049l\
 \x1b[?1007h\
@@ -550,6 +554,24 @@ pub(crate) const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[2J\
 \x1b[H\
 \x1b[?25h";
+
+/// The detach-only head of `TERMINAL_RESET_SEQUENCE`: back to the primary
+/// screen, and `alternateScroll` back on for the user's next `less`.
+pub(crate) const ATTACH_ALT_SCREEN_EXIT: &[u8] = b"\x1b[?1049l\x1b[?1007h";
+
+/// What an in-process switch writes between session A's last byte and
+/// session B's replayed screen: every input mode and the screen reset, but
+/// **not** the host modes. The host stays on the alternate screen across a
+/// switch (`filter_host` would drop the `?1049l` anyway), and `?1007h` must
+/// not go out: `filter_host` passes it, so writing the full detach sequence
+/// here re-enabled `alternateScroll` for the rest of the attach whenever the
+/// client was not holding the mouse (`APLEXER_MOUSE=off`, a non-tty stdin)
+/// -- the wheel-types-into-the-agent bug `ATTACH_ALT_SCREEN_ENTER` exists
+/// to prevent. Derived from the one literal so the two cannot drift; the
+/// derivation is pinned by `switch_reset_keeps_the_hosts_own_modes`.
+pub(crate) const SWITCH_RESET_SEQUENCE: &[u8] = TERMINAL_RESET_SEQUENCE
+    .split_at(ATTACH_ALT_SCREEN_EXIT.len())
+    .1;
 
 /// Written once at attach start, before layout or the snapshot. Isolates the
 /// live session from the host's primary-screen scrollback (the `a` list), and
