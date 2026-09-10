@@ -385,12 +385,14 @@ pub(crate) fn read_history_marker(path: &Path) -> Result<Option<HistoryMarker>> 
     Ok(Some(marker))
 }
 
-pub(crate) fn publish_history_marker(path: &Path, commit: &HistoryCommit) -> Result<()> {
+/// Publishes the v2 presence marker for `commit`'s store unless one is
+/// already there. Returns true once the marker is known to be in place.
+pub(crate) fn publish_history_marker(path: &Path, commit: &HistoryCommit) -> Result<bool> {
     if let Some(marker) = read_history_marker(path)? {
         if marker.store_id != commit.store_id || marker.session_id != commit.session_id {
             bail!("history marker does not match the committed history store");
         }
-        return Ok(());
+        return Ok(true);
     }
     let marker = HistoryMarker {
         format_version: HISTORY_FORMAT_VERSION,
@@ -405,7 +407,8 @@ pub(crate) fn publish_history_marker(path: &Path, commit: &HistoryCommit) -> Res
     }
     let marker_path = history_marker_path(path);
     atomic_write_json(&marker_path, &marker)
-        .with_context(|| format!("publish history marker {}", marker_path.display()))
+        .with_context(|| format!("publish history marker {}", marker_path.display()))?;
+    Ok(true)
 }
 
 pub(crate) fn recover_history_candidate(
@@ -607,6 +610,10 @@ pub struct History {
     pub(crate) compatibility_len: u64,
     pub(crate) compatibility_known: bool,
     pub(crate) persisted: Option<RecoveredHistory>,
+    /// The v2 presence marker is written once per store and never changes,
+    /// so after this worker has seen or published it there is nothing to
+    /// re-read and re-validate on every 500 ms flush.
+    pub(crate) marker_published: bool,
     #[cfg(test)]
     pub(crate) data_bytes_written: u64,
     #[cfg(test)]
@@ -654,6 +661,7 @@ impl History {
             compatibility_len: if legacy_present { legacy_total_len } else { 0 },
             compatibility_known: !had_v2,
             persisted,
+            marker_published: marker_present,
             #[cfg(test)]
             data_bytes_written: 0,
             #[cfg(test)]
@@ -665,7 +673,7 @@ impl History {
                 .as_ref()
                 .expect("v2 recovery has a committed generation")
                 .commit;
-            publish_history_marker(&history.path, commit)?;
+            history.marker_published = publish_history_marker(&history.path, commit)?;
         }
         let needs_capacity_migration = history
             .persisted
@@ -843,6 +851,13 @@ impl History {
         }
     }
 
+    fn ensure_marker_published(&mut self, commit: &HistoryCommit) -> Result<()> {
+        if !self.marker_published {
+            self.marker_published = publish_history_marker(&self.path, commit)?;
+        }
+        Ok(())
+    }
+
     fn next_commit_generation(&self) -> Result<u64> {
         self.persisted
             .as_ref()
@@ -921,7 +936,7 @@ impl History {
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;
-        publish_history_marker(&self.path, &commit)?;
+        self.ensure_marker_published(&commit)?;
         #[cfg(test)]
         {
             self.data_bytes_written = self.data_bytes_written.saturating_add(pending.len() as u64);
@@ -989,7 +1004,7 @@ impl History {
             metadata_sha256: String::new(),
         };
         let commit = self.publish_commit(commit)?;
-        publish_history_marker(&self.path, &commit)?;
+        self.ensure_marker_published(&commit)?;
         #[cfg(test)]
         {
             self.data_bytes_written = self
