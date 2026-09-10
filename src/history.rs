@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::persist::read_bounded_json;
 use crate::{atomic_write_bytes, atomic_write_json, MAX_FRAME_BYTES};
 
 pub const DEFAULT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -334,23 +335,12 @@ pub(crate) fn read_history_commit(path: &Path, slot: u8) -> Result<Option<Histor
     let Some(file) = open_optional_history_file(&commit_path, "history commit", false)? else {
         return Ok(None);
     };
-    let length = file.metadata()?.len();
-    if length > HISTORY_COMMIT_MAX_BYTES as u64 {
-        bail!(
-            "history commit {} exceeds the {}-byte cap",
-            commit_path.display(),
-            HISTORY_COMMIT_MAX_BYTES
-        );
-    }
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.take(HISTORY_COMMIT_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read history commit {}", commit_path.display()))?;
-    if bytes.len() > HISTORY_COMMIT_MAX_BYTES {
-        bail!("history commit {} exceeds its cap", commit_path.display());
-    }
-    let commit: HistoryCommit = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse history commit {}", commit_path.display()))?;
+    let commit: HistoryCommit = read_bounded_json(
+        file,
+        &commit_path,
+        "history commit",
+        HISTORY_COMMIT_MAX_BYTES,
+    )?;
     commit
         .validate(path, slot)
         .with_context(|| format!("validate history commit {}", commit_path.display()))?;
@@ -362,23 +352,12 @@ pub(crate) fn read_history_marker(path: &Path) -> Result<Option<HistoryMarker>> 
     let Some(file) = open_optional_history_file(&marker_path, "history marker", false)? else {
         return Ok(None);
     };
-    let length = file.metadata()?.len();
-    if length > HISTORY_MARKER_MAX_BYTES as u64 {
-        bail!(
-            "history marker {} exceeds the {}-byte cap",
-            marker_path.display(),
-            HISTORY_MARKER_MAX_BYTES
-        );
-    }
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.take(HISTORY_MARKER_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read history marker {}", marker_path.display()))?;
-    if bytes.len() > HISTORY_MARKER_MAX_BYTES {
-        bail!("history marker {} exceeds its cap", marker_path.display());
-    }
-    let marker: HistoryMarker = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse history marker {}", marker_path.display()))?;
+    let marker: HistoryMarker = read_bounded_json(
+        file,
+        &marker_path,
+        "history marker",
+        HISTORY_MARKER_MAX_BYTES,
+    )?;
     marker
         .validate(path)
         .with_context(|| format!("validate history marker {}", marker_path.display()))?;

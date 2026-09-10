@@ -2,11 +2,12 @@
 //! temp-file-and-rename writes for JSON records and raw bytes, and advisory
 //! whole-file locks.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -105,6 +106,71 @@ fn write_atomically(parent: &Path, path: &Path, bytes: &[u8], mode: u32) -> Resu
         .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// Reads a small file the caller has already opened and vetted, refusing
+/// more than `cap` bytes both by size up front and by a recount after the
+/// read, so a regular file that grows after fstat is rejected rather than
+/// parsed from a truncated prefix.
+pub(crate) fn read_bounded(file: File, path: &Path, label: &str, cap: usize) -> Result<Vec<u8>> {
+    let length = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?
+        .len();
+    if length > cap as u64 {
+        bail!(
+            "{label} {} exceeds the {cap}-byte cap (got {length} bytes)",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {label} {}", path.display()))?;
+    if bytes.len() > cap {
+        bail!("{label} {} exceeds the {cap}-byte cap", path.display());
+    }
+    Ok(bytes)
+}
+
+/// `read_bounded`, parsed as JSON.
+pub(crate) fn read_bounded_json<T: DeserializeOwned>(
+    file: File,
+    path: &Path,
+    label: &str,
+    cap: usize,
+) -> Result<T> {
+    let bytes = read_bounded(file, path, label, cap)?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {label} {}", path.display()))
+}
+
+/// Opens `path` without following a final-component symlink or blocking
+/// on an accidental FIFO/device, then reads it whole under `cap`. `None`
+/// when absent, so callers with a documented empty state keep it; every
+/// other file type and any oversize fails closed.
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    label: &str,
+    cap: usize,
+) -> Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {label} {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{label} is not a regular file: {}", path.display());
+    }
+    Ok(Some(read_bounded(file, path, label, cap)?))
 }
 
 pub struct FileLock {

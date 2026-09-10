@@ -8,6 +8,7 @@
 //! process may read, append, or prune it.
 
 use crate::history::hex_encode;
+use crate::persist::{read_bounded_json, read_bounded_regular_file};
 use crate::{
     atomic_write_bytes, atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock,
     Paths,
@@ -20,7 +21,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -132,45 +133,6 @@ fn verify_workspace_metadata(workspace_dir: &Path, canonical_workspace: &Path) -
         );
     }
     Ok(())
-}
-
-/// Read small mailbox state without following symlinks or blocking on an
-/// accidental FIFO/device. Returning `None` for absence lets cursor callers
-/// retain their documented empty-state behavior while every other file type
-/// and oversize value fails closed.
-fn read_bounded_regular_file(path: &Path, label: &str, cap: usize) -> Result<Option<Vec<u8>>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("open {label} {}", path.display()))
-        }
-    };
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect {label} {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("{label} is not a regular file: {}", path.display());
-    }
-    if metadata.len() > cap as u64 {
-        bail!(
-            "{label} {} exceeds the {cap}-byte cap (got {} bytes)",
-            path.display(),
-            metadata.len()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read {label} {}", path.display()))?;
-    if bytes.len() > cap {
-        bail!("{label} {} exceeds the {cap}-byte cap", path.display());
-    }
-    Ok(Some(bytes))
 }
 
 fn initialize_workspace_dir(mp: &MessagePaths, canonical_workspace: &Path) -> Result<()> {
@@ -726,20 +688,8 @@ fn load_open_message_file(
     expected_workspace: &Path,
 ) -> Result<MessageEnvelope> {
     let expected_id = message_id_from_path(path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_ENVELOPE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read mailbox message {}", path.display()))?;
-    // Recheck after reading so a regular file that grows after fstat remains
-    // bounded and is rejected instead of being parsed from a truncated prefix.
-    if bytes.len() > MAX_ENVELOPE_BYTES {
-        bail!(
-            "mailbox message {} exceeds the {MAX_ENVELOPE_BYTES}-byte envelope cap",
-            path.display()
-        );
-    }
-    let envelope: MessageEnvelope = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse mailbox message {}", path.display()))?;
+    let envelope: MessageEnvelope =
+        read_bounded_json(file, path, "mailbox message", MAX_ENVELOPE_BYTES)?;
     if envelope.schema_version != MESSAGE_SCHEMA_VERSION {
         bail!(
             "unsupported mailbox message schema {} in {}",
