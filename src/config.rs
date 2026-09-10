@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::CString;
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -617,10 +618,16 @@ impl Config {
     /// with an "unset" state (default engine/profile) only override when
     /// set; maps extend so a user entry wins on key collision.
     fn merge_user_file(&mut self, paths: &Paths) -> Result<()> {
-        if !paths.config_file.exists() {
-            return Ok(());
-        }
-        let text = fs::read_to_string(&paths.config_file)?;
+        let text = match fs::read_to_string(&paths.config_file) {
+            Ok(text) => text,
+            // No file is the common case and means "defaults". Any other
+            // failure (EACCES, ENOTDIR, ...) is a file the user wrote and
+            // we could not honour; it must not silently become defaults.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", paths.config_file.display()))
+            }
+        };
         let user: Config = toml::from_str(&text)
             .with_context(|| format!("parse {}", paths.config_file.display()))?;
         if user.version != 1 {

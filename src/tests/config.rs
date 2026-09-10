@@ -101,6 +101,30 @@ impl Drop for DelegatedCgroup {
     }
 }
 
+/// A config file that exists but cannot be read is an error, never the
+/// built-in defaults. The old `exists()` gate was false on EACCES too, so
+/// an unreadable file loaded silently as "no config". ENOTDIR (a regular
+/// file where the parent directory should be) is the same failure class,
+/// reproducible without root.
+#[test]
+fn unreadable_config_file_is_an_error_not_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let blocker = root.path().join("not-a-dir");
+    fs::write(&blocker, "").unwrap();
+    let mut paths = Paths {
+        runtime_root: root.path().join("runtime"),
+        state_root: root.path().join("state"),
+        config_file: blocker.join("config.toml"),
+    };
+    let message = format!("{:#}", Config::load(&paths).unwrap_err());
+    assert!(message.contains("read"), "{message}");
+    assert!(message.contains("config.toml"), "{message}");
+
+    // A genuinely absent file still means defaults.
+    paths.config_file = root.path().join("missing.toml");
+    assert!(Config::load(&paths).is_ok());
+}
+
 #[test]
 fn config_rejects_oversized_profile_history() {
     let root = tempfile::tempdir().unwrap();
