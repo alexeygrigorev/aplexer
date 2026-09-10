@@ -346,21 +346,6 @@ pub(crate) fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     // still landed mid-CSI) -- it writes another chunk in between, and the
     // "safe" answer the status thread got is stale by the time its bytes go
     // out. See `write_locked` for the lock order this relies on.
-    // Cheap pre-gate, before anything is rendered. The main frame loop calls
-    // this after *every* PTY chunk while a redraw is pending; the
-    // authoritative check is the one inside `status_bar_redraw_locked`,
-    // which runs under the stdout lock, and this one only avoids the render
-    // when the answer is already known to be "not here".
-    {
-        let (at_boundary, in_sync) = {
-            let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-            (screen.at_escape_boundary(), screen.in_synchronized_update())
-        };
-        if !at_boundary || sync_defer(ctx, in_sync) {
-            ctx.pending.store(true, Ordering::Relaxed);
-            return false;
-        }
-    }
     let Some((geom, text)) = status_bar_render(ctx) else {
         return false;
     };
@@ -398,16 +383,6 @@ pub(crate) fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
 /// emitted CSI. Deferring sets `pending_refresh`, which the main frame loop
 /// flushes at the next safe chunk.
 pub(crate) fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
-    {
-        let (at_boundary, in_sync) = {
-            let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-            (screen.at_escape_boundary(), screen.in_synchronized_update())
-        };
-        if !at_boundary || sync_defer(ctx, in_sync) {
-            ctx.pending_refresh.store(true, Ordering::Relaxed);
-            return false;
-        }
-    }
     let mut out = ctx
         .stdout
         .lock()
@@ -428,26 +403,19 @@ pub(crate) fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
 /// Snapshot plus a forced status-bar sequence, or `None` when the stream is
 /// not at a safe boundary (in which case `pending_refresh` is set).
 pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
-    let (at_boundary, in_sync, snapshot) = {
-        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        (
-            screen.at_escape_boundary(),
-            screen.in_synchronized_update(),
-            screen.snapshot(),
-        )
-    };
-    if !at_boundary || sync_defer(ctx, in_sync) {
-        ctx.pending_refresh.store(true, Ordering::Relaxed);
+    if defer_unless_safe(ctx, &ctx.pending_refresh) {
         return None;
     }
     ctx.pending_refresh.store(false, Ordering::Relaxed);
-    let snapshot = {
+    let mut seq = {
         let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = screen.snapshot();
         screen.filter_host(&snapshot).unwrap_or(snapshot)
     };
-    let mut seq = snapshot;
     if let Some((geom, text)) = status_bar_render(ctx) {
-        if let Some(bar) = status_bar_redraw_locked(ctx, geom, &text, true) {
+        // Gated once, above, for the whole sequence: the bar rides on the
+        // snapshot's boundary.
+        if let Some(bar) = status_bar_changed_sequence(ctx, geom, &text, true) {
             seq.extend_from_slice(&bar);
         }
     }
@@ -491,32 +459,57 @@ pub(crate) fn status_bar_redraw_locked(
     text: &str,
     force: bool,
 ) -> Option<Vec<u8>> {
-    // -- Boundary gate, before anything is rendered or written --------------
-    //
-    // The client is a raw byte relay, so a PTY read boundary lands at an
-    // arbitrary offset in the workload's output: "between two chunks" is not
-    // "between two escape sequences". Writing anywhere else splices our
-    // `\x1b...` into the middle of the workload's half-emitted sequence (or
-    // its half-emitted UTF-8 character); the host terminal abandons the
-    // partial sequence and prints its remaining parameter bytes as literal
-    // text into the workload's own frame. That is the reported corruption,
-    // and it is not fixable by re-timing -- only by asking the stream.
-    //
-    // Deferring is never dropping: `ctx.pending` is flushed by the main frame
-    // loop at the first safe boundary, which is at most one PTY chunk away.
-    let (at_boundary, in_sync, restore, workload_margins) = {
-        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
-        (
-            screen.at_escape_boundary(),
-            screen.in_synchronized_update(),
-            screen.cursor_restore(),
-            screen.margins(),
-        )
-    };
-    if !at_boundary || sync_defer(ctx, in_sync) {
-        ctx.pending.store(true, Ordering::Relaxed);
+    if defer_unless_safe(ctx, &ctx.pending) {
         return None;
     }
+    status_bar_changed_sequence(ctx, geom, text, force)
+}
+
+/// The escape-boundary gate for a client injection into the live stream,
+/// as every gated writer asks it: `true` means the bytes must wait, and the
+/// caller's parking flag has been raised so the frame loop retries at the
+/// next chunk.
+///
+/// The client is a raw byte relay, so a PTY read boundary lands at an
+/// arbitrary offset in the workload's output: "between two chunks" is not
+/// "between two escape sequences". Writing anywhere else splices our
+/// `\x1b...` into the middle of the workload's half-emitted sequence (or
+/// its half-emitted UTF-8 character); the host terminal abandons the
+/// partial sequence and prints its remaining parameter bytes as literal
+/// text into the workload's own frame. That is the reported corruption,
+/// and it is not fixable by re-timing -- only by asking the stream.
+///
+/// Deferring is never dropping: `parked` is flushed by the main frame loop
+/// at the first safe boundary, which is at most one PTY chunk away. The
+/// answer is only worth having under the stdout lock (`write_locked`), so
+/// each writer asks once, there; a pre-check outside the lock is a second
+/// read of a value the relay may change before the write.
+pub(crate) fn defer_unless_safe(ctx: &StatusBarCtx, parked: &AtomicBool) -> bool {
+    let (at_boundary, in_sync) = {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        (screen.at_escape_boundary(), screen.in_synchronized_update())
+    };
+    if !at_boundary || sync_defer(ctx, in_sync) {
+        parked.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// The bar's bytes when its text or geometry changed since the last write
+/// (or unconditionally with `force`), recorded as drawn; `None` when the
+/// dirty check skipped it. Not gated: the caller has already asked
+/// `defer_unless_safe` under the stdout lock.
+pub(crate) fn status_bar_changed_sequence(
+    ctx: &StatusBarCtx,
+    geom: TermGeom,
+    text: &str,
+    force: bool,
+) -> Option<Vec<u8>> {
+    let (restore, workload_margins) = {
+        let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+        (screen.cursor_restore(), screen.margins())
+    };
     {
         let mut last = ctx
             .last_drawn
