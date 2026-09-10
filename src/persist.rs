@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,21 +57,52 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    let parent = parent_dir(path)?;
     ensure_private_dir(parent)?;
+    write_atomically(parent, path, bytes, 0o600)
+}
+
+/// `atomic_write_bytes` with an explicit file mode, for files outside
+/// aplexer's private state tree (engine configs in the user's home). The
+/// parent directory must already exist and is left exactly as found: this
+/// never forces it private.
+pub fn atomic_write_bytes_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    write_atomically(parent_dir(path)?, path, bytes, mode)
+}
+
+fn parent_dir(path: &Path) -> Result<&Path> {
+    path.parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))
+}
+
+fn write_atomically(parent: &Path, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".history.{}.{}.tmp", std::process::id(), seq));
+    let temp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .unwrap_or(OsStr::new("bytes"))
+            .to_string_lossy(),
+        std::process::id(),
+        seq
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&temp)?;
+        .open(&temp)
+        .with_context(|| format!("create {}", temp.display()))?;
     let _temp_guard = AtomicTempGuard(temp.clone());
+    // Created private, then widened while still empty: fchmod is not
+    // subject to the umask, so the requested mode lands exactly, and no
+    // content is ever visible at a wider mode than it will end up with.
+    if mode != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {}", temp.display()))?;
+    }
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&temp, path)?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
     File::open(parent)?.sync_all()?;
     Ok(())
 }

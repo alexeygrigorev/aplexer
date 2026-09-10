@@ -68,11 +68,13 @@
 //! reports `active` while the agent produces output, so the resume boundary
 //! needs no hook of its own.
 
+use crate::persist::atomic_write_bytes_with_mode;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Engines `a init` manages. `zcodex` is intentionally absent: it is a
@@ -595,32 +597,42 @@ fn read_json_or_default(path: &Path) -> Result<Value> {
         .with_context(|| format!("parse {} (left untouched)", path.display()))
 }
 
+/// Where a write to `path` must land: the file itself, or -- when `path`
+/// is a symlink, as a dotfiles-managed `settings.json` is -- its target,
+/// so the atomic rename replaces the real file and leaves the link intact.
+/// A dangling link resolves to the file it points at, which the write then
+/// creates.
+fn write_target(path: &Path) -> Result<PathBuf> {
+    let is_symlink = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_symlink {
+        return Ok(path.to_path_buf());
+    }
+    if let Ok(real) = fs::canonicalize(path) {
+        return Ok(real);
+    }
+    let link = fs::read_link(path).with_context(|| format!("read link {}", path.display()))?;
+    Ok(if link.is_absolute() {
+        link
+    } else {
+        path.parent().unwrap_or(Path::new("")).join(link)
+    })
+}
+
 /// Atomically write text, preserving the existing file's mode and using
 /// 0600 for new files. Unlike the session-record writer this must NOT
 /// force private dirs: engine configs live in the user's normal (often
 /// 0755) home tree.
 fn atomic_write_text_preserving_mode(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    let target = write_target(path)?;
+    if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create directory {}", parent.display()))?;
     }
-    let mode = match fs::metadata(path) {
-        Ok(meta) => {
-            use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o777
-        }
-        Err(_) => 0o600,
-    };
-    let temp = path.with_extension(format!("aplexer-tmp-{}", std::process::id()));
-    fs::write(&temp, text).with_context(|| format!("write {}", temp.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod {}", temp.display()))?;
-    }
-    fs::rename(&temp, path)
-        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
-    Ok(())
+    let mode = fs::metadata(&target)
+        .map(|meta| meta.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    atomic_write_bytes_with_mode(&target, text.as_bytes(), mode)
+        .with_context(|| format!("write {}", target.display()))
 }
 
 /// Write only when the content differs (idempotence without mtime churn).
@@ -1494,5 +1506,51 @@ mod tests {
         assert!(statuses.iter().all(|s| s.installed));
         let others = check(&targets, Some("claude"));
         assert!(others.iter().all(|s| !s.installed));
+    }
+
+    #[test]
+    fn install_writes_through_a_symlinked_settings_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".gemini")).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("claude-settings.json");
+        fs::write(&real, "{\"permissions\": {}}\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = home.join(".claude").join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A dotfiles link whose target does not exist yet.
+        let dangling_target = dotfiles.join("gemini").join("settings.json");
+        let dangling = home.join(".gemini").join("settings.json");
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+
+        let targets = resolve_targets(&home, None, None, &[]);
+        let statuses = install(&targets, A_BIN, None);
+        assert!(statuses.iter().all(|s| s.installed), "{statuses:?}");
+
+        for path in [&link, &dangling] {
+            assert!(
+                fs::symlink_metadata(path).unwrap().file_type().is_symlink(),
+                "{} is no longer a symlink",
+                path.display()
+            );
+        }
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&real).unwrap()).unwrap();
+        assert!(missing_nested_hooks(&doc, &CLAUDE_EVENTS).is_empty());
+        assert_eq!(doc["permissions"], json!({}));
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "mode of the real file was not preserved"
+        );
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&dangling_target).unwrap()).unwrap();
+        assert!(missing_nested_hooks(&doc, &GEMINI_EVENTS).is_empty());
+        assert_eq!(
+            fs::metadata(&dangling_target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
