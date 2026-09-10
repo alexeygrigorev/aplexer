@@ -1297,6 +1297,41 @@ pub struct ClientScreen {
     host_alt: Option<HostAltHold>,
 }
 
+/// A chunk on its way to the host, with the client's own bytes spliced in at
+/// chosen offsets. Nothing is copied until the first splice, so a chunk that
+/// needs none costs no allocation and `finish` reports it as unchanged.
+struct Rewrite<'a> {
+    data: &'a [u8],
+    out: Option<Vec<u8>>,
+    /// How much of `data` has already been copied into `out`.
+    copied: usize,
+}
+
+impl<'a> Rewrite<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            out: None,
+            copied: 0,
+        }
+    }
+
+    /// Copy `data` up to `upto`, then `extra`.
+    fn splice(&mut self, upto: usize, extra: &[u8]) {
+        let buf = self.out.get_or_insert_with(Vec::new);
+        buf.extend_from_slice(&self.data[self.copied..upto]);
+        buf.extend_from_slice(extra);
+        self.copied = upto;
+    }
+
+    /// The rewritten chunk, or `None` when nothing was spliced in.
+    fn finish(self) -> Option<Vec<u8>> {
+        let mut buf = self.out?;
+        buf.extend_from_slice(&self.data[self.copied..]);
+        Some(buf)
+    }
+}
+
 impl ClientScreen {
     pub fn try_new(rows: u16, cols: u16) -> Result<Self> {
         Self::try_new_with_scrollback(rows, cols, 0)
@@ -1573,9 +1608,7 @@ impl ClientScreen {
             return None;
         }
 
-        let mut out: Option<Vec<u8>> = None;
-        // How much of `data` has already been copied into `out`.
-        let mut copied = 0usize;
+        let mut rewrite = Rewrite::new(data);
         let mut i = 0usize;
         // Set once the host has been repositioned ahead of a character that
         // is about to wrap, so the guard cannot fire again on that
@@ -1584,88 +1617,58 @@ impl ClientScreen {
 
         while i < data.len() {
             if !wrap_guarded && self.wrap_would_walk(data[i]) {
-                let row = self.screen.cursor_position().0;
                 // The model will wrap this character to column 1 of the row
                 // it is already on (it is outside the sub-range, so it clamps
                 // instead of scrolling); the host, one row taller, would wrap
                 // it onto the reserved row. Cancel the host's pending wrap by
                 // putting it where the model is about to be.
-                Self::splice(
-                    &mut out,
-                    data,
-                    &mut copied,
-                    i,
-                    format!("\x1b[{};1H", row + 1).as_bytes(),
-                );
+                let row = self.screen.cursor_position().0;
+                rewrite.splice(i, format!("\x1b[{};1H", row + 1).as_bytes());
                 wrap_guarded = true;
             }
 
-            let run = self.run_len(data, i);
-            let end = i + run;
-            let line_feed = run == 1 && matches!(data[i], b'\n' | 0x0b | 0x0c);
-            let sequence = data[i] == 0x1b || !self.screen.at_escape_boundary();
-            let final_byte = data[end - 1];
+            let end = i + self.run_len(data, i);
+            let run = &data[i..end];
+            let line_feed = run.len() == 1 && matches!(run[0], b'\n' | 0x0b | 0x0c);
+            let sequence = run[0] == 0x1b || !self.screen.at_escape_boundary();
+            let final_byte = run[run.len() - 1];
             let exposed = self.exposed();
             let before_row = self.screen.cursor_position().0;
-            let change = self.screen.process(&data[i..end]);
+            let change = self.screen.process(run);
             i = end;
 
             let last_row = self.last_row();
-            let (row, col) = self.screen.cursor_position();
+            let row = self.screen.cursor_position().0;
             let at_boundary = self.screen.at_escape_boundary();
 
             // Mechanisms 1 and 4: the model clamped on its last row where the
             // host, one row taller, walked onto the reserved row.
-            let walked = exposed
-                && before_row == last_row
-                && row == last_row
-                && (line_feed
-                    || (sequence && at_boundary && matches!(final_byte, b'B' | b'E' | b'e')));
-            if walked {
-                // Neither a line feed nor a downward cursor move leaves a
-                // pending-wrap state, so a plain `CUP` is an exact restore.
-                let col = col.min(self.screen.cols().saturating_sub(1));
-                Self::splice(
-                    &mut out,
-                    data,
-                    &mut copied,
-                    i,
-                    format!("\x1b[{};{}H", row + 1, col + 1).as_bytes(),
-                );
+            let moved_down =
+                line_feed || (sequence && at_boundary && matches!(final_byte, b'B' | b'E' | b'e'));
+            if exposed && before_row == last_row && row == last_row && moved_down {
+                rewrite.splice(i, &self.clamp_repair());
             }
 
             if wrap_guarded && at_boundary {
-                if row == last_row && col >= self.screen.cols() {
+                if self.pending_wrap_on_last_row() {
                     // The character attached to the preceding cell -- a
                     // zero-width combining mark -- instead of wrapping, so the
                     // model is still in pending wrap and the host is not. Put
                     // the host's pending wrap back; a `CUP` cannot express it,
                     // `cursor_state_formatted` (inside `cursor_restore`) can.
-                    let restore = self.screen.cursor_restore();
-                    Self::splice(&mut out, data, &mut copied, i, &restore);
+                    rewrite.splice(i, &self.screen.cursor_restore());
                 }
                 wrap_guarded = false;
             }
 
             // Mechanism 3: close the reservation window in the stream itself.
-            if at_boundary
-                && matches!(change, Some(c) if c.margins_reset)
-                && self.screen.margins().is_none()
-                && self.screen.rows() >= 2
-            {
-                let mut seq = format!("\x1b[1;{}r", self.screen.rows()).into_bytes();
-                // DECSTBM homes the cursor on a real terminal, so the
-                // reposition is not optional. Absolute, from the model, and
-                // never through the shared DECSC register.
-                seq.extend_from_slice(&self.screen.cursor_restore());
-                Self::splice(&mut out, data, &mut copied, i, &seq);
+            if at_boundary && matches!(change, Some(c) if c.margins_reset) {
+                if let Some(seq) = self.reservation_reassert() {
+                    rewrite.splice(i, &seq);
+                }
             }
         }
-
-        if let Some(buf) = out.as_mut() {
-            buf.extend_from_slice(&data[copied..]);
-        }
-        out
+        rewrite.finish()
     }
 
     /// The model's own last row index -- the row the host terminal has one
@@ -1682,16 +1685,46 @@ impl ClientScreen {
         matches!(self.screen.margins(), Some((_, bottom)) if bottom <= self.last_row())
     }
 
-    /// True when `byte` is the start of a character that the model is about
-    /// to wrap off the far end of its last row while that row is outside the
-    /// scroll region -- `vt100` reports the pending-wrap state as a cursor
-    /// column equal to the screen width.
-    fn wrap_would_walk(&self, byte: u8) -> bool {
-        if byte < 0x20 || byte == 0x7f || !self.screen.at_escape_boundary() || !self.exposed() {
-            return false;
-        }
+    /// True while the model's cursor sits past the far end of its last row
+    /// -- `vt100` reports the pending-wrap state as a cursor column equal to
+    /// the screen width.
+    fn pending_wrap_on_last_row(&self) -> bool {
         let (row, col) = self.screen.cursor_position();
         row == self.last_row() && col >= self.screen.cols()
+    }
+
+    /// True when `byte` is the start of a character that the model is about
+    /// to wrap off the far end of its last row while that row is outside the
+    /// scroll region.
+    fn wrap_would_walk(&self, byte: u8) -> bool {
+        byte >= 0x20
+            && byte != 0x7f
+            && self.screen.at_escape_boundary()
+            && self.exposed()
+            && self.pending_wrap_on_last_row()
+    }
+
+    /// The repair for a downward move the model clamped: put the host back
+    /// on the model's cursor. Neither a line feed nor a downward cursor move
+    /// leaves a pending-wrap state, so a plain `CUP` is an exact restore.
+    fn clamp_repair(&self) -> Vec<u8> {
+        let (row, col) = self.screen.cursor_position();
+        let col = col.min(self.screen.cols().saturating_sub(1));
+        format!("\x1b[{};{}H", row + 1, col + 1).into_bytes()
+    }
+
+    /// The client's own `1;{rows}` reservation plus an absolute cursor
+    /// restore (DECSTBM homes the cursor on a real terminal, so the
+    /// reposition is not optional -- and never through the shared DECSC
+    /// register), when the workload is on full-screen margins and the
+    /// reservation is expressible at all.
+    fn reservation_reassert(&self) -> Option<Vec<u8>> {
+        if self.screen.margins().is_some() || self.screen.rows() < 2 {
+            return None;
+        }
+        let mut seq = format!("\x1b[1;{}r", self.screen.rows()).into_bytes();
+        seq.extend_from_slice(&self.screen.cursor_restore());
+        Some(seq)
     }
 
     /// How many bytes of `data[i..]` can be handed to the model in one
@@ -1737,21 +1770,6 @@ impl ClientScreen {
             n += 1;
         }
         n.max(1)
-    }
-
-    /// Copy `data[copied..upto]` into the rewrite buffer, then `extra`, and
-    /// remember how far the copy got.
-    fn splice(
-        out: &mut Option<Vec<u8>>,
-        data: &[u8],
-        copied: &mut usize,
-        upto: usize,
-        extra: &[u8],
-    ) {
-        let buf = out.get_or_insert_with(Vec::new);
-        buf.extend_from_slice(&data[*copied..upto]);
-        buf.extend_from_slice(extra);
-        *copied = upto;
     }
 
     /// Re-fit both the model and the tracked margins to a new workload
