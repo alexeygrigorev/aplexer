@@ -669,9 +669,9 @@ residue meanwhile.
 > (src/screen.rs) and
 > `workload_line_feed_no_longer_reaches_the_reserved_row_under_a_sub_range`
 > (src/bin/a.rs), which replaced the characterization test named below. The
-> residual case is a *wrap* off the last column of that same row, which is
-> not rewritten but now self-heals, because every status redraw restores the
-> cursor absolutely from the model.
+> *wrap* off the last column of that same row was first recorded as residue
+> that self-heals because every status redraw restores the cursor
+> absolutely; it did not heal fast enough (§7.2), and is rewritten too.
 
 Originally recorded as open, deliberately not fixed in v1. DECSTBM constrains scrolling *inside*
 the region, not cursor motion outside it, so while the client is
@@ -696,6 +696,135 @@ cannot both be expressed as one DECSTBM. Closing it means the client
 emulating the workload's stream well enough to clamp cursor motion — the
 same full client-side composition §10.2's v2 needs for the ED2 residue
 above, and the same place that fix belongs.
+
+### 7.2 The client's own model: `ClientScreen`
+
+The worker has had a live `vt100` model since this design shipped, but only
+the worker had one: the client stayed a blind relay that hand-injected
+`\x1b7 ... \x1b8` brackets into someone else's byte stream and hoped.
+`ClientScreen` (src/screen.rs) gives the client the same model, fed the
+very bytes it relays, sized to the workload's geometry (the physical
+terminal minus the reserved row) so its coordinates are the host's for
+every row the workload can reach — and, unlike the worker's model (§5.2),
+with retained scrollback, which is what `Ctrl-b [` pages through. A single
+scanner (`StreamBoundary`, following `vte`'s transitions) walks each chunk
+once for the margin tracker, the injection-boundary check and the relay
+rewrite below.
+
+**Relay rewrites** (`ClientScreen::relay`). One class of bug: the host's
+cursor ending up on a *different row* from the workload's own model, after
+which every column-addressed partial repaint — Ink paints words at absolute
+columns, `\x1b[2GQuick\x1b[8Gsafety\x1b[15Gcheck:` — welds onto whatever the
+wrong row already held (the reported "two frames interleaved on one row").
+Four mechanisms, each measured against a real `vt100::Parser` at the host's
+geometry (one row taller than the model):
+
+1. A line feed on the model's last row while a workload sub-range excludes
+   that row (§7.1): the host's bottom row is the *screen* bottom rather than
+   a margin boundary, so the host walks onto the reserved row while the
+   model clamps. Repaired with an absolute reposition spliced in right
+   after it.
+2. A wrap off the last column of that same row. §7.1 first recorded this
+   as residue that self-heals because every status redraw restores the
+   cursor absolutely; it does not heal fast enough — up to 450 ms idle,
+   3 s forced — and every Ink repaint in between lands a row low. The
+   reposition is spliced *before* the character that wraps, so the
+   character itself lands on the right row instead of on the bar. The guard
+   fires on the character's lead byte, before it can be known to be
+   zero-width; if it turns out to be a combining mark the model stays in
+   pending wrap and the host's wrap is put back with
+   `cursor_state_formatted` — across a chunk boundary too, since the lead
+   byte can be a PTY read's last byte.
+3. The workload resetting DECSTBM. Claude Code opens with `ESC 7`,
+   `ESC [ r`, `ESC 8`; the bare `ESC [ r` widens the *host's* region back
+   over the reserved row, and the client's own re-assert only comes back
+   around one socket round-trip later (the worker's `Layout` event). Inside
+   that window — which starts in the middle of the very chunk that reset it
+   — every line feed, wrap and downward move on the model's last row walks
+   the host onto the reserved row, and the host also fails to *scroll* where
+   the model does; a cursor repair after the fact cannot put back a scroll
+   that never happened. So the reservation is re-asserted *in the stream*,
+   immediately behind the sequence that reset it. This is §7's rule, not a
+   new one: it happens only while the workload is on full-screen margins,
+   which is exactly when the client's own reservation is the region to
+   assert.
+4. A relative cursor-down (`CSI B`/`E`/`e`, `ESC E`) on the exposed last
+   row: mechanism 1 by another sequence. Matched on the parsed shape, not
+   the final byte — `ESC ( B` (the charset designation every `tput sgr0`
+   ends with) is not a cursor-down — and the repair reproduces a pending
+   wrap where vt100 keeps one across CUD.
+
+With the client's own `1;{rows}` reservation in force — which mechanism 3
+guarantees whenever the workload is on full-screen margins — a line feed, a
+wrap, `CSI B`, `CSI E` and `CSI e` on the model's last row all leave host and
+model in agreement, because that row is the bottom of the host's region and
+both sides scroll identically. Pinned by
+`relay_client_reservation_never_walks_onto_the_reserved_row`.
+
+Cost: a chunk with no `ESC`, arriving between sequences while no sub-range
+excludes the last row, is one bulk `process` — the throughput case.
+Otherwise the chunk is walked in runs: a whole escape sequence per run, or
+printable text bounded by the columns left before the far end of the last
+row, so the model's cursor is current at every byte that could wrap off it.
+
+**History seeding** (`seed_history`, `without_scroll_regions`,
+`refresh_scrollback`). A freshly attached client's model is empty, so the
+worker's raw tail is replayed into it once, model-only, before the
+snapshot. The replay strips every DECSTBM first, and that is what makes
+`Ctrl-b [` show anything at all in an agent session: vt100 pushes a row
+into the retained scrollback only `if self.scrollback_len > 0 &&
+!self.scroll_region_active()` (`grid.rs::scroll_up`), so while a sub-range
+is in force rows scrolled out of it are dropped. Right for a live pane —
+tmux's behaviour too — but the seed replay's grid is thrown away by the
+reattach snapshot moments later and only its history survives, so a region
+has nothing to protect there. Measured against 4 MiB of real retained
+history from thirteen live agent sessions (codex, claude, opencode), replayed
+at 23x100 with a 2000-line grid — retained lines before and after the strip:
+
+```text
+  0 ->  225   0 ->  2000    53 ->  594   228 ->  570
+1004 -> 2000  1269 -> 2000   728 ->  751  1881 -> 2000
+```
+
+Three of those sessions produced a *completely* empty pager before it. The
+rows recovered are ordinary transcript text, spot-checked at several depths:
+an agent CLI reserves its sub-range for the composer at the bottom and
+scrolls the transcript through the region above, so the rows leaving that
+region are exactly the ones worth keeping.
+
+The seed only runs at attach, so a session attached *before* its output
+happened — `a new`, the default flow — accumulates its history through the
+live path, where vt100 correctly drops every row that scrolls out of a
+sub-range. The codex TUI holds a sub-range almost constantly (289 of them in
+a 100 KiB sample of one real session, the transcript scrolling through
+bottom-anchored ones like `CSI 10;29 r`), so its pager opened on
+`SCROLL 0/0` after minutes of visible output. `refresh_scrollback` re-runs
+the seed at pager entry — replace the tracker at the current geometry and
+depth, replay the region-stripped tail, feed the worker's `CaptureScreen`
+snapshot so the grid is the live screen again — gated by
+`MarginTracker::subregion_seen` (sticky: one sub-range anywhere in the
+model's lifetime means the live scrollback may be missing rows, even after
+the workload resets its margins) and by not being on the alternate screen
+(no scrollback there, in vt100 or any real terminal). Two deliberate,
+bounded, self-healing losses: bytes between the snapshot fetch and the
+tracker swap are missing until the workload's next repaint, and rows that
+scrolled by in that sliver are missing from the rebuilt history for good —
+a sub-millisecond window, against holding the model lock across two RPCs.
+
+**The spinner-hour wipe.** The tail is a byte budget out of a log, and
+bytes are not rows: an agent idling between turns spends the budget on a
+spinner — thousands of absolute cursor addresses, not one line feed — so
+the tail a pager entry happens to catch can replay to zero retained rows
+even though the log is far from empty. The first rebuild reset the tracker
+and adopted that anyway, so a session whose pager had pages of history one
+entry opened on `SCROLL 0/0` the next, depending on what the agent was
+doing when the user scrolled. tmux never shrinks a pane's history by
+re-deriving it, and neither does this: the rebuild is prepared in a
+scratch model and swapped in only when it retained at least as much as the
+live path currently shows — one extra model allocation, no extra replay.
+Pinned by
+`refresh_scrollback_never_trades_history_for_a_tail_that_replayed_to_less`
+and `refresh_scrollback_adopts_a_rebuild_that_retains_at_least_as_much`.
 
 ## 8. What happens to `History` / `a capture`
 

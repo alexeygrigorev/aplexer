@@ -116,13 +116,8 @@ pub struct MarginTracker {
     /// so a single pass over the bytes serves both.
     scanner: StreamBoundary,
     /// Current scroll region as *tracked*, 1-based inclusive `(top, bottom)`;
-    /// `None` means full-screen (the default, and the common case).
-    ///
-    /// Deliberately not the same thing as what should be *emitted*: a resize
-    /// can collapse this onto a single row (`top == bottom`), which the grid
-    /// beside it also does and which a later resize can grow back, but which
-    /// is not expressible as a DECSTBM. `margins()` is the emission-facing
-    /// view that filters that out; nothing outside this type reads the field.
+    /// `None` is full-screen. Can hold the one-row region a resize collapses
+    /// onto (`top == bottom`), which `margins()` filters out at emission.
     region: Option<(u16, u16)>,
     /// Whether a DECSTBM sub-range has been in force at any point since this
     /// tracker last became authoritative (construction, or the reset that
@@ -157,17 +152,10 @@ impl MarginTracker {
     /// sub-range, or `None` for "no sub-range -- leave the default, or the
     /// client's own status-bar reservation, in force".
     ///
-    /// Filtered, not raw. `set_rows` can leave the tracked region collapsed
-    /// onto a single row, matching what the `vt100` grid does (see its doc
-    /// comment for why keeping it matters), but a one-row region is not
-    /// expressible as a DECSTBM at all: `finish_csi` here and vt100's own
-    /// `set_scroll_region` both require `top < bottom`, so emitting
-    /// `\x1b[8;8r` would be ignored by the host terminal and leave whatever
-    /// region was previously in force -- worse than saying nothing. Both
-    /// emission sites (`ScreenTracker::snapshot` and `draw_status_bar` in
-    /// `src/bin/a.rs`) want "no sub-range" in that case, which is exactly what
-    /// `None` already means to them, so the filter lives here rather than
-    /// being repeated at each of them.
+    /// Filters out the one-row region `set_rows` can leave behind: it is not
+    /// expressible as a DECSTBM (`top < bottom` is required, here and in
+    /// vt100), so emitting it would be ignored by the host and leave a stale
+    /// region in force -- worse than saying nothing.
     pub fn margins(&self) -> Option<(u16, u16)> {
         self.region.filter(|&(top, bottom)| top < bottom)
     }
@@ -204,115 +192,43 @@ impl MarginTracker {
         self.subregion_seen = false;
     }
 
-    /// Re-fits the tracked region to a new row count, following
-    /// `vt100::Screen::set_size`'s rules for the grid's own scroll region --
-    /// exactly, with no exemptions (what `margins()` chooses to *report* for a
-    /// degenerate region is a separate, emission-time question; see below).
+    /// Re-fits the tracked region to a new row count exactly the way
+    /// `vt100::Screen::set_size` re-fits the grid's own scroll region
+    /// (0.16.2 `grid.rs::set_size`) -- because `snapshot()` pairs that grid's
+    /// `state_formatted()` with *these* margins and the two must agree --
+    /// and not the way a real terminal does (xterm resets margins on resize;
+    /// docs/terminal-state-design.md section 5.3 records why that was wrong
+    /// here). In order:
     ///
-    /// This deliberately does **not** follow design doc section 5.3's
-    /// "margins reset to full-screen on resize, matching xterm". That would
-    /// be right for a tracker modelling a *terminal*, but this one models
-    /// what the `vt100` grid beside it believes, because `snapshot()` pairs
-    /// the grid's `state_formatted()` with *these* margins.
+    /// 1. A bottom-anchored region (`bottom == old rows`) follows the screen
+    ///    in both directions: `(3,23)` at 23 rows becomes `(3,39)` at 39.
+    /// 2. Otherwise a bottom past the new end is clamped to it, top kept.
+    /// 3. A top no longer below the clamped bottom degenerates to the full
+    ///    screen.
     ///
-    /// vt100 0.16.2 (`grid.rs::set_size`, lines 66-99) applies three rules,
-    /// in this order, all translated here from its 0-based half-inclusive
-    /// storage to this tracker's 1-based inclusive `(top, bottom)`:
-    ///
-    /// 1. A **bottom-anchored** region -- one whose bottom edge sits on the
-    ///    old screen's last row -- follows the screen, in *both* directions
-    ///    (`if scroll_bottom == self.size.rows - 1 { scroll_bottom =
-    ///    size.rows - 1 }`). So `(3,23)` at 23 rows becomes `(3,39)` at 39
-    ///    rows: "two fixed header rows, everything below scrolls" keeps
-    ///    meaning that after the terminal is enlarged.
-    /// 2. A bottom past the new end is clamped to it, top preserved:
-    ///    `(5,23)` at 20 rows becomes `(5,20)`.
-    /// 3. A top that no longer fits below the clamped bottom degenerates to
-    ///    the full screen: `(21,23)` at 10 rows becomes full-screen (`None`).
-    ///
-    /// A region that still fits is left alone, which is the case every
-    /// attach hits -- and resetting instead made this tracker and the grid
-    /// disagree after every resize. Since *every* attach resizes the PTY by
-    /// one row to reserve the status-bar row, the practical effect was that
-    /// attaching to a workload with a scroll region silently dropped that
-    /// region from the snapshot, and the host then scrolled the wrong rows
-    /// for the rest of the session. See
-    /// `round_trip_preserves_scroll_region_across_resize`, and
-    /// `margin_tracker_resize_matches_real_vt100_set_size` for the
-    /// case-by-case differential against the real crate.
-    ///
-    /// **The degenerate one-row case.** When the clamps leave `top == bottom`
-    /// (only reachable as `top == bottom == rows`, e.g. `(5,15)` resized to 5
-    /// rows), vt100's grid keeps that single-row region -- and so does this
-    /// tracker. It is held as `Some((rows, rows))` and filtered out only at
-    /// emission time by `margins()`, which reports "no sub-range" because a
-    /// one-row region is not expressible as a DECSTBM.
-    ///
-    /// Keeping it is load-bearing rather than pedantic. A collapsed region is
-    /// always bottom-anchored -- `bottom == rows` by construction -- so rule 1
-    /// grows it again on the next enlargement, exactly as vt100 does:
-    /// `\x1b[8;9r` at 20 rows, shrunk to 8 rows and re-grown to 24, is
-    /// `(8,24)` in the grid, and now here too. Dropping it to full-screen
-    /// instead made the loss **sticky**: the tracker reported full-screen from
-    /// then on, at every later size, while the grid whose `state_formatted()`
-    /// `snapshot()` pairs these margins with held an ordinary region.
-    ///
-    /// An earlier version of this comment called that divergence
-    /// inconsequential *by construction*, on the grounds that a one-row region
-    /// "could not be re-emitted even if it were tracked". That reasoning was
-    /// wrong: it is about what can be emitted at that instant and says nothing
-    /// about what the region becomes after the next resize, which is when the
-    /// discarded state was needed. Measured over a two-step sweep, 4,823 of
-    /// 147,420 resize pairs ended up reporting a region that disagreed with
-    /// vt100 about a perfectly expressible sub-range. Both sweeps below now
-    /// pin the tracked region against the real crate with no exemption at all:
-    /// `margin_tracker_resize_divergence_from_vt100_is_only_the_degenerate_row`
-    /// (single step) and
-    /// `margin_tracker_tracked_region_matches_vt100_across_two_resizes`, plus
-    /// `margin_tracker_regrows_a_region_a_shrink_collapsed_onto_one_row` for
-    /// the reported-margins path end to end. The only remaining difference
-    /// anywhere is what `margins()` *reports* while the region is degenerate,
-    /// which is an emission decision, documented on `margins()`, and no longer
-    /// costs the tracker any state.
-    ///
-    /// Any in-flight partial CSI parse is deliberately preserved: a DECSTBM
-    /// split across two PTY reads with a resize landing in between is still
-    /// a DECSTBM, and dropping it would lose exactly the state this tracker
-    /// exists to keep.
+    /// A region that still fits is untouched. The clamps can leave a one-row
+    /// region (`top == bottom == rows`); it is kept, as the grid keeps it, so
+    /// a later enlargement grows it back through rule 1 -- `margins()` is
+    /// what declines to emit it. An in-flight partial sequence survives the
+    /// resize: a DECSTBM split across two PTY reads with a resize between
+    /// them is still a DECSTBM. Pinned against the real crate by the
+    /// `margin_tracker_resize_*` sweeps.
     pub fn set_rows(&mut self, rows: u16) {
         let rows = rows.max(1);
         let old_rows = self.rows;
         self.rows = rows;
-        self.region = match self.region {
-            Some((top, bottom)) => {
-                let bottom = if bottom == old_rows {
-                    // Rule 1: bottom-anchored, so it follows the screen (and
-                    // needs no further clamping -- it *is* the new bottom).
-                    rows
-                } else {
-                    // Rule 2.
-                    bottom.min(rows)
-                };
-                // Rule 3 (`top > bottom`, which after the clamps can only
-                // mean `bottom == rows`, i.e. the full screen), plus the same
-                // whole-screen normalization `finish_csi` applies -- both of
-                // which this tracker spells `None`.
-                //
-                // `top == bottom` is deliberately *not* in here: that is the
-                // degenerate single-row region, which vt100's grid keeps and
-                // this tracker keeps with it, so a later enlargement can grow
-                // it back (see the doc comment above). `margins()` is what
-                // declines to emit it.
-                if top > bottom || (top == 1 && bottom == rows) {
-                    None
-                } else {
-                    Some((top, bottom))
-                }
-            }
-            // Full-screen is bottom-anchored by definition, so rule 1 keeps
-            // it full-screen at the new size.
-            None => None,
-        };
+        self.region = self.region.and_then(|(top, bottom)| {
+            // Rule 1, else rule 2.
+            let bottom = if bottom == old_rows {
+                rows
+            } else {
+                bottom.min(rows)
+            };
+            // Rule 3 (`top > bottom` can only mean the full screen after the
+            // clamps) plus the whole-screen normalization `apply` uses.
+            // `top == bottom` is deliberately kept -- see the doc comment.
+            (top <= bottom && !(top == 1 && bottom == rows)).then_some((top, bottom))
+        });
     }
 
     /// Feed a chunk of raw PTY bytes. Returns the triggers this chunk
@@ -640,30 +556,24 @@ impl ScreenTracker {
         self.process(data);
     }
 
-    /// Resizes the parser's grid (content-preserving) and re-fits the margin
-    /// tracker to the new row count the same way the grid re-fits its own
-    /// scroll region -- it is *not* reset to full-screen, correcting design
-    /// doc section 5.3's original "margins reset on resize" plan. See
-    /// `MarginTracker::set_rows` for the exact rules and why the tracker has
-    /// to follow the grid rather than a real terminal here.
+    /// Resizes the grid (content-preserving) and re-fits the tracked margins
+    /// the way the grid re-fits its own scroll region
+    /// (`MarginTracker::set_rows`).
     ///
-    /// One place the tracker *does* have to follow a real terminal rather
-    /// than `vt100`: a shrink keeps the cursor's line on screen. A real
-    /// terminal (xterm, and tmux's vt100) scrolls the content up by exactly
-    /// the excess when the cursor sits below the new bottom row;
-    /// `vt100`'s `Grid::set_size` instead truncates rows from the bottom,
-    /// so the newest line falls off and the cursor clamps onto the row
-    /// above it -- where the workload's WINCH redraw (a shell repainting
-    /// its prompt) then overwrites what is left. Attaching to an idle shell
-    /// visibly lost its last output line this way, and every later snapshot
-    /// carried the loss. The compensation is a synthetic SU by the excess,
-    /// under two gates: no DECSTBM sub-range in force (a region holder owns
-    /// its own resize semantics, and `set_size` already follows a
-    /// bottom-anchored region), and the stream not mid-escape-sequence
-    /// (`boundary`), because an SU glued into a half-received sequence
-    /// corrupts the parse it was meant to protect. A skipped compensation
-    /// costs nothing permanent: SIGWINCH makes the workload repaint anyway,
-    /// and the next resize retries.
+    /// One departure from `vt100` toward a real terminal: on a shrink that
+    /// would push the cursor's row off the bottom, `Grid::set_size`
+    /// truncates rows from the bottom -- the newest line falls off and the
+    /// cursor clamps onto the row above, where the workload's WINCH repaint
+    /// then overwrites it (an idle shell visibly lost its last output line
+    /// on every attach, and every later snapshot carried the loss). xterm
+    /// scrolls the content up by the excess instead, so a synthetic
+    /// `CSI n S` does the same first -- gated on no DECSTBM sub-range being
+    /// in force (a region holder owns its own resize semantics) and on the
+    /// stream not being mid-sequence (an SU glued into a half-received
+    /// sequence corrupts the parse it was meant to protect). Applied to
+    /// whichever grid is active: it is about the cursor's line, not
+    /// scrollback, and a skipped or superfluous compensation costs nothing
+    /// permanent because SIGWINCH makes the workload repaint anyway.
     pub fn try_set_size(&mut self, rows: u16, cols: u16) -> Result<()> {
         let (rows, cols) = validate_size(rows, cols)?;
         if rows < self.rows() && self.margins.margins().is_none() && self.at_escape_boundary() {
@@ -1226,45 +1136,20 @@ fn mode_is_alt_screen(num: &[u8]) -> bool {
     matches!(n, 47 | 1047 | 1048 | 1049)
 }
 
-/// Strip every DECSTBM (`CSI <params> r`) out of a raw history tail before it
-/// is replayed into the client's model.
+/// Strip every DECSTBM (`CSI <digits and ;> r`) out of a raw history tail
+/// before it is replayed into the client's model -- what makes `Ctrl-b [`
+/// show anything at all in an agent session.
 ///
-/// **This is what makes `Ctrl-b [` show anything at all in an agent session.**
-///
-/// The mechanism, from `vt100` 0.16.2 `grid.rs::scroll_up`: a row is pushed
-/// into the retained scrollback only `if self.scrollback_len > 0 &&
-/// !self.scroll_region_active()`. While a DECSTBM sub-range is in force, rows
-/// scrolled out of the top of that region are **dropped**, not retained. That
-/// is the right behavior for a live pane -- it is tmux's too -- but the seed
-/// replay is not a live pane. It is a one-shot pass whose only product is the
-/// history; its final grid is thrown away moments later by the reattach
-/// snapshot, which repaints the screen from the worker's own model. So a
-/// region has nothing to protect here, and honoring one only discards the
-/// transcript the user is trying to scroll back to.
-///
-/// Measured against 4 MiB of real retained history from thirteen live agent
-/// sessions (codex, claude, opencode), replayed at 23x100 with a 2000-line
-/// grid -- retained lines, before and after this strip:
-///
-/// ```text
-///   0 ->  225   0 ->  2000    53 ->  594   228 ->  570
-/// 1004 -> 2000  1269 -> 2000   728 ->  751  1881 -> 2000
-/// ```
-///
-/// Three of those sessions produced a *completely* empty pager before it. The
-/// rows recovered are ordinary transcript text, spot-checked at several
-/// depths, not the region's static header and footer: an agent CLI reserves
-/// its sub-range for the composer at the bottom and scrolls the transcript
-/// through the region above, so the rows leaving that region are exactly the
-/// ones worth keeping.
-///
-/// Borrowed, not copied, when the tail holds no DECSTBM at all -- which is
-/// every plain shell session, and the case where the seed is already fine.
-///
-/// Only an unprefixed `CSI <digits and semicolons> r` is removed. `CSI ? Ps r`
-/// is XTRESTORE (restore private modes), a different sequence that must
-/// survive, so a parameter list containing anything but digits and `;`
-/// disqualifies the match.
+/// `vt100` retains a row scrolled off the top only while no scroll region
+/// is active (`grid.rs::scroll_up`), which is right for a live pane but not
+/// for the seed replay: its grid is thrown away by the reattach snapshot
+/// moments later and only its history survives, so a region has nothing to
+/// protect there and only discards the transcript
+/// (docs/terminal-state-design.md section 7.2 has the measurements).
+/// Borrowed, not copied, when the tail holds no DECSTBM -- every plain
+/// shell session, on the attach path. `CSI ? Ps r` (XTRESTORE) is a
+/// different sequence and survives: anything but digits and `;` in the
+/// parameters disqualifies the match.
 fn without_scroll_regions(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut out: Option<Vec<u8>> = None;
     let mut copied = 0usize;
@@ -1298,27 +1183,17 @@ fn without_scroll_regions(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
-/// The attached client's own copy of the workload's terminal, kept by feeding
-/// it the very bytes the client is relaying to the user's terminal.
-///
-/// The worker has had a live `vt100` model since docs/terminal-state-design.md
-/// shipped, but only the *worker* had one: the client stayed a blind relay
-/// that hand-injected `\x1b7 ... \x1b8` brackets into someone else's byte
-/// stream and hoped. This gives the client the same model, which is what the
-/// status bar needs to be able to
-///
-/// - inject only at a boundary where an injection is invisible
-///   (`at_safe_boundary`),
-/// - put the cursor and pen back absolutely rather than through the shared
-///   DECSC register (`ScreenTracker::cursor_restore`), and
-/// - keep the host's cursor on the row the workload believes it is on --
-///   line feeds, wraps and downward cursor moves off the workload's last row
-///   under a scroll-region sub-range, and the window a workload's own
-///   `\x1b[r` opens over the reserved row (`relay`).
-///
-/// Sized to the workload's geometry -- the physical terminal minus the
-/// reserved status row -- so its coordinates are the host's coordinates for
-/// every row the workload can reach.
+/// The attached client's own copy of the workload's terminal, kept by
+/// feeding it the very bytes the client relays to the user's terminal, so
+/// the status bar can inject only at a boundary where an injection is
+/// invisible (`at_escape_boundary`), put the cursor and pen back absolutely
+/// rather than through the shared DECSC register (`cursor_restore`), and
+/// keep the host's cursor on the row the workload believes it is on
+/// (`relay`). Sized to the workload's geometry -- the physical terminal
+/// minus the reserved status row -- so its coordinates are the host's for
+/// every row the workload can reach. Unlike the worker's model it retains
+/// scrollback, which is what `Ctrl-b [` pages through
+/// (docs/terminal-state-design.md section 7.2).
 pub struct ClientScreen {
     screen: ScreenTracker,
     /// When set, bytes written to the host have alt-screen DECSET/DECRST
@@ -1387,31 +1262,16 @@ impl ClientScreen {
     }
 
     /// Prime the scrollback grid from a tail of the worker's retained raw
-    /// history, before the first live byte and before the reattach snapshot.
-    ///
-    /// The model itself is the history (that is the whole tmux-shaped
-    /// design), but a *freshly attached* client's model is empty: it has
-    /// been parsing this session for zero seconds. Without this, "attach and
-    /// scroll up" -- the exact gesture being fixed -- would show nothing at
-    /// all until the workload produced a screenful under the new client.
-    /// Replaying the worker's byte log once, into the model only, is what
-    /// gives the grid a past to page through; from that point on the live
-    /// relay maintains it and nothing re-parses anything.
-    ///
-    /// Deliberately **not** written to the terminal, and deliberately not
-    /// allowed to leave state behind:
-    ///
-    /// - The tail can begin mid-escape-sequence (it is a byte-count slice of
-    ///   a log), so the scanner is reset afterwards (`reset_margins`) rather
-    ///   than left holding a half-sequence that was never the workload's.
-    /// - The epilogue leaves the primary grid selected, full-screen margins,
-    ///   and a default pen, and `MarginTracker` is reset to match, so a
-    ///   DECSTBM or `?1049h` that happened to be in force at the end of the
-    ///   tail cannot outlive the seed and contradict the snapshot that is
-    ///   fed next.
-    /// - The tail is replayed with its **scroll regions removed**
-    ///   (`without_scroll_regions`), which is what makes the replay produce
-    ///   history at all for an agent TUI. See that function.
+    /// history, before the first live byte and before the reattach
+    /// snapshot: a freshly attached client's model is empty, and without
+    /// this "attach and scroll up" would show nothing until the workload
+    /// produced a screenful. Model-only, and allowed to leave no state
+    /// behind: the tail is replayed with its scroll regions removed
+    /// (`without_scroll_regions`), the epilogue leaves the primary grid,
+    /// full-screen margins and a default pen, and the margins and scanner
+    /// are reset (`reset_margins`) so neither a DECSTBM or `?1049h` in force
+    /// at the end of the tail nor its mid-sequence ending can outlive the
+    /// seed and contradict the snapshot fed next.
     pub fn seed_history(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -1437,60 +1297,28 @@ impl ClientScreen {
 
     /// Rebuild the pager's history from a fresh tail of the worker's retained
     /// raw bytes, then re-feed the worker's current snapshot so the grid is
-    /// the live screen again.
+    /// the live screen again -- `seed_history` re-run on a live attach.
     ///
-    /// This is `seed_history` + snapshot re-run on a live attach, and it
-    /// exists because the seed's region-stripping only ran at attach. A
-    /// session attached *before* its interesting output happened -- `a new`,
-    /// the default flow: the client model has been parsing since the first
-    /// frame -- accumulated its history through the live path, where vt100
-    /// behaves correctly for a real pane and drops every row that scrolls out
-    /// of a DECSTBM sub-range. The codex TUI holds a sub-range almost
-    /// constantly (289 of them in a 100 KiB sample of one real session, the
-    /// transcript scrolling through bottom-anchored ones like `CSI 10;29 r`),
-    /// so its pager opened on `SCROLL 0/0` after minutes of visible output.
-    /// Re-running the seed at pager entry gives that attach the same past a
-    /// fresh attach already gets, which is the only consistency the pager
-    /// has ever promised (`scrollback_seed_bytes` in `src/bin/a.rs`).
+    /// Needed because the live path honors DECSTBM sub-ranges and `vt100`
+    /// drops every row that scrolls out of one, so a session attached
+    /// *before* its output happened (`a new`, the default) accumulates no
+    /// history under a region-holding TUI (docs/terminal-state-design.md
+    /// section 7.2). The caller gates on `subregion_seen` and
+    /// `!alternate_screen`; an empty tail is rejected here, next to the
+    /// invariant it protects, because a seed of zero bytes would replace
+    /// whatever the live path retained with nothing. Model-only: nothing
+    /// reaches the host. Bytes that arrive between the caller fetching the
+    /// snapshot and this swap are missing until the workload's next repaint,
+    /// and rows scrolled by in that sliver are missing from the history for
+    /// good -- bounded, and the price of not holding the model lock across
+    /// two RPCs.
     ///
-    /// Mechanics, in order: replace the inner tracker at the current geometry
-    /// and scrollback depth (`reset` -- also keeps the host alt-screen hold),
-    /// replay the region-stripped tail into the fresh grid's history
-    /// (`seed_history` -- its grid is as disposable as at attach), then feed
-    /// the worker's `CaptureScreen` snapshot -- the same paintable bytes the
-    /// attach handshake delivers -- so grid, margins, alt-screen state and
-    /// input modes describe the live screen again rather than the tail's.
-    /// Model-only throughout: nothing here reaches the host terminal.
-    ///
-    /// Two deliberate losses, both bounded and both self-healing for exactly
-    /// the workloads that reach this path: bytes that arrived between the
-    /// snapshot being fetched and the tracker swap are missing from the
-    /// rebuilt grid until the workload's next repaint (a TUI repaints within
-    /// a frame), and rows that scrolled by in that sliver are missing from
-    /// the rebuilt history for good. A sub-millisecond window over two
-    /// consecutive statements, against holding the model lock across both
-    /// RPCs -- this codebase does not hold locks across I/O.
-    ///
-    /// The gate is the caller's (`subregion_seen`, plus `alternate_screen`:
-    /// the alternate grid has no scrollback in vt100 or any real terminal, so
-    /// there is nothing to rebuild for a full-screen application). An empty
-    /// tail is rejected here rather than by the caller so the invariant is
-    /// visible next to the rebuild it protects: a seed of zero bytes would
-    /// replace whatever history the live path did retain with nothing.
-    ///
-    /// So is a tail that rebuilds to *less* history than the model already
-    /// holds. The tail is a byte-count slice of a log, and the bytes are not
-    /// rows: an agent idling between turns spends them on a spinner --
-    /// thousands of absolute cursor addresses, not one line feed -- so the
-    /// tail a pager entry happens to catch can replay to zero retained rows
-    /// even though the log is far from empty. Adopting that rebuild would
-    /// replace real transcript with nothing mid-conversation (`SCROLL 0/0`
-    /// one entry, pages of history the next, depending on what the agent was
-    /// doing when the user scrolled). tmux never shrinks a pane's history by
-    /// re-deriving it, and neither does this: the rebuild is prepared in a
-    /// scratch model and swapped in only when it retained at least as much
-    /// as the live path currently shows. Costs one extra model allocation,
-    /// no extra replay -- the parse was always the price of knowing.
+    /// A tail that rebuilds to *less* history than the model already holds
+    /// is refused too: the tail is a byte budget out of a log and bytes are
+    /// not rows -- an agent idling between turns spends them on a spinner --
+    /// so the rebuild is prepared in a scratch model and swapped in only
+    /// when it retained at least as much as the live path shows (section
+    /// 7.2; tmux never shrinks a pane's history by re-deriving it either).
     pub fn refresh_scrollback(&mut self, tail: &[u8], snapshot: &[u8]) {
         if tail.is_empty() {
             return;
@@ -1583,72 +1411,42 @@ impl ClientScreen {
     /// Feed a live PTY chunk and return the bytes the client should actually
     /// write, or `None` when the chunk goes out unchanged (the common case).
     ///
-    /// The rewrite exists for exactly one class of bug: the host terminal's
-    /// cursor ending up on a **different row** from the workload's own screen
-    /// model. Nothing re-aligns that on its own, and every later
-    /// column-addressed partial repaint -- Ink paints words at absolute
-    /// columns, `\x1b[2GQuick\x1b[8Gsafety\x1b[15Gcheck:` -- then welds onto
-    /// whatever the wrong row already held, which is the reported "two frames
-    /// interleaved on one row" garbling. Three mechanisms produce it, each
-    /// measured against a real `vt100::Parser` at the *host's* geometry (one
-    /// row taller than this model, because the client reserved the bottom row
-    /// for the status bar):
+    /// The rewrite exists for one class of bug: the host terminal's cursor
+    /// ending up on a **different row** from the workload's own model, after
+    /// which every column-addressed partial repaint (Ink paints words at
+    /// absolute columns) welds onto the wrong row. The host is one row
+    /// taller than this model -- the client reserved the bottom row for the
+    /// status bar -- and four things walk it onto that row where the model
+    /// clamps or scrolls (docs/terminal-state-design.md section 7.2, each
+    /// measured against a real `vt100::Parser` at the host's geometry):
     ///
-    /// 1. **A line feed off the model's last row while a sub-range is in
-    ///    force** -- docs/terminal-state-design.md section 7.1. While the
-    ///    client is re-asserting a workload's own DECSTBM sub-range, the
-    ///    host's bottom row is the *screen* bottom rather than a margin
-    ///    boundary, so a line feed on the workload's last row (which is
-    ///    outside that sub-range) walks the host cursor down onto the
-    ///    reserved row while this model, one row shorter, clamps and stays.
-    /// 2. **A wrap off the last column of that same row.** Section 7.1
-    ///    recorded this as residue that "self-heals because every status
-    ///    redraw restores the cursor absolutely". It does not heal fast
-    ///    enough -- up to 450 ms idle, 3 s forced -- and every Ink repaint in
-    ///    between lands a row low. Same divergence, same repair, except that
-    ///    the reposition is spliced *before* the character that wraps, so the
-    ///    character itself also lands on the right row instead of on the bar.
-    /// 3. **The workload resetting DECSTBM.** Claude Code opens with
-    ///    `ESC 7`, `ESC [ r`, `ESC 8`. That bare `ESC [ r` widens the
-    ///    *host's* scroll region back over the reserved row, and the client's
-    ///    own re-assert only comes back around one socket round-trip later
-    ///    (the worker's `Layout` event, `src/bin/a.rs`). Inside that window
-    ///    -- which starts in the middle of the very chunk that reset it --
-    ///    every line feed, wrap and downward cursor move on the model's last
-    ///    row walks the host onto the reserved row, and this time the host
-    ///    also fails to *scroll* where the model does. A cursor repair after
-    ///    the fact cannot put back a scroll that never happened, so the
-    ///    reservation is re-asserted *in the stream*, immediately after the
-    ///    sequence that reset it and before the workload's next byte can use
-    ///    it. Re-asserting `1;{rows}` here is the documented rule, not a new
-    ///    one: it happens only while the workload is on full-screen margins,
-    ///    which is precisely when section 7 says the client's own reservation
-    ///    is the region to assert.
+    /// 1. a line feed on the model's last row while a workload sub-range
+    ///    excludes that row (`exposed`) -- repaired with an absolute
+    ///    reposition spliced in right after it (`clamp_repair`);
+    /// 2. a wrap off the last column of that row -- the reposition is
+    ///    spliced *before* the wrapping character, so the character lands
+    ///    on the right row too (`wrap_would_walk`, `wrap_guarded`);
+    /// 3. the workload resetting DECSTBM (`ESC [ r`, RIS), which widens the
+    ///    host's region over the reserved row until the client's own
+    ///    re-assert comes back around a socket round-trip later, and inside
+    ///    that window the host also fails to *scroll* where the model does
+    ///    -- so the reservation is re-asserted in the stream, right behind
+    ///    the sequence that reset it (`reservation_reassert`);
+    /// 4. a relative cursor-down (`CSI B`/`E`/`e`, `ESC E`) on the exposed
+    ///    last row -- mechanism 1 by another sequence (`moves_down`).
     ///
-    /// A fourth, `CSI B` / `CSI E` / `CSI e` (and `ESC E`) off the last row
-    /// under a sub-range, is mechanism 1's clamp mismatch driven by a
-    /// cursor-motion sequence instead of a control, and is repaired the same
-    /// way.
+    /// With the client's own `1;{rows}` reservation in force -- which 3
+    /// guarantees whenever the workload is on full-screen margins -- none of
+    /// these can diverge, because the model's last row is the bottom of the
+    /// host's region and both sides scroll identically
+    /// (`relay_client_reservation_never_walks_onto_the_reserved_row`).
     ///
-    /// **What is not reachable**, measured rather than assumed: with the
-    /// client's own `1;{rows}` reservation in force -- which is what this
-    /// method now *guarantees* whenever the workload is on full-screen
-    /// margins -- a line feed, a wrap, `CSI B`, `CSI E` and `CSI e` on the
-    /// model's last row all leave the host and the model in agreement,
-    /// because that row is the bottom of the host's region and both sides
-    /// scroll identically. Pinned by
-    /// `relay_client_reservation_never_walks_onto_the_reserved_row`.
-    ///
-    /// Cost. A chunk with no `ESC` in it, arriving on a stream that is
-    /// between sequences while no sub-range excludes the last row, cannot
-    /// diverge at all and takes the same single bulk `process` call it always
-    /// did -- that is bulk program output, the throughput case. Otherwise the
-    /// chunk is walked in runs, never byte-by-byte for its own sake: a whole
-    /// escape sequence per run (`StreamBoundary::bytes_to_ground`), and
-    /// printable text in one run bounded by the number of columns still
-    /// between the cursor and the far end of the last row, which is what
-    /// makes the model's cursor guaranteed-current at every byte that could
-    /// wrap off that row.
+    /// Cost: a chunk with no `ESC`, arriving between sequences while the last
+    /// row is not exposed, is one bulk `process` -- the throughput case.
+    /// Otherwise the chunk is walked in runs (`run_len`): a whole escape
+    /// sequence per run, or printable text bounded by the columns left
+    /// before the far end of the last row, so the model's cursor is current
+    /// at every byte that could wrap off it.
     pub fn relay(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if self.screen.at_escape_boundary() && !self.exposed() && !data.contains(&0x1b) {
             // No `ESC` anywhere and a stream that is between sequences: this
