@@ -742,14 +742,15 @@ pub(crate) fn validate_recorded_cgroup(
             canonical.display()
         );
     }
-    if !fs::metadata(&canonical)?.is_dir() {
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("inspect recorded cgroup {}", canonical.display()))?;
+    if !metadata.is_dir() {
         bail!(
             "recorded cgroup is not a directory: {}",
             canonical.display()
         );
     }
     ensure_cgroup2_filesystem(&canonical)?;
-    let metadata = fs::metadata(&canonical)?;
     if metadata.dev() != current_identity.cgroup_root_device {
         bail!(
             "recorded cgroup {} is on a different cgroup-v2 mount",
