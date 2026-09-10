@@ -53,6 +53,31 @@ fn recorded_cgroup_cleanup_checks_deadline_before_locator_io() {
     assert!(error.to_string().contains("timed out validating"));
 }
 
+/// A member that ignores the graceful signal must be SIGKILLed once the
+/// grace period ends. The grace wait used to report its own expiry as
+/// "timed out waiting for recorded cgroup grace", so `a kill` with any
+/// non-zero grace failed on a stubborn member instead of escalating.
+/// `#[ignore]`d like every test that needs a real delegated cgroup.
+#[test]
+#[ignore = "needs cgroup-v2 delegation to the running user; run explicitly"]
+fn recorded_cgroup_cleanup_escalates_to_kill_after_grace() {
+    let id = Uuid::new_v4();
+    let mut cgroup =
+        DelegatedCgroup::create(id).expect("this environment has no writable cgroup-v2 parent");
+    cgroup.populate_ignoring(Some(libc::SIGTERM));
+    let identity = current_cgroup_identity().unwrap();
+    let grace = Duration::from_millis(100);
+
+    let started = Instant::now();
+    cleanup_recorded_cgroup(id, &cgroup.path, Some(&identity), libc::SIGTERM, grace)
+        .expect("grace expiry must escalate to SIGKILL, not fail");
+    assert!(started.elapsed() >= grace, "grace must be honoured first");
+    assert!(
+        !cgroup_path_populated(&cgroup.path).unwrap(),
+        "the SIGTERM-ignoring member must be gone after escalation"
+    );
+}
+
 #[test]
 fn recorded_cgroup_cleanup_rejects_untrusted_locator() {
     let id = Uuid::new_v4();

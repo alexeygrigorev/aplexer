@@ -656,8 +656,14 @@ pub fn cleanup_recorded_cgroup_until(
             .checked_add(grace)
             .ok_or_else(|| anyhow!("cgroup cleanup grace deadline overflow"))?
             .min(deadline);
-        while cgroup_path_populated_until(&path, deadline)? && Instant::now() < grace_deadline {
-            sleep_until_cgroup_deadline(grace_deadline, "waiting for recorded cgroup grace")?;
+        // Grace expiry is the cue to escalate, never an error: only the
+        // overall deadline (checked by the populated probe) can fail here.
+        while cgroup_path_populated_until(&path, deadline)? {
+            let now = Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25).min(grace_deadline - now));
         }
         if cgroup_path_populated_until(&path, deadline)? {
             check_cgroup_cleanup_deadline(deadline, "killing recorded cgroup")?;

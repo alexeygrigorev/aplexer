@@ -71,10 +71,25 @@ impl DelegatedCgroup {
     }
 
     fn populate(&mut self) -> u32 {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn cgroup member");
+        self.populate_ignoring(None)
+    }
+
+    /// Add a `sleep` member; with `ignored` set, that signal is already
+    /// SIG_IGN before `exec`, so the member shrugs it off from its very
+    /// first instruction (no window in which a trap is not yet installed).
+    fn populate_ignoring(&mut self, ignored: Option<i32>) -> u32 {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        if let Some(signal) = ignored {
+            unsafe {
+                command.pre_exec(move || {
+                    libc::signal(signal, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let child = command.spawn().expect("spawn cgroup member");
         let pid = child.id();
         self.members.push(child);
         fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
