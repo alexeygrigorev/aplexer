@@ -921,7 +921,17 @@ pub fn locate_claude_transcript(
         return None;
     }
     let since = created_at_ms.saturating_sub(5_000);
-    best_candidate(&dir, since, false)
+    // Direct children only: claude's project dirs also hold a `subagents/`
+    // subdirectory, which is deliberately NOT walked -- those are sub-agent
+    // transcripts, not the top-level session.
+    let children = fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        });
+    newest_since(children, since)
 }
 
 /// Codex: `~/.codex/sessions/<YYYY>/<MM>/<DD>/<session>.jsonl`, date-
@@ -943,27 +953,26 @@ pub fn locate_codex_transcript(
     }
     let since = created_at_ms.saturating_sub(5_000);
     let cwd_str = cwd.display().to_string();
-    let mut best: Option<(u64, PathBuf)> = None;
-    walk_jsonl(&root, &mut |path, mtime_ms| {
-        if mtime_ms < since {
-            return;
-        }
-        if let Ok(file) = File::open(path) {
-            let mut reader = BufReader::new(file);
-            let mut first_line = String::new();
-            if std::io::BufRead::read_line(&mut reader, &mut first_line).unwrap_or(0) > 0 {
-                if let Ok(payload) = serde_json::from_str::<Value>(first_line.trim()) {
-                    if codex_native_cwd(&payload).as_deref() != Some(cwd_str.as_str()) {
-                        return;
-                    }
-                }
-            }
-        }
-        if best.as_ref().map(|(m, _)| mtime_ms > *m).unwrap_or(true) {
-            best = Some((mtime_ms, path.to_path_buf()));
-        }
-    });
-    best.map(|(_, p)| p)
+    let mut rollouts = Vec::new();
+    walk_jsonl(&root, &mut |path| rollouts.push(path.to_path_buf()));
+    // Only rollouts recent enough to matter are opened: one whose
+    // session_meta names a different cwd is not ours, whatever its mtime,
+    // while one without a readable session_meta stays a candidate on
+    // mtime alone.
+    let ours = rollouts
+        .into_iter()
+        .filter(|path| file_mtime_ms(path).is_some_and(|mtime| mtime >= since))
+        .filter(|path| rollout_cwd(path).is_none_or(|rollout_cwd| rollout_cwd == cwd_str));
+    newest_since(ours, since)
+}
+
+/// The `cwd` recorded in a codex rollout's first (`session_meta`) row.
+fn rollout_cwd(path: &Path) -> Option<String> {
+    let mut first_line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut first_line)
+        .ok()?;
+    codex_native_cwd(&serde_json::from_str::<Value>(first_line.trim()).ok()?)
 }
 
 /// Grok Build: `$GROK_HOME/sessions/<urlencoded-cwd>/<session-id>/updates.jsonl`
@@ -1031,24 +1040,12 @@ fn encode_grok_cwd(cwd: &str) -> String {
 }
 
 fn best_grok_updates(project_dir: &Path, since_ms: u64) -> Option<PathBuf> {
-    let entries = fs::read_dir(project_dir).ok()?;
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let candidate = entry.path().join("updates.jsonl");
-        if !candidate.is_file() {
-            continue;
-        }
-        let Some(mtime) = file_mtime_ms(&candidate) else {
-            continue;
-        };
-        if mtime < since_ms {
-            continue;
-        }
-        if best.as_ref().map(|(m, _)| mtime > *m).unwrap_or(true) {
-            best = Some((mtime, candidate));
-        }
-    }
-    best.map(|(_, p)| p)
+    let updates = fs::read_dir(project_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join("updates.jsonl"))
+        .filter(|candidate| candidate.is_file());
+    newest_since(updates, since_ms)
 }
 
 fn file_mtime_ms(path: &Path) -> Option<u64> {
@@ -1058,7 +1055,8 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     Some(dur.as_millis() as u64)
 }
 
-fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path, u64)) {
+/// Every `*.jsonl` under `dir`, recursively.
+fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path)) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1067,37 +1065,20 @@ fn walk_jsonl(dir: &Path, visit: &mut impl FnMut(&Path, u64)) {
         if path.is_dir() {
             walk_jsonl(&path, visit);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(mtime_ms) = file_mtime_ms(&path) {
-                visit(&path, mtime_ms);
-            }
+            visit(&path);
         }
     }
 }
 
-/// Picks the most-recently-modified direct `*.jsonl` child of `dir` with
-/// mtime `>= since_ms`. `recurse` is unused today (claude's project dirs
-/// also contain a `subagents/` subdirectory which is deliberately NOT
-/// walked -- those are sub-agent transcripts, not the top-level session).
-fn best_candidate(dir: &Path, since_ms: u64, recurse: bool) -> Option<PathBuf> {
-    let _ = recurse;
-    let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
-            continue;
-        };
-        if mtime_ms < since_ms {
-            continue;
-        }
-        if best.as_ref().map(|(m, _)| mtime_ms > *m).unwrap_or(true) {
-            best = Some((mtime_ms, path));
-        }
-    }
-    best.map(|(_, p)| p)
+/// The most-recently-modified candidate whose mtime is `>= since_ms` --
+/// the "which log is this session's" heuristic every engine shares.
+fn newest_since(candidates: impl IntoIterator<Item = PathBuf>, since_ms: u64) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .filter_map(|path| file_mtime_ms(&path).map(|mtime| (mtime, path)))
+        .filter(|(mtime, _)| *mtime >= since_ms)
+        .max_by_key(|(mtime, _)| *mtime)
+        .map(|(_, path)| path)
 }
 
 // ---------------------------------------------------------------------
