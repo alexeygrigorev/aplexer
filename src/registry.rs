@@ -3,6 +3,7 @@
 //! tag/id reference to its record.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -136,41 +137,43 @@ pub fn resolve_record(
     tag: Option<&str>,
 ) -> Result<SessionRecord> {
     let records = list_records(paths)?;
-    let mut matches = Vec::new();
+    let mut matches: Vec<&SessionRecord> = Vec::new();
     if let Some(raw) = selector {
         let needle = raw.to_ascii_lowercase();
-        for record in records {
+        // `workspace:tag`, matched against the record's fields directly so
+        // no selector string is built per record compared.
+        let pair = raw.rsplit_once(':');
+        matches.extend(records.iter().filter(|record| {
             let id = record.id.to_string();
-            if id == needle
+            id == needle
                 || (needle.len() >= 8 && id.starts_with(&needle))
-                || record.selector() == raw
-            {
-                matches.push(record);
-            }
-        }
+                || pair.is_some_and(|(workspace, tag)| {
+                    record.tag == tag && record.workspace.as_os_str() == OsStr::new(workspace)
+                })
+        }));
         if matches.is_empty() {
-            if let Some((workspace_text, tag_text)) = raw.rsplit_once(':') {
+            if let Some((workspace_text, tag_text)) = pair {
                 if let Ok(ws) = canonical_workspace(Path::new(workspace_text)) {
-                    for record in list_records(paths)? {
-                        if record.workspace == ws && record.tag == tag_text {
-                            matches.push(record);
-                        }
-                    }
+                    matches.extend(
+                        records
+                            .iter()
+                            .filter(|record| record.workspace == ws && record.tag == tag_text),
+                    );
                 }
             }
         }
     } else {
         let ws = canonical_workspace(workspace.unwrap_or(Path::new(".")))?;
         let tag = tag.unwrap_or("default");
-        for record in records {
-            if record.workspace == ws && record.tag == tag {
-                matches.push(record);
-            }
-        }
+        matches.extend(
+            records
+                .iter()
+                .filter(|record| record.workspace == ws && record.tag == tag),
+        );
     }
     match matches.len() {
         0 => bail!("no matching session"),
-        1 => Ok(matches.remove(0)),
+        1 => Ok(matches[0].clone()),
         // A pair can transiently be held by two records: `a rename` takes a
         // dead holder's name but leaves the corpse for `a prune` (issue
         // #13), and the pair is only clean again once prune runs. In that
@@ -179,13 +182,9 @@ pub fn resolve_record(
         // error would make the name unusable instead. Only when no live
         // holder disambiguates the matches does the ambiguity error apply.
         _ => {
-            let live: Vec<SessionRecord> = matches
-                .iter()
-                .filter(|r| reap_verdict(r).is_none())
-                .cloned()
-                .collect();
-            match live.len() {
-                1 => Ok(live.into_iter().next().expect("exactly one live match")),
+            let mut live = matches.iter().filter(|r| reap_verdict(r).is_none());
+            match (live.next(), live.next()) {
+                (Some(only), None) => Ok((*only).clone()),
                 _ => bail!("selector is ambiguous; use a longer UUID"),
             }
         }
