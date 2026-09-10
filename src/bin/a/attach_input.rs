@@ -203,7 +203,7 @@ fn handle_input_action(
         InputAction::Redraw => {
             // `Ctrl-b r` redraws the view the user is looking at. While the
             // pager is up that is the pager, not the live screen.
-            if config.status.scroll.is_active() && !config.status.scroll.is_typing() {
+            if config.status.scroll.owns_host() {
                 paint_scroll_view(&config.status);
             } else {
                 redraw_live_screen(&config.status);

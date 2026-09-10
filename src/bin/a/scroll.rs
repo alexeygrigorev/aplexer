@@ -31,6 +31,15 @@ impl ScrollMode {
     pub(crate) fn is_typing(&self) -> bool {
         self.typing.load(Ordering::Relaxed)
     }
+    /// Whether the pager's *frame* is what the host is showing: the mode is
+    /// up and type-through has not handed the screen back to the relay. This
+    /// is the predicate every "may the live screen be painted?" decision
+    /// asks; `is_active` alone also answers yes for type-through, where the
+    /// host shows the live stream and a pager frame would paint old history
+    /// under it.
+    pub(crate) fn owns_host(&self) -> bool {
+        self.is_active() && !self.is_typing()
+    }
 }
 
 /// Where the pager is looking: `offset` lines above the live screen, out of
@@ -287,6 +296,22 @@ pub(crate) fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
         ctx.pending.store(true, Ordering::Relaxed);
     }
     wrote
+}
+
+/// The per-tick and per-chunk upkeep of the pager's bar row.
+///
+/// In type-through the relay is live, so a resize's deferred DECSTBM is
+/// delivered here as well as by the frame loop: the frame loop only runs
+/// when the workload sends something, and a silent workload would otherwise
+/// leave the parked layout undelivered until the pager closed -- the
+/// tick-driven delivery `flush_pending_layout` promises. The pager proper
+/// writes nothing of the workload's, so its parked layout waits for the exit
+/// repaint instead of being spliced onto the frame the user is reading.
+pub(crate) fn maintain_pager_bar(ctx: &StatusBarCtx) {
+    if ctx.scroll.is_typing() {
+        flush_pending_layout(ctx);
+    }
+    refresh_scroll_bar(ctx);
 }
 
 /// The bar while type-through is active. The pager still owns the reserved

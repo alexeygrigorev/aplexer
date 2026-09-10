@@ -98,6 +98,96 @@ fn pager_bar_without_typing_still_writes_unconditionally() {
     );
 }
 
+/// The resize poller's whole reaction, as `run_resize_loop` runs it. The
+/// worker end of the writer is a dead socket pair: the Resize control
+/// send is best-effort there and irrelevant to what reaches the host.
+fn resize_config(ctx: &StatusBarCtx) -> ResizeThreadConfig {
+    let (writer, _peer) = UnixStream::pair().expect("socket pair");
+    ResizeThreadConfig {
+        writer: Arc::new(Mutex::new(writer)),
+        active: Arc::new(AtomicBool::new(true)),
+        status: ctx.clone(),
+        initial_geometry: Some((24, 80)),
+        status_enabled: true,
+    }
+}
+
+/// In type-through the relay streams to the host, so a resize must repaint
+/// what the host is showing -- the live screen -- and never the pager's
+/// scrolled-back frame. That frame is written under `StreamSuspended`, so
+/// painting it here put old history under live bytes, and did so even
+/// mid-escape-sequence, where a live injection has to wait.
+#[test]
+fn resize_while_typing_repaints_the_live_screen_not_the_pager() {
+    let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let ctx = ctx_in_typing_mode();
+    let config = resize_config(&ctx);
+
+    // Mid-sequence: nothing of the client's may go out at all.
+    feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+    let pipe = StdoutToPipe::new();
+    apply_resize(&config, 30, 100);
+    let out = pipe.take();
+    // fd 1 is process-wide, so the harness's own progress lines can land
+    // in the pipe too; what must be absent is anything escape-shaped.
+    assert!(
+        !out.contains(&0x1b) && !out.contains(&SCROLL_CANCEL[0]),
+        "a resize while typing must defer like any live injection, got {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        ctx.pending_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some(),
+        "the deferred resize must be parked, not dropped"
+    );
+
+    // At a boundary: the live screen and its bar, not a pager frame.
+    feed_test_screen(&ctx.screen, b"m");
+    let pipe = StdoutToPipe::new();
+    apply_resize(&config, 32, 100);
+    let out = pipe.take();
+    assert!(
+        !out.contains(&SCROLL_CANCEL[0]),
+        "the pager's frame must not be painted over a live stream: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("\x1b[1;31r") && text.contains("RUNNING"),
+        "the live screen and its bar must be repainted at the new geometry: {text:?}"
+    );
+}
+
+/// The status thread is the only writer that keeps running while the
+/// workload is silent. In type-through it must deliver a parked resize the
+/// way the frame loop would, or a deferred DECSTBM on a quiet session stays
+/// parked until the pager closes.
+#[test]
+fn typing_tick_delivers_a_parked_resize_on_a_silent_workload() {
+    let _fd1 = FD1_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let ctx = ctx_in_typing_mode();
+    feed_test_screen(&ctx.screen, b"\x1b[38;5;");
+    assert!(!resize_capturing(&ctx, 30, 100).0, "the fixture must park a resize");
+
+    feed_test_screen(&ctx.screen, b"m");
+    let pipe = StdoutToPipe::new();
+    maintain_pager_bar(&ctx);
+    let text = String::from_utf8_lossy(&pipe.take()).into_owned();
+    assert!(
+        text.contains("\x1b[1;29r"),
+        "the tick must deliver the parked DECSTBM while typing: {text:?}"
+    );
+    assert!(
+        ctx.pending_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none(),
+        "a delivered resize must clear the parking slot"
+    );
+}
+
 // -- Issue #14: the resize path is a client-originated writer too ------
 //
 // `2db19d0` put the escape-boundary gate inside `draw_status_bar`, which

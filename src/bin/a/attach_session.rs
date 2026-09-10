@@ -122,8 +122,7 @@ fn handle_data_frame(config: &SessionLoopConfig, payload: &[u8]) -> Result<()> {
     // still gets the same per-chunk maintenance as the live bar.
     if config.scroll_mode.is_active() || config.key_overlay.is_active() {
         if config.scroll_mode.is_typing() && !config.key_overlay.is_active() {
-            flush_pending_layout(&config.status);
-            refresh_scroll_bar(&config.status);
+            maintain_pager_bar(&config.status);
         }
         return Ok(());
     }

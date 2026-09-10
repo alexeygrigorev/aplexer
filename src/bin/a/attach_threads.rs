@@ -33,7 +33,7 @@ fn run_resize_loop(config: ResizeThreadConfig) {
     }
 }
 
-fn apply_resize(config: &ResizeThreadConfig, rows: u16, cols: u16) {
+pub(crate) fn apply_resize(config: &ResizeThreadConfig, rows: u16, cols: u16) {
     // Keep the client's tracker in step with the worker-side model across the
     // same resize: both re-clamp the region to the new row count rather than
     // dropping it.
@@ -68,8 +68,11 @@ fn apply_resize(config: &ResizeThreadConfig, rows: u16, cols: u16) {
 
 fn repaint_resize_modal(status: &StatusBarCtx) {
     // The pager renders at the reserved geometry, so a resize has to redraw
-    // it while the relay is suspended.
-    if status.scroll.is_active() {
+    // it while the relay is suspended. Not in type-through: the relay is
+    // streaming to the host, and the pager's frame would paint old history
+    // under the live bytes -- `apply_terminal_layout` repaints the live
+    // screen there, as it does for the ordinary live view.
+    if status.scroll.owns_host() {
         paint_scroll_view(status);
     }
     // A new geometry may be too small for the key overlay. If it cannot be
@@ -122,8 +125,9 @@ fn run_status_loop(config: StatusThreadConfig) {
 
         sync_client_mouse(&config.status);
         if config.status.scroll.is_active() {
-            // The pager owns the terminal; only its position readout moves.
-            refresh_scroll_bar(&config.status);
+            // The pager owns the bar row; only its position readout moves
+            // (and, in type-through, a parked resize is delivered).
+            maintain_pager_bar(&config.status);
             continue;
         }
 

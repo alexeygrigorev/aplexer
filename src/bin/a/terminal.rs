@@ -438,9 +438,10 @@ pub(crate) fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) 
 ///
 /// Modal painters already own resize repainting. They deliberately keep this
 /// helper live-only so a resize does not replace a pager or key overlay with
-/// the workload's screen.
+/// the workload's screen. Type-through is live: the host shows the relayed
+/// stream, so it is repainted here like the ordinary live view.
 pub(crate) fn redraw_live_screen_after_layout(ctx: &StatusBarCtx) -> bool {
-    if ctx.scroll.is_active() || ctx.overlay.is_active() {
+    if ctx.scroll.owns_host() || ctx.overlay.is_active() {
         return false;
     }
     redraw_live_screen(ctx)
@@ -482,7 +483,7 @@ pub(crate) fn relay_to_terminal(
         // keyboard over, the pager keeps only the bar row and the offset,
         // and the stream flows -- typing with no echo would be worse than
         // the reading view the user chose to give up. Esc takes it back.
-        if (scroll.is_active() && !scroll.is_typing()) || overlay.is_active() {
+        if scroll.owns_host() || overlay.is_active() {
             return Ok(());
         }
         let src = rewritten.as_deref().unwrap_or(data);
