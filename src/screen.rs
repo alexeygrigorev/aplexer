@@ -678,10 +678,11 @@ impl ScreenTracker {
     ///    position/visibility + input modes (bracketed paste, mouse,
     ///    application keypad/cursor).
     /// 3. If `MarginTracker` holds non-default margins: the DECSTBM
-    ///    sequence, followed by re-fixing the cursor (DECSTBM homes the
-    ///    cursor as a side effect on real terminals). Skipped when margins
-    ///    are default, leaving the client's own status-bar reservation in
-    ///    force.
+    ///    sequence, followed by `cursor_restore` (DECSTBM homes the cursor
+    ///    on a real terminal; a plain `CUP` would put it back but cannot
+    ///    express a pending wrap, which `cursor_restore` can). Skipped when
+    ///    margins are default, leaving the client's own status-bar
+    ///    reservation in force.
     pub fn snapshot(&self) -> Vec<u8> {
         let screen = self.parser.screen();
         let mut out = Vec::new();
@@ -691,8 +692,7 @@ impl ScreenTracker {
         out.extend_from_slice(&screen.state_formatted());
         if let Some((top, bottom)) = self.margins.margins() {
             out.extend_from_slice(format!("\x1b[{top};{bottom}r").as_bytes());
-            let (row, col) = screen.cursor_position();
-            out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+            out.extend_from_slice(&self.cursor_restore());
         }
         out
     }
@@ -2601,6 +2601,11 @@ mod tests {
             screen_b.mouse_protocol_mode(),
             "mouse_protocol_mode mismatch"
         );
+        assert_eq!(
+            screen_a.attributes_formatted(),
+            screen_b.attributes_formatted(),
+            "drawing attributes mismatch"
+        );
     }
 
     #[test]
@@ -2629,6 +2634,18 @@ mod tests {
         let mut stream = Vec::new();
         stream.extend_from_slice(b"\x1b[3;20r");
         stream.extend_from_slice(b"line one\r\nline two\r\n");
+        round_trip_check(&stream, 24, 80);
+    }
+
+    /// The cursor re-fix after the DECSTBM has to reproduce a *pending
+    /// wrap*: with the workload's cursor past the last column `vt100` reports
+    /// `col == cols`, which a plain `CUP` clamps to the last cell -- so the
+    /// restored terminal put the workload's next character on the same row
+    /// where the workload's own screen wrapped it onto the next.
+    #[test]
+    fn round_trip_decstbm_with_the_cursor_in_pending_wrap() {
+        let mut stream = b"\x1b[3;20r\x1b[1;31m".to_vec();
+        stream.extend(std::iter::repeat_n(b'W', 80));
         round_trip_check(&stream, 24, 80);
     }
 
