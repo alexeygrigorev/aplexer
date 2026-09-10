@@ -508,8 +508,10 @@ pub struct MessageFrom {
     pub profile: Option<String>,
     /// Design doc section 2.1: a sender with no resolvable session identity
     /// (no `--from`, no `APLEXER_SESSION_ID`) is still allowed to send, "a
-    /// human poking at the mailbox is a legitimate participant" -- recorded
-    /// as `{"tag": null, "external": true}`.
+    /// human poking at the mailbox is a legitimate participant". On the
+    /// wire that is `{"external": true}` alone: absent fields are omitted,
+    /// so the design doc's `"tag": null` is never written (and reads back
+    /// as `None` either way).
     #[serde(default, skip_serializing_if = "is_false")]
     pub external: bool,
 }
