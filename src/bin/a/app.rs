@@ -42,6 +42,8 @@ mod capture_commands;
 mod cli;
 #[path = "cli_examples.rs"]
 mod cli_examples;
+#[path = "cli_message_args.rs"]
+mod cli_message_args;
 #[path = "cli_session_args.rs"]
 mod cli_session_args;
 #[path = "commands.rs"]
@@ -106,6 +108,7 @@ pub(crate) use attach_session::*;
 pub(crate) use attach_threads::*;
 pub(crate) use capture_commands::*;
 pub(crate) use cli::*;
+pub(crate) use cli_message_args::*;
 pub(crate) use cli_session_args::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
