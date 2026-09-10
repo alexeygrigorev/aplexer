@@ -50,6 +50,8 @@ mod list_helpers;
 mod list_plain;
 #[path = "list_tty.rs"]
 mod list_tty;
+#[path = "message_commands.rs"]
+mod message_commands;
 #[path = "rpc.rs"]
 mod rpc;
 #[path = "scroll.rs"]
@@ -79,6 +81,7 @@ pub(crate) use key_overlay::*;
 pub(crate) use list_helpers::*;
 pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
+pub(crate) use message_commands::*;
 pub(crate) use rpc::*;
 pub(crate) use scroll::*;
 pub(crate) use scroll_input::*;

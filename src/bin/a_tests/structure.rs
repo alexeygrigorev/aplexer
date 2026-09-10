@@ -76,6 +76,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("../a/diagnostics.rs"),
     "\n",
+    include_str!("../a/message_commands.rs"),
+    "\n",
     include_str!("../a/rpc.rs"),
     "\n",
     include_str!("../a/terminal.rs"),
