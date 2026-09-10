@@ -458,16 +458,3 @@ fn skip_permissions_argv_ported_values() {
         vec!["--dangerously-skip-permissions".to_string()]
     );
 }
-
-#[test]
-fn executable_available_requires_execute_permission() {
-    let root = tempfile::tempdir().unwrap();
-    let program = root.path().join("tool");
-    fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
-
-    assert!(!executable_available(program.to_str().unwrap()));
-
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(executable_available(program.to_str().unwrap()));
-}

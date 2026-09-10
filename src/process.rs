@@ -14,8 +14,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::executable_available;
-
 /// Long enough for graceful shutdown, but bounded so an authenticated local
 /// client cannot monopolize a worker's serialized kill path indefinitely.
 pub const MAX_KILL_GRACE_MS: u64 = 30_000;
@@ -452,4 +450,27 @@ pub fn shell_quote(value: &str) -> String {
 
 pub fn c_string(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).context("path contains NUL")
+}
+
+pub fn executable_available(program: &str) -> bool {
+    fn is_executable_file(path: &Path) -> bool {
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+    }
+
+    let candidate = Path::new(program);
+    if candidate.components().count() > 1 {
+        return is_executable_file(candidate);
+    }
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|dir| is_executable_file(&dir.join(program))))
+        .unwrap_or(false)
 }
