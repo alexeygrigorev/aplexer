@@ -66,6 +66,8 @@ mod scroll;
 mod scroll_input;
 #[path = "session_commands.rs"]
 mod session_commands;
+#[path = "session_diagnostics.rs"]
+mod session_diagnostics;
 #[path = "status_bar.rs"]
 mod status_bar;
 #[path = "status_commands.rs"]
@@ -97,6 +99,7 @@ pub(crate) use rpc::*;
 pub(crate) use scroll::*;
 pub(crate) use scroll_input::*;
 pub(crate) use session_commands::*;
+pub(crate) use session_diagnostics::*;
 pub(crate) use status_bar::*;
 pub(crate) use status_commands::*;
 pub(crate) use switching::*;

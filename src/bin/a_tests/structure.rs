@@ -78,6 +78,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("../a/session_commands.rs"),
     "\n",
+    include_str!("../a/session_diagnostics.rs"),
+    "\n",
     include_str!("../a/diagnostics.rs"),
     "\n",
     include_str!("../a/message_commands.rs"),
