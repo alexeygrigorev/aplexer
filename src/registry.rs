@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::{canonical_workspace, reap_verdict, Paths, SessionRecord, SCHEMA_VERSION};
+use crate::{canonical_workspace, io_kind, reap_verdict, Paths, SessionRecord, SCHEMA_VERSION};
 
 pub fn read_record(path: &Path) -> Result<SessionRecord> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -126,11 +126,7 @@ pub fn list_records(paths: &Paths) -> Result<Vec<SessionRecord>> {
 /// access in the chain, so a `NotFound` anywhere in it can only mean the record
 /// file itself is missing.
 pub(crate) fn record_is_not_written_yet(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|cause| cause.kind() == io::ErrorKind::NotFound)
-    })
+    io_kind(error) == Some(io::ErrorKind::NotFound)
 }
 
 pub fn resolve_record(

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::persist::TEMP_COUNTER;
 use crate::{
-    cgroup_path_populated, linux_boot_id, now_ms, pidfd_open, process_alive,
+    cgroup_path_populated, io_kind, linux_boot_id, now_ms, pidfd_open, process_alive,
     process_start_time_ticks, validate_recorded_cgroup,
 };
 
@@ -400,13 +400,7 @@ impl SessionRecord {
         }
         match process_start_time_ticks(pid) {
             Ok(start_time) => start_time == identity.start_time_ticks,
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-            {
-                false
-            }
+            Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => false,
             Err(_) => true,
         }
     }
@@ -797,13 +791,7 @@ pub fn signal_recorded_worker(record: &SessionRecord, signal: i32) -> Result<()>
     }
     let current_start_time = match process_start_time_ticks(pid) {
         Ok(start_time) => start_time,
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-        {
-            return Ok(());
-        }
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => return Ok(()),
         Err(error) => return Err(error),
     };
     if current_start_time != identity.start_time_ticks {

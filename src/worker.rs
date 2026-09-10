@@ -884,7 +884,7 @@ fn read_record_under_worker_lock(paths: &Paths, id: Uuid) -> Result<SessionRecor
     match read_session_record(paths, id) {
         Ok(record) => Ok(record),
         Err(error) => {
-            if crate::registry::record_is_not_written_yet(&error) {
+            if io_kind(&error) == Some(io::ErrorKind::NotFound) {
                 let _ = fs::remove_dir_all(paths.runtime_session(id));
             }
             Err(error).with_context(|| {
@@ -1244,13 +1244,7 @@ fn recover_control_socket(
     let lock_path = runtime.paths.worker_lock(record.id);
     let current_lock_identity = match trusted_lock_identity(&lock_path) {
         Ok(identity) => Some(identity),
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-        {
-            None
-        }
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => None,
         Err(error) => return Err(error),
     };
     let (replacement_lock, lock_identity) = if current_lock_identity == Some(held_lock_identity) {

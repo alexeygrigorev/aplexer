@@ -1,10 +1,26 @@
-//! Small shared helpers: wall-clock milliseconds, byte-size parsing, and
-//! environment/OsString conversions.
+//! Small shared helpers: wall-clock milliseconds, byte-size parsing,
+//! environment/OsString conversions, and the io-error-kind probe every
+//! "was that NotFound?" match uses.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The kind of the first `io::Error` in `error`'s cause chain, if any.
+///
+/// Every filesystem probe that wants to treat "the thing is gone" (or
+/// "the lock is held") differently from a real failure used to spell out
+/// the same `chain().any(downcast_ref::<io::Error>)` walk. One predicate
+/// keeps them from drifting -- in particular from checking only the
+/// outermost error, which misses an io error under a `context`.
+pub fn io_kind(error: &anyhow::Error) -> Option<io::ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind)
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()

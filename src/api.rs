@@ -29,7 +29,7 @@ use startup_cleanup::*;
 use crate::agent_kind::{detect_agent, AgentKind, DEFAULT_PROC_ROOT};
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
-    ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json,
+    ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json, io_kind,
     kill_grace_duration, list_records, parse_byte_size, process_start_time_ticks,
     public_session_record, read_frame, read_persisted_history_tail, read_record,
     read_session_record, reap_verdict, resolve_record, session_metadata_env, validate_tag,
@@ -441,12 +441,7 @@ pub(crate) fn fence_pre_pid_worker(paths: &Paths, record: &SessionRecord) -> Res
     let lock_path = paths.worker_lock(record.id);
     match FileLock::exclusive(&lock_path, true) {
         Ok(lock) => Ok(PrePidFence::Fenced(Some(lock))),
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .and_then(io::Error::raw_os_error)
-                .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
-        {
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::WouldBlock) => {
             Ok(PrePidFence::WorkerHoldsLock(lock_path))
         }
         Err(error) => Err(error),

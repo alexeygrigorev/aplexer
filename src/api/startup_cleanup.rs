@@ -340,14 +340,6 @@ impl CleanupDeadline {
     }
 }
 
-pub(super) fn proc_entry_disappeared(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
-    })
-}
-
 pub(super) fn open_startup_descendant(
     pid: u32,
     deadline: CleanupDeadline,
@@ -355,7 +347,7 @@ pub(super) fn open_startup_descendant(
     deadline.check("opening startup process handle")?;
     let start_time_ticks = match process_start_time_ticks(pid) {
         Ok(value) => value,
-        Err(error) if proc_entry_disappeared(&error) => return Ok(None),
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("identify descendant {pid}")),
     };
     deadline.check("opening startup process handle")?;
@@ -379,7 +371,7 @@ pub(super) fn open_startup_descendant(
             }))
         }
         Ok(_) => bail!("descendant {pid} changed identity while opening its pidfd"),
-        Err(error) if proc_entry_disappeared(&error) => Ok(None),
+        Err(error) if io_kind(&error) == Some(io::ErrorKind::NotFound) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("recheck descendant {pid} identity")),
     }
 }
