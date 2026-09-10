@@ -74,6 +74,8 @@ mod session_diagnostics;
 mod status_bar;
 #[path = "status_commands.rs"]
 mod status_commands;
+#[path = "switch_targets.rs"]
+mod switch_targets;
 #[path = "switching.rs"]
 mod switching;
 #[path = "system.rs"]
@@ -105,6 +107,7 @@ pub(crate) use session_commands::*;
 pub(crate) use session_diagnostics::*;
 pub(crate) use status_bar::*;
 pub(crate) use status_commands::*;
+pub(crate) use switch_targets::*;
 pub(crate) use switching::*;
 pub(crate) use system::*;
 pub(crate) use terminal::*;
