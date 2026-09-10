@@ -1028,7 +1028,7 @@ pub(super) mod tests {
             runtime_session_dir: dir.path().join("runtime-session"),
             socket_path: dir.path().join("control.sock"),
             record: Mutex::new(record),
-            pty_write: Mutex::new(Some(File::open("/dev/null").unwrap())),
+            pty_write: Mutex::new(Some(Arc::new(File::open("/dev/null").unwrap()))),
             workload: Mutex::new(WorkloadState {
                 running: true,
                 pgid: 1,

@@ -188,7 +188,13 @@ struct WorkerRuntime {
     runtime_session_dir: std::path::PathBuf,
     socket_path: std::path::PathBuf,
     record: Mutex<SessionRecord>,
-    pty_write: Mutex<Option<File>>,
+    /// The PTY master's write side. `None` once the lifecycle sees EOF.
+    /// Held as an `Arc` so `send` can clone the handle and write *outside*
+    /// the mutex: a PTY write blocks whenever the tty input queue is full
+    /// behind a stopped foreground job, and holding the lock across it
+    /// used to block `Status` (foreground_command needs the fd), every
+    /// resize, and the lifecycle's PtyEof handler behind one wedged client.
+    pty_write: Mutex<Option<Arc<File>>>,
     workload: Mutex<WorkloadState>,
     terminal: Mutex<TerminalState>,
     cgroup: Mutex<Option<Cgroup>>,
@@ -262,10 +268,12 @@ impl WorkerRuntime {
         if !lock(&self.workload)?.running {
             bail!("workload has exited");
         }
-        let mut pty = lock(&self.pty_write)?;
-        let file = pty.as_mut().ok_or_else(|| anyhow!("PTY is closed"))?;
-        file.write_all(data).context("write PTY")?;
-        file.flush()?;
+        let file = lock(&self.pty_write)?
+            .clone()
+            .ok_or_else(|| anyhow!("PTY is closed"))?;
+        // Unlocked: see `pty_write`.
+        (&*file).write_all(data).context("write PTY")?;
+        (&*file).flush()?;
         Ok(())
     }
     /// Apply a size while `terminal` is held. The shared state check avoids
@@ -1013,7 +1021,7 @@ pub fn run_worker(id: Uuid, initial_size: Option<(u16, u16)>) -> Result<()> {
             runtime_session_dir: paths.runtime_session(id),
             socket_path,
             record: Mutex::new(record.clone()),
-            pty_write: Mutex::new(Some(master_write)),
+            pty_write: Mutex::new(Some(Arc::new(master_write))),
             workload: Mutex::new(WorkloadState {
                 running: true,
                 pgid: pid as i32,
