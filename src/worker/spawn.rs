@@ -401,3 +401,32 @@ pub(super) fn run_child_waiter(mut child: Child, tx: mpsc::Sender<LifeEvent>) {
     disown_child_pid(pid);
     let _ = tx.send(event);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub(super) fn startup_history_node_must_be_regular_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        assert!(validate_existing_history_node(&missing).is_ok());
+
+        let regular = dir.path().join("regular.bin");
+        fs::write(&regular, b"history").unwrap();
+        assert!(validate_existing_history_node(&regular).is_ok());
+
+        let directory = dir.path().join("directory.bin");
+        fs::create_dir(&directory).unwrap();
+        assert!(validate_existing_history_node(&directory).is_err());
+
+        let symlink = dir.path().join("symlink.bin");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert!(validate_existing_history_node(&symlink).is_err());
+
+        let fifo = dir.path().join("fifo.bin");
+        let fifo_c = c_string(&fifo).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(validate_existing_history_node(&fifo).is_err());
+    }
+}

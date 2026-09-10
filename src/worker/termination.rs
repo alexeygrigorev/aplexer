@@ -344,3 +344,32 @@ pub(super) fn run_child_reaper(event_fd: RawFd) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub(super) fn termination_event_blocks_without_timer_and_wakes_on_notification() {
+        let fd = create_worker_event_fd("termination").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(wait_for_event_fd(fd, "termination")).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        notify_event_fd(fd);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("eventfd notification did not wake waiter")
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+}

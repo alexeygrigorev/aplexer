@@ -572,7 +572,7 @@ impl OutputHub {
 pub(super) mod tests {
     use super::*;
 
-    pub(super) fn test_hub(dir: &tempfile::TempDir) -> OutputHub {
+    pub(crate) fn test_hub(dir: &tempfile::TempDir) -> OutputHub {
         OutputHub::new(
             History::open(dir.path().join("history.bin"), 1024 * 1024).unwrap(),
             24,
@@ -580,56 +580,6 @@ pub(super) mod tests {
             dir.path().join("screen.txt"),
         )
         .unwrap()
-    }
-
-    #[test]
-    pub(super) fn termination_event_blocks_without_timer_and_wakes_on_notification() {
-        let fd = create_worker_event_fd("termination").unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let waiter = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            done_tx.send(wait_for_event_fd(fd, "termination")).unwrap();
-        });
-        started_rx.recv().unwrap();
-
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(75)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        notify_event_fd(fd);
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("eventfd notification did not wake waiter")
-            .unwrap();
-        waiter.join().unwrap();
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-    }
-
-    #[test]
-    pub(super) fn lifecycle_wait_blocks_until_an_event_before_cleanup_is_needed() {
-        let (life_tx, life_rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let waiter = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let woke_for_event = matches!(
-                wait_for_lifecycle_wake(&life_rx, false),
-                LifecycleWake::Event(LifeEvent::PtyEof)
-            );
-            done_tx.send(woke_for_event).unwrap();
-        });
-        started_rx.recv().unwrap();
-
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(75)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        life_tx.send(LifeEvent::PtyEof).unwrap();
-        assert!(done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("lifecycle event did not wake waiter"));
-        waiter.join().unwrap();
     }
 
     #[test]
@@ -951,25 +901,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(super) fn failed_pty_resize_restores_the_previous_screen_geometry() {
-        let dir = tempfile::tempdir().unwrap();
-        let hub = test_hub(&dir);
-        let before = hub.screen_snapshot().unwrap();
-
-        let error = resize_screen_and_pty(&hub, (24, 80), (10, 20), || {
-            bail!("injected PTY ioctl failure")
-        })
-        .unwrap_err();
-
-        assert_eq!(error.to_string(), "injected PTY ioctl failure");
-        assert_eq!(
-            hub.screen_snapshot().unwrap(),
-            before,
-            "failed PTY resize left the screen model at the rejected size"
-        );
-    }
-
-    #[test]
     pub(super) fn connection_permits_are_bounded_and_release_on_drop() {
         let active = Arc::new(AtomicUsize::new(0));
         let permits: Vec<_> = (0..MAX_CLIENT_CONNECTIONS)
@@ -1000,186 +931,5 @@ pub(super) mod tests {
         assert!(!transient_accept_error(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
-    }
-
-    /// A `WorkerRuntime` over a throwaway hub, with its durable record at
-    /// `record_path` and every other path under `dir`.
-    pub(super) fn test_runtime(
-        dir: &tempfile::TempDir,
-        record_path: std::path::PathBuf,
-    ) -> WorkerRuntime {
-        let mut record = SessionRecord::fixture(dir.path(), "before");
-        record.socket_path = dir.path().join("control.sock");
-        record.history_path = dir.path().join("history.bin");
-        WorkerRuntime {
-            id: record.id,
-            paths: Paths {
-                runtime_root: dir.path().join("runtime"),
-                state_root: dir.path().join("state"),
-                config_file: dir.path().join("config.toml"),
-            },
-            record_path,
-            runtime_session_dir: dir.path().join("runtime-session"),
-            socket_path: dir.path().join("control.sock"),
-            record: Mutex::new(record),
-            pty_write: Mutex::new(Some(Arc::new(File::open("/dev/null").unwrap()))),
-            workload: Mutex::new(WorkloadState {
-                running: true,
-                pgid: 1,
-            }),
-            terminal: Mutex::new(TerminalState {
-                rows: 24,
-                cols: 80,
-                clients: HashMap::new(),
-                next_client_id: 1,
-                activity_clock: 0,
-            }),
-            cgroup: Mutex::new(None),
-            kill_gate: Mutex::new(()),
-            output: test_hub(dir),
-            record_persistence_error: Mutex::new(None),
-            active_connections: Arc::new(AtomicUsize::new(0)),
-            last_activity_ms: AtomicU64::new(0),
-        }
-    }
-
-    #[test]
-    pub(super) fn failed_record_persistence_does_not_publish_and_idle_activity_retries() {
-        let dir = tempfile::tempdir().unwrap();
-        let record_path = dir.path().join("session.json");
-        // Atomic rename onto a directory deterministically fails after the
-        // candidate was serialized, exercising the publish boundary.
-        fs::create_dir(&record_path).unwrap();
-        let runtime = test_runtime(&dir, record_path);
-
-        assert!(runtime
-            .update_record(|candidate| candidate.tag = "after".into())
-            .is_err());
-        assert_eq!(runtime.record().unwrap().tag, "before");
-        assert!(runtime.record_persistence_error.lock().unwrap().is_some());
-
-        runtime.last_activity_ms.store(123, Ordering::Relaxed);
-        let mut persisted_activity_ms = 0;
-        assert!(persist_activity_checkpoint(&runtime, &mut persisted_activity_ms).is_err());
-        assert_eq!(persisted_activity_ms, 0, "failed write advanced checkpoint");
-        assert_eq!(runtime.record().unwrap().last_activity_ms, None);
-
-        // No new activity occurs between attempts. Once the transient
-        // destination failure is removed, the unchanged timestamp must still
-        // be retried and published by the next tick.
-        fs::remove_dir(&runtime.record_path).unwrap();
-        persist_activity_checkpoint(&runtime, &mut persisted_activity_ms).unwrap();
-        assert_eq!(persisted_activity_ms, 123);
-        assert_eq!(runtime.record().unwrap().last_activity_ms, Some(123));
-        assert!(runtime.record_persistence_error.lock().unwrap().is_none());
-    }
-
-    /// The clean-exit resurrection: `run_lifecycle` removes the state dir,
-    /// then drains connections for up to 3 s before exiting, and in that
-    /// window the periodic flush thread and a late attach both wrote into
-    /// the removed directory (`atomic_write_*` recreates parents), leaving
-    /// a `phase: exiting` record with a dead worker pid for `a list` to
-    /// show as broken until `a prune`. Pins that once the lifecycle marks
-    /// the session finalized, neither the record writer nor the history
-    /// flusher recreates anything -- whether the write is an activity
-    /// checkpoint, an attach stamp, or a forced flush.
-    #[test]
-    pub(super) fn finalized_session_refuses_every_later_durable_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_dir = dir.path().join("state-session");
-        let runtime = test_runtime(&dir, state_dir.join("session.json"));
-        // Sanity: before finalization the same writers land on disk.
-        runtime
-            .update_record(|record| record.tag = "live".into())
-            .expect("record write before finalization");
-        runtime.output.append(b"output").unwrap();
-        runtime.output.flush_history(true).unwrap();
-        assert!(runtime.record_path.exists());
-        assert!(dir.path().join("history.bin").exists());
-
-        runtime.mark_finalized().unwrap();
-        fs::remove_dir_all(&state_dir).unwrap();
-        fs::remove_file(dir.path().join("history.bin")).unwrap();
-
-        let error = runtime
-            .update_record(|record| record.last_accessed_ms = Some(now_ms()))
-            .expect_err("a finalized session must refuse record writes");
-        assert!(format!("{error:#}").contains("finalized"), "{error:#}");
-        assert!(
-            runtime.record_persistence_error.lock().unwrap().is_none(),
-            "a refused post-finalization write is not a persistence failure"
-        );
-        runtime.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-        let mut persisted_activity_ms = 0;
-        persist_activity_checkpoint(&runtime, &mut persisted_activity_ms)
-            .expect("the activity checkpoint quietly skips a finalized session");
-        runtime.output.append(b"late output").unwrap();
-        runtime.output.flush_history(false).unwrap();
-        runtime.output.flush_history(true).unwrap();
-
-        assert!(
-            !state_dir.exists(),
-            "a durable write after finalization resurrected the state dir"
-        );
-        assert!(
-            !dir.path().join("history.bin").exists(),
-            "a history flush after finalization resurrected the history file"
-        );
-    }
-
-    /// `a start` holds the registry lock for its whole spawn-and-poll; a
-    /// rename that blocked on it outlived the client's control deadline
-    /// and then applied unobserved. It must refuse instead, in time, with
-    /// an error that says the registry is busy and nothing changed.
-    #[test]
-    pub(super) fn rename_refuses_in_time_while_the_registry_lock_is_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = test_runtime(&dir, dir.path().join("session.json"));
-        runtime.paths.ensure().unwrap();
-        let _held = FileLock::exclusive(&runtime.paths.registry_lock(), true).unwrap();
-
-        let started = Instant::now();
-        let error = runtime
-            .rename(dir.path().to_path_buf(), "renamed".into())
-            .expect_err("rename must not wait out a held registry lock");
-        let elapsed = started.elapsed();
-        assert!(
-            format!("{error:#}").contains("registry is busy"),
-            "{error:#}"
-        );
-        assert!(
-            elapsed >= RENAME_REGISTRY_WAIT
-                && elapsed < RENAME_REGISTRY_WAIT + Duration::from_secs(1),
-            "rename gave up after {elapsed:?}, expected about {RENAME_REGISTRY_WAIT:?}"
-        );
-        assert_eq!(runtime.record().unwrap().tag, "before");
-        assert!(
-            !runtime.record_path.exists(),
-            "a refused rename wrote the record"
-        );
-    }
-
-    #[test]
-    pub(super) fn startup_history_node_must_be_regular_or_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.bin");
-        assert!(validate_existing_history_node(&missing).is_ok());
-
-        let regular = dir.path().join("regular.bin");
-        fs::write(&regular, b"history").unwrap();
-        assert!(validate_existing_history_node(&regular).is_ok());
-
-        let directory = dir.path().join("directory.bin");
-        fs::create_dir(&directory).unwrap();
-        assert!(validate_existing_history_node(&directory).is_err());
-
-        let symlink = dir.path().join("symlink.bin");
-        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
-        assert!(validate_existing_history_node(&symlink).is_err());
-
-        let fifo = dir.path().join("fifo.bin");
-        let fifo_c = c_string(&fifo).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        assert!(validate_existing_history_node(&fifo).is_err());
     }
 }

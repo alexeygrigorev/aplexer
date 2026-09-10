@@ -375,3 +375,34 @@ pub(super) fn run_lifecycle(runtime: Arc<WorkerRuntime>, rx: mpsc::Receiver<Life
     let _ = fs::remove_dir_all(&runtime.runtime_session_dir);
     std::process::exit(0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub(super) fn lifecycle_wait_blocks_until_an_event_before_cleanup_is_needed() {
+        let (life_tx, life_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let woke_for_event = matches!(
+                wait_for_lifecycle_wake(&life_rx, false),
+                LifecycleWake::Event(LifeEvent::PtyEof)
+            );
+            done_tx.send(woke_for_event).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        life_tx.send(LifeEvent::PtyEof).unwrap();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lifecycle event did not wake waiter"));
+        waiter.join().unwrap();
+    }
+}
