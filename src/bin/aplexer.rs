@@ -22,9 +22,9 @@ enum Command {
         /// resized out from under it a moment later -- see the doc comment
         /// on `run_worker`'s `initial_size` parameter for why that race
         /// matters. Both flags must be given together or not at all.
-        #[arg(long)]
+        #[arg(long, requires = "cols")]
         rows: Option<u16>,
-        #[arg(long)]
+        #[arg(long, requires = "rows")]
         cols: Option<u16>,
     },
 }
