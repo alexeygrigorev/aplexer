@@ -1830,14 +1830,9 @@ mod tests {
             b"\x1b[5;20r\x1b[3\x1bc",
             b"\x1b[5;20r\x1b\x1bc",
         ] {
-            let mut real = vt100::Parser::new(24, 80, 0);
-            real.process(stream);
-            let expected = probe_vt100_scroll_region(&mut real);
-
-            let mut tracker = MarginTracker::new(24);
-            tracker.scan(stream);
+            let expected = vt100_region(24, stream, &[]);
             assert_eq!(
-                tracker.margins().unwrap_or((1, 24)),
+                tracked(24, stream, &[]).margins().unwrap_or((1, 24)),
                 expected,
                 "{stream:?}: vt100={expected:?}"
             );
@@ -1929,10 +1924,7 @@ mod tests {
             "5;5", "1;24", "1;25", "5;25", "24;25", "0;25", "70000;20", "5;70000",
         ] {
             let seq = format!("\x1b[{params}r");
-            let mut real = vt100::Parser::new(24, 80, 0);
-            real.process(seq.as_bytes());
-            let expected = probe_vt100_scroll_region(&mut real);
-
+            let expected = vt100_region(24, seq.as_bytes(), &[]);
             let mut tracker = MarginTracker::new(24);
             let event = tracker.scan(seq.as_bytes());
             let actual = tracker.margins().unwrap_or((1, 24));
@@ -1954,13 +1946,10 @@ mod tests {
             for top in 0..=rows + 2 {
                 for bottom in 0..=rows + 2 {
                     let seq = format!("\x1b[{top};{bottom}r");
-                    let mut real = vt100::Parser::new(rows, 4, 0);
-                    real.process(seq.as_bytes());
-                    let expected = probe_vt100_scroll_region(&mut real);
-
-                    let mut tracker = MarginTracker::new(rows);
-                    tracker.scan(seq.as_bytes());
-                    let actual = tracker.margins().unwrap_or((1, rows));
+                    let expected = vt100_region(rows, seq.as_bytes(), &[]);
+                    let actual = tracked(rows, seq.as_bytes(), &[])
+                        .margins()
+                        .unwrap_or((1, rows));
                     compared += 1;
                     assert_eq!(
                         actual, expected,
@@ -2125,6 +2114,27 @@ mod tests {
         );
     }
 
+    /// vt100's own scroll region after `stream` at `rows` rows and the
+    /// resizes in `sizes`, in the probe's `(top, bottom)` convention.
+    fn vt100_region(rows: u16, stream: &[u8], sizes: &[u16]) -> (u16, u16) {
+        let mut real = vt100::Parser::new(rows, 4, 0);
+        real.process(stream);
+        for &size in sizes {
+            real.screen_mut().set_size(size, 4);
+        }
+        probe_vt100_scroll_region(&mut real)
+    }
+
+    /// The tracker's side of the same differential.
+    fn tracked(rows: u16, stream: &[u8], sizes: &[u16]) -> MarginTracker {
+        let mut tracker = MarginTracker::new(rows);
+        tracker.scan(stream);
+        for &size in sizes {
+            tracker.set_rows(size);
+        }
+        tracker
+    }
+
     /// Differential test: `MarginTracker::set_rows` versus what the real
     /// `vt100::Screen::set_size` actually does to the grid's scroll region
     /// (0.16.2 `grid.rs::set_size`, lines 66-99), read back with the probe
@@ -2175,16 +2185,10 @@ mod tests {
         ];
         for &(before, (top, bottom), after) in cases {
             let decstbm = format!("\x1b[{top};{bottom}r");
-
-            let mut real = vt100::Parser::new(before, 80, 0);
-            real.process(decstbm.as_bytes());
-            real.screen_mut().set_size(after, 80);
-            let expected = probe_vt100_scroll_region(&mut real);
-
-            let mut tracker = MarginTracker::new(before);
-            tracker.scan(decstbm.as_bytes());
-            tracker.set_rows(after);
-            let actual = tracker.margins().unwrap_or((1, after));
+            let expected = vt100_region(before, decstbm.as_bytes(), &[after]);
+            let actual = tracked(before, decstbm.as_bytes(), &[after])
+                .margins()
+                .unwrap_or((1, after));
 
             assert_eq!(
                 actual, expected,
@@ -2219,14 +2223,8 @@ mod tests {
                 for bottom in (top + 1)..=before {
                     let decstbm = format!("\x1b[{top};{bottom}r");
                     for after in 1u16..=30 {
-                        let mut real = vt100::Parser::new(before, 4, 0);
-                        real.process(decstbm.as_bytes());
-                        real.screen_mut().set_size(after, 4);
-                        let expected = probe_vt100_scroll_region(&mut real);
-
-                        let mut tracker = MarginTracker::new(before);
-                        tracker.scan(decstbm.as_bytes());
-                        tracker.set_rows(after);
+                        let expected = vt100_region(before, decstbm.as_bytes(), &[after]);
+                        let tracker = tracked(before, decstbm.as_bytes(), &[after]);
                         let tracked = tracker.tracked_region().unwrap_or((1, after));
                         let actual = tracker.margins().unwrap_or((1, after));
 
@@ -2338,15 +2336,8 @@ mod tests {
                     let decstbm = format!("\x1b[{top};{bottom}r");
                     for mid in 1u16..=18 {
                         for after in 1u16..=18 {
-                            let mut real = vt100::Parser::new(before, 4, 0);
-                            real.process(decstbm.as_bytes());
-                            real.screen_mut().set_size(mid, 4);
-                            real.screen_mut().set_size(after, 4);
-                            let expected = probe_vt100_scroll_region(&mut real);
-
-                            let mut tracker = MarginTracker::new(before);
-                            tracker.scan(decstbm.as_bytes());
-                            tracker.set_rows(mid);
+                            let expected = vt100_region(before, decstbm.as_bytes(), &[mid, after]);
+                            let mut tracker = tracked(before, decstbm.as_bytes(), &[mid]);
                             let midpoint = tracker.tracked_region();
                             tracker.set_rows(after);
                             let actual = tracker.tracked_region().unwrap_or((1, after));
@@ -2589,13 +2580,18 @@ mod tests {
     /// left. A real terminal scrolls instead, so the tracker does too: the
     /// cursor's line survives, the top advances, and the last line stays
     /// last.
+    /// `HISTLINE-{i}\r\n` for every `i` in `range` -- the fill the shrink
+    /// tests scroll through.
+    fn histlines(range: std::ops::RangeInclusive<u16>) -> Vec<u8> {
+        range
+            .flat_map(|i| format!("HISTLINE-{i}\r\n").into_bytes())
+            .collect()
+    }
+
     #[test]
     fn shrinking_keeps_the_cursor_line_the_way_a_real_terminal_does() {
         let mut t = ScreenTracker::new(24, 80);
-        let mut fill = Vec::new();
-        for i in 58..=80 {
-            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
-        }
+        let mut fill = histlines(58..=80);
         fill.extend_from_slice(b"prompt$ ");
         t.process(&fill);
         assert!(t.contents().contains("HISTLINE-80"));
@@ -2625,11 +2621,7 @@ mod tests {
     fn shrinking_compensation_is_gated_on_regions_and_mid_sequence_streams() {
         // Region holder: no compensation.
         let mut t = ScreenTracker::new(24, 80);
-        let mut fill = Vec::new();
-        for i in 58..=80 {
-            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
-        }
-        t.process(&fill);
+        t.process(&histlines(58..=80));
         t.process(b"\x1b[3;20r");
         t.set_size(23, 80);
         let region = t.contents();
@@ -2643,10 +2635,7 @@ mod tests {
         // Mid-sequence: the guard must skip the SU and leave the pending
         // sequence parseable.
         let mut t = ScreenTracker::new(24, 80);
-        let mut fill = Vec::new();
-        for i in 58..=80 {
-            fill.extend_from_slice(format!("HISTLINE-{i}\r\n").as_bytes());
-        }
+        let mut fill = histlines(58..=80);
         fill.extend_from_slice(b"prompt$ \x1b[38;5");
         t.process(&fill);
         t.set_size(23, 80);
