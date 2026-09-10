@@ -346,13 +346,21 @@ impl MarginTracker {
     }
 
     fn step(&mut self, byte: u8) -> CsiEvent {
-        match self.state {
-            MarginParseState::Ground => {
-                if byte == 0x1b {
-                    self.state = MarginParseState::Esc;
-                }
-                CsiEvent::default()
+        // Like `vte`: `ESC` abandons whatever is in flight and starts a new
+        // sequence, `CAN`/`SUB` abandon it and return to ground.
+        match byte {
+            0x1b => {
+                self.state = MarginParseState::Esc;
+                return CsiEvent::default();
             }
+            0x18 | 0x1a => {
+                self.state = MarginParseState::Ground;
+                return CsiEvent::default();
+            }
+            _ => {}
+        }
+        match self.state {
+            MarginParseState::Ground => CsiEvent::default(),
             MarginParseState::Esc => match byte {
                 b'c' => {
                     self.state = MarginParseState::Ground;
@@ -1907,6 +1915,37 @@ mod tests {
                 t.margins(),
                 Some((3, 20)),
                 "split at {split} lost the margin"
+            );
+        }
+    }
+
+    /// `vte` abandons a CSI on `ESC` (a new sequence starts) and on
+    /// `CAN`/`SUB` (back to ground); a recognizer that kept accumulating
+    /// would read `ESC [ 3 ESC [ 5 ; 2 0 r` as `35;20` where the grid beside
+    /// it sees `5;20`. Measured against the real crate.
+    #[test]
+    fn margin_tracker_aborts_a_csi_the_way_vte_does() {
+        for stream in [
+            &b"\x1b[3\x1b[5;20r"[..],
+            b"\x1b[3;\x1b[5;20r",
+            b"\x1b[3\x18\x1b[5;20r",
+            b"\x1b[3;9\x1a\x1b[5;20r",
+            b"\x1b\x1b[5;20r",
+            b"\x1b[?\x1b[5;20r",
+            b"\x1b[5;20r\x1b[3\x1a",
+            b"\x1b[5;20r\x1b[3\x1bc",
+            b"\x1b[5;20r\x1b\x1bc",
+        ] {
+            let mut real = vt100::Parser::new(24, 80, 0);
+            real.process(stream);
+            let expected = probe_vt100_scroll_region(&mut real);
+
+            let mut tracker = MarginTracker::new(24);
+            tracker.scan(stream);
+            assert_eq!(
+                tracker.margins().unwrap_or((1, 24)),
+                expected,
+                "{stream:?}: vt100={expected:?}"
             );
         }
     }
