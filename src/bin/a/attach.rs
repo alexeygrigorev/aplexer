@@ -1,4 +1,6 @@
-fn attach(
+use super::*;
+
+pub(crate) fn attach(
     paths: &Paths,
     record: &SessionRecord,
     history_bytes: Option<usize>,

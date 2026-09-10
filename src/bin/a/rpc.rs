@@ -1,9 +1,11 @@
-#[cfg(not(test))]
-const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(test)]
-const CONTROL_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+use super::*;
 
-fn set_control_deadlines(stream: &UnixStream) -> Result<()> {
+#[cfg(not(test))]
+pub(crate) const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+pub(crate) const CONTROL_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(crate) fn set_control_deadlines(stream: &UnixStream) -> Result<()> {
     stream
         .set_read_timeout(Some(CONTROL_RPC_TIMEOUT))
         .context("set worker response deadline")?;
@@ -13,7 +15,7 @@ fn set_control_deadlines(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn clear_streaming_deadlines(stream: &UnixStream) -> Result<()> {
+pub(crate) fn clear_streaming_deadlines(stream: &UnixStream) -> Result<()> {
     stream
         .set_read_timeout(None)
         .context("clear attach streaming read deadline")?;
@@ -23,7 +25,7 @@ fn clear_streaming_deadlines(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub(crate) fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let path_bytes = path.as_os_str().as_bytes();
     let _ = CString::new(path_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
@@ -162,13 +164,17 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream
     Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
 }
 
-fn connect(record: &SessionRecord) -> Result<UnixStream> {
+pub(crate) fn connect(record: &SessionRecord) -> Result<UnixStream> {
     let stream = connect_with_timeout(&record.socket_path, CONTROL_RPC_TIMEOUT)
         .with_context(|| format!("connect {}", record.socket_path.display()))?;
     set_control_deadlines(&stream)?;
     Ok(stream)
 }
-fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
+pub(crate) fn rpc_simple(
+    record: &SessionRecord,
+    operation: Operation,
+    data: Option<&[u8]>,
+) -> Result<Value> {
     let mut stream = connect(record)?;
     let request = Request::new(record.id, operation);
     let id = request.request_id.clone();
@@ -183,11 +189,11 @@ fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>)
     }
     response.into_result()
 }
-fn rpc_send(record: &SessionRecord, data: &[u8]) -> Result<()> {
+pub(crate) fn rpc_send(record: &SessionRecord, data: &[u8]) -> Result<()> {
     rpc_simple(record, Operation::Send { bytes: data.len() }, Some(data))?;
     Ok(())
 }
-fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
+pub(crate) fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
     let mut stream = connect(record)?;
     let request = Request::new(record.id, Operation::Capture { max_bytes: max });
     let id = request.request_id.clone();
@@ -206,7 +212,7 @@ fn rpc_capture(record: &SessionRecord, max: Option<usize>) -> Result<Vec<u8>> {
 }
 /// `a capture --screen [--plain]` (docs/terminal-state-design.md section 8):
 /// mirrors `rpc_capture`'s shape exactly, against `Operation::CaptureScreen`.
-fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
+pub(crate) fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
     let mut stream = connect(record)?;
     let request = Request::new(record.id, Operation::CaptureScreen { plain });
     let id = request.request_id.clone();
@@ -223,4 +229,3 @@ fn rpc_capture_screen(record: &SessionRecord, plain: bool) -> Result<Vec<u8>> {
     }
     Ok(frame.payload)
 }
-

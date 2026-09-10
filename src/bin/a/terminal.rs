@@ -1,3 +1,5 @@
+use super::*;
+
 /// Default amount of history replayed on attach when the caller didn't ask
 /// for more via `--history-bytes`. The old default -- passing `None` through
 /// to the server, which `History::snapshot` treats as "the whole buffer" --
@@ -10,7 +12,7 @@
 /// that tail still usually contains the shell/TUI's own recent
 /// cursor-position/clear escapes and renders close enough.
 
-const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
+pub(crate) const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 
 /// **These timers no longer decide whether a redraw is *safe*, only when one
 /// is *wanted*.** The previous version of this comment said aplexer had "no
@@ -37,9 +39,9 @@ const DEFAULT_ATTACH_REPLAY_BYTES: usize = 32 * 1024;
 /// these constants is scheduling: `STATUS_BAR_IDLE_GAP` still debounces an
 /// idle session's redraws, and `STATUS_BAR_MAX_INTERVAL` still bounds how
 /// stale a continuously-streaming session's bar may get.
-const STATUS_BAR_IDLE_GAP: Duration = Duration::from_millis(450);
-const STATUS_BAR_MAX_INTERVAL: Duration = Duration::from_secs(3);
-const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
+pub(crate) const STATUS_BAR_IDLE_GAP: Duration = Duration::from_millis(450);
+pub(crate) const STATUS_BAR_MAX_INTERVAL: Duration = Duration::from_secs(3);
+pub(crate) const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// While the attached session's state is `working` (a fresh `a state-report`
 /// push -- the agent said it is running; see `spinner_frame` for why the
@@ -53,8 +55,8 @@ const STATUS_BAR_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// tick keeps the cadence aligned with the thread that drives it; ten
 /// frames is a 1.5s revolution -- standard spinner speed, deliberately
 /// unhurried.
-const SPINNER_FRAME_MS: u64 = STATUS_BAR_POLL_INTERVAL.as_millis() as u64;
-const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub(crate) const SPINNER_FRAME_MS: u64 = STATUS_BAR_POLL_INTERVAL.as_millis() as u64;
+pub(crate) const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// How long a redraw may be held back purely because the workload has an
 /// unclosed synchronized-output block (`CSI ? 2026 h`).
@@ -67,7 +69,7 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 /// restored absolutely. Bounding it means a workload that opens a block and
 /// never closes it (or a terminal-side sync timeout that already released it)
 /// cannot freeze the bar indefinitely.
-const STATUS_BAR_SYNC_DEFER_LIMIT: Duration = Duration::from_millis(500);
+pub(crate) const STATUS_BAR_SYNC_DEFER_LIMIT: Duration = Duration::from_millis(500);
 
 /// How long a terminal resize's DECSTBM may be held back by the escape
 /// boundary gate before it is written anyway (issue #14).
@@ -81,37 +83,37 @@ const STATUS_BAR_SYNC_DEFER_LIMIT: Duration = Duration::from_millis(500);
 /// within one PTY chunk, so this deadline only fires when a workload has
 /// stopped emitting part-way through an escape sequence -- a state in which
 /// the host terminal is already stuck waiting for bytes that are not coming.
-const LAYOUT_DEFER_LIMIT: Duration = Duration::from_millis(500);
+pub(crate) const LAYOUT_DEFER_LIMIT: Duration = Duration::from_millis(500);
 
 /// A terminal resize whose DECSTBM the boundary gate held back, and when it
 /// was first held back (`LAYOUT_DEFER_LIMIT`'s deadline is measured from the
 /// first deferral, not from the most recent resize).
 #[derive(Clone, Copy)]
-struct PendingLayout {
-    rows: u16,
-    cols: u16,
-    since: Instant,
+pub(crate) struct PendingLayout {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) since: Instant,
 }
 
 /// Physical terminal geometry as last observed by the resize-poll thread,
 /// shared with the status-bar thread so its redraws always target the
 /// current last row/width without a second ioctl.
 #[derive(Clone, Copy)]
-struct TermGeom {
-    rows: u16,
-    cols: u16,
+pub(crate) struct TermGeom {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
     /// Whether the bottom row is reserved for the status bar. False for
     /// terminals too small to spare a row (see `reserved_rows`), in which
     /// case the scroll region is left/reset to full-screen and the status
     /// bar is simply not drawn.
-    reserved: bool,
+    pub(crate) reserved: bool,
 }
 
 /// The row count told to the SERVER: one less than the physical terminal
 /// when a status row is reserved, exactly like tmux tells the remote PTY its
 /// terminal is one row shorter than reality so its own output never
 /// overwrites the reserved line.
-fn reserved_rows(rows: u16) -> u16 {
+pub(crate) fn reserved_rows(rows: u16) -> u16 {
     if rows > 2 {
         rows - 1
     } else {
@@ -145,7 +147,7 @@ fn reserved_rows(rows: u16) -> u16 {
 /// `write_client_locked`, which is the boundary gate. `write_locked`'s two
 /// call sites are pinned by
 /// `every_client_terminal_write_site_is_gated_or_explicitly_exempt`.
-fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()> {
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -156,7 +158,7 @@ fn write_locked(stdout: &Arc<Mutex<io::Stdout>>, bytes: &[u8]) -> io::Result<()>
 /// Whether a client-originated write may still go out when the relayed
 /// stream is *not* between complete escape sequences.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BoundaryPolicy {
+pub(crate) enum BoundaryPolicy {
     /// Refuse and let the caller park the write for the next boundary.
     /// Everything the user can wait for: the status bar, `Ctrl-b r`, and a
     /// resize that has not yet hit `LAYOUT_DEFER_LIMIT`.
@@ -214,7 +216,7 @@ enum BoundaryPolicy {
 /// Returns whether the bytes went out. `false` means the stream was
 /// mid-sequence and the caller must park the write for a later boundary
 /// rather than drop it.
-fn write_client_locked(
+pub(crate) fn write_client_locked(
     out: &mut impl Write,
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     bytes: &[u8],
@@ -237,7 +239,7 @@ fn write_client_locked(
 ///
 /// No `\x1b7`/`\x1b8` bracket: see `status_bar_sequence` for why the client
 /// must never write to the shared save-cursor register.
-fn terminal_layout_sequence(rows: u16, restore: &[u8]) -> Vec<u8> {
+pub(crate) fn terminal_layout_sequence(rows: u16, restore: &[u8]) -> Vec<u8> {
     let mut seq = Vec::new();
     if rows > 2 {
         seq.extend_from_slice(format!("\x1b[1;{}r", rows - 1).as_bytes());
@@ -289,7 +291,7 @@ fn terminal_layout_sequence(rows: u16, restore: &[u8]) -> Vec<u8> {
 /// Returns whether bytes actually reached the terminal. A deferral is
 /// recorded in `ctx.pending_layout` and flushed by `flush_pending_layout`;
 /// see that function for why deferring here never loses a resize.
-fn apply_terminal_layout(ctx: &StatusBarCtx, rows: u16, cols: u16) -> bool {
+pub(crate) fn apply_terminal_layout(ctx: &StatusBarCtx, rows: u16, cols: u16) -> bool {
     // The initial layout is followed by the attach snapshot, so repainting it
     // here would only draw a frame that the snapshot immediately replaces.
     // Every later layout change needs a full repaint: the old status row is
@@ -315,7 +317,7 @@ fn apply_terminal_layout(ctx: &StatusBarCtx, rows: u16, cols: u16) -> bool {
 /// harness. Production has exactly one caller pair -- `apply_terminal_layout`
 /// and `flush_pending_layout` -- and both hold the lock across it, because
 /// the boundary check and the write must not be separable.
-fn apply_terminal_layout_to(
+pub(crate) fn apply_terminal_layout_to(
     out: &mut impl Write,
     ctx: &StatusBarCtx,
     rows: u16,
@@ -371,7 +373,7 @@ fn apply_terminal_layout_to(
 }
 
 /// When the currently-parked resize was *first* held back, if there is one.
-fn layout_deferred_since(ctx: &StatusBarCtx) -> Option<Instant> {
+pub(crate) fn layout_deferred_since(ctx: &StatusBarCtx) -> Option<Instant> {
     ctx.pending_layout
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -397,7 +399,7 @@ fn layout_deferred_since(ctx: &StatusBarCtx) -> Option<Instant> {
 /// writes and re-parks it (keeping the original deadline) when it cannot, so
 /// a flush that loses the race with a still-unsafe stream does not drop the
 /// resize on the floor.
-fn flush_pending_layout(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn flush_pending_layout(ctx: &StatusBarCtx) -> bool {
     // Cheap pre-check, before the stdout lock. The frame loop calls this
     // after *every* PTY chunk and there is almost never a resize parked, so
     // the common case must not queue behind the status thread's redraw for
@@ -419,7 +421,7 @@ fn flush_pending_layout(ctx: &StatusBarCtx) -> bool {
 /// `flush_pending_layout` with the destination passed in and the stdout lock
 /// already held. Calls `apply_terminal_layout_to`, never
 /// `apply_terminal_layout`: the lock is not reentrant.
-fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) -> bool {
+pub(crate) fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) -> bool {
     let pending = *ctx
         .pending_layout
         .lock()
@@ -438,7 +440,7 @@ fn flush_pending_layout_to(out: &mut impl Write, ctx: &StatusBarCtx) -> bool {
 /// Modal painters already own resize repainting. They deliberately keep this
 /// helper live-only so a resize does not replace a pager or key overlay with
 /// the workload's screen.
-fn redraw_live_screen_after_layout(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn redraw_live_screen_after_layout(ctx: &StatusBarCtx) -> bool {
     if ctx.scroll.is_active() || ctx.overlay.is_active() {
         return false;
     }
@@ -459,7 +461,7 @@ fn redraw_live_screen_after_layout(ctx: &StatusBarCtx) -> bool {
 /// (docs/terminal-state-design.md section 9's steady-state parse budget);
 /// paying it a second time in the client is the price of the client no longer
 /// writing blind into someone else's byte stream.
-fn relay_to_terminal(
+pub(crate) fn relay_to_terminal(
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     stdout: &Arc<Mutex<io::Stdout>>,
     scroll: &Arc<ScrollMode>,
@@ -498,7 +500,7 @@ fn relay_to_terminal(
 /// switch's replayed screen -- and feeds them to the model under the *same*
 /// stdout lock, so a concurrent status redraw can never see a model that is
 /// ahead of what the terminal has actually been sent.
-fn feed_and_write(
+pub(crate) fn feed_and_write(
     stdout: &Arc<Mutex<io::Stdout>>,
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     prefix: &[u8],
@@ -531,7 +533,7 @@ fn feed_and_write(
 /// the status bar) just sits in the user's terminal after attach() returns.
 /// `\x1b[2J\x1b[H` (full clear + cursor home) is used rather than a fuller
 /// reset (`\x1bc`) because it doesn't disturb terminal scrollback history.
-const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
+pub(crate) const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 \x1b[?1049l\
 \x1b[?1007h\
 \x1b>\
@@ -563,9 +565,9 @@ const TERMINAL_RESET_SEQUENCE: &[u8] = b"\
 /// the attach, so the wheel does nothing instead of something destructive.
 /// `reset_terminal` restores it on detach, since the mode is terminal-global
 /// and the user's next `less`/`vim` expects the default back.
-const ATTACH_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h\x1b[?1007l";
+pub(crate) const ATTACH_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h\x1b[?1007l";
 
-fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
+pub(crate) fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
     // `\x1b[?1049l` first (docs/terminal-state-design.md section 6.3): the
     // attach client holds the host on the alternate screen for the whole
     // session (see `ATTACH_ALT_SCREEN_ENTER`) so the pre-attach primary
@@ -599,8 +601,8 @@ fn reset_terminal(stdout: &Arc<Mutex<io::Stdout>>) {
 /// error, or an early `?` return -- so a new exit path added later can't
 /// forget the cleanup. Constructed whenever stdout is a tty, independently
 /// of whether stdin is interactive; `RawMode` remains stdin-specific.
-struct TerminalUiGuard {
-    stdout: Arc<Mutex<io::Stdout>>,
+pub(crate) struct TerminalUiGuard {
+    pub(crate) stdout: Arc<Mutex<io::Stdout>>,
 }
 impl Drop for TerminalUiGuard {
     fn drop(&mut self) {
@@ -608,7 +610,7 @@ impl Drop for TerminalUiGuard {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KI: u64 = 1024;
     const MI: u64 = KI * 1024;
     const GI: u64 = MI * 1024;
@@ -629,7 +631,7 @@ fn format_bytes(bytes: u64) -> String {
 /// failure (worker briefly unreachable) -- every indicator built from this
 /// just degrades to "omitted" in that case, same as before this was
 /// shared.
-fn live_status(record: &SessionRecord) -> Option<Value> {
+pub(crate) fn live_status(record: &SessionRecord) -> Option<Value> {
     rpc_simple(record, Operation::Status, None).ok()
 }
 
@@ -651,7 +653,7 @@ fn live_status(record: &SessionRecord) -> Option<Value> {
 /// from the bar's point of view. A missing field (older worker) or a
 /// failed RPC (`raw` None) leaves the snapshot untouched, same degradation
 /// as the memory indicator.
-fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> SessionRecord {
+pub(crate) fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> SessionRecord {
     let mut fresh = record.clone();
     let Some(raw) = raw else {
         return fresh;
@@ -673,7 +675,7 @@ fn overlay_reported_state(record: &SessionRecord, raw: Option<&Value>) -> Sessio
 /// for existing is resource-isolated agent sessions. Best-effort: absence
 /// of cgroup stats in `raw` (no cgroup configured) just omits the
 /// indicator rather than disrupting the status bar.
-fn memory_indicator(record: &SessionRecord, raw: &Value) -> Option<String> {
+pub(crate) fn memory_indicator(record: &SessionRecord, raw: &Value) -> Option<String> {
     let current = raw.get("cgroup")?.get("memory_current")?.as_u64()?;
     let used = format_bytes(current);
     Some(match record.limits.memory_bytes {
@@ -687,7 +689,8 @@ fn memory_indicator(record: &SessionRecord, raw: &Value) -> Option<String> {
 /// means), not information. Only an actually interesting foreground
 /// program -- something manually run inside the session that isn't just
 /// its own shell -- is worth surfacing.
-const PLAIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"];
+pub(crate) const PLAIN_SHELLS: &[&str] =
+    &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"];
 
 /// The live foreground-command override for the status bar, if there's
 /// anything worth showing beyond `record.engine` alone (see
@@ -700,7 +703,7 @@ const PLAIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcs
 /// engine's own launch command running as expected (e.g. a `codex`-engine
 /// session actually running `codex` shouldn't redundantly show
 /// `[codex -> codex]`).
-fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
+pub(crate) fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
     let fg = raw.get("foreground_command")?.as_str()?;
     if PLAIN_SHELLS.contains(&fg) {
         return None;
@@ -725,7 +728,7 @@ fn foreground_override(record: &SessionRecord, raw: &Value) -> Option<String> {
 /// family (`engine_family`): a `zcodex`-engine session running
 /// zcodex says codex once, because zcodex is a codex variant, not a second
 /// agent.
-fn extra_agent_label(
+pub(crate) fn extra_agent_label(
     record: &SessionRecord,
     detected: Option<aplexer::agent_kind::AgentKind>,
 ) -> Option<&'static str> {
@@ -739,7 +742,7 @@ fn extra_agent_label(
 /// `codex` is the fact. A declared engine keeps the `engine -> agent` form,
 /// where the base carries real information (a claude session someone
 /// started codex inside).
-fn engine_label(
+pub(crate) fn engine_label(
     record: &SessionRecord,
     detected: Option<aplexer::agent_kind::AgentKind>,
 ) -> String {
@@ -774,7 +777,7 @@ fn engine_label(
 /// makes sense as a complete index. Example: `1:main* 2:review
 /// 3:build(broken)`. A single-session workspace omits the segment (empty
 /// string), same as before.
-fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
+pub(crate) fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
     let records = match list_records(&ctx.paths) {
         Ok(r) => r,
         Err(_) => return String::new(),
@@ -812,13 +815,13 @@ fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
 /// Session records and transient errors can contain arbitrary persisted or
 /// remote text; C0/C1 controls (including ESC, BEL, CR, and LF) must never be
 /// allowed to become terminal instructions when the bar is drawn.
-fn sanitize_terminal_text(text: &str) -> String {
+pub(crate) fn sanitize_terminal_text(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { '?' } else { ch })
         .collect()
 }
 
-fn terminal_display_width(text: &str) -> usize {
+pub(crate) fn terminal_display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
@@ -826,7 +829,7 @@ fn terminal_display_width(text: &str) -> usize {
 /// splitting an extended grapheme cluster. This keeps wide glyphs, combining
 /// sequences, and emoji aligned while the reverse-video bar spans the full
 /// terminal width like tmux's own.
-fn pad_or_truncate(text: &str, cols: usize) -> String {
+pub(crate) fn pad_or_truncate(text: &str, cols: usize) -> String {
     let cols = cols.max(1);
     let mut rendered = String::new();
     let mut width = 0;
@@ -850,17 +853,17 @@ fn pad_or_truncate(text: &str, cols: usize) -> String {
 /// respawning the thread; `flash` is a transient error line (switch
 /// failures); `last_drawn` backs the dirty-check in `draw_status_bar`.
 #[derive(Clone)]
-struct StatusBarCtx {
-    stdout: Arc<Mutex<io::Stdout>>,
-    term: Arc<Mutex<TermGeom>>,
-    paths: Paths,
-    record: Arc<Mutex<SessionRecord>>,
-    flash: Arc<Mutex<Option<(String, Instant)>>>,
+pub(crate) struct StatusBarCtx {
+    pub(crate) stdout: Arc<Mutex<io::Stdout>>,
+    pub(crate) term: Arc<Mutex<TermGeom>>,
+    pub(crate) paths: Paths,
+    pub(crate) record: Arc<Mutex<SessionRecord>>,
+    pub(crate) flash: Arc<Mutex<Option<(String, Instant)>>>,
     /// (text, rows, cols, workload margins) last actually written, so an
     /// unchanged bar isn't rewritten every debounce tick -- see
     /// `draw_status_bar`'s doc comment and
     /// docs/low-bandwidth-remote-access-design.md section 2.1.
-    last_drawn: Arc<Mutex<LastDrawnStatus>>,
+    pub(crate) last_drawn: Arc<Mutex<LastDrawnStatus>>,
     /// The client's own live model of the *workload's* screen, fed every PTY
     /// byte this client writes to the terminal (including the attach
     /// snapshot, which is a full repaint of that screen per
@@ -882,41 +885,41 @@ struct StatusBarCtx {
     ///   re-asserting `\x1b[1;{rows-1}r` unconditionally destroys a
     ///   workload's own sub-range, including the one the attach snapshot just
     ///   restored.
-    screen: Arc<Mutex<aplexer::screen::ClientScreen>>,
+    pub(crate) screen: Arc<Mutex<aplexer::screen::ClientScreen>>,
     /// Set when a redraw was wanted but the stream was not at a safe boundary
     /// (or was inside a synchronized-output frame). The main frame loop
     /// flushes it at the first boundary that is safe, so deferring never
     /// means dropping.
-    pending: Arc<AtomicBool>,
+    pub(crate) pending: Arc<AtomicBool>,
     /// Set when `Ctrl-b r` wanted a full live-screen repaint but the stream
     /// was not at a safe boundary. Flushed by the main frame loop the same
     /// way as `pending`; a successful refresh also redraws the status bar,
     /// so it subsumes a pending bar redraw.
-    pending_refresh: Arc<AtomicBool>,
+    pub(crate) pending_refresh: Arc<AtomicBool>,
     /// The physical geometry a terminal resize wanted to reserve a row out
     /// of, parked here because the relayed stream was mid-escape-sequence
     /// when the resize poller fired (issue #14). Flushed by
     /// `flush_pending_layout` from both the frame loop and the status
     /// thread, so a deferred resize is delivered late, never dropped.
-    pending_layout: Arc<Mutex<Option<PendingLayout>>>,
+    pub(crate) pending_layout: Arc<Mutex<Option<PendingLayout>>>,
     /// When the current synchronized-output deferral started, so
     /// `STATUS_BAR_SYNC_DEFER_LIMIT` can bound it.
-    sync_deferred_since: Arc<Mutex<Option<Instant>>>,
+    pub(crate) sync_deferred_since: Arc<Mutex<Option<Instant>>>,
     /// Scroll mode (`Ctrl-b [`, or a wheel roll): whether the pager is up
     /// and where in the retained history it is looking. Read by the relay on
     /// every chunk to decide whether the host may be written to at all.
-    scroll: Arc<ScrollMode>,
+    pub(crate) scroll: Arc<ScrollMode>,
     /// The which-key overlay: whether the `Ctrl-b` keymap is currently drawn
     /// over the screen. Read by the relay on every chunk for the same reason
     /// `scroll` is -- while a modal owns the host, the model keeps eating
     /// bytes and the terminal is written nothing.
-    overlay: Arc<KeyOverlay>,
+    pub(crate) overlay: Arc<KeyOverlay>,
     /// Who currently owns mouse reporting on the host: `Some(true)` this
     /// client (so the wheel reaches `a`), `Some(false)` the workload,
     /// `None` nothing asserted yet. See `sync_client_mouse`.
-    mouse_owned: Arc<Mutex<Option<bool>>>,
+    pub(crate) mouse_owned: Arc<Mutex<Option<bool>>>,
     /// Whether borrowing the mouse is permitted at all (`APLEXER_MOUSE`).
-    mouse_capture: bool,
+    pub(crate) mouse_capture: bool,
 }
 
 type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
@@ -925,7 +928,7 @@ type LastDrawnStatus = Option<(String, u16, u16, Option<(u16, u16)>)>;
 /// `Ctrl-b ?` help) stays visible before the normal text resumes
 /// (docs/fast-session-switching-design.md section 6.1). Three seconds
 /// rather than two: help text has to be readable, not merely noticed.
-const FLASH_DURATION: Duration = Duration::from_secs(3);
+pub(crate) const FLASH_DURATION: Duration = Duration::from_secs(3);
 
 /// One attach-mode chord, as every rendering of it needs it.
 ///
@@ -940,20 +943,20 @@ const FLASH_DURATION: Duration = Duration::from_secs(3);
 /// that has to show the keymap reads this table too rather than adding
 /// another copy; if it needs something the table does not carry, the field
 /// belongs here.
-struct AttachBinding {
+pub(crate) struct AttachBinding {
     /// The keys, as the `a keys` listing's left column shows them.
-    keys: &'static str,
+    pub(crate) keys: &'static str,
     /// `key label` for the one-line status-bar flash, which has a terminal
     /// width to live inside; `None` keeps a binding out of that line only.
     /// Order here is the order shown, and the flash is truncated from the
     /// right, so the entries most worth seeing on an 80-column terminal come
     /// first.
-    brief: Option<&'static str>,
+    pub(crate) brief: Option<&'static str>,
     /// The sentence `a keys` prints.
-    description: &'static str,
+    pub(crate) description: &'static str,
 }
 
-const ATTACH_BINDINGS: &[AttachBinding] = &[
+pub(crate) const ATTACH_BINDINGS: &[AttachBinding] = &[
     AttachBinding {
         keys: "Right / Left",
         brief: Some("←/→ session"),
@@ -1010,7 +1013,7 @@ const ATTACH_BINDINGS: &[AttachBinding] = &[
 /// the same chords `a keys`/`a hotkeys` print, compressed to what fits a
 /// terminal line (and truncated by the bar renderer when it does not).
 /// Consumed locally: no byte reaches the workload.
-fn attach_key_help() -> String {
+pub(crate) fn attach_key_help() -> String {
     let brief: Vec<&str> = ATTACH_BINDINGS.iter().filter_map(|b| b.brief).collect();
     format!("Ctrl-b: {}", brief.join(" · "))
 }
@@ -1020,7 +1023,7 @@ fn attach_key_help() -> String {
 /// nothing is ever printed into the workload's output stream (the original
 /// attach banner's corruption failure mode, docs/terminal-state-design.md
 /// section 6.3 step 6).
-fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
+pub(crate) fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
     if let Ok(mut flash) = ctx.flash.lock() {
         *flash = Some((message.into(), Instant::now()));
     }
@@ -1034,7 +1037,7 @@ fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
 /// (tag-first), compact (tag + state + detected agent + help), and a minimum
 /// that keeps state and `^b ?` alive on even a few columns. Renders a flashed
 /// message instead of all of these while one is active (section 6.1).
-fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
+pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     {
         let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((msg, at)) = flash.clone() {
@@ -1174,7 +1177,7 @@ fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
 /// keep the timer perpetually "recently fired" without ever actually
 /// rewriting a margin a full-screen erase clobbered, breaking the self-heal
 /// guarantee this constant exists for.
-fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
+pub(crate) fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     // The stdout lock is taken *before* `status_bar_redraw` consults the
     // client's terminal model, and held across the write. Checking the escape
     // boundary and then writing without the lock is a race the frame loop
@@ -1235,7 +1238,7 @@ fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
 /// Same boundary rules as `draw_status_bar`: never splice into a half-
 /// emitted CSI. Deferring sets `pending_refresh`, which the main frame loop
 /// flushes at the next safe chunk.
-fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
     {
         let (at_boundary, in_sync) = {
             let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1265,7 +1268,7 @@ fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
 
 /// Snapshot plus a forced status-bar sequence, or `None` when the stream is
 /// not at a safe boundary (in which case `pending_refresh` is set).
-fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
+pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
     let (at_boundary, in_sync, snapshot) = {
         let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
         (
@@ -1296,7 +1299,7 @@ fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> {
 /// reserved row. Deliberately computed *before* the stdout lock is taken:
 /// `status_bar_text` reads session records off disk, and the PTY relay must
 /// not block behind that.
-fn status_bar_render(ctx: &StatusBarCtx) -> Option<(TermGeom, String)> {
+pub(crate) fn status_bar_render(ctx: &StatusBarCtx) -> Option<(TermGeom, String)> {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return None,
@@ -1311,7 +1314,7 @@ fn status_bar_render(ctx: &StatusBarCtx) -> Option<(TermGeom, String)> {
 /// `status_bar_render` + `status_bar_redraw_locked`, for tests and for
 /// callers with no concurrent writer.
 #[cfg(test)]
-fn status_bar_redraw(ctx: &StatusBarCtx, force: bool) -> Option<Vec<u8>> {
+pub(crate) fn status_bar_redraw(ctx: &StatusBarCtx, force: bool) -> Option<Vec<u8>> {
     let (geom, text) = status_bar_render(ctx)?;
     status_bar_redraw_locked(ctx, geom, &text, force)
 }
@@ -1323,7 +1326,7 @@ fn status_bar_redraw(ctx: &StatusBarCtx, force: bool) -> Option<Vec<u8>> {
 /// Split out so tests can drive the real decision path and feed the real
 /// bytes through a real `vt100` host terminal, without redirecting the
 /// process's fd 1 out from under a concurrently-running test harness.
-fn status_bar_redraw_locked(
+pub(crate) fn status_bar_redraw_locked(
     ctx: &StatusBarCtx,
     geom: TermGeom,
     text: &str,
@@ -1374,7 +1377,7 @@ fn status_bar_redraw_locked(
 /// Whether a redraw should be held back because the workload is part-way
 /// through a synchronized-output frame, bounded by
 /// `STATUS_BAR_SYNC_DEFER_LIMIT` so an unclosed block cannot freeze the bar.
-fn sync_defer(ctx: &StatusBarCtx, in_sync: bool) -> bool {
+pub(crate) fn sync_defer(ctx: &StatusBarCtx, in_sync: bool) -> bool {
     let mut since = ctx
         .sync_deferred_since
         .lock()
@@ -1422,7 +1425,7 @@ fn sync_defer(ctx: &StatusBarCtx, in_sync: bool) -> bool {
 /// scroll the wrong rows. DECSTBM homes the cursor as a side effect on real
 /// terminals, which is precisely why the absolute restore has to come after
 /// it rather than being skipped when the region is unchanged.
-fn status_bar_sequence(
+pub(crate) fn status_bar_sequence(
     geom: TermGeom,
     text: &str,
     workload_margins: Option<(u16, u16)>,
@@ -1489,7 +1492,7 @@ fn status_bar_sequence(
 /// model costs exactly what it did before this feature). The value is
 /// clamped against `MAX_SCROLLBACK_CELLS` at the terminal's width, so a
 /// large number cannot turn into a large allocation.
-fn history_limit() -> usize {
+pub(crate) fn history_limit() -> usize {
     match env::var("APLEXER_HISTORY_LIMIT") {
         Ok(v) => v
             .trim()
@@ -1537,7 +1540,7 @@ fn history_limit() -> usize {
 /// spends another ~27 ms on every switch anyone ever makes to take a single
 /// pathological session from 83 rows of history to 225. That is not a trade
 /// worth making, and 83 rows is already three and a half screens.
-fn scrollback_seed_bytes() -> usize {
+pub(crate) fn scrollback_seed_bytes() -> usize {
     (2 * 1024 * 1024).min(aplexer::DEFAULT_HISTORY_BYTES)
 }
 
@@ -1549,7 +1552,7 @@ fn scrollback_seed_bytes() -> usize {
 /// `mouse on` -- while the client owns the mouse, drag-to-select needs the
 /// terminal's usual Shift override -- so `APLEXER_MOUSE=off` turns the
 /// borrowing off and leaves `Ctrl-b [` as the way in.
-fn mouse_capture_enabled() -> bool {
+pub(crate) fn mouse_capture_enabled() -> bool {
     !matches!(
         env::var("APLEXER_MOUSE").as_deref(),
         Ok("off") | Ok("0") | Ok("no") | Ok("false")
@@ -1563,18 +1566,17 @@ fn mouse_capture_enabled() -> bool {
 /// `?1000h` rather than `?1002h`/`?1003h` deliberately: press/release is all
 /// a wheel needs, and not asking for motion reports keeps the terminal from
 /// streaming a report per cell of mouse movement across the socket.
-const CLIENT_MOUSE_ENABLE: &[u8] =
+pub(crate) const CLIENT_MOUSE_ENABLE: &[u8] =
     b"\x1b[?9l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1000h\x1b[?1006h";
 
 /// `CAN` -- "abandon any control sequence in flight". Leads every write made
 /// under `BoundaryPolicy::StreamSuspended`; see that variant's doc comment
 /// for why that is what makes those writes safe without the boundary gate.
-const SCROLL_CANCEL: &[u8] = b"\x18";
+pub(crate) const SCROLL_CANCEL: &[u8] = b"\x18";
 
 /// Lines a wheel notch moves, matching tmux's own three.
-const WHEEL_LINES: usize = 3;
+pub(crate) const WHEEL_LINES: usize = 3;
 
 /// SGR mouse button numbers for the wheel (xterm: 64 + button index).
-const MOUSE_WHEEL_UP: u32 = 64;
-const MOUSE_WHEEL_DOWN: u32 = 65;
-
+pub(crate) const MOUSE_WHEEL_UP: u32 = 64;
+pub(crate) const MOUSE_WHEEL_DOWN: u32 = 65;

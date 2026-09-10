@@ -1,3 +1,5 @@
+use super::*;
+
 /// Whether the key overlay currently owns the host terminal.
 ///
 /// An atomic for exactly the reason `ScrollMode::active` is one: the relay
@@ -5,19 +7,19 @@
 /// to write.
 #[derive(Default)]
 
-struct KeyOverlay {
-    active: AtomicBool,
+pub(crate) struct KeyOverlay {
+    pub(crate) active: AtomicBool,
 }
 
 impl KeyOverlay {
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
 }
 
 /// Rows the overlay may draw into: the physical terminal less the status
 /// bar's reserved row, which the box must never write over.
-fn key_overlay_rows(geom: TermGeom) -> u16 {
+pub(crate) fn key_overlay_rows(geom: TermGeom) -> u16 {
     if geom.reserved {
         geom.rows.saturating_sub(1)
     } else {
@@ -32,7 +34,7 @@ fn key_overlay_rows(geom: TermGeom) -> u16 {
 /// is obviously cut because it runs to the edge of the terminal. Inside a box
 /// with a border on the right there is no such cue, so an over-long
 /// description would read as a complete sentence that happens to be wrong.
-fn fit_overlay_cell(text: &str, width: usize) -> String {
+pub(crate) fn fit_overlay_cell(text: &str, width: usize) -> String {
     let text = sanitize_terminal_text(text);
     if terminal_display_width(&text) <= width || width < 2 {
         return pad_or_truncate(&text, width);
@@ -63,7 +65,7 @@ fn fit_overlay_cell(text: &str, width: usize) -> String {
 /// seeing first" (it is the order the one-line flash truncates from the right
 /// of), so a short terminal trims from the end and the footer says how many
 /// went.
-fn key_overlay_lines(rows: usize, cols: usize) -> Option<Vec<String>> {
+pub(crate) fn key_overlay_lines(rows: usize, cols: usize) -> Option<Vec<String>> {
     let capacity = rows.checked_sub(KEY_OVERLAY_CHROME_ROWS)?;
     if capacity < KEY_OVERLAY_MIN_BINDINGS {
         return None;
@@ -127,7 +129,7 @@ fn key_overlay_lines(rows: usize, cols: usize) -> Option<Vec<String>> {
 /// Absolute row addressing, so the caller must have the client's own
 /// full-height reservation in force -- see `paint_key_overlay`, which
 /// re-asserts it for exactly this reason.
-fn key_overlay_sequence(geom: TermGeom, lines: &[String]) -> Vec<u8> {
+pub(crate) fn key_overlay_sequence(geom: TermGeom, lines: &[String]) -> Vec<u8> {
     let mut seq = Vec::new();
     let top = key_overlay_rows(geom).saturating_sub(lines.len() as u16) + 1;
     seq.extend_from_slice(b"\x1b[?25l");
@@ -154,7 +156,7 @@ fn key_overlay_sequence(geom: TermGeom, lines: &[String]) -> Vec<u8> {
 /// the snapshot may have just restored a workload sub-range (and, with it,
 /// an origin mode that would make those rows relative to it). The dismissal
 /// repaint puts the workload's own region back.
-fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return false,
@@ -202,7 +204,7 @@ fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
 /// too small for one and the one-line reference was flashed on the status bar
 /// instead -- the honest degradation, decided *before* anything is suspended
 /// so the fallback path never suspends the relay at all.
-fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
     if ctx.scroll.is_active() {
         // The pager has its own key routing (`ScrollInput::route`) and its own
         // full-screen view; a second modal on top of it would describe keys
@@ -252,7 +254,7 @@ fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
 /// went up; the model has been fed every byte that arrived since, so the
 /// snapshot is the screen as it *is*. The bar is rewritten in the same
 /// sequence because the snapshot's `ED2` blanks its reserved row.
-fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
     if !ctx.overlay.is_active() {
         return false;
     }
@@ -291,7 +293,7 @@ fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
 /// a session that just exited, or a history file that has been rotated all
 /// mean "no history to seed", and the attach continues with an empty grid
 /// that fills from the live stream.
-fn seed_client_scrollback(
+pub(crate) fn seed_client_scrollback(
     screen: &Arc<Mutex<aplexer::screen::ClientScreen>>,
     record: &SessionRecord,
 ) {
@@ -344,7 +346,7 @@ fn seed_client_scrollback(
 /// Failure is invisible, exactly like the attach seed: a worker that has gone
 /// away or stopped answering means "page through whatever the live model
 /// has", which is the pre-refresh behavior.
-fn refresh_pager_history(ctx: &StatusBarCtx) {
+pub(crate) fn refresh_pager_history(ctx: &StatusBarCtx) {
     if history_limit() == 0 {
         return;
     }
@@ -377,7 +379,7 @@ fn refresh_pager_history(ctx: &StatusBarCtx) {
 /// Which session a `Ctrl-b` switch chord asks for
 /// (docs/fast-session-switching-design.md section 3).
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SwitchTarget {
+pub(crate) enum SwitchTarget {
     /// `Ctrl-b Right`: next session in the current workspace.
     Next,
     /// `Ctrl-b Left`: previous session in the current workspace.
@@ -411,7 +413,7 @@ enum SwitchTarget {
 /// True iff `check_attachable` would pass; used to skip dead sessions when
 /// cycling with n/p/N/P (never for explicit `Index`/`Last` addressing,
 /// which report the real error instead of silently hopping past it).
-fn is_attachable(r: &SessionRecord) -> bool {
+pub(crate) fn is_attachable(r: &SessionRecord) -> bool {
     check_attachable(r).is_ok()
 }
 
@@ -420,7 +422,11 @@ fn is_attachable(r: &SessionRecord) -> bool {
 /// (`prev = false`) or -1 (`prev = true`) with wraparound, skipping
 /// `current_id` itself and any candidate that fails `is_attachable`.
 /// Returns `None` once every other candidate has been tried and rejected.
-fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<SessionRecord> {
+pub(crate) fn walk_group(
+    group: &[SessionRecord],
+    current_id: Uuid,
+    prev: bool,
+) -> Option<SessionRecord> {
     let len = group.len();
     if len == 0 {
         return None;
@@ -449,7 +455,7 @@ fn walk_group(group: &[SessionRecord], current_id: Uuid, prev: bool) -> Option<S
 /// most recent session has since died is entered at its next-best one
 /// rather than erroring; `None` means the whole group is dead, and the
 /// caller moves on to the next workspace.
-fn workspace_entry_session(group: &[SessionRecord]) -> Option<SessionRecord> {
+pub(crate) fn workspace_entry_session(group: &[SessionRecord]) -> Option<SessionRecord> {
     let mut best: Option<&SessionRecord> = None;
     for candidate in group.iter().filter(|r| is_attachable(r)) {
         let better = match best {
@@ -489,7 +495,7 @@ fn workspace_entry_session(group: &[SessionRecord]) -> Option<SessionRecord> {
 ///   `check_attachable` call, so the error names the actual session.
 /// - `Last`: resolved by UUID against every group (survives renames, works
 ///   across workspaces).
-fn pick_switch_target(
+pub(crate) fn pick_switch_target(
     groups: &[(PathBuf, Vec<SessionRecord>)],
     current_workspace: &Path,
     current_id: Uuid,
@@ -577,7 +583,7 @@ fn pick_switch_target(
     }
 }
 
-fn resolve_switch_target(
+pub(crate) fn resolve_switch_target(
     paths: &Paths,
     current: &SessionRecord,
     target: SwitchTarget,
@@ -591,7 +597,7 @@ fn resolve_switch_target(
 /// giving up -- `a start`'s own `--startup-timeout-ms` default, because this
 /// chord is `a new` with the CLI trip removed and must not be quietly less
 /// patient than typing it.
-const NEW_SESSION_STARTUP_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const NEW_SESSION_STARTUP_TIMEOUT_MS: u64 = 10_000;
 
 /// `Ctrl-b c`'s half of the chord: create another session in the attached
 /// session's workspace, the way `a new` (i.e. `a start --fresh --attach`)
@@ -622,7 +628,7 @@ const NEW_SESSION_STARTUP_TIMEOUT_MS: u64 = 10_000;
 /// Errors propagate to `perform_switch`'s caller untouched: nothing here has
 /// touched the live attachment, so a bad config or an exhausted tag space is a
 /// status-bar flash and the user stays exactly where they were.
-fn create_sibling_session(
+pub(crate) fn create_sibling_session(
     paths: &Paths,
     current: &SessionRecord,
     geometry: Option<(u16, u16)>,
@@ -655,16 +661,16 @@ fn create_sibling_session(
 /// Result of `establish()`: the connected/subscribed stream, its initial
 /// payload (either a live-screen snapshot or a raw-tail replay -- see
 /// `screen`), and enough of the response to know which one it got.
-struct AttachHandshake {
-    reader: UnixStream,
-    initial: Vec<u8>,
+pub(crate) struct AttachHandshake {
+    pub(crate) reader: UnixStream,
+    pub(crate) initial: Vec<u8>,
     /// The response's `"screen"` field: `Some(true)`/`Some(false)` from a
     /// worker new enough to report it, `None` from an old worker whose
     /// response predates the field entirely (docs/terminal-state-design.md
     /// section 6.1's compatibility matrix) -- used to decide whether the
     /// explicit post-connect Resize control send is still needed (section
     /// 6.3 step 7).
-    screen: Option<bool>,
+    pub(crate) screen: Option<bool>,
 }
 
 /// Extracted attach handshake (connect + `Operation::Attach` request +
@@ -680,7 +686,7 @@ struct AttachHandshake {
 /// 6.3 step 1). An old worker's serde simply ignores these unknown request
 /// fields and falls back to today's raw-tail replay -- no worse than
 /// before.
-fn establish(
+pub(crate) fn establish(
     record: &SessionRecord,
     replay_bytes: Option<usize>,
     want_screen: bool,
@@ -743,17 +749,17 @@ fn establish(
 /// terminal. An explicit `--history-bytes` from the CLI is still honored
 /// (see `switch_replay_bytes` in `attach()`) -- this only changes the
 /// *default*, the same way `DEFAULT_ATTACH_REPLAY_BYTES` is only a default.
-const SWITCH_REPLAY_BYTES: usize = 4 * 1024;
+pub(crate) const SWITCH_REPLAY_BYTES: usize = 4 * 1024;
 
 /// A fully established connection to the new session, handed from the
 /// input thread (which runs `perform_switch`) to the main frame loop
 /// (which installs it -- see the `'session` loop in `attach()`).
-struct SwitchOutcome {
-    record: SessionRecord,
+pub(crate) struct SwitchOutcome {
+    pub(crate) record: SessionRecord,
     /// Attach handshake already completed on this socket.
-    reader: UnixStream,
+    pub(crate) reader: UnixStream,
     /// The replay tail read during that handshake.
-    history: Vec<u8>,
+    pub(crate) history: Vec<u8>,
 }
 
 /// One button press/release reported by xterm's SGR extended mouse mode
@@ -767,11 +773,11 @@ struct SwitchOutcome {
 /// ahead of the riskier live-input-thread integration.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MouseReport {
-    button: u32,
-    press: bool,
-    col: u16,
-    row: u16,
+pub(crate) struct MouseReport {
+    pub(crate) button: u32,
+    pub(crate) press: bool,
+    pub(crate) col: u16,
+    pub(crate) row: u16,
 }
 
 /// Result of attempting to parse an SGR mouse report off the front of a
@@ -784,7 +790,7 @@ struct MouseReport {
 /// same role `pending_ctrl_b` plays for the one-byte `Ctrl-b` prefix.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MouseParse {
+pub(crate) enum MouseParse {
     NotMouse,
     Incomplete,
     Complete(MouseReport, usize),
@@ -798,7 +804,7 @@ enum MouseParse {
 /// caller doesn't buffer forever waiting for a `M`/`m` that will never
 /// come.
 #[allow(dead_code)]
-fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
+pub(crate) fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
     const PREFIX: &[u8] = b"\x1b[<";
     if buf.len() < PREFIX.len() {
         if PREFIX.starts_with(buf) {
@@ -867,14 +873,14 @@ fn parse_sgr_mouse(buf: &[u8]) -> MouseParse {
 /// **Not yet wired into `draw_status_bar`** -- see the design doc section 7.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BarRegion {
-    cols: std::ops::Range<usize>,
-    action: BarClick,
+pub(crate) struct BarRegion {
+    pub(crate) cols: std::ops::Range<usize>,
+    pub(crate) action: BarClick,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BarClick {
+pub(crate) enum BarClick {
     /// Click a sibling's `{i}:{tag}` token: switch to it (`i` is exactly
     /// the digit `Ctrl-b <i>` would send, `SwitchTarget::Index`).
     Sibling(usize),
@@ -898,7 +904,7 @@ enum BarClick {
 /// section 7; `workspace_summary` (the currently-live renderer) is
 /// untouched by this addition.
 #[allow(dead_code)]
-fn workspace_summary_regions(
+pub(crate) fn workspace_summary_regions(
     siblings: &[SessionRecord],
     current_id: Uuid,
 ) -> (String, Vec<BarRegion>) {
@@ -929,7 +935,7 @@ fn workspace_summary_regions(
 /// What one `InputScanner::scan` call decided to do with a chunk of raw
 /// stdin bytes; several may result from a single `read()` (e.g.
 /// `"a\x02n"` -> `Forward([b'a'])`, `Switch(Next)`).
-enum InputAction {
+pub(crate) enum InputAction {
     /// Ordinary input for the currently attached session.
     Forward(Vec<u8>),
     /// `Ctrl-b d`.
@@ -962,7 +968,7 @@ enum InputAction {
 /// to bound the scanner's wait for the rest of an arrow chord, so an error
 /// (or a signal) answers "yes": the caller falls through to its ordinary
 /// blocking `read`, which is where read errors are already handled.
-fn readable(fd: libc::c_int, timeout: Duration) -> bool {
+pub(crate) fn readable(fd: libc::c_int, timeout: Duration) -> bool {
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -994,24 +1000,24 @@ fn readable(fd: libc::c_int, timeout: Duration) -> bool {
 /// buffer boundary, not a pause) and short enough to read as instant for the
 /// Escape case. It is only ever paid after a literal `Ctrl-b ESC`, never on
 /// ordinary input.
-const CHORD_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const CHORD_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
-struct InputScanner {
-    pending_ctrl_b: bool,
+pub(crate) struct InputScanner {
+    pub(crate) pending_ctrl_b: bool,
     /// Bytes withheld *after* a `Ctrl-b` because they could still complete an
     /// arrow chord: `ESC`, `ESC [`, or `ESC O`, and nothing else. Empty at
     /// every other moment, which is what `awaiting_escape` reports. The
     /// withheld `Ctrl-b` itself is implied (it is not stored here) and is
     /// re-emitted ahead of these bytes whenever the sequence turns out not to
     /// be a chord.
-    pending_escape: Vec<u8>,
+    pub(crate) pending_escape: Vec<u8>,
 }
 
 impl InputScanner {
     /// True while a partial arrow chord is held. The input thread uses this
     /// to bound its wait for the rest (see `CHORD_ESCAPE_TIMEOUT`).
-    fn awaiting_escape(&self) -> bool {
+    pub(crate) fn awaiting_escape(&self) -> bool {
         !self.pending_escape.is_empty()
     }
 
@@ -1024,14 +1030,14 @@ impl InputScanner {
     /// deadline and `CHORD_ESCAPE_TIMEOUT` mutually exclusive, so it states
     /// that exclusion rather than relying on a reader knowing the other
     /// invariant.
-    fn awaiting_key(&self) -> bool {
+    pub(crate) fn awaiting_key(&self) -> bool {
         self.pending_ctrl_b && self.pending_escape.is_empty()
     }
 
     /// True when nothing at all is withheld: no prefix, no partial chord.
     /// The input thread reads this as "whatever the user was in the middle of
     /// is resolved", which is when the overlay comes down.
-    fn settled(&self) -> bool {
+    pub(crate) fn settled(&self) -> bool {
         !self.pending_ctrl_b && self.pending_escape.is_empty()
     }
 
@@ -1043,7 +1049,7 @@ impl InputScanner {
     /// indefinitely for its second key is this keymap's documented behavior
     /// (a chord is only a chord once its key arrives), and only the
     /// multi-byte arrows introduced ambiguity worth timing out.
-    fn flush_pending(&mut self) -> Vec<InputAction> {
+    pub(crate) fn flush_pending(&mut self) -> Vec<InputAction> {
         if self.pending_escape.is_empty() {
             return Vec::new();
         }
@@ -1061,7 +1067,7 @@ impl InputScanner {
     /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
     /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
     /// still pass through to the workload untouched.
-    fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
+    pub(crate) fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
         let mut actions = Vec::new();
         let mut out: Vec<u8> = Vec::new();
         let mut i = 0;
@@ -1181,7 +1187,7 @@ impl InputScanner {
 /// `establish` itself) leaves the attachment to the current session
 /// completely undisturbed.
 #[allow(clippy::too_many_arguments)]
-fn perform_switch(
+pub(crate) fn perform_switch(
     paths: &Paths,
     target: SwitchTarget,
     replay_bytes: Option<usize>,
@@ -1262,7 +1268,7 @@ fn perform_switch(
 /// `switch_in_progress` is true, poll briefly for the outcome before giving
 /// up and treating it as a normal exit (docs/fast-session-switching-design.md
 /// section 5.2).
-fn take_pending_switch(
+pub(crate) fn take_pending_switch(
     pending: &Arc<Mutex<Option<SwitchOutcome>>>,
     in_progress: &Arc<AtomicBool>,
 ) -> Option<SwitchOutcome> {
@@ -1288,7 +1294,7 @@ fn take_pending_switch(
 /// cannot read the control frame. This is shared by explicit detach, stdin
 /// EOF, and terminal read/write failure so none can strand `attach()` in its
 /// blocking socket read.
-fn detach_attached_client(writer: &Arc<Mutex<UnixStream>>, active: &Arc<AtomicBool>) {
+pub(crate) fn detach_attached_client(writer: &Arc<Mutex<UnixStream>>, active: &Arc<AtomicBool>) {
     let _ = send_control(writer, &AttachControl::Detach);
     active.store(false, Ordering::Relaxed);
     let stream = writer.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1300,7 +1306,7 @@ fn detach_attached_client(writer: &Arc<Mutex<UnixStream>>, active: &Arc<AtomicBo
 /// client that left on purpose -- a worker-side error or a dropped socket
 /// must not borrow that word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachStop {
+pub(crate) enum AttachStop {
     /// Ctrl-b d, stdin EOF, or a terminal read/write failure that made this
     /// client tear its own attach down.
     ClientDetached,
@@ -1322,7 +1328,7 @@ enum AttachStop {
 /// Client intent wins over everything but a session that actually ended:
 /// Ctrl-b d shuts our own stream down, so the frame loop very often then
 /// observes a reset that must not be reported as a connection loss.
-fn classify_attach_stop(
+pub(crate) fn classify_attach_stop(
     session_ended: bool,
     detached_by_client: bool,
     worker_error: bool,
@@ -1341,7 +1347,11 @@ fn classify_attach_stop(
 /// `inspect_id` is the short session id when a record survived the session's
 /// end (Failed/OOM leftovers); a clean exit removes the record and leaves
 /// nothing to point the user at.
-fn attach_goodbye_line(stop: AttachStop, selector: &str, inspect_id: Option<&str>) -> String {
+pub(crate) fn attach_goodbye_line(
+    stop: AttachStop,
+    selector: &str,
+    inspect_id: Option<&str>,
+) -> String {
     match stop {
         AttachStop::ClientDetached => format!("Detached from {selector}."),
         AttachStop::SessionEnded => match inspect_id {
@@ -1368,13 +1378,13 @@ fn attach_goodbye_line(stop: AttachStop, selector: &str, inspect_id: Option<&str
 /// stale id inherited from elsewhere costs one failed record read and the
 /// common not-in-a-session attach pays one `getenv`. `--force` opts in for
 /// a deliberate peek at the cost of the nesting above.
-fn nested_attach_conflict(paths: &Paths) -> Result<()> {
+pub(crate) fn nested_attach_conflict(paths: &Paths) -> Result<()> {
     nested_attach_conflict_for(paths, discover_session_id())
 }
 
 /// `nested_attach_conflict` with the inner session id injected, so tests
 /// never mutate process-global state.
-fn nested_attach_conflict_for(paths: &Paths, inner: Option<Uuid>) -> Result<()> {
+pub(crate) fn nested_attach_conflict_for(paths: &Paths, inner: Option<Uuid>) -> Result<()> {
     let Some(inner) = inner else {
         return Ok(());
     };
@@ -1393,4 +1403,3 @@ fn nested_attach_conflict_for(paths: &Paths, inner: Option<Uuid>) -> Result<()> 
         inner_record.tag
     )
 }
-

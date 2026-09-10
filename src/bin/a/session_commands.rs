@@ -1,3 +1,5 @@
+use super::*;
+
 /// `a <N>` / `a <N> <M>` / `a <N> <tag>` -- attach by position in the same
 /// workspace tree `a list` prints, or by tag within a chosen workspace.
 /// `a -` and friends -- create-or-attach in the current directory, agent
@@ -42,7 +44,7 @@
 /// `a -`'s plain shell would silently reattach to that shell instead of
 /// ever running htop.
 
-fn command_tag(word: &str) -> String {
+pub(crate) fn command_tag(word: &str) -> String {
     let base = Path::new(word)
         .file_name()
         .and_then(|s| s.to_str())
@@ -64,7 +66,7 @@ fn command_tag(word: &str) -> String {
     }
 }
 
-fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
+pub(crate) fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
     let workspace = canonical_workspace(Path::new("."))?;
     let config = Config::load(paths)?;
     // See the precedence note on the doc comment above: real engine id,
@@ -148,7 +150,7 @@ fn cmd_quick_launch(paths: &Paths, args: QuickLaunchArgs) -> Result<()> {
     )
 }
 
-fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
+pub(crate) fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
     let record = resolve_quick_index(paths, args.workspace_index, args.session.as_deref())?;
     attach(paths, &record, None, false, false)
 }
@@ -161,16 +163,16 @@ fn cmd_quick_attach(paths: &Paths, args: QuickAttachArgs) -> Result<()> {
 /// seconds -- this budget is sized for a saturated box, and burning all of
 /// it can only produce the pre-existing "retained" answer, never a wrong
 /// removal.
-const PRUNE_TERMINATION_BUDGET: Duration = Duration::from_secs(5);
-const PRUNE_TERMINATION_POLL: Duration = Duration::from_millis(25);
+pub(crate) const PRUNE_TERMINATION_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const PRUNE_TERMINATION_POLL: Duration = Duration::from_millis(25);
 
-struct PruneOutcome {
-    removed: Vec<Uuid>,
-    removed_without_containment_proof: Vec<Uuid>,
-    retained_count: usize,
+pub(crate) struct PruneOutcome {
+    pub(crate) removed: Vec<Uuid>,
+    pub(crate) removed_without_containment_proof: Vec<Uuid>,
+    pub(crate) retained_count: usize,
 }
 
-enum ReapResult {
+pub(crate) enum ReapResult {
     Removed {
         containment_proven: bool,
     },
@@ -186,7 +188,7 @@ enum ReapResult {
 /// finishes its lifecycle while we wait (writing its exit, its terminal
 /// phase and its containment proof), so the stale in-memory copy must not be
 /// the one the reap decision is made from.
-fn settle_terminating_record(
+pub(crate) fn settle_terminating_record(
     paths: &Paths,
     record: SessionRecord,
     deadline: Instant,
@@ -218,7 +220,7 @@ fn settle_terminating_record(
 /// ours. Re-read and re-check before destroying anything, and fence a
 /// pre-PID worker the same way `a forget` does, so a worker spawned but not
 /// yet registered cannot come up on top of a removed record.
-fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> {
+pub(crate) fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> {
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     let current = match read_session_record(paths, id) {
         Ok(record) => record,
@@ -247,7 +249,7 @@ fn reap_session_state(paths: &Paths, id: Uuid) -> Result<ReapResult> {
     })
 }
 
-fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
+pub(crate) fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
     reap_sweep(paths, true)
 }
 
@@ -256,11 +258,11 @@ fn prune_dead_sessions(paths: &Paths) -> Result<PruneOutcome> {
 /// in-flight worker teardown. A worker that is still alive is retained here
 /// and its own teardown (or a later sweep) decides the outcome, so nothing
 /// a later `a prune` would have kept can be removed early.
-fn sweep_prunable_corpses(paths: &Paths) -> Result<PruneOutcome> {
+pub(crate) fn sweep_prunable_corpses(paths: &Paths) -> Result<PruneOutcome> {
     reap_sweep(paths, false)
 }
 
-fn reap_sweep(paths: &Paths, wait_for_terminating: bool) -> Result<PruneOutcome> {
+pub(crate) fn reap_sweep(paths: &Paths, wait_for_terminating: bool) -> Result<PruneOutcome> {
     let deadline = Instant::now() + PRUNE_TERMINATION_BUDGET;
     let mut outcome = PruneOutcome {
         removed: Vec::new(),
@@ -291,7 +293,7 @@ fn reap_sweep(paths: &Paths, wait_for_terminating: bool) -> Result<PruneOutcome>
     Ok(outcome)
 }
 
-fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
     let outcome = prune_dead_sessions(paths)?;
     // Say plainly which reaps rested on "nothing left to hold on to" rather
     // than on a worker's own proof that its containment domain was empty --
@@ -323,7 +325,7 @@ fn cmd_prune(paths: &Paths, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> {
     // Only the CLI's target spellings (quick index, tag, `workspace:tag`) and
     // its presentation live here. The destructive body -- force gate,
     // live-worker refusal, pre-PID fence, both removals, and the survival
@@ -346,7 +348,7 @@ fn cmd_forget(paths: &Paths, args: ForgetArgs, json_output: bool) -> Result<()> 
 /// (session_is_listed), so the numbers track the default list's rows rather
 /// than the full registry -- a corpse found via `a list --all` is addressed
 /// by tag or UUID prefix, not by its --all index.
-fn resolve_quick_index(
+pub(crate) fn resolve_quick_index(
     paths: &Paths,
     workspace_index: usize,
     session: Option<&str>,
@@ -394,7 +396,7 @@ fn resolve_quick_index(
     }
 }
 
-fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &target)?;
     // Process existence and control-plane reachability are separate facts:
     // a wedged worker can still have a live pid, while a successfully reached
@@ -559,7 +561,7 @@ fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -> Result<()
 /// source, and exactly one next action chosen from lifecycle/reachability/
 /// containment evidence rather than a generic "try these commands" list.
 /// The redirected rendering above stays byte-identical to the pre-UX format.
-fn cmd_status_tty(
+pub(crate) fn cmd_status_tty(
     paths: &Paths,
     current: &SessionRecord,
     raw: &Value,
@@ -721,7 +723,7 @@ fn cmd_status_tty(
     Ok(())
 }
 
-fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> {
     // `a send --workspace W --tag T "text"` parses "text" into the flattened
     // TargetArgs selector positional (clap fills positionals in declaration
     // order), which then fails to resolve as a session -- or worse, silently
@@ -763,7 +765,7 @@ fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> Result<()> 
     Ok(())
 }
 
-fn base64_standard(data: &[u8]) -> String {
+pub(crate) fn base64_standard(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(data.len().div_ceil(3).saturating_mul(4));
     for chunk in data.chunks(3) {
@@ -786,7 +788,7 @@ fn base64_standard(data: &[u8]) -> String {
     encoded
 }
 
-fn capture_json_value(record: &SessionRecord, data: &[u8]) -> Value {
+pub(crate) fn capture_json_value(record: &SessionRecord, data: &[u8]) -> Value {
     let mut value = json!({
         "id": record.id,
         "bytes": data.len(),
@@ -802,7 +804,7 @@ fn capture_json_value(record: &SessionRecord, data: &[u8]) -> Value {
     value
 }
 
-fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let data = if args.screen {
         match rpc_capture_screen(&record, args.plain) {
@@ -876,7 +878,7 @@ fn cmd_capture(paths: &Paths, args: CaptureArgs, json_output: bool) -> Result<()
 /// every `a kill` path that actually retires a session's record, so
 /// "removed" means the same thing everywhere instead of each call site
 /// growing its own slightly-different deletion routine.
-fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
+pub(crate) fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     fs::remove_dir_all(paths.state_session(id))?;
     let _ = fs::remove_dir_all(paths.runtime_session(id));
@@ -888,7 +890,7 @@ fn remove_session_state(paths: &Paths, id: Uuid) -> Result<()> {
 /// lands within milliseconds (bounded above by the worker's attach-drain
 /// window), so this is a settling pause, not a retry campaign; the deadline
 /// only bounds the pathological cases, which are reported, never looped on.
-const KILL_RECORD_REMOVAL_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const KILL_RECORD_REMOVAL_WAIT: Duration = Duration::from_secs(5);
 
 /// Outcome of waiting for a killed session's record to disappear. The
 /// worker that accepted the kill RPC removes the record during
@@ -898,7 +900,7 @@ const KILL_RECORD_REMOVAL_WAIT: Duration = Duration::from_secs(5);
 /// (worker still alive at the deadline) means the removal is still in
 /// flight or the worker is holding the evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KillRecordOutcome {
+pub(crate) enum KillRecordOutcome {
     Removed,
     Kept,
     Pending,
@@ -909,7 +911,7 @@ enum KillRecordOutcome {
 /// worker may remove a record whose worker process is still finishing --
 /// deleting it client-side would race the worker's own final record write
 /// into a persist-error retry loop -- so this observes instead of acting.
-fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
+pub(crate) fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
     let deadline = Instant::now() + KILL_RECORD_REMOVAL_WAIT;
     // Polled at 5 ms, not 25 ms: the worker's fast-path finalization for an
     // accepted kill (benchmark PLAN P0.2) removes the record in tens of
@@ -931,11 +933,11 @@ fn wait_for_kill_record_removal(paths: &Paths, id: Uuid) -> KillRecordOutcome {
 /// Only this one rare case counts as "force-cleanable": a live, reachable
 /// worker can also fail an RPC, but then it must not be signalled directly.
 /// ESRCH is success because the process may exit between checks.
-fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
+pub(crate) fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
     signal_recorded_worker(record, libc::SIGKILL).context("force-kill unreachable worker")
 }
 
-fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     let record = resolve(paths, &args.target)?;
     let signal = parse_signal(&args.signal)?;
     kill_grace_duration(args.grace_ms)?;
@@ -1048,7 +1050,7 @@ fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn preflight_broken_containment_recovery(record: &SessionRecord) -> Result<()> {
+pub(crate) fn preflight_broken_containment_recovery(record: &SessionRecord) -> Result<()> {
     if record.containment_proven_empty() {
         return Ok(());
     }
@@ -1067,7 +1069,7 @@ fn preflight_broken_containment_recovery(record: &SessionRecord) -> Result<()> {
 }
 
 /// Record that the client killed an orphaned workload after its worker died.
-fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<()> {
+pub(crate) fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<()> {
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     let mut current = read_record(&paths.record(record.id)).unwrap_or_else(|_| record.clone());
     current.phase = Phase::Failed;
@@ -1097,7 +1099,11 @@ fn mark_broken_workload_killed(paths: &Paths, record: &SessionRecord) -> Result<
 /// which pins the case where an escaped `setsid` descendant outlives the
 /// reap). `a kill` never does that: it still refuses, and still preserves
 /// both directories, because unlike prune it would be claiming a cleanup.
-fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64) -> Result<()> {
+pub(crate) fn recover_broken_containment(
+    record: &SessionRecord,
+    signal: i32,
+    grace_ms: u64,
+) -> Result<()> {
     let grace = kill_grace_duration(grace_ms)?;
     if record.containment_proven_empty() {
         return Ok(());
@@ -1118,7 +1124,7 @@ fn recover_broken_containment(record: &SessionRecord, signal: i32, grace_ms: u64
     .context("recover recorded cgroup containment")
 }
 
-fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
     let old = resolve_record(paths, Some(&args.selector), None, None)?;
     let workspace = canonical_workspace(args.workspace.as_deref().unwrap_or(&old.workspace))?;
     let tag = args.tag.unwrap_or_else(|| old.tag.clone());
@@ -1133,7 +1139,7 @@ fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> 
     Ok(())
 }
 
-fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
     let values = aplexer::api::engines_json(paths)?;
     let values = values.as_array().cloned().unwrap_or_default();
     if json_output {
@@ -1161,7 +1167,7 @@ fn cmd_engines(paths: &Paths, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
     let profiles = aplexer::api::profiles_json(paths)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&profiles)?);
@@ -1180,4 +1186,3 @@ fn cmd_profiles(paths: &Paths, json_output: bool) -> Result<()> {
     }
     Ok(())
 }
-

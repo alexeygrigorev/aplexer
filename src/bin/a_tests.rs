@@ -1,4 +1,5 @@
 use super::*;
+use clap::Parser;
 
 #[test]
 fn attach_goodbye_distinguishes_detach_error_and_socket_loss() {
@@ -4385,11 +4386,12 @@ fn enclosing_fns_of(lines: &[&str], needle: &str) -> Vec<(String, String)> {
 /// The body of a top-level `fn`, from its declaration to the `}` that
 /// closes it at column 0.
 fn top_level_fn_body(lines: &[&str], name: &str) -> String {
-    let decl = format!("fn {name}(");
+    let private_decl = format!("fn {name}(");
+    let crate_decl = format!("pub(crate) fn {name}(");
     let start = lines
         .iter()
-        .position(|l| l.starts_with(&decl))
-        .unwrap_or_else(|| panic!("no top-level `fn {name}` in src/bin/a.rs"));
+        .position(|l| l.starts_with(&private_decl) || l.starts_with(&crate_decl))
+        .unwrap_or_else(|| panic!("no top-level `fn {name}` in the production source slices"));
     let end = start
         + 1
         + lines[start + 1..]

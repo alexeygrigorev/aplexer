@@ -1,4 +1,6 @@
-fn run() -> Result<()> {
+use super::*;
+
+pub(crate) fn run() -> Result<()> {
     // `a` is a standalone process, so it can safely repair an inherited
     // auto-reaping SIGCHLD disposition before any subcommand spawns a child.
     // The embeddable Rust/Python API only validates and preserves its host.
@@ -71,7 +73,7 @@ fn run() -> Result<()> {
 /// positional number mean "attach" without a subcommand keyword. Only the
 /// first argument is inspected, and only when it's non-empty and all
 /// digits -- none of `a`'s real subcommand names collide with that.
-fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
+pub(crate) fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
     // (hidden subcommand name, how many leading args to drop before it --
     // the "-" marker itself carries no information once rewritten, but a
     // quick-attach index like "1" is itself the first real argument).
@@ -100,17 +102,17 @@ fn rewrite_quick_attach_args(args: Vec<String>) -> Vec<String> {
 /// The tag the terminal-first vocabulary creates and resolves by default:
 /// `a here`, `a -`, and `a start` all mean tag `main` in the current
 /// workspace, so "work on the main thing here" is one word in every form.
-const DEFAULT_HUMAN_TAG: &str = "main";
+pub(crate) const DEFAULT_HUMAN_TAG: &str = "main";
 /// Sessions created before the terminal-first default stay attachable with
 /// no flags: after `main`, a bare `a attach`/`a status` falls back to this
 /// pre-UX tag before giving up.
-const LEGACY_DEFAULT_TAG: &str = "default";
+pub(crate) const LEGACY_DEFAULT_TAG: &str = "default";
 
 /// Whether a selector could plausibly be a UUID or UUID prefix: only hex
 /// digits and dashes, with 8..=32 digits (a full UUID is 32, the shortest
 /// useful prefix `resolve_record` honors is 8). Anything containing a
 /// non-hex character is a word -- i.e. a candidate tag -- never a UUID.
-fn looks_like_uuid_selector(raw: &str) -> bool {
+pub(crate) fn looks_like_uuid_selector(raw: &str) -> bool {
     let mut hex_digits = 0usize;
     for byte in raw.bytes() {
         if byte == b'-' {
@@ -124,7 +126,7 @@ fn looks_like_uuid_selector(raw: &str) -> bool {
     (8..=32).contains(&hex_digits)
 }
 
-fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
+pub(crate) fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
     // `a attach 1`, `a status 1`, `a kill 1`, etc. should mean the same
     // thing as the bare `a 1` shortcut, not just work for `attach`. Only
     // kick in for selectors shorter than 8 characters, the minimum length
@@ -230,7 +232,7 @@ fn resolve(paths: &Paths, target: &TargetArgs) -> Result<SessionRecord> {
     )
 }
 
-fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
     if json_output && args.attach {
         bail!(
             "--json cannot be combined with `start --attach`: JSON session metadata and terminal bytes cannot share stdout; run `a --json start ...` and `a attach SESSION` separately"
@@ -289,7 +291,7 @@ fn cmd_start(paths: &Paths, args: StartArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
     // `--sort` remembers even on the JSON path, so a later human `a list` /
     // `a N` uses the same workspace order. JSON row order itself stays
     // newest-created-first (spec.md §18).
@@ -324,12 +326,12 @@ fn cmd_list(paths: &Paths, args: ListArgs, json_output: bool) -> Result<()> {
 /// shares this so the numbers `a <workspace#>` understands stay the numbers
 /// the default list prints; a corpse you found via `a list --all` is
 /// addressed by tag or UUID prefix, not by its --all index.
-fn session_is_listed(record: &SessionRecord, now: u64) -> bool {
+pub(crate) fn session_is_listed(record: &SessionRecord, now: u64) -> bool {
     session_ui_state(record, now).0 != "exited"
 }
 
 /// The terminal rendering of `a list` -- see cmd_list's redirect contract.
-fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
+pub(crate) fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
     // The default view is self-cleaning: sweep first, so a corpse a killed
     // worker left behind is gone from the registry rather than merely
     // hidden. Same verdict and locked removal as `a prune`; best-effort,
@@ -591,7 +593,7 @@ fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
 
 /// The redirected rendering of `a list` -- the pre-UX format, unchanged so
 /// piped/parsed output is stable across the UX work.
-fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
+pub(crate) fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     let mut records = list_records(paths)?;
     if args.running {
         records.retain(|r| r.worker_phase_active() && r.worker_alive());
@@ -678,19 +680,19 @@ fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_DIM: &str = "\x1b[2m";
-const ANSI_CYAN: &str = "\x1b[36m";
-const ANSI_GREEN: &str = "\x1b[32m";
-const ANSI_YELLOW: &str = "\x1b[33m";
-const ANSI_RED: &str = "\x1b[31m";
-const ANSI_GRAY: &str = "\x1b[90m";
+pub(crate) const ANSI_RESET: &str = "\x1b[0m";
+pub(crate) const ANSI_BOLD: &str = "\x1b[1m";
+pub(crate) const ANSI_DIM: &str = "\x1b[2m";
+pub(crate) const ANSI_CYAN: &str = "\x1b[36m";
+pub(crate) const ANSI_GREEN: &str = "\x1b[32m";
+pub(crate) const ANSI_YELLOW: &str = "\x1b[33m";
+pub(crate) const ANSI_RED: &str = "\x1b[31m";
+pub(crate) const ANSI_GRAY: &str = "\x1b[90m";
 
 /// Colors only when stdout is a real terminal and the user hasn't opted out
 /// via `NO_COLOR` (https://no-color.org) -- `a list | grep foo` or similar
 /// piping must never see escape codes.
-fn color_enabled() -> bool {
+pub(crate) fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
@@ -698,7 +700,7 @@ fn color_enabled() -> bool {
 /// widths (`{:<14}` etc.) on the plain string BEFORE calling this, since
 /// padding a string that already contains escape codes counts the invisible
 /// bytes toward the width and breaks column alignment.
-fn paint(enabled: bool, code: &str, text: &str) -> String {
+pub(crate) fn paint(enabled: bool, code: &str, text: &str) -> String {
     if enabled {
         format!("{code}{text}{ANSI_RESET}")
     } else {
@@ -706,7 +708,7 @@ fn paint(enabled: bool, code: &str, text: &str) -> String {
     }
 }
 
-fn state_glyph(state: &str) -> (&'static str, &'static str) {
+pub(crate) fn state_glyph(state: &str) -> (&'static str, &'static str) {
     match state {
         "running" | "working" | "active" => ("\u{25CF}", ANSI_GREEN),
         "waiting" => ("!", ANSI_YELLOW),
@@ -736,7 +738,7 @@ fn state_glyph(state: &str) -> (&'static str, &'static str) {
 /// `SPINNER_FRAME_MS` window agree on the frame without sharing anything.
 /// (Sanitized-then-padded like all bar text, and the same width-1 as the
 /// `●` it replaces, so truncation math is unchanged.)
-fn spinner_frame(state: &str, now_ms: u64) -> Option<char> {
+pub(crate) fn spinner_frame(state: &str, now_ms: u64) -> Option<char> {
     if state != "working" {
         return None;
     }
@@ -770,11 +772,15 @@ fn spinner_frame(state: &str, now_ms: u64) -> Option<char> {
 /// have no injected clock of their own. Every derived `state` a CLI command
 /// prints goes through here or through `observed_state` directly, so none of
 /// them can disagree about the startup window (issue #9).
-fn derived_liveness(phase: &Phase, worker_alive: bool, created_at_ms: u64) -> &'static str {
+pub(crate) fn derived_liveness(
+    phase: &Phase,
+    worker_alive: bool,
+    created_at_ms: u64,
+) -> &'static str {
     observed_state(phase, worker_alive, created_at_ms, now_ms())
 }
 
-fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static str) {
+pub(crate) fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static str) {
     // Deferred to `observed_state` rather than repeating its predicate, so
     // the TTY UI cannot go on painting a mid-create session `broken` after
     // the derived state stopped saying so.
@@ -841,7 +847,7 @@ fn session_ui_state(record: &SessionRecord, now: u64) -> (&'static str, &'static
 
 /// Whether a state word counts as "alive/working" in workspace summaries --
 /// everything a live worker can be in, including the merely-quiet.
-fn ui_state_is_active(state: &str) -> bool {
+pub(crate) fn ui_state_is_active(state: &str) -> bool {
     matches!(
         state,
         "working" | "waiting" | "idle" | "active" | "quiet" | "running" | "starting" | "stopping"
@@ -851,7 +857,7 @@ fn ui_state_is_active(state: &str) -> bool {
 /// Whether a state word means "the human should look at this": reported
 /// waits and every failure/health condition. Inferred quiet is deliberately
 /// not attention -- it is usually just a long-running command.
-fn ui_state_needs_attention(state: &str) -> bool {
+pub(crate) fn ui_state_needs_attention(state: &str) -> bool {
     matches!(state, "waiting" | "broken" | "failed" | "oom")
 }
 
@@ -859,7 +865,7 @@ fn ui_state_needs_attention(state: &str) -> bool {
 /// column: the state-report push for semantic states, last PTY output for
 /// activity states, the exit for terminal ones. Falls back to the record's
 /// own update time so the column always has something honest to show.
-fn state_timestamp(record: &SessionRecord, state: &str, now: u64) -> u64 {
+pub(crate) fn state_timestamp(record: &SessionRecord, state: &str, now: u64) -> u64 {
     let candidate = match state {
         "working" | "waiting" | "idle" => record.reported_state_at_ms,
         "active" | "quiet" => record.last_activity_ms,
@@ -873,7 +879,7 @@ fn state_timestamp(record: &SessionRecord, state: &str, now: u64) -> u64 {
 
 /// Compact age: `now`, `30s`, `5m`, `5h 1m`, `5d 5h`. Two units once the
 /// span is at least an hour, so a week-old session is not just `5d`.
-fn compact_elapsed(ms: u64) -> String {
+pub(crate) fn compact_elapsed(ms: u64) -> String {
     let seconds = ms / 1_000;
     if seconds < 5 {
         return "now".to_string();
@@ -902,7 +908,7 @@ fn compact_elapsed(ms: u64) -> String {
 }
 
 /// The phrase form for prose contexts (`a status`): "just now", "4m ago".
-fn human_age_phrase(ms: u64) -> String {
+pub(crate) fn human_age_phrase(ms: u64) -> String {
     match compact_elapsed(ms).as_str() {
         "now" => "just now".to_string(),
         age => format!("{age} ago"),
@@ -911,7 +917,7 @@ fn human_age_phrase(ms: u64) -> String {
 
 /// Qualifier appended to a semantic state so a human can tell what kind of
 /// fact they are looking at; empty for authoritative sources.
-fn state_source_suffix(source: &str) -> &'static str {
+pub(crate) fn state_source_suffix(source: &str) -> &'static str {
     match source {
         "activity" => " (inferred from output activity)",
         _ => "",
@@ -922,7 +928,7 @@ fn state_source_suffix(source: &str) -> &'static str {
 /// with `…` (counted against the width), Unicode-width safe: CJK-width
 /// glyphs and combining sequences never split mid-cluster or misalign the
 /// columns built from `fit_column` calls.
-fn fit_column(text: &str, width: usize) -> String {
+pub(crate) fn fit_column(text: &str, width: usize) -> String {
     let display_width = terminal_display_width(text);
     if display_width <= width {
         return format!("{text}{}", " ".repeat(width - display_width));
@@ -948,7 +954,7 @@ fn fit_column(text: &str, width: usize) -> String {
     result
 }
 
-fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str) {
+pub(crate) fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str) {
     if running == total {
         ("\u{25CF}", ANSI_GREEN)
     } else if running == 0 {
@@ -960,7 +966,7 @@ fn workspace_glyph(running: usize, total: usize) -> (&'static str, &'static str)
 
 /// Shortens a workspace path under $HOME to `~/...`, matching spec.md's own
 /// display examples (e.g. section 2's `~/git/pocketshell` tree).
-fn display_workspace(path: &Path, home: Option<&Path>) -> String {
+pub(crate) fn display_workspace(path: &Path, home: Option<&Path>) -> String {
     if let Some(home) = home {
         if let Ok(rest) = path.strip_prefix(home) {
             return if rest.as_os_str().is_empty() {
@@ -973,7 +979,10 @@ fn display_workspace(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-fn running_count(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> (usize, usize) {
+pub(crate) fn running_count(
+    group: &[SessionRecord],
+    alive: &BTreeMap<Uuid, bool>,
+) -> (usize, usize) {
     let running = group
         .iter()
         .filter(|r| {
@@ -987,7 +996,7 @@ fn running_count(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> (usiz
     (running, group.len())
 }
 
-fn running_summary(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> String {
+pub(crate) fn running_summary(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> String {
     let (running, total) = running_count(group, alive);
     if running == total {
         format!("running {running}")
@@ -998,7 +1007,7 @@ fn running_summary(group: &[SessionRecord], alive: &BTreeMap<Uuid, bool>) -> Str
     }
 }
 
-fn group_by_workspace(
+pub(crate) fn group_by_workspace(
     records: Vec<SessionRecord>,
     sort: ListSort,
 ) -> Vec<(PathBuf, Vec<SessionRecord>)> {
@@ -1013,7 +1022,7 @@ fn group_by_workspace(
     groups
 }
 
-fn compare_workspaces(
+pub(crate) fn compare_workspaces(
     left: &(PathBuf, Vec<SessionRecord>),
     right: &(PathBuf, Vec<SessionRecord>),
     sort: ListSort,
@@ -1037,14 +1046,14 @@ fn compare_workspaces(
     }
 }
 
-fn workspace_created_ms(sessions: &[SessionRecord]) -> u64 {
+pub(crate) fn workspace_created_ms(sessions: &[SessionRecord]) -> u64 {
     sessions.iter().map(|s| s.created_at_ms).max().unwrap_or(0)
 }
 
 /// Recency of human access: last attach, falling back to created so
 /// never-attached records (including those from before `last_accessed_ms`
 /// existed) still have a stable place in the order.
-fn workspace_accessed_ms(sessions: &[SessionRecord]) -> u64 {
+pub(crate) fn workspace_accessed_ms(sessions: &[SessionRecord]) -> u64 {
     sessions
         .iter()
         .map(|s| s.last_accessed_ms.unwrap_or(s.created_at_ms))
@@ -1052,14 +1061,14 @@ fn workspace_accessed_ms(sessions: &[SessionRecord]) -> u64 {
         .unwrap_or(0)
 }
 
-fn last_agent_activity_ms(record: &SessionRecord) -> Option<u64> {
+pub(crate) fn last_agent_activity_ms(record: &SessionRecord) -> Option<u64> {
     match (record.last_activity_ms, record.reported_state_at_ms) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     }
 }
 
-fn workspace_activity_ms(sessions: &[SessionRecord]) -> u64 {
+pub(crate) fn workspace_activity_ms(sessions: &[SessionRecord]) -> u64 {
     sessions
         .iter()
         .filter_map(last_agent_activity_ms)
@@ -1067,7 +1076,11 @@ fn workspace_activity_ms(sessions: &[SessionRecord]) -> u64 {
         .unwrap_or(0)
 }
 
-fn workspace_recency_label(sort: ListSort, sessions: &[SessionRecord], now: u64) -> String {
+pub(crate) fn workspace_recency_label(
+    sort: ListSort,
+    sessions: &[SessionRecord],
+    now: u64,
+) -> String {
     let ago = |at: u64| human_age_phrase(now.saturating_sub(at));
     match sort {
         ListSort::Name => String::new(),
@@ -1083,29 +1096,28 @@ fn workspace_recency_label(sort: ListSort, sessions: &[SessionRecord], now: u64)
     }
 }
 
-fn list_sort_path(paths: &Paths) -> PathBuf {
+pub(crate) fn list_sort_path(paths: &Paths) -> PathBuf {
     paths.state_root.join("list-sort")
 }
 
-fn load_list_sort(paths: &Paths) -> ListSort {
+pub(crate) fn load_list_sort(paths: &Paths) -> ListSort {
     fs::read_to_string(list_sort_path(paths))
         .ok()
         .and_then(|text| ListSort::parse(text.trim()))
         .unwrap_or(ListSort::Name)
 }
 
-fn save_list_sort(paths: &Paths, sort: ListSort) -> Result<()> {
+pub(crate) fn save_list_sort(paths: &Paths, sort: ListSort) -> Result<()> {
     fs::write(list_sort_path(paths), format!("{}\n", sort.as_str()))
         .with_context(|| format!("write {}", list_sort_path(paths).display()))
 }
 
 /// `--sort KEY` both applies and remembers; a bare `a list` (and `a N`)
 /// reuse the last choice so the numbers on the tree stay stable.
-fn resolve_list_sort(paths: &Paths, requested: Option<ListSort>) -> Result<ListSort> {
+pub(crate) fn resolve_list_sort(paths: &Paths, requested: Option<ListSort>) -> Result<ListSort> {
     if let Some(sort) = requested {
         save_list_sort(paths, sort)?;
         return Ok(sort);
     }
     Ok(load_list_sort(paths))
 }
-

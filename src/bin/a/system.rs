@@ -1,14 +1,17 @@
-fn send_data(writer: &Arc<Mutex<UnixStream>>, data: &[u8]) -> Result<()> {
+use super::*;
+
+pub(crate) fn send_data(writer: &Arc<Mutex<UnixStream>>, data: &[u8]) -> Result<()> {
     let mut stream = writer.lock().map_err(|_| anyhow!("socket lock poisoned"))?;
     write_frame(&mut *stream, FrameKind::Data, data)
 }
-fn send_control(writer: &Arc<Mutex<UnixStream>>, control: &AttachControl) -> Result<()> {
+pub(crate) fn send_control(writer: &Arc<Mutex<UnixStream>>, control: &AttachControl) -> Result<()> {
     let mut stream = writer.lock().map_err(|_| anyhow!("socket lock poisoned"))?;
     write_json(&mut *stream, control)
 }
 
-const ATTACH_CLEANUP_SIGNALS: [i32; 4] = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
-static ATTACH_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+pub(crate) const ATTACH_CLEANUP_SIGNALS: [i32; 4] =
+    [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
+pub(crate) static ATTACH_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Async-signal-safe half of attach cleanup. The handler deliberately does
 /// nothing except write one byte to a nonblocking self-pipe. Terminal I/O,
@@ -24,16 +27,16 @@ extern "C" fn attach_cleanup_signal(signal: i32) {
     }
 }
 
-struct AttachSignalBridge {
-    read_fd: i32,
-    write_fd: i32,
-    previous: Vec<(i32, libc::sigaction)>,
-    watcher: Option<thread::JoinHandle<()>>,
-    caught: Arc<AtomicI32>,
+pub(crate) struct AttachSignalBridge {
+    pub(crate) read_fd: i32,
+    pub(crate) write_fd: i32,
+    pub(crate) previous: Vec<(i32, libc::sigaction)>,
+    pub(crate) watcher: Option<thread::JoinHandle<()>>,
+    pub(crate) caught: Arc<AtomicI32>,
 }
 
 impl AttachSignalBridge {
-    fn install(writer: Arc<Mutex<UnixStream>>, active: Arc<AtomicBool>) -> Result<Self> {
+    pub(crate) fn install(writer: Arc<Mutex<UnixStream>>, active: Arc<AtomicBool>) -> Result<Self> {
         let mut fds = [-1; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error()).context("create attach signal pipe");
@@ -108,7 +111,7 @@ impl AttachSignalBridge {
         })
     }
 
-    fn finish(mut self) -> Option<i32> {
+    pub(crate) fn finish(mut self) -> Option<i32> {
         self.stop_and_restore();
         match self.caught.load(Ordering::SeqCst) {
             0 => None,
@@ -116,7 +119,7 @@ impl AttachSignalBridge {
         }
     }
 
-    fn stop_and_restore(&mut self) {
+    pub(crate) fn stop_and_restore(&mut self) {
         if self.write_fd < 0 {
             return;
         }
@@ -148,12 +151,12 @@ impl Drop for AttachSignalBridge {
     }
 }
 
-struct RawMode {
-    fd: i32,
-    old: libc::termios,
+pub(crate) struct RawMode {
+    pub(crate) fd: i32,
+    pub(crate) old: libc::termios,
 }
 impl RawMode {
-    fn enter(fd: i32) -> Result<Self> {
+    pub(crate) fn enter(fd: i32) -> Result<Self> {
         let mut old = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(fd, old.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error()).context("tcgetattr");
@@ -176,7 +179,7 @@ impl Drop for RawMode {
         }
     }
 }
-fn terminal_size(fd: i32) -> Option<(u16, u16)> {
+pub(crate) fn terminal_size(fd: i32) -> Option<(u16, u16)> {
     let mut ws = std::mem::MaybeUninit::<libc::winsize>::zeroed();
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, ws.as_mut_ptr()) } < 0 {
         return None;
@@ -200,7 +203,7 @@ fn terminal_size(fd: i32) -> Option<(u16, u16)> {
     ))
 }
 
-fn parse_signal(raw: &str) -> Result<i32> {
+pub(crate) fn parse_signal(raw: &str) -> Result<i32> {
     let upper = raw.trim().trim_start_matches("SIG").to_ascii_uppercase();
     let value = match upper.as_str() {
         "TERM" => libc::SIGTERM,
@@ -217,7 +220,7 @@ fn parse_signal(raw: &str) -> Result<i32> {
     }
     Ok(value)
 }
-fn parse_hex(input: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn parse_hex(input: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(input)?
         .chars()
         .filter(|c| !c.is_whitespace())

@@ -1,3 +1,5 @@
+use super::*;
+
 /// Shared scroll-mode state.
 ///
 /// `active` is an atomic rather than part of the mutex because the relay
@@ -6,28 +8,28 @@
 /// existing `stdout` -> `term` -> `screen` order rather than crossing it:
 /// nothing takes `stdout` while holding `view`.
 
-struct ScrollMode {
-    active: AtomicBool,
+pub(crate) struct ScrollMode {
+    pub(crate) active: AtomicBool,
     /// Type-through (`i` while the pager is up): `active` stays set -- the
     /// pager keeps the reserved bar row and the scroll offset -- but the
     /// relay flows and stdin forwards to the workload, so typing has its
     /// echo and the reply is visible as it streams. Esc drops it.
-    typing: AtomicBool,
-    view: Mutex<ScrollView>,
+    pub(crate) typing: AtomicBool,
+    pub(crate) view: Mutex<ScrollView>,
 }
 
 impl ScrollMode {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
             typing: AtomicBool::new(false),
             view: Mutex::new(ScrollView::default()),
         }
     }
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
-    fn is_typing(&self) -> bool {
+    pub(crate) fn is_typing(&self) -> bool {
         self.typing.load(Ordering::Relaxed)
     }
 }
@@ -35,9 +37,9 @@ impl ScrollMode {
 /// Where the pager is looking: `offset` lines above the live screen, out of
 /// `available` retained.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-struct ScrollView {
-    offset: usize,
-    available: usize,
+pub(crate) struct ScrollView {
+    pub(crate) offset: usize,
+    pub(crate) available: usize,
 }
 
 /// Keep the pager's view anchored to its *content* while the workload
@@ -61,7 +63,7 @@ struct ScrollView {
 /// `paint_scroll_view` on navigation and resize, `refresh_scroll_bar` on
 /// the status tick -- must run this, or the tick's honest `available`
 /// update silently swallows the growth and the next paint under-compensates.
-fn reanchor_view(view: &mut ScrollView, fresh_available: usize) {
+pub(crate) fn reanchor_view(view: &mut ScrollView, fresh_available: usize) {
     let grown = fresh_available.saturating_sub(view.available);
     if view.offset > 0 && grown > 0 {
         view.offset += grown;
@@ -72,7 +74,7 @@ fn reanchor_view(view: &mut ScrollView, fresh_available: usize) {
 /// One navigation step, resolved against the viewport height by
 /// `apply_scroll_command`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScrollCommand {
+pub(crate) enum ScrollCommand {
     /// Enter the pager without moving (`Ctrl-b [`).
     Stay,
     Up(usize),
@@ -92,7 +94,7 @@ enum ScrollCommand {
 
 /// What `scroll_keys` made of the bytes at the front of the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScrollKey {
+pub(crate) enum ScrollKey {
     /// A navigation command, and how many bytes it consumed.
     Command(ScrollCommand, usize),
     /// Recognized and deliberately swallowed (a non-wheel mouse report, an
@@ -121,7 +123,7 @@ enum ScrollKey {
 /// is only theoretically reachable, and resolving it the other way would
 /// mean Escape did nothing until the user pressed another key -- much worse
 /// than the rare case of a split arrow key exiting the pager.
-fn scroll_keys(buf: &[u8]) -> ScrollKey {
+pub(crate) fn scroll_keys(buf: &[u8]) -> ScrollKey {
     use ScrollCommand::*;
     let Some(&first) = buf.first() else {
         return ScrollKey::Incomplete;
@@ -240,7 +242,7 @@ fn scroll_keys(buf: &[u8]) -> ScrollKey {
 /// question the mode has to answer at a glance. Trimmed from the right as
 /// the terminal narrows, down to a minimum that keeps the word SCROLL and
 /// the way out.
-fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
+pub(crate) fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
     let position = format!("SCROLL {}/{}", view.offset, view.available);
     // An empty pager must say *why* it is empty, and must say it on an
     // ordinary 80-column terminal rather than only on a wide one. So the two
@@ -289,7 +291,7 @@ fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
 /// The bar row, drawn for scroll mode: no workload cursor restore (the
 /// workload's cursor is not on screen -- the pager is), and the cursor left
 /// hidden.
-fn scroll_bar_sequence(geom: TermGeom, text: &str) -> Vec<u8> {
+pub(crate) fn scroll_bar_sequence(geom: TermGeom, text: &str) -> Vec<u8> {
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b[?25l");
     seq.extend_from_slice(format!("\x1b[{};1H", geom.rows).as_bytes());
@@ -317,7 +319,7 @@ fn scroll_bar_sequence(geom: TermGeom, text: &str) -> Vec<u8> {
 ///   workload's margins. The pager owns the whole screen above the bar; a
 ///   workload sub-range is meaningless to it, and would let the frame's own
 ///   absolute row addressing fall outside the region.
-fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
         Err(_) => return false,
@@ -383,7 +385,7 @@ fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
 /// the next chunk. `pending` doubles as the force flag here -- a deferred bar
 /// must not be swallowed by the dirty check on the retry, because between the
 /// deferral and the retry nothing else may have changed the text.
-fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
     let typing = ctx.scroll.is_typing();
     let geom = match ctx.term.lock() {
         Ok(g) => *g,
@@ -454,7 +456,7 @@ fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
 /// row and its position readout stays honest, but the mode word and the hint
 /// change: the keyboard currently belongs to the session, and Esc is the way
 /// back to paging.
-fn scroll_bar_typing_text(view: ScrollView, cols: usize) -> String {
+pub(crate) fn scroll_bar_typing_text(view: ScrollView, cols: usize) -> String {
     let full = format!(
         "SCROLL {}/{} · TYPE — keys go to the session · Esc back to paging",
         view.offset, view.available
@@ -473,7 +475,7 @@ fn scroll_bar_typing_text(view: ScrollView, cols: usize) -> String {
 /// `active` is flipped under the stdout lock, which is the same lock
 /// `relay_to_terminal` checks it under -- so a chunk cannot be half-written
 /// over the pager's first frame.
-fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
+pub(crate) fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
     {
         let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
         if ctx.scroll.active.swap(true, Ordering::SeqCst) {
@@ -525,7 +527,7 @@ fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
 /// the frames the relay declined to write are already accounted for in it.
 /// The bar is rewritten in the same sequence because the snapshot's `ED2`
 /// blanks the reserved row.
-fn exit_scroll_mode(ctx: &StatusBarCtx) {
+pub(crate) fn exit_scroll_mode(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_active() {
         return;
     }
@@ -539,7 +541,7 @@ fn exit_scroll_mode(ctx: &StatusBarCtx) {
 /// throughout. `exit_scroll_mode` runs this before dropping `active`, and
 /// `enter_typing` runs it before raising `typing` -- both orderings mean a
 /// relay chunk can only ever land on the view it belongs on.
-fn paint_live_screen(ctx: &StatusBarCtx) {
+pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
     // Reads session records off disk; must not happen under the stdout lock.
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
@@ -571,7 +573,7 @@ fn paint_live_screen(ctx: &StatusBarCtx) {
 /// streams), then `typing` rises under the stdout lock, which is the lock
 /// `relay_to_terminal` checks the flag under -- the relay stays suspended
 /// until the flip, so no chunk can land on the pager's view.
-fn enter_typing(ctx: &StatusBarCtx) {
+pub(crate) fn enter_typing(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_active() || ctx.scroll.is_typing() {
         return;
     }
@@ -589,7 +591,7 @@ fn enter_typing(ctx: &StatusBarCtx) {
 /// offset. `typing` drops first, under the stdout lock, and the pager frame
 /// repaints after -- a relay chunk in between can only land on the live view
 /// it was headed for anyway, and is covered by the frame immediately.
-fn exit_typing(ctx: &StatusBarCtx) {
+pub(crate) fn exit_typing(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_typing() {
         return;
     }
@@ -606,7 +608,7 @@ fn exit_typing(ctx: &StatusBarCtx) {
 /// does not but every pager the user has ever used does: scrolling back to
 /// the bottom means "I am done reading", and having to also press `q` to get
 /// the keyboard back is exactly the confusion this mode must not create.
-fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
+pub(crate) fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
     let page = {
         let geom = ctx.term.lock().map(|g| *g).unwrap_or(TermGeom {
             rows: 0,
@@ -672,12 +674,12 @@ fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
 /// is forwarded immediately rather than held, because holding it would make
 /// the Escape key in the user's editor wait for the next keystroke.
 #[derive(Default)]
-struct ScrollInput {
-    pending: Vec<u8>,
+pub(crate) struct ScrollInput {
+    pub(crate) pending: Vec<u8>,
 }
 
 impl ScrollInput {
-    fn route(&mut self, ctx: &StatusBarCtx, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn route(&mut self, ctx: &StatusBarCtx, bytes: &[u8]) -> Vec<u8> {
         let client_mouse = matches!(
             *ctx.mouse_owned
                 .lock()
@@ -810,7 +812,7 @@ impl ScrollInput {
 /// into a relayed stream (the workload can flip mouse modes at any byte),
 /// so it waits for a real boundary and simply tries again on the next status
 /// tick if it does not get one.
-fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
+pub(crate) fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
     if !ctx.mouse_capture {
         return false;
     }
@@ -897,17 +899,16 @@ fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
 /// the chord deadline exists, the overlay's own is gone -- and a bare
 /// `Ctrl-b ESC` still reaches the workload after exactly
 /// `CHORD_ESCAPE_TIMEOUT`, not after that plus this.
-const KEY_OVERLAY_DELAY: Duration = Duration::from_millis(350);
+pub(crate) const KEY_OVERLAY_DELAY: Duration = Duration::from_millis(350);
 
 /// Rows the box spends on things that are not bindings: its two borders and
 /// the footer line.
-const KEY_OVERLAY_CHROME_ROWS: usize = 3;
+pub(crate) const KEY_OVERLAY_CHROME_ROWS: usize = 3;
 
 /// Fewer binding rows than this and the box has stopped being a reference;
 /// the one-line status-bar flash says more in less space.
-const KEY_OVERLAY_MIN_BINDINGS: usize = 3;
+pub(crate) const KEY_OVERLAY_MIN_BINDINGS: usize = 3;
 
 /// The narrowest description column worth drawing. Below it the rows stop
 /// being sentences and become ellipses, which is again worse than the flash.
-const KEY_OVERLAY_MIN_DESC: usize = 14;
-
+pub(crate) const KEY_OVERLAY_MIN_DESC: usize = 14;

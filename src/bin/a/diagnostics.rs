@@ -1,19 +1,21 @@
+use super::*;
+
 /// Resolution result shared by `a launch-spec` and `a launch-exec` -- both
 /// wrap the exact same `Config::resolve` that `a start` uses
 /// (pocketshell-integration-plan.md 0.3/0.4); they differ only in what they
 /// do with it (print JSON vs execvpe). Neither creates a session or spawns
 /// a worker -- pure resolution/preview.
 
-struct LaunchPreview {
-    engine: String,
-    profile: Option<String>,
-    argv: Vec<String>,
-    env_set: BTreeMap<String, String>,
-    env_unset: Vec<String>,
-    cwd: PathBuf,
+pub(crate) struct LaunchPreview {
+    pub(crate) engine: String,
+    pub(crate) profile: Option<String>,
+    pub(crate) argv: Vec<String>,
+    pub(crate) env_set: BTreeMap<String, String>,
+    pub(crate) env_unset: Vec<String>,
+    pub(crate) cwd: PathBuf,
 }
 
-fn build_launch_preview(paths: &Paths, args: &LaunchArgs) -> Result<LaunchPreview> {
+pub(crate) fn build_launch_preview(paths: &Paths, args: &LaunchArgs) -> Result<LaunchPreview> {
     let config = Config::load(paths)?;
     // launch-spec/launch-exec intentionally have no --workspace flag (only
     // --cwd, matching the plan doc's exact flag list) -- the process's own
@@ -55,7 +57,7 @@ fn build_launch_preview(paths: &Paths, args: &LaunchArgs) -> Result<LaunchPrevie
 /// [--cwd D] --json` (pocketshell-integration-plan.md 0.3) -- prints the
 /// resolved `{engine, profile, argv, env_set, env_unset, cwd}` without
 /// creating a session or spawning anything.
-fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result<()> {
     let preview = build_launch_preview(paths, &args)?;
     if json_output {
         println!(
@@ -104,7 +106,7 @@ fn cmd_launch_spec(paths: &Paths, args: LaunchArgs, json_output: bool) -> Result
 /// always wins even over an explicitly-set value -- same ordering worker.rs's
 /// spawn_workload uses. Drop-in exec-step target for a future pocketshell
 /// `agents.py::launch_agent` shim.
-fn cmd_launch_exec(paths: &Paths, args: LaunchArgs) -> Result<()> {
+pub(crate) fn cmd_launch_exec(paths: &Paths, args: LaunchArgs) -> Result<()> {
     let preview = build_launch_preview(paths, &args)?;
     let program = preview
         .argv
@@ -133,7 +135,7 @@ fn cmd_launch_exec(paths: &Paths, args: LaunchArgs) -> Result<()> {
 /// record for the fuller picture (engine, profile, phase) and gives a
 /// stable, scriptable "nothing/non-zero if not inside one" contract, the
 /// same shape `$TMUX` serves for tmux but structured instead of a bare path.
-fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
     let Some(id) = discover_session_id() else {
         // Deliberately silent on stdout either way -- a script doing
         // `id=$(a whoami --json)` should see empty output and rely on the
@@ -204,7 +206,7 @@ fn cmd_whoami(paths: &Paths, json_output: bool) -> Result<()> {
 /// and Gemini hooks) — this command is the ingestion primitive it builds
 /// on. `a init --check --json` is the machine-readable way to verify the
 /// wiring is present.
-fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
+pub(crate) fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
     let Some(id) = discover_session_id() else {
         eprintln!("a state-report: not inside an aplexer session (APLEXER_SESSION_ID not set)");
         std::process::exit(1);
@@ -243,7 +245,7 @@ fn cmd_state_report(paths: &Paths, state: ReportedState) -> Result<()> {
 /// - `--uninstall`: remove our hooks again.
 ///
 /// `--engine` limits any mode to one engine (`zcodex` maps onto `codex`).
-fn cmd_init(paths: &Paths, args: InitArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_init(paths: &Paths, args: InitArgs, json_output: bool) -> Result<()> {
     if args.check && args.uninstall {
         bail!("`a init --check` and `a init --uninstall` cannot be combined");
     }
@@ -337,14 +339,14 @@ fn cmd_init(paths: &Paths, args: InitArgs, json_output: bool) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct CgroupLimitProbe {
-    cgroup_v2: bool,
-    controllers: Vec<String>,
-    delegated_scope: bool,
-    detail: String,
+pub(crate) struct CgroupLimitProbe {
+    pub(crate) cgroup_v2: bool,
+    pub(crate) controllers: Vec<String>,
+    pub(crate) delegated_scope: bool,
+    pub(crate) detail: String,
 }
 
-fn probe_cgroup_limits() -> CgroupLimitProbe {
+pub(crate) fn probe_cgroup_limits() -> CgroupLimitProbe {
     if let Err(error) = current_cgroup_identity() {
         return CgroupLimitProbe {
             cgroup_v2: false,
@@ -439,7 +441,7 @@ fn probe_cgroup_limits() -> CgroupLimitProbe {
     }
 }
 
-fn cgroup_limits_check(probe: CgroupLimitProbe) -> Value {
+pub(crate) fn cgroup_limits_check(probe: CgroupLimitProbe) -> Value {
     let required_controllers = ["cpu", "memory", "pids"];
     let controllers_ok = required_controllers
         .iter()
@@ -482,7 +484,7 @@ fn cgroup_limits_check(probe: CgroupLimitProbe) -> Value {
     })
 }
 
-fn doctor_checks_ok(checks: &[Value]) -> bool {
+pub(crate) fn doctor_checks_ok(checks: &[Value]) -> bool {
     checks
         .iter()
         .all(|check| check["ok"].as_bool().unwrap_or(false) || check["severity"] == "warning")
@@ -497,7 +499,7 @@ fn doctor_checks_ok(checks: &[Value]) -> bool {
 /// at launch. Warning-severity by design: the issue asks aplexer to warn
 /// clearly, and a vulnerable placement has actionable workarounds (launch
 /// context, or the opt-in system scope), so it must not fail the host.
-fn launch_placement_check(paths: &Paths) -> Value {
+pub(crate) fn launch_placement_check(paths: &Paths) -> Value {
     let own_cgroup = aplexer::placement::read_process_cgroup(std::process::id());
     let own_placement = own_cgroup
         .as_deref()
@@ -573,7 +575,7 @@ fn launch_placement_check(paths: &Paths) -> Value {
     })
 }
 
-fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let mut checks = Vec::<Value>::new();
     checks.push(json!({"name":"linux","ok":true,"detail":std::env::consts::OS}));
     checks.push(path_check("runtime_root", &paths.runtime_root));
@@ -708,7 +710,7 @@ fn cmd_doctor(paths: &Paths, json_output: bool) -> Result<()> {
 /// (from `#[command(name = "a")]` on `Cli` above, not the `aplexer` package
 /// name), so callers just redirect it into whatever path their shell's
 /// completion loader scans.
-fn cmd_completions(args: CompletionsArgs) -> Result<()> {
+pub(crate) fn cmd_completions(args: CompletionsArgs) -> Result<()> {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
     generate(args.shell, &mut cmd, name, &mut io::stdout());
@@ -720,7 +722,7 @@ fn cmd_completions(args: CompletionsArgs) -> Result<()> {
 /// `?` flash (`attach_key_help`) renders. There is one authoritative keymap
 /// and one place it is written down; this just prints it somewhere you can
 /// look it up without already being attached.
-fn cmd_hotkeys() -> Result<()> {
+pub(crate) fn cmd_hotkeys() -> Result<()> {
     println!("Attach-mode keys (press Ctrl-b, then one of these):");
     println!();
     let width = ATTACH_BINDINGS
@@ -765,7 +767,7 @@ fn cmd_hotkeys() -> Result<()> {
 
 /// `a watch --jsonl [--all] [--workspace PATH]` -- see src/watch.rs for the
 /// poll/diff loop and the heru UnifiedEvent mapping it emits.
-fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
+pub(crate) fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
     if !args.jsonl {
         bail!("a watch currently requires --jsonl (no other output format is implemented yet)");
     }
@@ -787,7 +789,7 @@ fn cmd_watch(paths: &Paths, args: WatchArgs) -> Result<()> {
 /// With no SESSION, `--workspace`, or `--tag`, falls back to
 /// `$APLEXER_SESSION_ID` (`a whoami`) so an agent or hook inside a session
 /// can dump its own log without addressing itself.
-fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Result<()> {
     let record = resolve_transcript_target(paths, &args)?;
     let bind_path = paths.state_session(record.id).join("transcript.json");
     let located = aplexer::agent_events::resolve_transcript(&record, &bind_path)?;
@@ -812,7 +814,10 @@ fn cmd_transcript(paths: &Paths, args: TranscriptArgs, json_output: bool) -> Res
 
 /// Prefer an explicit selector; otherwise the session this process is
 /// running inside (`APLEXER_SESSION_ID` from worker spawn / `a whoami`).
-fn resolve_transcript_target(paths: &Paths, args: &TranscriptArgs) -> Result<SessionRecord> {
+pub(crate) fn resolve_transcript_target(
+    paths: &Paths,
+    args: &TranscriptArgs,
+) -> Result<SessionRecord> {
     let targeted = args.target.selector.is_some()
         || args.target.workspace.is_some()
         || args.target.tag.is_some();
@@ -826,7 +831,7 @@ fn resolve_transcript_target(paths: &Paths, args: &TranscriptArgs) -> Result<Ses
     resolve(paths, &args.target)
 }
 
-fn path_check(name: &str, path: &Path) -> Value {
+pub(crate) fn path_check(name: &str, path: &Path) -> Value {
     match fs::metadata(path) {
         Ok(meta) => json!({"name":name,"ok":meta.is_dir(),"detail":path.display().to_string()}),
         Err(e) => json!({"name":name,"ok":false,"detail":format!("{}: {e}",path.display())}),
@@ -863,7 +868,7 @@ fn path_check(name: &str, path: &Path) -> Value {
 /// which is bounded by `DEFAULT_STARTUP_TIMEOUT_MS`: past the startup
 /// budget the record really is a crashed start and the advice above applies
 /// again.
-fn check_attachable(record: &SessionRecord) -> Result<()> {
+pub(crate) fn check_attachable(record: &SessionRecord) -> Result<()> {
     if matches!(record.phase, Phase::Exited | Phase::Failed) {
         bail!(
             "session {} has already exited (see `a status {}` for details); run `a kill {}` to remove it",
@@ -924,7 +929,7 @@ fn check_attachable(record: &SessionRecord) -> Result<()> {
 /// Workspace for `send`/`reply`/`inbox`/`ack`/`show`, which take no
 /// `--workspace` flag (design doc section 7): `$APLEXER_WORKSPACE`, else
 /// cwd. `log`/`gc` accept an explicit override, passed as `explicit`.
-fn resolve_message_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_message_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         return canonical_workspace(p);
     }
@@ -940,7 +945,7 @@ fn resolve_message_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
 /// applying the typo guard of design doc section 2.3: a tag that has never
 /// existed in this workspace is rejected with the list of known tags unless
 /// `--queue` is passed. Broadcast/engine forms always succeed.
-fn build_recipient(
+pub(crate) fn build_recipient(
     paths: &Paths,
     workspace: &Path,
     to: Option<&str>,
@@ -991,7 +996,7 @@ fn build_recipient(
 /// RPC path (`Operation::Send`, `rpc_send` below) -- the client resolves the
 /// target session and connects to its worker socket directly, exactly like
 /// `a send <target> <text>` does today. No new server-side RPC operation.
-fn deliver_pane(
+pub(crate) fn deliver_pane(
     paths: &Paths,
     workspace: &Path,
     tag: &str,
@@ -1020,7 +1025,12 @@ fn deliver_pane(
 /// return, so a message typed into an agent's prompt actually submits
 /// instead of sitting there unconfirmed. `--no-enter` drops the return for
 /// the rare target that should compose rather than submit.
-fn pane_input_bytes(body: &str, from_tag: Option<&str>, raw: bool, no_enter: bool) -> Vec<u8> {
+pub(crate) fn pane_input_bytes(
+    body: &str,
+    from_tag: Option<&str>,
+    raw: bool,
+    no_enter: bool,
+) -> Vec<u8> {
     let mut out = if raw {
         body.as_bytes().to_vec()
     } else {
@@ -1033,7 +1043,7 @@ fn pane_input_bytes(body: &str, from_tag: Option<&str>, raw: bool, no_enter: boo
     out
 }
 
-fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
+pub(crate) fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
     raw.map(|s| serde_json::from_str::<Value>(s).context("--data must be valid JSON"))
         .transpose()
 }
@@ -1043,7 +1053,7 @@ fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
 /// message to the durable mailbox -- pane-delivered messages are recorded
 /// too (with `delivery: pane`, pre-acked for the recipient) so the mailbox
 /// stays a complete account of inter-agent traffic (design doc section 6.2).
-fn finish_send(
+pub(crate) fn finish_send(
     paths: &Paths,
     workspace: &Path,
     mut envelope: MessageEnvelope,
@@ -1105,7 +1115,7 @@ fn finish_send(
     Ok(envelope)
 }
 
-fn print_message_line(m: &MessageEnvelope) {
+pub(crate) fn print_message_line(m: &MessageEnvelope) {
     let sender = m.from.tag.clone().unwrap_or_else(|| {
         if m.from.external {
             "external".into()
@@ -1129,7 +1139,7 @@ fn print_message_line(m: &MessageEnvelope) {
     );
 }
 
-fn print_message_details(m: &MessageEnvelope) {
+pub(crate) fn print_message_details(m: &MessageEnvelope) {
     println!("id: {}", m.id);
     println!("workspace: {}", m.workspace.display());
     println!("created_at: {}", m.created_at);
@@ -1172,7 +1182,7 @@ fn print_message_details(m: &MessageEnvelope) {
     }
 }
 
-fn cmd_message(paths: &Paths, args: MessageArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message(paths: &Paths, args: MessageArgs, json_output: bool) -> Result<()> {
     match args.command {
         MessageCommand::Send(a) => cmd_message_send(paths, a, json_output),
         MessageCommand::Reply(a) => cmd_message_reply(paths, a, json_output),
@@ -1184,7 +1194,11 @@ fn cmd_message(paths: &Paths, args: MessageArgs, json_output: bool) -> Result<()
     }
 }
 
-fn cmd_message_send(paths: &Paths, args: MessageSendArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_send(
+    paths: &Paths,
+    args: MessageSendArgs,
+    json_output: bool,
+) -> Result<()> {
     if args.pane_delivery.pane && (args.all || args.to_engine.is_some()) {
         bail!("--pane cannot be combined with --all or --to-engine: no pane broadcast");
     }
@@ -1225,7 +1239,11 @@ fn cmd_message_send(paths: &Paths, args: MessageSendArgs, json_output: bool) -> 
     Ok(())
 }
 
-fn cmd_message_reply(paths: &Paths, args: MessageReplyArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_reply(
+    paths: &Paths,
+    args: MessageReplyArgs,
+    json_output: bool,
+) -> Result<()> {
     check_body_size(&args.text)?;
     let workspace = resolve_message_workspace(None)?;
     let original = read_message(paths, &workspace, args.message_id)
@@ -1264,7 +1282,11 @@ fn cmd_message_reply(paths: &Paths, args: MessageReplyArgs, json_output: bool) -
     Ok(())
 }
 
-fn cmd_message_inbox(paths: &Paths, args: MessageInboxArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_inbox(
+    paths: &Paths,
+    args: MessageInboxArgs,
+    json_output: bool,
+) -> Result<()> {
     let _ = args.new; // `--new` is accepted for CLI-surface compatibility; unread is already the default (design doc section 7).
     let workspace = resolve_message_workspace(None)?;
     let (consumer_id, consumer_tag, consumer_engine) =
@@ -1288,7 +1310,11 @@ fn cmd_message_inbox(paths: &Paths, args: MessageInboxArgs, json_output: bool) -
     Ok(())
 }
 
-fn cmd_message_log(paths: &Paths, args: MessageLogArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_log(
+    paths: &Paths,
+    args: MessageLogArgs,
+    json_output: bool,
+) -> Result<()> {
     let workspace = resolve_message_workspace(args.workspace.as_deref())?;
     let _ = maybe_gc(paths, &workspace);
     let messages = list_messages(paths, &workspace)?;
@@ -1304,7 +1330,11 @@ fn cmd_message_log(paths: &Paths, args: MessageLogArgs, json_output: bool) -> Re
     Ok(())
 }
 
-fn cmd_message_show(paths: &Paths, args: MessageShowArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_show(
+    paths: &Paths,
+    args: MessageShowArgs,
+    json_output: bool,
+) -> Result<()> {
     let workspace = resolve_message_workspace(None)?;
     let message = read_message(paths, &workspace, args.message_id)?;
     if json_output {
@@ -1315,7 +1345,11 @@ fn cmd_message_show(paths: &Paths, args: MessageShowArgs, json_output: bool) -> 
     Ok(())
 }
 
-fn cmd_message_ack(paths: &Paths, args: MessageAckArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_ack(
+    paths: &Paths,
+    args: MessageAckArgs,
+    json_output: bool,
+) -> Result<()> {
     if args.all && !args.message_ids.is_empty() {
         bail!("cannot combine --all with explicit message ids");
     }
@@ -1345,7 +1379,7 @@ fn cmd_message_ack(paths: &Paths, args: MessageAckArgs, json_output: bool) -> Re
     Ok(())
 }
 
-fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Result<()> {
+pub(crate) fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Result<()> {
     let workspace = resolve_message_workspace(args.workspace.as_deref())?;
     let report = gc_workspace(paths, &workspace)?;
     if json_output {
@@ -1358,4 +1392,3 @@ fn cmd_message_gc(paths: &Paths, args: MessageGcArgs, json_output: bool) -> Resu
     }
     Ok(())
 }
-
