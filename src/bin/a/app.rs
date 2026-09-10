@@ -88,7 +88,7 @@ pub(crate) use terminal::*;
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod switching_tests {
-    include!("../a_tests.rs");
+    include!("../a_tests/mod.rs");
 }
 
 pub(crate) fn entrypoint() {
