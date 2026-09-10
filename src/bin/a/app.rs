@@ -62,6 +62,8 @@ mod scroll_input;
 mod session_commands;
 #[path = "status_bar.rs"]
 mod status_bar;
+#[path = "status_commands.rs"]
+mod status_commands;
 #[path = "switching.rs"]
 mod switching;
 #[path = "system.rs"]
@@ -87,6 +89,7 @@ pub(crate) use scroll::*;
 pub(crate) use scroll_input::*;
 pub(crate) use session_commands::*;
 pub(crate) use status_bar::*;
+pub(crate) use status_commands::*;
 pub(crate) use switching::*;
 pub(crate) use system::*;
 pub(crate) use terminal::*;
