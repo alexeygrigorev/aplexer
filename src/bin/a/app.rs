@@ -34,6 +34,8 @@ mod attach_input;
 mod attach_session;
 #[path = "attach_threads.rs"]
 mod attach_threads;
+#[path = "capture_commands.rs"]
+mod capture_commands;
 #[path = "cli.rs"]
 mod cli;
 #[path = "commands.rs"]
@@ -75,6 +77,7 @@ pub(crate) use attach::*;
 pub(crate) use attach_input::*;
 pub(crate) use attach_session::*;
 pub(crate) use attach_threads::*;
+pub(crate) use capture_commands::*;
 pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
