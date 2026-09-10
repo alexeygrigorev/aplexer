@@ -42,6 +42,8 @@ mod cli;
 mod commands;
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "doctor.rs"]
+mod doctor;
 #[path = "input_scanner.rs"]
 mod input_scanner;
 #[path = "key_overlay.rs"]
@@ -87,6 +89,7 @@ pub(crate) use capture_commands::*;
 pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
+pub(crate) use doctor::*;
 pub(crate) use input_scanner::*;
 pub(crate) use key_overlay::*;
 pub(crate) use launch_commands::*;
