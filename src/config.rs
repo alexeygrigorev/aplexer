@@ -113,6 +113,28 @@ pub(crate) fn default_config_version() -> u32 {
     1
 }
 
+/// The version-gated prefix of a config file, parsed leniently: unknown
+/// fields are ignored here so a future-version file reports "unsupported
+/// config version" rather than tripping over the first field the strict
+/// [`Config`] schema (`deny_unknown_fields`) does not know.
+#[derive(Deserialize)]
+struct ConfigHeader {
+    #[serde(default = "default_config_version")]
+    version: u32,
+    #[serde(default)]
+    keep_exited: bool,
+}
+
+impl ConfigHeader {
+    fn parse(text: &str) -> Result<Self> {
+        let header: Self = toml::from_str(text)?;
+        if header.version != 1 {
+            bail!("unsupported config version {}", header.version);
+        }
+        Ok(header)
+    }
+}
+
 /// Read the `keep_exited` policy without building a full [`Config`].
 ///
 /// The worker consults this on its exit path, where [`Config::load`] would
@@ -120,23 +142,19 @@ pub(crate) fn default_config_version() -> u32 {
 /// discovery that finalization has no use for, and it fails the whole load
 /// on an unrelated invalid engine/profile/shortcut entry -- which would flip
 /// the retention policy as a side effect of a typo elsewhere in the file.
-/// Only the single field is parsed here, so an unreadable or unparsable
-/// config file (and a missing one, the common case) means the documented
-/// default: do not keep exited records.
+/// Only the [`ConfigHeader`] is parsed here, so an unreadable or unparsable
+/// config file, one of an unsupported version (whose field may not mean
+/// the same thing), and a missing one (the common case) all mean the
+/// documented default: do not keep exited records.
 ///
 /// The `Config` field above stays the source of truth for the name and the
 /// default; `config_keep_exited_matches_full_config_load` pins the two
 /// readers together.
 pub fn config_keep_exited(paths: &Paths) -> bool {
-    #[derive(Deserialize)]
-    struct KeepExitedOnly {
-        #[serde(default)]
-        keep_exited: bool,
-    }
     fs::read_to_string(&paths.config_file)
         .ok()
-        .and_then(|text| toml::from_str::<KeepExitedOnly>(&text).ok())
-        .map(|parsed| parsed.keep_exited)
+        .and_then(|text| ConfigHeader::parse(&text).ok())
+        .map(|header| header.keep_exited)
         .unwrap_or(false)
 }
 
@@ -628,11 +646,10 @@ impl Config {
                 return Err(error).with_context(|| format!("read {}", paths.config_file.display()))
             }
         };
+        ConfigHeader::parse(&text)
+            .with_context(|| format!("parse {}", paths.config_file.display()))?;
         let user: Config = toml::from_str(&text)
             .with_context(|| format!("parse {}", paths.config_file.display()))?;
-        if user.version != 1 {
-            bail!("unsupported config version {}", user.version);
-        }
         if user.default_engine.is_some() {
             self.default_engine = user.default_engine;
         }

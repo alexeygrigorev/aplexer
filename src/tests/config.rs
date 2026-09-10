@@ -86,6 +86,28 @@ fn config_keep_exited_matches_full_config_load() {
     // Unparsable or unreadable config: default, never a panic.
     fs::write(&paths.config_file, "this is not toml {{{").unwrap();
     assert!(!config_keep_exited(&paths));
+
+    // An unsupported version is refused by both readers: the field may
+    // not mean the same thing there, so the worker falls back to the
+    // default rather than trusting it.
+    fs::write(&paths.config_file, "version = 2\nkeep_exited = true\n").unwrap();
+    assert!(Config::load(&paths).is_err());
+    assert!(!config_keep_exited(&paths));
+}
+
+/// A future-version file is reported by its version, not by whichever of
+/// its fields the strict current schema happens to reject first.
+#[test]
+fn unsupported_config_version_is_reported_before_unknown_fields() {
+    let message = format!(
+        "{:#}",
+        load_config_text("version = 2\nbrand_new_setting = true\n").unwrap_err()
+    );
+    assert!(
+        message.contains("unsupported config version 2"),
+        "{message}"
+    );
+    assert!(!message.contains("unknown field"), "{message}");
 }
 
 impl Drop for DelegatedCgroup {
