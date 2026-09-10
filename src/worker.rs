@@ -515,7 +515,7 @@ impl WorkerRuntime {
         // could be lost entirely). Polled at KILL_POLL_INTERVAL (5 ms), not
         // the 25 ms lifecycle cadence, so a workload that dies on the first
         // signal does not pay a quantization delay (benchmark PLAN P0.2).
-        while self.workload_populated()? && Instant::now() < grace_deadline {
+        while self.workload_still_populated()? && Instant::now() < grace_deadline {
             thread::sleep(KILL_POLL_INTERVAL);
         }
         if self.workload_populated()? {
@@ -526,6 +526,27 @@ impl WorkerRuntime {
             }
         }
         Ok(())
+    }
+
+    /// `workload_populated` for a poll loop: a process group that still
+    /// answers `kill(-pgid, 0)` is populated without walking `/proc` at all.
+    /// The 5 ms kill poll used to do a full descendant walk on every tick
+    /// for an unlimited session -- dozens of `/proc/*/task/*/children`
+    /// reads per tick while a workload ran out its grace window. Only a
+    /// "yes" is taken from the probe: an empty group still needs the walk,
+    /// because a `setsid` descendant leaves the group without leaving the
+    /// domain. A zombie member keeps the group signalable until its parent
+    /// (this worker's reaper thread, or the waiter for the leader) reaps
+    /// it, which is immediate, so the answer is at most one poll late.
+    fn workload_still_populated(&self) -> Result<bool> {
+        let signalable = {
+            let workload = lock(&self.workload)?;
+            workload.running && unsafe { libc::kill(-workload.pgid, 0) } == 0
+        };
+        if signalable {
+            return Ok(true);
+        }
+        self.workload_populated()
     }
 
     /// Whether any process remains inside this session's containment domain.
