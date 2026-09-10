@@ -4326,24 +4326,33 @@ const FUNNELLED_WRITERS: &[&str] = &[
 /// anywhere. These are the only two places allowed to.
 const WRITE_LOCKED_CALLERS: &[&str] = &["attach", "reset_terminal"];
 
-/// This file's source with the test module cut out. Compiled in, so it
-/// is the same text the rest of the binary was built from.
+/// The production source slices, in the same order that `app.rs` includes
+/// them. Compiled in, so the write census checks the exact source used by the
+/// binary rather than a hand-maintained copy.
+const PRODUCTION_SOURCE: &str = concat!(
+    include_str!("a/cli.rs"),
+    "\n",
+    include_str!("a/commands.rs"),
+    "\n",
+    include_str!("a/session_commands.rs"),
+    "\n",
+    include_str!("a/diagnostics.rs"),
+    "\n",
+    include_str!("a/rpc.rs"),
+    "\n",
+    include_str!("a/terminal.rs"),
+    "\n",
+    include_str!("a/scroll.rs"),
+    "\n",
+    include_str!("a/switching.rs"),
+    "\n",
+    include_str!("a/attach.rs"),
+    "\n",
+    include_str!("a/system.rs"),
+);
+
 fn production_source_lines() -> Vec<&'static str> {
-    let src = include_str!("a.rs");
-    let lines: Vec<&str> = src.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| l.starts_with("mod switching_tests {"))
-        .expect("src/bin/a.rs must contain the switching_tests module");
-    let end = start
-        + 1
-        + lines[start + 1..]
-            .iter()
-            .position(|l| *l == "}")
-            .expect("the test module must close at column 0");
-    let mut production = lines[..start].to_vec();
-    production.extend_from_slice(&lines[end + 1..]);
-    production
+    PRODUCTION_SOURCE.lines().collect()
 }
 
 /// Maps each line matching `needle` to the name of the nearest
