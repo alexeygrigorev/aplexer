@@ -92,7 +92,12 @@ const CONTROL_SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const HISTORY_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const HISTORY_RETRY_MAX: Duration = Duration::from_secs(30);
 const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+/// The bound on the SIGKILL sweep that ends every kill path: after the
+/// graceful signal's grace window, and immediately for `--signal KILL`. A
+/// `Kill` RPC's response is held until this sweep proves the domain empty,
+/// so a client must wait at least grace + this before giving up on it
+/// (`api::kill_response_timeout`).
+pub const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Kill-path responsiveness (benchmark PLAN P0.2): the graceful-signal wait
 /// in `WorkerRuntime::kill` and the post-kill connection drain poll with
 /// `DESCENDANT_POLL_INTERVAL` (25 ms) by default, adding up to ~25 ms of

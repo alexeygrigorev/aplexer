@@ -228,7 +228,22 @@ fn connect_control(record: &SessionRecord) -> Result<UnixStream> {
 }
 
 fn rpc_simple(record: &SessionRecord, operation: Operation, data: Option<&[u8]>) -> Result<Value> {
+    rpc_simple_within(record, operation, data, CONTROL_RPC_TIMEOUT)
+}
+
+/// `rpc_simple` for a request whose response is legitimately slower than
+/// the ordinary control deadline: `response_timeout` replaces the read
+/// deadline once the request is on the wire.
+fn rpc_simple_within(
+    record: &SessionRecord,
+    operation: Operation,
+    data: Option<&[u8]>,
+    response_timeout: Duration,
+) -> Result<Value> {
     let mut stream = connect_control(record)?;
+    stream
+        .set_read_timeout(Some(response_timeout))
+        .context("set worker response deadline")?;
     let request = Request::new(record.id, operation);
     let request_id = request.request_id.clone();
     write_json(&mut stream, &request)?;
@@ -351,14 +366,35 @@ pub fn capture_bytes(paths: &Paths, selector: &str, max_bytes: Option<usize>) ->
     }
 }
 
+/// How long a client should wait for the worker's answer to a `Kill` RPC.
+///
+/// The worker holds the response until the kill has run to completion:
+/// the graceful signal, the whole grace window while the workload ignores
+/// it, and then the bounded SIGKILL sweep (`DESCENDANT_KILL_TIMEOUT`). With
+/// the ordinary 3 s control deadline, `kill --grace-ms 5000` against a
+/// TERM-trapping workload timed out client-side and reported an error
+/// while the worker went on to escalate and remove the record anyway.
+/// The ordinary deadline is kept on top as the margin for signal delivery
+/// and the record write.
+pub fn kill_response_timeout(grace: Duration) -> Duration {
+    grace
+        .saturating_add(crate::worker::DESCENDANT_KILL_TIMEOUT)
+        .saturating_add(CONTROL_RPC_TIMEOUT)
+}
+
 /// Ask the live worker to stop its complete workload containment domain.
 pub fn kill_session(paths: &Paths, selector: &str, signal: i32, grace_ms: u64) -> Result<()> {
     if !(1..=64).contains(&signal) {
         bail!("signal out of range");
     }
-    kill_grace_duration(grace_ms)?;
+    let grace = kill_grace_duration(grace_ms)?;
     let record = selected_record(paths, selector)?;
-    let result = rpc_simple(&record, Operation::Kill { signal, grace_ms }, None)?;
+    let result = rpc_simple_within(
+        &record,
+        Operation::Kill { signal, grace_ms },
+        None,
+        kill_response_timeout(grace),
+    )?;
     if result.get("signalled").and_then(Value::as_bool) != Some(true) {
         bail!("worker kill response omitted confirmation");
     }
