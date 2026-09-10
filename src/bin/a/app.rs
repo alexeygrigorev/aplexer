@@ -74,6 +74,8 @@ mod scroll;
 mod scroll_config;
 #[path = "scroll_input.rs"]
 mod scroll_input;
+#[path = "scroll_keys.rs"]
+mod scroll_keys;
 #[path = "session_commands.rs"]
 mod session_commands;
 #[path = "session_diagnostics.rs"]
@@ -117,6 +119,7 @@ pub(crate) use rpc_connection::*;
 pub(crate) use scroll::*;
 pub(crate) use scroll_config::*;
 pub(crate) use scroll_input::*;
+pub(crate) use scroll_keys::*;
 pub(crate) use session_commands::*;
 pub(crate) use session_diagnostics::*;
 pub(crate) use status_bar::*;
