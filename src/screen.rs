@@ -1841,26 +1841,42 @@ impl ClientScreen {
     }
 
     /// Re-fit both the model and the tracked margins to a new workload
-    /// geometry (the physical terminal minus the reserved row).
+    /// geometry (the physical terminal minus the reserved row). Fails, with
+    /// the model left at its previous geometry, on a size `validate_size`
+    /// rejects.
+    pub fn try_set_size(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.screen.try_set_size(rows, cols)
+    }
+
+    /// `try_set_size` with the failure dropped: the model then stays at its
+    /// previous geometry and its coordinates no longer match the host's.
+    /// Callers that can surface the error should use `try_set_size`.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        let _ = self.screen.try_set_size(rows, cols);
+        let _ = self.try_set_size(rows, cols);
     }
 
     /// Start over for a different session (`Ctrl-b n`): a new workload has
     /// its own screen, its own margins and its own half-parsed sequences.
-    pub fn reset(&mut self, rows: u16, cols: u16) {
+    /// Fails, with nothing changed, on a size `validate_size` rejects.
+    pub fn try_reset(&mut self, rows: u16, cols: u16) -> Result<()> {
         // The retained-history depth belongs to the *client*, not to the
         // session it happens to be showing, so a switch rebuilds an equally
         // deep (and equally empty) grid rather than silently dropping to the
         // worker's zero-scrollback shape.
         let scrollback = self.screen.scrollback_capacity();
-        if let Ok(fresh) = ScreenTracker::try_new_with_scrollback(rows, cols, scrollback) {
-            self.screen = fresh;
-        }
+        self.screen = ScreenTracker::try_new_with_scrollback(rows, cols, scrollback)?;
         if let Some(hold) = self.host_alt.as_mut() {
             hold.reset();
         }
         self.wrap_guarded = false;
+        Ok(())
+    }
+
+    /// `try_reset` with the failure dropped: the previous session's screen
+    /// then stays in the model. Callers that can surface the error should
+    /// use `try_reset`.
+    pub fn reset(&mut self, rows: u16, cols: u16) {
+        let _ = self.try_reset(rows, cols);
     }
 
     pub fn margins(&self) -> Option<(u16, u16)> {
@@ -3477,6 +3493,21 @@ mod tests {
             assert_eq!(host.screen().mouse_protocol_mode(), mode);
             assert_eq!(host.screen().mouse_protocol_encoding(), encoding);
         }
+    }
+
+    /// A geometry the model cannot hold is reported, and the model is left
+    /// exactly as it was -- not half-resized, not silently stale.
+    #[test]
+    fn client_screen_rejects_an_oversized_geometry_and_keeps_its_own() {
+        let mut client = ClientScreen::try_new(24, 80).unwrap();
+        client.feed(b"kept");
+        assert!(client.try_set_size(1000, 1000).is_err());
+        assert!(client.try_reset(1000, 1000).is_err());
+        assert!(client.snapshot().windows(4).any(|w| w == b"kept"));
+        assert_eq!(client.cursor_position(), (0, 4));
+        client.set_size(30, 100);
+        assert!(client.try_reset(30, 100).is_ok());
+        assert!(!client.snapshot().windows(4).any(|w| w == b"kept"));
     }
 
     #[test]
