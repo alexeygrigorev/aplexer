@@ -30,6 +30,8 @@ pub(crate) use uuid::Uuid;
 mod attach;
 #[path = "attach_input.rs"]
 mod attach_input;
+#[path = "attach_protocol.rs"]
+mod attach_protocol;
 #[path = "attach_session.rs"]
 mod attach_session;
 #[path = "attach_threads.rs"]
@@ -85,6 +87,7 @@ mod terminal;
 
 pub(crate) use attach::*;
 pub(crate) use attach_input::*;
+pub(crate) use attach_protocol::*;
 pub(crate) use attach_session::*;
 pub(crate) use attach_threads::*;
 pub(crate) use capture_commands::*;
