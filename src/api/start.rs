@@ -432,10 +432,10 @@ pub fn pick_fresh_tag(records: &[SessionRecord], workspace: &Path, base: &str) -
     // simply continues from the next integer.
     let mut candidate = base.to_string();
     while live_holder(&candidate) {
-        candidate = match candidate
-            .rsplit_once('-')
-            .and_then(|(stem, n)| n.parse::<u64>().ok().map(|n| format!("{stem}-{}", n + 1)))
-        {
+        candidate = match candidate.rsplit_once('-').and_then(|(stem, n)| {
+            let next = n.parse::<u64>().ok()?.checked_add(1)?;
+            Some(format!("{stem}-{next}"))
+        }) {
             Some(next) => next,
             None => format!("{base}-2"),
         };
@@ -977,6 +977,19 @@ mod fresh_tag_tests {
         assert_eq!(
             pick_fresh_tag(&records, ws, "review-2"),
             Some("review-3".into())
+        );
+    }
+
+    #[test]
+    fn saturated_numeric_suffix_restarts_from_the_base() {
+        // `n + 1` on a parsed u64 suffix overflowed for `x-18446744073709551615`;
+        // an unsuffixable candidate falls back to `<base>-2` like any other.
+        let ws = Path::new("/ws");
+        let base = format!("x-{}", u64::MAX);
+        let records = vec![live("/ws", &base)];
+        assert_eq!(
+            pick_fresh_tag(&records, ws, &base),
+            Some(format!("{base}-2"))
         );
     }
 
