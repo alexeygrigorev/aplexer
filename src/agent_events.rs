@@ -76,6 +76,10 @@ const FOLLOW_POLL: Duration = Duration::from_millis(200);
 // iter_codex_payloads` brace/bracket/string balance tracking).
 // ---------------------------------------------------------------------
 
+/// Most bytes a multi-line value may accumulate before the assembler
+/// concludes its opening line was corrupt and drops it.
+const MAX_ASSEMBLY_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Default)]
 struct JsonAssembler {
     buffer: String,
@@ -85,14 +89,36 @@ struct JsonAssembler {
     escaped: bool,
 }
 
+/// What one fed line produced: possibly a discarded corrupt prefix (its
+/// byte length), possibly a complete payload -- both when a fresh record
+/// starts right after a line that never balanced.
+#[derive(Default)]
+struct Fed {
+    discarded: Option<usize>,
+    payload: Option<Value>,
+}
+
 impl JsonAssembler {
-    /// Feed one line (no trailing newline). Returns a complete JSON value
+    /// Feed one line (no trailing newline). Yields a complete JSON value
     /// once enough lines have been buffered to balance braces/brackets
-    /// outside of any string, or `None` while still accumulating.
-    fn feed(&mut self, line: &str) -> Option<Value> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() && self.buffer.is_empty() {
-            return None;
+    /// outside of any string.
+    ///
+    /// A corrupt line (an unterminated string, a missing brace) would
+    /// otherwise leave the balance off forever and swallow every later
+    /// line unbounded. So a buffered prefix is discarded, and reported,
+    /// when it outgrows `MAX_ASSEMBLY_BYTES` or when a line that is a whole
+    /// record by itself (opens with `{` at column 0 and balances alone)
+    /// arrives on top of it.
+    fn feed(&mut self, line: &str) -> Fed {
+        let mut fed = Fed::default();
+        if line.trim().is_empty() && self.buffer.is_empty() {
+            return fed;
+        }
+        if !self.buffer.is_empty()
+            && (self.buffer.len() > MAX_ASSEMBLY_BYTES || Self::is_whole_record(line))
+        {
+            fed.discarded = Some(self.buffer.len());
+            self.clear();
         }
         if !self.buffer.is_empty() {
             self.buffer.push('\n');
@@ -101,13 +127,27 @@ impl JsonAssembler {
         self.update_balance(line);
         if self.is_complete() {
             let text = std::mem::take(&mut self.buffer);
-            self.braces = 0;
-            self.brackets = 0;
-            self.in_string = false;
-            self.escaped = false;
-            return serde_json::from_str::<Value>(text.trim()).ok();
+            self.clear();
+            fed.payload = serde_json::from_str::<Value>(text.trim()).ok();
         }
-        None
+        fed
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.braces = 0;
+        self.brackets = 0;
+        self.in_string = false;
+        self.escaped = false;
+    }
+
+    fn is_whole_record(line: &str) -> bool {
+        if !line.starts_with('{') {
+            return false;
+        }
+        let mut probe = JsonAssembler::default();
+        probe.update_balance(line);
+        probe.is_complete()
     }
 
     fn is_complete(&self) -> bool {
@@ -834,7 +874,7 @@ fn peek_continuation(engine: &str, path: &Path) -> Option<String> {
     let reader = BufReader::new(file);
     let mut assembler = JsonAssembler::default();
     for line in reader.lines().map_while(std::io::Result::ok).take(64) {
-        let Some(payload) = assembler.feed(&line) else {
+        let Some(payload) = assembler.feed(&line).payload else {
             continue;
         };
         let (_events, continuation) = translate(format, engine, &payload);
@@ -1172,7 +1212,16 @@ impl NativeLogReader {
                 return;
             }
         }
-        let Some(payload) = self.assembler.feed(&String::from_utf8_lossy(line)) else {
+        let fed = self.assembler.feed(&String::from_utf8_lossy(line));
+        if let Some(discarded) = fed.discarded {
+            let mut e = ev("error");
+            e.error = Some(format!(
+                "discarded {discarded} bytes of unbalanced JSON before a new record"
+            ));
+            e.timestamp = iso8601_utc(now_ms());
+            sink(self.finish(e, record));
+        }
+        let Some(payload) = fed.payload else {
             return;
         };
         let ts = row_timestamp(self.format, &payload);
@@ -1336,15 +1385,15 @@ mod tests {
     #[test]
     fn json_assembler_single_line() {
         let mut a = JsonAssembler::default();
-        let v = a.feed(r#"{"type":"assistant"}"#).unwrap();
+        let v = a.feed(r#"{"type":"assistant"}"#).payload.unwrap();
         assert_eq!(v.get("type").unwrap(), "assistant");
     }
 
     #[test]
     fn json_assembler_multi_line() {
         let mut a = JsonAssembler::default();
-        assert!(a.feed("{\"type\":\"assistant\",").is_none());
-        let v = a.feed("\"x\":1}").unwrap();
+        assert!(a.feed("{\"type\":\"assistant\",").payload.is_none());
+        let v = a.feed("\"x\":1}").payload.unwrap();
         assert_eq!(v.get("x").unwrap(), 1);
     }
 
@@ -1814,5 +1863,56 @@ mod tests {
         let mut reader = NativeLogReader::open("claude", &path, None).unwrap();
         let once = snapshot_page(&mut reader, &record, &TranscriptQuery::default()).unwrap();
         assert_eq!(once.len(), 1);
+    }
+
+    #[test]
+    fn json_assembler_recovers_from_an_unterminated_line() {
+        let mut a = JsonAssembler::default();
+        let stuck = a.feed(r#"{"type":"user","text":"never closed"#);
+        assert!(stuck.discarded.is_none() && stuck.payload.is_none());
+        // A continuation line is still buffered: it does not open a record.
+        let more = a.feed(r#"  "x": 1,"#);
+        assert!(more.discarded.is_none() && more.payload.is_none());
+        let fresh = a.feed(r#"{"type":"assistant"}"#);
+        assert!(fresh.discarded.is_some_and(|bytes| bytes > 0));
+        assert_eq!(fresh.payload.unwrap().get("type").unwrap(), "assistant");
+        // Back in sync: the next record needs no recovery.
+        let next = a.feed(r#"{"type":"user"}"#);
+        assert!(next.discarded.is_none());
+        assert!(next.payload.is_some());
+
+        // A genuinely multi-line value whose inner lines are indented is
+        // still assembled, not mistaken for corruption.
+        let mut a = JsonAssembler::default();
+        assert!(a.feed("{").payload.is_none());
+        assert!(a.feed(r#"  "inner": {"k": 1},"#).payload.is_none());
+        assert!(a.feed(r#"  "type": "x""#).payload.is_none());
+        assert_eq!(a.feed("}").payload.unwrap().get("type").unwrap(), "x");
+    }
+
+    #[test]
+    fn reader_reports_a_discarded_corrupt_row_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"torn"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = read_transcript_events("claude", &path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "error");
+        assert!(events[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("discarded "));
+        assert_eq!(events[1].content, "ok");
+        assert_eq!(events[1].sequence, 1);
     }
 }
