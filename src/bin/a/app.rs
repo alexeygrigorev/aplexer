@@ -40,6 +40,8 @@ mod attach_threads;
 mod capture_commands;
 #[path = "cli.rs"]
 mod cli;
+#[path = "cli_examples.rs"]
+mod cli_examples;
 #[path = "commands.rs"]
 mod commands;
 #[path = "diagnostics.rs"]

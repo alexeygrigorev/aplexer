@@ -62,6 +62,8 @@ const WRITE_LOCKED_CALLERS: &[&str] = &["attach", "reset_terminal"];
 /// them. Compiled in, so the write census checks the exact source used by the
 /// binary rather than a hand-maintained copy.
 const PRODUCTION_SOURCE: &str = concat!(
+    include_str!("../a/cli_examples.rs"),
+    "\n",
     include_str!("../a/cli.rs"),
     "\n",
     include_str!("../a/commands.rs"),
