@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -186,11 +185,7 @@ pub(crate) fn cgroup_path_populated(path: &Path) -> Result<bool> {
 }
 
 pub(crate) fn error_is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
-    })
+    crate::io_kind(error) == Some(io::ErrorKind::NotFound)
 }
 
 /// Read live membership only while the cgroup pathname still belongs to the
@@ -292,21 +287,8 @@ pub(crate) fn signal_cgroup_path_until(path: &Path, signal: i32, deadline: Insta
         if !current.contains(&member.pid) {
             continue;
         }
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                member.pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).with_context(|| format!("signal cgroup member {}", member.pid));
-            }
-        }
+        crate::pidfd::send_signal(&member.pidfd, signal)
+            .with_context(|| format!("signal cgroup member {}", member.pid))?;
         check_cgroup_cleanup_deadline(deadline, "signalling recorded cgroup members")?;
     }
     Ok(())
