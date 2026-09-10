@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aplexer.local/schema/session-v1.json",
   "title": "aplexer session record v1",
-  "description": "The PERSISTED on-disk session record (session.json). `a list --json`, `a snapshot`, and `a status --json` return this object plus fields derived at query time and never written to disk: `worker_alive`, `state`, and `agent` (which agent is running in the workload's live process tree -- see spec.md section 18). Those derived fields are deliberately absent from this schema because `additionalProperties: false` here describes exactly what a session record file may contain.",
+  "description": "The PERSISTED on-disk session record (session.json). `a list --json`, `a snapshot`, and `a status --json` return this object plus fields derived at query time and never written to disk: `worker_alive`, `state`, `agent` (which agent is running in the workload's live process tree -- see spec.md section 18), and `agent_profile` (which of that agent's configured variations it runs as: a profile id like `zcodex`/`godex`/`zlaude`, or `\"default\"`; null exactly when `agent` is). Those derived fields are deliberately absent from this schema because `additionalProperties: false` here describes exactly what a session record file may contain.",
   "type": "object",
   "required": [
     "schema_version",

@@ -75,7 +75,9 @@ impl StatusData {
             self.worker_alive(),
             self.current.created_at_ms
         ));
-        value["agent"] = json!(aplexer::api::record_agent(&self.current));
+        let detected = aplexer::api::record_detected(&self.current);
+        value["agent"] = json!(detected.as_ref().map(|d| d.kind));
+        value["agent_profile"] = json!(detected.as_ref().map(|d| d.profile_label()));
         value["worker_placement"] =
             aplexer::placement::placement_summary(self.current.worker_cgroup.as_deref());
         value["workload_placement"] =
@@ -222,9 +224,10 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
     println!("  engine      {engine}");
     // Same display rule as the list and the attach status bar: the detected
     // agent gets its own line only when the declared engine doesn't already
-    // name it (`api::record_agent`, the value `a status --json` reports as
-    // `agent`).
-    if let Some(agent) = extra_agent_label(current, aplexer::api::record_agent(current)) {
+    // name it (`api::record_detected`, the pair `a status --json` reports as
+    // `agent`/`agent_profile`).
+    if let Some(agent) = extra_agent_label(current, aplexer::api::record_detected(current).as_ref())
+    {
         println!("  agent       {agent}");
     }
     println!("  session     {}", current.id);

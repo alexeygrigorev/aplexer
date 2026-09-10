@@ -220,16 +220,16 @@ pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     let mut ep = engine_profile(&record);
     let raw = live.raw;
     // Which agent is live in this session right now -- the same query-time
-    // detection every JSON surface carries (`api::record_agent`). When it
+    // detection every JSON surface carries (`api::record_detected`). When it
     // names the same program as the live foreground read, the foreground
     // annotation steps aside -- `claude  shell -> claude` would say claude
     // twice -- so an agent not in the foreground (claude running, vim in
     // front) shows both facts: `claude  shell -> vim`.
-    let agent = extra_agent_label(&record, live.agent);
+    let agent = extra_agent_label(&record, live.agent.as_ref());
     let foreground = raw
         .as_ref()
         .and_then(|raw| foreground_override(&record, raw))
-        .filter(|fg| Some(fg.as_str()) != agent);
+        .filter(|fg| Some(fg.as_str()) != agent.as_deref());
     if let Some(fg) = foreground {
         ep.push_str(&format!(" -> {fg}"));
     }

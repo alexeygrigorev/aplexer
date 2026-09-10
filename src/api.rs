@@ -30,7 +30,7 @@ use startup_containment::*;
 use startup_guard::*;
 use worker_reaper::*;
 
-use crate::agent_kind::{detect_agent, AgentKind, DEFAULT_PROC_ROOT};
+use crate::agent_kind::{detect_agent_detailed, AgentKind, DetectedAgent, DEFAULT_PROC_ROOT};
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, io_kind,
@@ -141,10 +141,17 @@ pub fn launch_spec_json(
 ///   box look like this dead session's agent.
 /// * A record with no recorded `workload_pid` has no handle to walk.
 pub fn record_agent(record: &SessionRecord) -> Option<AgentKind> {
+    record_detected(record).map(|detected| detected.kind)
+}
+
+/// `record_agent` plus the variation the agent runs as
+/// (`agent_kind::DetectedAgent`) -- the `agent`/`agent_profile` pair the
+/// JSON surfaces report.
+pub fn record_detected(record: &SessionRecord) -> Option<DetectedAgent> {
     if !record.worker_phase_active() {
         return None;
     }
-    detect_agent(Path::new(DEFAULT_PROC_ROOT), record.workload_pid?)
+    detect_agent_detailed(Path::new(DEFAULT_PROC_ROOT), record.workload_pid?)
 }
 
 pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
@@ -178,8 +185,13 @@ pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {
         // present, `null` when no agent is detectable -- every pocketshell
         // session is `engine: "shell"` with the agent started by hand inside
         // it, so `engine` cannot answer this and a consumer needs one key it
-        // can read unconditionally.
-        value["agent"] = json!(record_agent(record));
+        // can read unconditionally. `agent_profile` names the agent's
+        // variation the same way profiles are registered (spec.md 9): the
+        // profile id (`zcodex`, `godex`, ...) or `"default"` for the
+        // engine's own config, `null` exactly when `agent` is.
+        let detected = record_detected(record);
+        value["agent"] = json!(detected.as_ref().map(|d| d.kind));
+        value["agent_profile"] = json!(detected.as_ref().map(|d| d.profile_label()));
         // Placement facts derived from the recorded cgroup paths
         // (`placement::classify_cgroup_path`), the same classification
         // `a doctor`'s launch_placement check uses -- so a consumer of this
@@ -278,8 +290,10 @@ pub fn status_json(paths: &Paths, selector: &str) -> Result<Value> {
     value["worker_reachable"] = json!(worker_reachable);
     // Same query-time agent detection every `a list --json`/`a snapshot` row
     // carries, so the two commands cannot disagree about which agent is in a
-    // session.
-    value["agent"] = json!(record_agent(&current));
+    // session -- or which of its variations it runs (`agent_profile`).
+    let detected = record_detected(&current);
+    value["agent"] = json!(detected.as_ref().map(|d| d.kind));
+    value["agent_profile"] = json!(detected.as_ref().map(|d| d.profile_label()));
     // Same derived placement facts every `a list --json`/`a snapshot` row
     // carries, from the same helper (issue #1).
     value["worker_placement"] =

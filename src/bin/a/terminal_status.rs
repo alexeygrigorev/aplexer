@@ -44,7 +44,7 @@ pub(crate) struct LiveStatus {
     /// must not borrow the old one's memory, foreground or siblings.
     pub(crate) session: Option<Uuid>,
     pub(crate) raw: Option<Value>,
-    pub(crate) agent: Option<aplexer::agent_kind::AgentKind>,
+    pub(crate) agent: Option<aplexer::agent_kind::DetectedAgent>,
     pub(crate) siblings: String,
     pub(crate) fetched_at: Option<Instant>,
 }
@@ -67,7 +67,7 @@ pub(crate) fn refresh_live_status(ctx: &StatusBarCtx) {
     let fresh = LiveStatus {
         session: Some(record.id),
         raw: live_status(&record),
-        agent: aplexer::api::record_agent(&record),
+        agent: aplexer::api::record_detected(&record),
         siblings: workspace_summary(&ctx.paths, &record),
         fetched_at: Some(Instant::now()),
     };
@@ -188,13 +188,18 @@ pub(crate) fn foreground_override(record: &SessionRecord, raw: &Value) -> Option
 /// codex inside, gets the detected name appended. The engine compares by
 /// family (`engine_family`): a `zcodex`-engine session running
 /// zcodex says codex once, because zcodex is a codex variant, not a second
-/// agent.
+/// agent. A detected *variation* rides the same `engine/profile` spelling
+/// the declared side uses (`codex/zcodex`); the default profile adds
+/// nothing, so plain `codex` stays plain.
 pub(crate) fn extra_agent_label(
     record: &SessionRecord,
-    detected: Option<aplexer::agent_kind::AgentKind>,
-) -> Option<&'static str> {
+    detected: Option<&aplexer::agent_kind::DetectedAgent>,
+) -> Option<String> {
     let agent = detected?;
-    (agent.name() != aplexer::engine_family(&record.engine)).then_some(agent.name())
+    (agent.kind.name() != aplexer::engine_family(&record.engine)).then(|| match &agent.profile {
+        Some(profile) => format!("{}/{}", agent.kind.name(), profile),
+        None => agent.kind.name().to_string(),
+    })
 }
 
 /// The list/status engine cell. A plain `shell` workload that detection
@@ -205,12 +210,12 @@ pub(crate) fn extra_agent_label(
 /// started codex inside).
 pub(crate) fn engine_label(
     record: &SessionRecord,
-    detected: Option<aplexer::agent_kind::AgentKind>,
+    detected: Option<&aplexer::agent_kind::DetectedAgent>,
 ) -> String {
     let agent = extra_agent_label(record, detected);
     if record.engine == "shell" {
         if let Some(agent) = agent {
-            return agent.to_string();
+            return agent;
         }
     }
     let base = engine_profile(record);

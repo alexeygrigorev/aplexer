@@ -85,7 +85,7 @@ pub(crate) fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
     // keep it a fraction of the /proc reads it is made of, with the same
     // per-record answers as the serial order (each row's `agent` is
     // independent of every other's).
-    let agents: BTreeMap<Uuid, Option<aplexer::agent_kind::AgentKind>> = {
+    let agents: BTreeMap<Uuid, Option<aplexer::agent_kind::DetectedAgent>> = {
         let records: Vec<&SessionRecord> = groups
             .iter()
             .flat_map(|(_, sessions)| sessions.iter())
@@ -102,7 +102,7 @@ pub(crate) fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
                     scope.spawn(move || {
                         chunk
                             .iter()
-                            .map(|record| (record.id, aplexer::api::record_agent(record)))
+                            .map(|record| (record.id, aplexer::api::record_detected(record)))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -183,7 +183,7 @@ pub(crate) fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
             .map(|record| {
                 terminal_display_width(&engine_label(
                     record,
-                    agents.get(&record.id).copied().flatten(),
+                    agents.get(&record.id).and_then(|d| d.as_ref()),
                 ))
             })
             .max()
@@ -193,7 +193,7 @@ pub(crate) fn cmd_list_tty(paths: &Paths, args: ListArgs) -> Result<()> {
         for (index, record) in sessions.iter().enumerate() {
             let (state, _, attention) = states[index];
             let connector = if index == last { "└─" } else { "├─" };
-            let engine = engine_label(record, agents.get(&record.id).copied().flatten());
+            let engine = engine_label(record, agents.get(&record.id).and_then(|d| d.as_ref()));
             let tag = paint(color, ANSI_BOLD, &fit_column(&record.tag, tag_width));
             let engine = paint(color, ANSI_DIM, &fit_column(&engine, engine_width));
             let (sdot, scolor) = state_glyph(state);

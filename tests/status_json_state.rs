@@ -300,7 +300,9 @@ fn status_json_agrees_with_list_json_and_human_output_for_a_live_record() {
 /// this fixture is still there, and the only things added are the deliberate
 /// query-time derived fields -- `state` (liveness, see `observed_state`),
 /// `agent` (which agent is live in the workload's process tree,
-/// pocketshell issue #2580), and the issue #1 placement set: the recorded
+/// pocketshell issue #2580), `agent_profile` (which of that agent's
+/// configured variations it runs as, spec.md 9), and the issue #1 placement
+/// set: the recorded
 /// `worker_cgroup`/`workload_cgroup` (real /proc evidence, so a
 /// manager-wide kill leaves the failure domain provable) and the derived
 /// `worker_placement`/`workload_placement` summaries classified from them.
@@ -337,6 +339,7 @@ fn status_json_adds_only_the_derived_state_and_agent_fields() {
         added,
         vec![
             "agent",
+            "agent_profile",
             "state",
             "worker_cgroup",
             "worker_placement",

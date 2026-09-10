@@ -6,7 +6,11 @@
 //! and, through `/proc/<pid>/task/*/children`, its whole descendant tree --
 //! the same walk `worker::descendant_pids` uses for containment. This module
 //! reuses that walker to answer "which agent is live in this session right
-//! now" from the process tree instead of from configuration.
+//! now" from the process tree instead of from configuration, and -- through
+//! `DetectedAgent` -- which of the agent's configured variations (profiles,
+//! spec.md 9) that agent runs as: a non-default `CODEX_HOME`/`CLAUDE_CONFIG_DIR`
+//! in the agent's own environment, or a variant binary name (`zcodex`),
+//! naming the profile the way `config::discovery` registers it.
 //!
 //! The token rules mirror pocketshell's server-side classifier
 //! (`tools/pocketshell/src/pocketshell/cgroup_agents.py`, itself mirroring
@@ -65,6 +69,42 @@ impl AgentKind {
             AgentKind::Grok => "grok",
         }
     }
+
+    /// The profile-config environment variable this agent honours and the
+    /// basename of its default config dir, per `config::discovery`'s rules
+    /// (`PROFILE_DISCOVERY_RULES`). `None` for the agents with no profile
+    /// env var -- opencode has none and grok is not known to have one, so
+    /// neither can run as anything but the default profile.
+    fn profile_env(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            AgentKind::Claude => Some(("CLAUDE_CONFIG_DIR", ".claude")),
+            AgentKind::Codex => Some(("CODEX_HOME", ".codex")),
+            AgentKind::Opencode | AgentKind::Grok => None,
+        }
+    }
+}
+
+/// Which agent is live in a session, plus which of the agent's configured
+/// variations ("profiles", spec.md 9) it is running as. Detection names the
+/// variation the same way `config::discovery` names profiles -- the config
+/// dir's stem minus its leading dot (`~/.zodex` -> `zodex`) -- so a detected
+/// stem is always the id that profile is (or would be) registered under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedAgent {
+    pub kind: AgentKind,
+    /// The variation's stem when the agent runs as a named profile, `None`
+    /// for the engine's own default config. Never a display label, always
+    /// a profile id: `profile_label` is where the "default" spelling comes
+    /// from.
+    pub profile: Option<String>,
+}
+
+impl DetectedAgent {
+    /// The wire/display name of the variation: the profile id, or
+    /// `"default"` when the agent runs the engine's own config untouched.
+    pub fn profile_label(&self) -> &str {
+        self.profile.as_deref().unwrap_or("default")
+    }
 }
 
 impl fmt::Display for AgentKind {
@@ -94,6 +134,13 @@ struct TokenRule {
     /// Whether a `[-_][a-z0-9]+` continuation is accepted after the stem,
     /// the tail of `open[-_]?code(?:[-_][a-z0-9]+)?`.
     alnum_suffix: bool,
+    /// The variation a match implies when this rule's stem is not the
+    /// engine's canonical command (`Some("zcodex")`: the token named the
+    /// fork's binary, so the session is the zcodex profile even with no
+    /// `CODEX_HOME` in sight). `None` for the rules whose stems are the
+    /// engine's own name(s) -- matching them is the default profile as far
+    /// as the binary goes.
+    variant: Option<&'static str>,
 }
 
 /// Rules in the same order `cgroup_agents.py` applies them, with one
@@ -113,30 +160,35 @@ const TOKEN_RULES: &[TokenRule] = &[
         stems: &["claude"],
         literal_suffixes: &["code", "-code"],
         alnum_suffix: false,
+        variant: None,
     },
     TokenRule {
         kind: AgentKind::Codex,
         stems: &["zcodex"],
         literal_suffixes: &[],
         alnum_suffix: false,
+        variant: Some("zcodex"),
     },
     TokenRule {
         kind: AgentKind::Codex,
         stems: &["codex"],
         literal_suffixes: &[],
         alnum_suffix: false,
+        variant: None,
     },
     TokenRule {
         kind: AgentKind::Opencode,
         stems: &["opencode", "open-code", "open_code"],
         literal_suffixes: &[],
         alnum_suffix: true,
+        variant: None,
     },
     TokenRule {
         kind: AgentKind::Grok,
         stems: &["grok"],
         literal_suffixes: &[],
         alnum_suffix: false,
+        variant: None,
     },
 ];
 
@@ -218,11 +270,17 @@ impl TokenRule {
 /// and the rules themselves are lowercase, so `CLAUDE` and `claude` classify
 /// identically.
 pub fn classify_token(text: &str) -> Option<AgentKind> {
+    classify_token_detailed(text).map(|(kind, _)| kind)
+}
+
+/// `classify_token` plus the variation the matched rule implies (see
+/// `TokenRule::variant`).
+fn classify_token_detailed(text: &str) -> Option<(AgentKind, Option<&'static str>)> {
     let lowered = text.to_lowercase();
     TOKEN_RULES
         .iter()
         .find(|rule| rule.matches(&lowered))
-        .map(|rule| rule.kind)
+        .map(|rule| (rule.kind, rule.variant))
 }
 
 /// `/proc/<pid>/comm`, trimmed. `None` when the pid is gone or unreadable.
@@ -247,20 +305,67 @@ fn read_cmdline(proc_root: &Path, pid: u32) -> Option<String> {
     )
 }
 
+/// The value of `var` in `/proc/<pid>/environ` (NUL-delimited `KEY=value`
+/// words). `None` when the pid is gone, unreadable, or does not carry the
+/// variable -- the same defensive read every other /proc probe here does.
+fn read_environ_var(proc_root: &Path, pid: u32, var: &str) -> Option<String> {
+    let raw = fs::read(proc_root.join(pid.to_string()).join("environ")).ok()?;
+    let prefix = format!("{var}=");
+    String::from_utf8_lossy(&raw)
+        .split('\0')
+        .find(|word| word.starts_with(&prefix))
+        .map(|word| word[prefix.len()..].to_owned())
+}
+
+/// The profile id of the variation `kind` is running as on `pid`, from the
+/// same evidence `config::discovery` registers profiles from:
+///
+/// * A non-default profile env (`CODEX_HOME`/`CLAUDE_CONFIG_DIR`) wins: its
+///   dir's stem minus the leading dot is the profile id, matching discovery's
+///   keying exactly. An env value pointing at the *default* dir names no
+///   variation, so the binary rule still gets its say.
+/// * Otherwise the binary-name variation (`zcodex`): a session running the
+///   fork's binary is the zcodex profile even with no env override -- the
+///   usual hand-launched shape on this box.
+/// * Anything else is the engine's own default config: `None`.
+///
+/// Agents without a profile env (opencode, grok) can only ever be the
+/// default profile, so their env arm never fires.
+fn resolve_profile(
+    proc_root: &Path,
+    pid: u32,
+    kind: AgentKind,
+    variant: Option<&'static str>,
+) -> Option<String> {
+    if let Some((env_var, default_dirname)) = kind.profile_env() {
+        if let Some(dir) = read_environ_var(proc_root, pid, env_var) {
+            let stem = Path::new(&dir)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.trim_start_matches('.').to_owned())
+                .filter(|stem| !stem.is_empty());
+            if stem.as_deref() != Some(default_dirname.trim_start_matches('.')) {
+                return stem;
+            }
+        }
+    }
+    variant.map(str::to_owned)
+}
+
 /// Classify one pid by its `comm` first (cheap and definitive for an
 /// unwrapped CLI) and then its `cmdline` (which catches the node-wrapped
 /// form whose comm is just `node`).
-fn classify_pid(proc_root: &Path, pid: u32) -> Option<AgentKind> {
+fn classify_pid(proc_root: &Path, pid: u32) -> Option<(AgentKind, Option<&'static str>)> {
     if let Some(comm) = read_comm(proc_root, pid) {
-        if let Some(kind) = classify_token(&comm) {
-            return Some(kind);
+        if let Some(named) = classify_token_detailed(&comm) {
+            return Some(named);
         }
     }
     let cmdline = read_cmdline(proc_root, pid)?;
     if cmdline.is_empty() {
         return None;
     }
-    classify_token(&cmdline)
+    classify_token_detailed(&cmdline)
 }
 
 /// The agent running in `workload_pid`'s process tree, or `None`.
@@ -277,6 +382,11 @@ fn classify_pid(proc_root: &Path, pid: u32) -> Option<AgentKind> {
 /// skipped. `None` means "no agent found", which is also the honest answer
 /// for a workload that is no longer alive.
 pub fn detect_agent(proc_root: &Path, workload_pid: u32) -> Option<AgentKind> {
+    detect_agent_detailed(proc_root, workload_pid).map(|detected| detected.kind)
+}
+
+/// `detect_agent` plus the variation the agent runs as (`DetectedAgent`).
+pub fn detect_agent_detailed(proc_root: &Path, workload_pid: u32) -> Option<DetectedAgent> {
     let mut pending = VecDeque::from([workload_pid]);
     let mut seen = HashSet::from([workload_pid]);
     let mut scanned = 0usize;
@@ -285,8 +395,11 @@ pub fn detect_agent(proc_root: &Path, workload_pid: u32) -> Option<AgentKind> {
         if scanned > MAX_SCANNED_PIDS {
             return None;
         }
-        if let Some(kind) = classify_pid(proc_root, pid) {
-            return Some(kind);
+        if let Some((kind, variant)) = classify_pid(proc_root, pid) {
+            return Some(DetectedAgent {
+                kind,
+                profile: resolve_profile(proc_root, pid, kind, variant),
+            });
         }
         // A read error here is "this pid told us nothing", never a failure:
         // the strict, error-propagating variant is the containment walker's
@@ -328,6 +441,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         fs::write(task.join("children"), format!("{listed}\n")).unwrap();
+    }
+
+    /// `write_proc` plus an `environ` file, the `/proc` evidence profile
+    /// resolution reads.
+    fn write_proc_env(root: &Path, pid: u32, comm: &str, cmdline: &[&str], env: &[(&str, &str)]) {
+        write_proc(root, pid, comm, cmdline, &[]);
+        let mut raw = Vec::new();
+        for (key, value) in env {
+            raw.extend_from_slice(format!("{key}={value}").as_bytes());
+            raw.push(0);
+        }
+        fs::write(root.join(pid.to_string()).join("environ"), raw).unwrap();
     }
 
     fn proc_tree() -> (TempDir, PathBuf) {
@@ -379,6 +504,141 @@ mod tests {
         );
 
         assert_eq!(detect_agent(&root, 210), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn zcodex_binary_names_the_zcodex_profile_without_any_env() {
+        // The usual hand-launched shape: the fork's binary and no profile
+        // env at all. The variant rule names the profile the binary implies.
+        let (_dir, root) = proc_tree();
+        write_proc(&root, 220, "bash", &["/bin/bash", "-l"], &[221]);
+        write_proc(&root, 221, "zcodex", &["/opt/dev-small/zcodex"], &[]);
+
+        assert_eq!(
+            detect_agent_detailed(&root, 220),
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                profile: Some("zcodex".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn sibling_codex_home_env_names_that_profile() {
+        let (_dir, root) = proc_tree();
+        write_proc_env(
+            &root,
+            230,
+            "codex",
+            &["codex"],
+            &[("CODEX_HOME", "/home/alexey/.godex")],
+        );
+
+        assert_eq!(
+            detect_agent_detailed(&root, 230),
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                profile: Some("godex".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn default_codex_home_env_is_the_default_profile() {
+        let (_dir, root) = proc_tree();
+        write_proc_env(
+            &root,
+            240,
+            "codex",
+            &["codex"],
+            &[("CODEX_HOME", "/home/alexey/.codex")],
+        );
+
+        assert_eq!(
+            detect_agent_detailed(&root, 240),
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_default_env_wins_over_the_variant_binary_name() {
+        // A zcodex binary pointed at a different sibling home: the home
+        // decides which profile is live, the binary is only the fallback.
+        let (_dir, root) = proc_tree();
+        write_proc_env(
+            &root,
+            250,
+            "zcodex",
+            &["/opt/dev-small/zcodex"],
+            &[("CODEX_HOME", "/home/alexey/.godex/")],
+        );
+
+        assert_eq!(
+            detect_agent_detailed(&root, 250),
+            Some(DetectedAgent {
+                kind: AgentKind::Codex,
+                profile: Some("godex".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn sibling_claude_config_dir_names_that_profile() {
+        let (_dir, root) = proc_tree();
+        write_proc_env(
+            &root,
+            260,
+            "claude",
+            &["claude"],
+            &[("CLAUDE_CONFIG_DIR", "/home/alexey/.zlaude")],
+        );
+
+        assert_eq!(
+            detect_agent_detailed(&root, 260),
+            Some(DetectedAgent {
+                kind: AgentKind::Claude,
+                profile: Some("zlaude".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn agents_without_a_profile_env_can_only_be_the_default_profile() {
+        // Grok has no known profile env, so whatever else is in the
+        // environment cannot name a variation.
+        let (_dir, root) = proc_tree();
+        write_proc_env(
+            &root,
+            270,
+            "grok",
+            &["grok"],
+            &[("GROK_HOME", "/home/alexey/.zgrok")],
+        );
+
+        assert_eq!(
+            detect_agent_detailed(&root, 270),
+            Some(DetectedAgent {
+                kind: AgentKind::Grok,
+                profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn profile_label_defaults_to_default() {
+        let default = DetectedAgent {
+            kind: AgentKind::Codex,
+            profile: None,
+        };
+        assert_eq!(default.profile_label(), "default");
+        let zcodex = DetectedAgent {
+            kind: AgentKind::Codex,
+            profile: Some("zcodex".into()),
+        };
+        assert_eq!(zcodex.profile_label(), "zcodex");
     }
 
     #[test]

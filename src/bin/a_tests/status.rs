@@ -136,19 +136,32 @@ fn status_bar_sanitizes_record_fields_and_flash_messages() {
 
 #[test]
 fn agent_annotation_appears_only_when_it_adds_information() {
+    use aplexer::agent_kind::{AgentKind, DetectedAgent};
+    let detected = |kind: agent_kind::AgentKind, profile: Option<&'static str>| {
+        Some(DetectedAgent {
+            kind,
+            profile: profile.map(str::to_owned),
+        })
+    };
     let mut record = mk_record("/ws", "t", Phase::Running);
     assert_eq!(extra_agent_label(&record, None), None);
 
     // A claude-engine session running claude already says claude ...
     record.engine = "claude".to_string();
     assert_eq!(
-        extra_agent_label(&record, Some(agent_kind::AgentKind::Claude)),
+        extra_agent_label(&record, detected(AgentKind::Claude, None).as_ref()),
         None
     );
     // ... but the same session running codex does not.
     assert_eq!(
-        extra_agent_label(&record, Some(agent_kind::AgentKind::Codex)),
-        Some("codex")
+        extra_agent_label(&record, detected(AgentKind::Codex, None).as_ref()),
+        Some("codex".to_string())
+    );
+    // And when the codex runs a named variation, the label carries it in
+    // the same `engine/profile` spelling the declared side uses.
+    assert_eq!(
+        extra_agent_label(&record, detected(AgentKind::Codex, Some("zcodex")).as_ref()),
+        Some("codex/zcodex".to_string())
     );
 
     // The engine cell shows the declared engine/profile when there is
@@ -161,12 +174,18 @@ fn agent_annotation_appears_only_when_it_adds_information() {
     // column. A shell workload running zcodex lands here too -- the
     // zcodex token classifies as the codex kind.
     assert_eq!(
-        engine_label(&record, Some(agent_kind::AgentKind::Claude)),
+        engine_label(&record, detected(AgentKind::Claude, None).as_ref()),
         "claude"
     );
     assert_eq!(
-        engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+        engine_label(&record, detected(AgentKind::Codex, None).as_ref()),
         "codex"
+    );
+    // A variation names itself in the agent cell; the default profile
+    // does not.
+    assert_eq!(
+        engine_label(&record, detected(AgentKind::Codex, Some("zodex")).as_ref()),
+        "codex/zodex"
     );
 
     // A declared zcodex engine running zcodex is already fully named --
@@ -175,11 +194,11 @@ fn agent_annotation_appears_only_when_it_adds_information() {
     record.engine = "zcodex".to_string();
     record.profile = None;
     assert_eq!(
-        extra_agent_label(&record, Some(agent_kind::AgentKind::Codex)),
+        extra_agent_label(&record, detected(AgentKind::Codex, None).as_ref()),
         None
     );
     assert_eq!(
-        engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+        engine_label(&record, detected(AgentKind::Codex, None).as_ref()),
         "zcodex"
     );
 
@@ -188,7 +207,7 @@ fn agent_annotation_appears_only_when_it_adds_information() {
     record.engine = "claude".to_string();
     record.profile = None;
     assert_eq!(
-        engine_label(&record, Some(agent_kind::AgentKind::Codex)),
+        engine_label(&record, detected(AgentKind::Codex, None).as_ref()),
         "claude -> codex"
     );
 }
