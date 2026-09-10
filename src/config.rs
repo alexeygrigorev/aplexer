@@ -370,24 +370,15 @@ pub(crate) const PROVIDER_ENV_UNSET_VARS: &[&str] = &[
 /// prefix and configured additions.
 pub(crate) fn ordered_unique_env_names<'a>(
     prefix: impl IntoIterator<Item = &'a str>,
-    extra: &[String],
+    extra: &'a [String],
 ) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    let mut push = |name: &str| {
+    for name in prefix.into_iter().chain(extra.iter().map(String::as_str)) {
         let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        if seen.insert(trimmed.to_string()) {
+        if !trimmed.is_empty() && seen.insert(trimmed) {
             out.push(trimmed.to_string());
         }
-    };
-    for name in prefix {
-        push(name);
-    }
-    for name in extra {
-        push(name);
     }
     out
 }
