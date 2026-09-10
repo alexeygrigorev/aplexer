@@ -136,38 +136,69 @@ pub(super) struct SubscriberSender {
     pub(super) want_screen: bool,
 }
 
-impl SubscriberSender {
-    pub(super) fn backlog(&self) -> (usize, usize) {
-        let state = self.shared.poisoned_lock();
-        (state.queue.len(), state.queued_bytes)
-    }
+/// What one subscriber did with an offered PTY chunk.
+pub(super) enum Offer {
+    /// Queued behind its backlog (or silently accepted because a terminal
+    /// outcome is already pending and will win once the queue drains).
+    Queued,
+    /// A live-screen subscriber that fell behind: its backlog was replaced
+    /// by the current screen snapshot plus a layout nudge so the client
+    /// redraws its status bar (the snapshot's own ED2 blanked the bar row).
+    Coalesced,
+    /// The receiver is gone, or a raw-tail subscriber exceeded the cap and
+    /// was evicted; the hub drops the subscriber either way.
+    Dropped,
+}
 
-    /// Replace whatever this subscriber has queued with the current screen
-    /// snapshot plus a layout nudge so the client redraws its status bar
-    /// (the snapshot's own ED2 blanked the bar row). Returns false when the
-    /// receiver is gone and the subscriber should be dropped, true otherwise.
+impl SubscriberSender {
+    /// Offer one PTY chunk under a single lock hold. The backlog check, the
+    /// coalesce-or-evict decision, and the queue update used to take three
+    /// separate locks per subscriber per PTY read; here they are one.
+    ///
+    /// `snapshot` renders the current screen lazily, so the hub pays for it
+    /// only when some subscriber actually coalesces, and once per read.
     /// A pending terminal outcome is never disturbed -- it still wins once
-    /// the (now tiny) queue drains.
-    pub(super) fn coalesce_to_snapshot(&self, snapshot: Vec<u8>) -> bool {
+    /// the queue drains.
+    pub(super) fn offer(&self, data: &Arc<[u8]>, snapshot: &mut dyn FnMut() -> Arc<[u8]>) -> Offer {
         let mut state = self.shared.poisoned_lock();
         if !state.receiver_alive {
-            return false;
+            return Offer::Dropped;
         }
         if state.terminal.is_some() {
-            return true;
+            return Offer::Queued;
         }
-        state.queue.clear();
-        state.queued_bytes = snapshot.len();
-        state.queue.push_back(OutputEvent::Data(snapshot));
-        state
-            .queue
-            .push_back(OutputEvent::Layout(screen::LayoutChange {
-                alt_screen: false,
-                margins_reset: false,
-                erase_reset: true,
-            }));
-        self.shared.cvar.notify_all();
-        true
+        let queued_bytes = state.queued_bytes.saturating_add(data.len());
+        if self.want_screen
+            && (queued_bytes > COALESCE_SUBSCRIBER_QUEUED_BYTES
+                || state.queue.len() >= COALESCE_SUBSCRIBER_QUEUED_EVENTS)
+        {
+            let snapshot = snapshot();
+            state.queue.clear();
+            state.queued_bytes = snapshot.len();
+            state.queue.push_back(OutputEvent::Data(snapshot));
+            state
+                .queue
+                .push_back(OutputEvent::Layout(screen::LayoutChange {
+                    alt_screen: false,
+                    margins_reset: false,
+                    erase_reset: true,
+                }));
+            self.shared.cvar.notify_all();
+            return Offer::Coalesced;
+        }
+        if state.queue.len() >= MAX_SUBSCRIBER_QUEUED_EVENTS
+            || queued_bytes > MAX_SUBSCRIBER_QUEUED_BYTES
+        {
+            state.terminal = Some(OutputEvent::Error(
+                "attached client fell behind live output; reattach for a fresh snapshot".into(),
+            ));
+            self.shared.cvar.notify_all();
+            return Offer::Dropped;
+        }
+        state.queued_bytes = queued_bytes;
+        state.queue.push_back(OutputEvent::Data(Arc::clone(data)));
+        self.shared.cvar.notify_one();
+        Offer::Queued
     }
 
     pub(super) fn try_event(&self, event: OutputEvent) -> bool {
@@ -314,9 +345,9 @@ impl OutputHub {
         }
         let layout = inner.screen.process(data);
         // Ordering matters and is automatic: both sends go through the same
-        // per-subscriber mpsc channel under the same lock hold, so a Layout
-        // event always arrives after the Data frame that caused it (design
-        // doc section 5.1).
+        // per-subscriber queue under the same lock hold, so a Layout event
+        // always arrives after the Data frame that caused it (design doc
+        // section 5.1).
         //
         // A screen subscriber that fell behind does not get a fast-forward
         // replay of everything it missed: its backlog is replaced by the
@@ -324,51 +355,35 @@ impl OutputHub {
         // model above processed it before the snapshot is rendered). Skipped
         // bytes are not lost -- the history ring keeps them for `a capture`.
         //
-        // The snapshot is rendered once, before the subscriber scan, so the
-        // retain closures below never borrow `inner` while `subscribers` is
-        // mutably borrowed.
-        let mut needs_coalesce = false;
-        for subscriber in inner.subscribers.values() {
-            if subscriber.want_screen {
-                let (queued_events, queued_bytes) = subscriber.backlog();
-                if queued_bytes.saturating_add(data.len()) > COALESCE_SUBSCRIBER_QUEUED_BYTES
-                    || queued_events >= COALESCE_SUBSCRIBER_QUEUED_EVENTS
-                {
-                    needs_coalesce = true;
-                    break;
-                }
-            }
-        }
-        let snapshot_cache: Option<Vec<u8>> = if needs_coalesce {
-            Some(inner.screen.snapshot())
-        } else {
-            None
-        };
+        // One allocation for the chunk, shared by every queue it lands in;
+        // one snapshot render at most, on the first subscriber that needs
+        // it. Destructured so the lazy render borrows `screen` while the
+        // retain borrows `subscribers`.
+        let HubInner {
+            screen,
+            subscribers,
+            ..
+        } = &mut *inner;
+        let data: Arc<[u8]> = Arc::from(data);
+        let mut snapshot: Option<Arc<[u8]>> = None;
+        let mut render =
+            || Arc::clone(snapshot.get_or_insert_with(|| Arc::from(screen.snapshot())));
         // Ids coalesced on the Data phase skip the Layout phase below: the
         // snapshot carries an erase nudge of its own, and the per-chunk
         // Layout would just be a redundant extra event behind it.
         let mut coalesced: Vec<u64> = Vec::new();
-        inner.subscribers.retain(|id, subscriber| {
-            if subscriber.want_screen {
-                let (queued_events, queued_bytes) = subscriber.backlog();
-                if queued_bytes.saturating_add(data.len()) > COALESCE_SUBSCRIBER_QUEUED_BYTES
-                    || queued_events >= COALESCE_SUBSCRIBER_QUEUED_EVENTS
-                {
-                    let snapshot = snapshot_cache
-                        .as_ref()
-                        .expect("snapshot rendered when any subscriber needs it")
-                        .clone();
-                    let kept = subscriber.coalesce_to_snapshot(snapshot);
-                    if kept {
-                        coalesced.push(*id);
-                    }
-                    return kept;
+        subscribers.retain(
+            |id, subscriber| match subscriber.offer(&data, &mut render) {
+                Offer::Queued => true,
+                Offer::Coalesced => {
+                    coalesced.push(*id);
+                    true
                 }
-            }
-            subscriber.try_event(OutputEvent::Data(data.to_vec()))
-        });
+                Offer::Dropped => false,
+            },
+        );
         if let Some(change) = layout {
-            inner.subscribers.retain(|id, subscriber| {
+            subscribers.retain(|id, subscriber| {
                 if coalesced.contains(id) {
                     return true;
                 }
@@ -661,7 +676,7 @@ pub(super) mod tests {
         let OutputEvent::Data(snapshot) = first else {
             panic!("expected coalesced snapshot Data, got something else");
         };
-        assert_eq!(snapshot, hub.screen_snapshot().unwrap());
+        assert_eq!(&snapshot[..], &hub.screen_snapshot().unwrap()[..]);
         assert!(matches!(
             rx.recv().unwrap(),
             OutputEvent::Layout(change) if change.erase_reset
@@ -720,7 +735,7 @@ pub(super) mod tests {
             let OutputEvent::Data(data) = event else {
                 panic!("tail subscriber must replay raw bytes, not a snapshot");
             };
-            assert_eq!(data, chunk);
+            assert_eq!(&data[..], &chunk[..]);
         }
     }
 
@@ -864,7 +879,7 @@ pub(super) mod tests {
         hub.append(b"still-live").unwrap();
         assert!(matches!(
             rx.recv().unwrap(),
-            OutputEvent::Data(data) if data == b"still-live"
+            OutputEvent::Data(data) if &data[..] == b"still-live"
         ));
         assert_eq!(hub.snapshot(None).unwrap(), b"still-live");
         let blocked_bank = dir.path().join("history.bin.v2.data.0");
@@ -905,7 +920,7 @@ pub(super) mod tests {
         );
         assert!(matches!(
             rx.recv().unwrap(),
-            OutputEvent::Data(data) if data == b"still-live"
+            OutputEvent::Data(data) if &data[..] == b"still-live"
         ));
         assert_eq!(
             hub.inner.lock().unwrap().history_retry_delay,
@@ -918,7 +933,7 @@ pub(super) mod tests {
         hub.append(b"and-more").unwrap();
         assert!(matches!(
             rx.recv().unwrap(),
-            OutputEvent::Data(data) if data == b"and-more"
+            OutputEvent::Data(data) if &data[..] == b"and-more"
         ));
         assert!(
             !hub.inner.lock().unwrap().subscribers.is_empty(),

@@ -33,7 +33,10 @@ pub(crate) use termination::{disown_child_pid, own_child_pid};
 
 #[derive(Debug, Clone)]
 enum OutputEvent {
-    Data(Vec<u8>),
+    /// One PTY read (or a coalesced screen snapshot), shared by every
+    /// subscriber it is queued for: the hub allocates it once per read
+    /// instead of copying the chunk into each subscriber's queue.
+    Data(Arc<[u8]>),
     /// Worker-internal only (docs/terminal-state-design.md section 5.1);
     /// `handle_attach`'s writer thread maps this to a `ServerEvent::Layout`
     /// JSON frame for `want_screen` subscribers and drops it otherwise.
