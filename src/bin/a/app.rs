@@ -62,6 +62,8 @@ mod list_plain;
 mod list_tty;
 #[path = "message_commands.rs"]
 mod message_commands;
+#[path = "mouse.rs"]
+mod mouse;
 #[path = "rpc.rs"]
 mod rpc;
 #[path = "scroll.rs"]
@@ -103,6 +105,7 @@ pub(crate) use list_helpers::*;
 pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
 pub(crate) use message_commands::*;
+pub(crate) use mouse::*;
 pub(crate) use rpc::*;
 pub(crate) use scroll::*;
 pub(crate) use scroll_input::*;
