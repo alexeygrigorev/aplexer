@@ -45,6 +45,7 @@ pub(crate) const HISTORY_COMMIT_MAX_BYTES: usize = 4096;
 pub(crate) const HISTORY_MARKER_MAX_BYTES: usize = 4096;
 pub(crate) const HISTORY_BANK_COUNT: u8 = 2;
 pub(crate) const HISTORY_COMMIT_COUNT: u8 = 2;
+const HISTORY_HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -442,23 +443,40 @@ pub(crate) fn recover_history_candidate(
     }
     let committed_len = usize::try_from(commit.committed_len)
         .context("history committed length does not fit memory")?;
-    let mut payload = Vec::with_capacity(committed_len);
-    file.take(commit.committed_len)
-        .read_to_end(&mut payload)
-        .context("read committed history payload")?;
-    if payload.len() != committed_len {
-        bail!("history data bank ended inside its committed prefix");
-    }
+    // Hash the committed payload in chunks and keep only the tail the
+    // caller can use: this runs for both commit slots on every open and
+    // every read of a persisted tail, and a bank can be 32 MiB.
+    let count = tail_limit.min(commit.capacity as usize).min(committed_len);
     let mut hasher = Sha256::new();
-    hasher.update(&payload);
+    let mut tail: VecDeque<u8> = VecDeque::with_capacity(count);
+    let mut chunk = vec![0; HISTORY_HASH_CHUNK_BYTES.min(committed_len.max(1))];
+    let mut remaining = committed_len;
+    while remaining > 0 {
+        let want = chunk.len().min(remaining);
+        let read = file
+            .read(&mut chunk[..want])
+            .context("read committed history payload")?;
+        if read == 0 {
+            bail!("history data bank ended inside its committed prefix");
+        }
+        let bytes = &chunk[..read];
+        hasher.update(bytes);
+        if bytes.len() >= count {
+            tail.clear();
+            tail.extend(&bytes[bytes.len() - count..]);
+        } else {
+            tail.extend(bytes);
+            let excess = tail.len().saturating_sub(count);
+            tail.drain(..excess);
+        }
+        remaining -= read;
+    }
     if format!("{:x}", hasher.clone().finalize()) != commit.data_sha256 {
         bail!("history data checksum mismatch");
     }
-    let count = tail_limit.min(commit.capacity as usize).min(payload.len());
-    let tail = payload[payload.len() - count..].to_vec();
     Ok(RecoveredHistory {
         commit,
-        tail,
+        tail: tail.into(),
         data_hasher: hasher,
     })
 }
