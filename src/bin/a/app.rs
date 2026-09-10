@@ -70,6 +70,8 @@ mod rpc;
 mod rpc_connection;
 #[path = "scroll.rs"]
 mod scroll;
+#[path = "scroll_config.rs"]
+mod scroll_config;
 #[path = "scroll_input.rs"]
 mod scroll_input;
 #[path = "session_commands.rs"]
@@ -113,6 +115,7 @@ pub(crate) use mouse::*;
 pub(crate) use rpc::*;
 pub(crate) use rpc_connection::*;
 pub(crate) use scroll::*;
+pub(crate) use scroll_config::*;
 pub(crate) use scroll_input::*;
 pub(crate) use session_commands::*;
 pub(crate) use session_diagnostics::*;

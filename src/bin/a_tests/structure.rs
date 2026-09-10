@@ -100,6 +100,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("../a/scroll.rs"),
     "\n",
+    include_str!("../a/scroll_config.rs"),
+    "\n",
     include_str!("../a/scroll_input.rs"),
     "\n",
     include_str!("../a/status_commands.rs"),
