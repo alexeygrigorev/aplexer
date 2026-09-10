@@ -942,39 +942,12 @@ mod startup_cleanup_tests {
         exit: Option<ExitInfo>,
         containment_empty: Option<bool>,
     ) -> SessionRecord {
-        SessionRecord {
-            parent_session: None,
-            schema_version: SCHEMA_VERSION,
-            id: Uuid::nil(),
-            workspace: PathBuf::from("/ws"),
-            tag: "main".into(),
-            engine: "shell".into(),
-            profile: None,
-            command: vec!["/bin/true".into()],
-            cwd: PathBuf::from("/ws"),
-            env: BTreeMap::new(),
-            env_unset: Vec::new(),
-            limits: Limits::default(),
-            history_bytes: 1024,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            last_activity_ms: None,
-            last_accessed_ms: None,
-            reported_state: None,
-            reported_state_at_ms: None,
-            phase,
-            worker_pid: Some(1),
-            workload_pid: None,
-            worker_cgroup: None,
-            workload_cgroup: None,
-            containment_cgroup: None,
-            containment_cgroup_identity: None,
-            containment_empty,
-            socket_path: PathBuf::from("/ws/control.sock"),
-            history_path: PathBuf::from("/ws/history.bin"),
-            exit,
-            error: None,
-        }
+        let mut record = SessionRecord::fixture("/ws", "main");
+        record.phase = phase;
+        record.worker_pid = Some(1);
+        record.containment_empty = containment_empty;
+        record.exit = exit;
+        record
     }
 
     /// `(description, phase, exit, containment_empty, expected_accept)`.

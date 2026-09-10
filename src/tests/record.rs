@@ -35,40 +35,11 @@ fn session_record_write_persists_worker_start_identity_once() {
 }
 
 fn liveness_record(state_dir: &Path) -> SessionRecord {
-    let pid = std::process::id();
-    SessionRecord {
-        parent_session: None,
-        schema_version: SCHEMA_VERSION,
-        id: Uuid::new_v4(),
-        workspace: state_dir.to_path_buf(),
-        tag: "identity-test".into(),
-        engine: "shell".into(),
-        profile: None,
-        command: vec!["/bin/true".into()],
-        cwd: state_dir.to_path_buf(),
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        limits: Limits::default(),
-        history_bytes: DEFAULT_HISTORY_BYTES,
-        created_at_ms: 1,
-        updated_at_ms: 1,
-        last_activity_ms: None,
-        last_accessed_ms: None,
-        reported_state: None,
-        reported_state_at_ms: None,
-        phase: Phase::Running,
-        worker_pid: Some(pid),
-        workload_pid: None,
-        worker_cgroup: None,
-        workload_cgroup: None,
-        containment_cgroup: None,
-        containment_cgroup_identity: None,
-        containment_empty: Some(false),
-        socket_path: state_dir.join("control.sock"),
-        history_path: state_dir.join("history.bin"),
-        exit: None,
-        error: None,
-    }
+    let mut record = SessionRecord::fixture(state_dir, "identity-test");
+    record.worker_pid = Some(std::process::id());
+    record.socket_path = state_dir.join("control.sock");
+    record.history_path = state_dir.join("history.bin");
+    record
 }
 
 /// The two proof shapes that short-circuit before the kernel is ever

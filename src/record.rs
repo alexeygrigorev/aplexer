@@ -334,6 +334,50 @@ pub struct SessionRecord {
     pub error: Option<String>,
 }
 
+#[cfg(test)]
+impl SessionRecord {
+    /// The minimal valid record tests start from: a fresh id, `Running`,
+    /// no pids, no containment proof, placeholder paths, a zero clock. A
+    /// test sets the few fields it is actually about instead of restating
+    /// all thirty in every fixture.
+    pub(crate) fn fixture(workspace: impl Into<PathBuf>, tag: &str) -> Self {
+        let workspace = workspace.into();
+        Self {
+            parent_session: None,
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            workspace: workspace.clone(),
+            tag: tag.to_string(),
+            engine: "shell".to_string(),
+            profile: None,
+            command: Vec::new(),
+            cwd: workspace,
+            env: BTreeMap::new(),
+            env_unset: Vec::new(),
+            limits: Limits::default(),
+            history_bytes: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_activity_ms: None,
+            last_accessed_ms: None,
+            reported_state: None,
+            reported_state_at_ms: None,
+            phase: Phase::Running,
+            worker_pid: None,
+            workload_pid: None,
+            worker_cgroup: None,
+            workload_cgroup: None,
+            containment_cgroup: None,
+            containment_cgroup_identity: None,
+            containment_empty: Some(false),
+            socket_path: PathBuf::from("/nonexistent"),
+            history_path: PathBuf::from("/nonexistent"),
+            exit: None,
+            error: None,
+        }
+    }
+}
+
 /// Environment entries that are session metadata rather than launch
 /// secrets. Transcript discovery needs these profile-specific roots after
 /// the worker exits; every other launch value remains one-shot/private.

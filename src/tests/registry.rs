@@ -3,39 +3,14 @@
 use super::*;
 
 fn registry_record(paths: &Paths, id: Uuid) -> SessionRecord {
-    SessionRecord {
-        parent_session: None,
-        schema_version: SCHEMA_VERSION,
-        id,
-        workspace: paths.state_root.clone(),
-        tag: "registry-test".into(),
-        engine: "shell".into(),
-        profile: None,
-        command: vec!["/bin/true".into()],
-        cwd: paths.state_root.clone(),
-        env: BTreeMap::new(),
-        env_unset: Vec::new(),
-        limits: Limits::default(),
-        history_bytes: DEFAULT_HISTORY_BYTES,
-        created_at_ms: 1,
-        updated_at_ms: 1,
-        last_activity_ms: None,
-        last_accessed_ms: None,
-        reported_state: None,
-        reported_state_at_ms: None,
-        phase: Phase::Exited,
-        worker_pid: None,
-        workload_pid: None,
-        worker_cgroup: None,
-        workload_cgroup: None,
-        containment_cgroup: None,
-        containment_cgroup_identity: None,
-        containment_empty: Some(true),
-        socket_path: paths.socket(id),
-        history_path: paths.history(id),
-        exit: None,
-        error: None,
-    }
+    let mut record = SessionRecord::fixture(paths.state_root.clone(), "registry-test");
+    record.id = id;
+    record.history_bytes = DEFAULT_HISTORY_BYTES;
+    record.phase = Phase::Exited;
+    record.containment_empty = Some(true);
+    record.socket_path = paths.socket(id);
+    record.history_path = paths.history(id);
+    record
 }
 
 #[test]

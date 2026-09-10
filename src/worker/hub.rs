@@ -990,39 +990,9 @@ pub(super) mod tests {
         dir: &tempfile::TempDir,
         record_path: std::path::PathBuf,
     ) -> WorkerRuntime {
-        let record = SessionRecord {
-            parent_session: None,
-            schema_version: SCHEMA_VERSION,
-            id: Uuid::new_v4(),
-            workspace: dir.path().to_path_buf(),
-            tag: "before".into(),
-            engine: "shell".into(),
-            profile: None,
-            command: vec!["/bin/sh".into()],
-            cwd: dir.path().to_path_buf(),
-            env: BTreeMap::new(),
-            env_unset: Vec::new(),
-            limits: Limits::default(),
-            history_bytes: 1024,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            last_activity_ms: None,
-            last_accessed_ms: None,
-            reported_state: None,
-            reported_state_at_ms: None,
-            phase: Phase::Running,
-            worker_pid: None,
-            workload_pid: None,
-            worker_cgroup: None,
-            workload_cgroup: None,
-            containment_cgroup: None,
-            containment_cgroup_identity: None,
-            containment_empty: Some(false),
-            socket_path: dir.path().join("control.sock"),
-            history_path: dir.path().join("history.bin"),
-            exit: None,
-            error: None,
-        };
+        let mut record = SessionRecord::fixture(dir.path(), "before");
+        record.socket_path = dir.path().join("control.sock");
+        record.history_path = dir.path().join("history.bin");
         WorkerRuntime {
             id: record.id,
             paths: Paths {

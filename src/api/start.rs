@@ -878,39 +878,9 @@ mod fresh_tag_tests {
     /// -- and a reclaimable one needs no pids plus an empty-containment
     /// shape, exactly like `mod reclaim_tests`' zombie fixture.
     fn record(workspace: &str, tag: &str, worker_pid: Option<u32>) -> SessionRecord {
-        SessionRecord {
-            parent_session: None,
-            schema_version: SCHEMA_VERSION,
-            id: Uuid::new_v4(),
-            workspace: PathBuf::from(workspace),
-            tag: tag.to_string(),
-            engine: "shell".to_string(),
-            profile: None,
-            command: vec![],
-            cwd: PathBuf::from(workspace),
-            env: Default::default(),
-            env_unset: Default::default(),
-            limits: Default::default(),
-            history_bytes: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            last_activity_ms: None,
-            last_accessed_ms: None,
-            reported_state: None,
-            reported_state_at_ms: None,
-            phase: Phase::Running,
-            worker_pid,
-            workload_pid: None,
-            worker_cgroup: None,
-            workload_cgroup: None,
-            containment_cgroup: None,
-            containment_cgroup_identity: None,
-            containment_empty: Some(false),
-            socket_path: PathBuf::from("/nonexistent"),
-            history_path: PathBuf::from("/nonexistent"),
-            exit: None,
-            error: None,
-        }
+        let mut record = SessionRecord::fixture(workspace, tag);
+        record.worker_pid = worker_pid;
+        record
     }
 
     fn live(workspace: &str, tag: &str) -> SessionRecord {
@@ -1026,39 +996,7 @@ mod reclaim_tests {
     /// The reported zombie shape: worker dead, `phase` stuck at `running`,
     /// nothing left running.
     fn zombie_record() -> SessionRecord {
-        SessionRecord {
-            parent_session: None,
-            schema_version: SCHEMA_VERSION,
-            id: Uuid::new_v4(),
-            workspace: PathBuf::from("/ws/zombie"),
-            tag: "zt".to_string(),
-            engine: "shell".to_string(),
-            profile: None,
-            command: vec![],
-            cwd: PathBuf::from("/ws/zombie"),
-            env: Default::default(),
-            env_unset: Default::default(),
-            limits: Default::default(),
-            history_bytes: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            last_activity_ms: None,
-            last_accessed_ms: None,
-            reported_state: None,
-            reported_state_at_ms: None,
-            phase: Phase::Running,
-            worker_pid: None,
-            workload_pid: None,
-            worker_cgroup: None,
-            workload_cgroup: None,
-            containment_cgroup: None,
-            containment_cgroup_identity: None,
-            containment_empty: Some(false),
-            socket_path: PathBuf::from("/nonexistent"),
-            history_path: PathBuf::from("/nonexistent"),
-            exit: None,
-            error: None,
-        }
+        SessionRecord::fixture("/ws/zombie", "zt")
     }
 
     /// A reclaimable predecessor is retired by the ordinary archive
