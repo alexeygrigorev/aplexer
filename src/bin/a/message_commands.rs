@@ -22,7 +22,7 @@ pub(crate) fn resolve_message_workspace(explicit: Option<&Path>) -> Result<PathB
 /// existed in this workspace is rejected with the list of known tags unless
 /// `--queue` is passed. Broadcast/engine forms always succeed.
 pub(crate) fn build_recipient(
-    paths: &Paths,
+    records: &[SessionRecord],
     workspace: &Path,
     to: Option<&str>,
     all: bool,
@@ -40,11 +40,9 @@ pub(crate) fn build_recipient(
         bail!("--to, --all, and --to-engine are mutually exclusive");
     }
     if let Some(tag) = to {
-        let existing = list_records(paths)?
-            .into_iter()
-            .find(|r| r.workspace == workspace && r.tag == tag);
+        let existing = session_by_tag(records, workspace, tag);
         if existing.is_none() && !queue {
-            let known = known_tags(paths, workspace);
+            let known = known_tags(records, workspace);
             let hint = if known.is_empty() {
                 "no session has ever run in this workspace".to_string()
             } else {
@@ -73,7 +71,7 @@ pub(crate) fn build_recipient(
 /// target session and connects to its worker socket directly, exactly like
 /// `a send <target> <text>` does today. No new server-side RPC operation.
 pub(crate) fn deliver_pane(
-    paths: &Paths,
+    records: &[SessionRecord],
     workspace: &Path,
     tag: &str,
     from_tag: Option<&str>,
@@ -84,15 +82,12 @@ pub(crate) fn deliver_pane(
     if body.len() > MAX_BODY_BYTES {
         bail!("message body exceeds the {MAX_BODY_BYTES}-byte cap");
     }
-    let record = list_records(paths)?
-        .into_iter()
-        .find(|r| r.workspace == workspace && r.tag == tag)
+    let record = session_by_tag(records, workspace, tag)
         .ok_or_else(|| anyhow!("no session tagged {tag:?} in this workspace"))?;
-    let alive = record.worker_alive();
-    if !alive {
+    if !record.worker_alive() {
         bail!("session {tag:?} is not running; pane delivery requires a live target");
     }
-    rpc_send(&record, &pane_input_bytes(body, from_tag, raw, no_enter))
+    rpc_send(record, &pane_input_bytes(body, from_tag, raw, no_enter))
         .with_context(|| format!("inject into session {tag:?}'s PTY"))
 }
 
@@ -130,7 +125,8 @@ pub(crate) fn parse_data_arg(raw: Option<&str>) -> Result<Option<Value>> {
 /// too (with `delivery: pane`, pre-acked for the recipient) so the mailbox
 /// stays a complete account of inter-agent traffic (design doc section 6.2).
 pub(crate) fn finish_send(
-    paths: &Paths,
+    mp: &MessagePaths,
+    records: &[SessionRecord],
     workspace: &Path,
     mut envelope: MessageEnvelope,
     pane: &PaneDeliveryArgs,
@@ -141,7 +137,7 @@ pub(crate) fn finish_send(
         };
         let tag = tag.clone();
         match deliver_pane(
-            paths,
+            records,
             workspace,
             &tag,
             envelope.from.tag.as_deref(),
@@ -159,7 +155,7 @@ pub(crate) fn finish_send(
             }
         }
     }
-    let recorded = match write_message(paths, &envelope) {
+    let recorded = match write_message_in(mp, &envelope) {
         Ok(()) => true,
         Err(error) if envelope.delivery == Delivery::Pane => {
             // PTY injection is the pane-delivery commit point. Reporting
@@ -182,13 +178,27 @@ pub(crate) fn finish_send(
             // definition, so a failure to also pre-ack it here is a
             // cosmetic mailbox-record issue, not a delivery failure
             // (design doc section 6.2).
-            let _ = ack_messages(paths, workspace, *sid, &[envelope.id]);
+            let _ = ack_messages_in(mp, *sid, &[envelope.id]);
         }
     }
     if recorded {
-        let _ = maybe_gc(paths, workspace);
+        let _ = maybe_gc_in(mp, workspace, records);
     }
     Ok(envelope)
+}
+
+/// Messages addressed to `consumer` that it has not acknowledged, in id
+/// (= time) order.
+fn unread_messages(
+    mp: &MessagePaths,
+    workspace: &Path,
+    consumer: &SessionIdentity,
+) -> Result<Vec<MessageEnvelope>> {
+    let cursor = read_cursor_in(mp, consumer.id)?;
+    Ok(list_messages_in(mp, workspace)?
+        .into_iter()
+        .filter(|m| consumer.receives(m) && !cursor.is_acked(m.id))
+        .collect())
 }
 
 pub(crate) fn print_message_line(m: &MessageEnvelope) {
@@ -283,10 +293,15 @@ pub(crate) fn cmd_message_send(
     }
     check_body_size(&args.text)?;
     let workspace = resolve_message_workspace(None)?;
+    let records = list_records(paths)?;
     let data = parse_data_arg(args.data.as_deref())?;
-    let from = resolve_sender(paths, &workspace, args.from.as_deref())?;
+    let from = MessageFrom::from_identity(resolve_identity(
+        &records,
+        &workspace,
+        args.from.as_deref(),
+    )?);
     let to = build_recipient(
-        paths,
+        &records,
         &workspace,
         args.to.as_deref(),
         args.all,
@@ -306,7 +321,8 @@ pub(crate) fn cmd_message_send(
         data,
         delivery: Delivery::Inbox,
     };
-    let envelope = finish_send(paths, &workspace, envelope, &args.pane_delivery)?;
+    let mp = ensure_workspace(paths, &workspace)?;
+    let envelope = finish_send(&mp, &records, &workspace, envelope, &args.pane_delivery)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -322,16 +338,20 @@ pub(crate) fn cmd_message_reply(
 ) -> Result<()> {
     check_body_size(&args.text)?;
     let workspace = resolve_message_workspace(None)?;
-    let original = read_message(paths, &workspace, args.message_id)
+    let records = list_records(paths)?;
+    let mp = ensure_workspace(paths, &workspace)?;
+    let original = read_message_in(&mp, &workspace, args.message_id)
         .with_context(|| format!("no such message {}", args.message_id))?;
     let to_tag = original.from.tag.clone().ok_or_else(|| {
         anyhow!("original message {} was sent anonymously (no sender tag); reply with `a message send --to <tag>` instead", args.message_id)
     })?;
     let data = parse_data_arg(args.data.as_deref())?;
-    let from = resolve_sender(paths, &workspace, args.from.as_deref())?;
-    let target = list_records(paths)?
-        .into_iter()
-        .find(|r| r.workspace == workspace && r.tag == to_tag);
+    let from = MessageFrom::from_identity(resolve_identity(
+        &records,
+        &workspace,
+        args.from.as_deref(),
+    )?);
+    let target = session_by_tag(&records, &workspace, &to_tag);
     let to = Recipient::Tag {
         tag: to_tag,
         session_id: target.map(|r| r.id).or(original.from.session_id),
@@ -349,7 +369,7 @@ pub(crate) fn cmd_message_reply(
         data,
         delivery: Delivery::Inbox,
     };
-    let envelope = finish_send(paths, &workspace, envelope, &args.pane_delivery)?;
+    let envelope = finish_send(&mp, &records, &workspace, envelope, &args.pane_delivery)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -365,15 +385,15 @@ pub(crate) fn cmd_message_inbox(
 ) -> Result<()> {
     let _ = args.new; // `--new` is accepted for CLI-surface compatibility; unread is already the default (design doc section 7).
     let workspace = resolve_message_workspace(None)?;
-    let (consumer_id, consumer_tag, consumer_engine) =
-        resolve_consumer(paths, &workspace, args.from.as_deref())?;
-    let _ = maybe_gc(paths, &workspace);
-    let cursor = read_cursor(paths, &workspace, consumer_id)?;
-    let messages: Vec<MessageEnvelope> = list_messages(paths, &workspace)?
-        .into_iter()
-        .filter(|m| addressed_to(m, consumer_id, &consumer_tag, &consumer_engine))
-        .filter(|m| !cursor.is_acked(m.id))
-        .collect();
+    let records = list_records(paths)?;
+    let consumer = SessionIdentity::required(resolve_identity(
+        &records,
+        &workspace,
+        args.from.as_deref(),
+    )?)?;
+    let mp = ensure_workspace(paths, &workspace)?;
+    let _ = maybe_gc_in(&mp, &workspace, &records);
+    let messages = unread_messages(&mp, &workspace, &consumer)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&messages)?);
     } else if messages.is_empty() {
@@ -392,8 +412,9 @@ pub(crate) fn cmd_message_log(
     json_output: bool,
 ) -> Result<()> {
     let workspace = resolve_message_workspace(args.workspace.as_deref())?;
-    let _ = maybe_gc(paths, &workspace);
-    let messages = list_messages(paths, &workspace)?;
+    let mp = ensure_workspace(paths, &workspace)?;
+    let _ = maybe_gc_in(&mp, &workspace, &list_records(paths)?);
+    let messages = list_messages_in(&mp, &workspace)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&messages)?);
     } else if messages.is_empty() {
@@ -433,20 +454,22 @@ pub(crate) fn cmd_message_ack(
         bail!("specify at least one message id, or --all");
     }
     let workspace = resolve_message_workspace(None)?;
-    let (consumer_id, consumer_tag, consumer_engine) =
-        resolve_consumer(paths, &workspace, args.from.as_deref())?;
+    let records = list_records(paths)?;
+    let consumer = SessionIdentity::required(resolve_identity(
+        &records,
+        &workspace,
+        args.from.as_deref(),
+    )?)?;
+    let mp = ensure_workspace(paths, &workspace)?;
     let ids: Vec<Uuid> = if args.all {
-        let cursor = read_cursor(paths, &workspace, consumer_id)?;
-        list_messages(paths, &workspace)?
+        unread_messages(&mp, &workspace, &consumer)?
             .into_iter()
-            .filter(|m| addressed_to(m, consumer_id, &consumer_tag, &consumer_engine))
-            .filter(|m| !cursor.is_acked(m.id))
             .map(|m| m.id)
             .collect()
     } else {
         args.message_ids
     };
-    let acked = ack_messages(paths, &workspace, consumer_id, &ids)?;
+    let acked = ack_messages_in(&mp, consumer.id, &ids)?;
     let unknown: Vec<Uuid> = ids
         .iter()
         .filter(|id| !acked.contains(id))

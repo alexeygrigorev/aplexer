@@ -11,7 +11,7 @@ use crate::history::hex_encode;
 use crate::persist::{read_bounded_json, read_bounded_regular_file};
 use crate::{
     atomic_write_bytes, atomic_write_json, ensure_private_dir, list_records, now_ms, FileLock,
-    Paths,
+    Paths, SessionRecord,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -580,16 +580,21 @@ fn mailbox_lock_path(mp: &MessagePaths) -> PathBuf {
 /// message's own UUIDv7 id so lexical directory order is chronological
 /// order (design doc section 3.2/4).
 pub fn write_message(paths: &Paths, envelope: &MessageEnvelope) -> Result<()> {
-    write_message_with_limits(
-        paths,
+    write_message_in(&ensure_workspace(paths, &envelope.workspace)?, envelope)
+}
+
+/// `write_message` into an already-ensured mailbox.
+pub fn write_message_in(mp: &MessagePaths, envelope: &MessageEnvelope) -> Result<()> {
+    write_message_limited(
+        mp,
         envelope,
         MAX_MESSAGES_PER_WORKSPACE,
         MAX_WORKSPACE_BYTES,
     )
 }
 
-fn write_message_with_limits(
-    paths: &Paths,
+fn write_message_limited(
+    mp: &MessagePaths,
     envelope: &MessageEnvelope,
     max_messages: usize,
     max_bytes: u64,
@@ -601,8 +606,7 @@ fn write_message_with_limits(
             bytes.len()
         );
     }
-    let mp = ensure_workspace(paths, &envelope.workspace)?;
-    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(mp), false)?;
     let path = mp.msgs_dir.join(format!("{}.json", envelope.id));
     if path.try_exists()? {
         bail!("message {} already exists", envelope.id);
@@ -614,7 +618,7 @@ fn write_message_with_limits(
     // old file cannot be removed, roll this append back and report failure
     // instead of returning success with the mailbox above its hard limits.
     if let Err(error) = prune_workspace_locked(
-        &mp,
+        mp,
         &envelope.workspace,
         Some(&path),
         max_messages,
@@ -633,7 +637,19 @@ pub fn read_message(
     canonical_workspace: &Path,
     id: Uuid,
 ) -> Result<MessageEnvelope> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
+    read_message_in(
+        &ensure_workspace(paths, canonical_workspace)?,
+        canonical_workspace,
+        id,
+    )
+}
+
+/// `read_message` from an already-ensured mailbox.
+pub fn read_message_in(
+    mp: &MessagePaths,
+    canonical_workspace: &Path,
+    id: Uuid,
+) -> Result<MessageEnvelope> {
     let path = mp.msgs_dir.join(format!("{id}.json"));
     load_message_file(&path, canonical_workspace)
         .with_context(|| format!("read mailbox message {id}"))
@@ -732,7 +748,17 @@ fn load_message_file(path: &Path, expected_workspace: &Path) -> Result<MessageEn
 /// reinterpreted or hidden: cursor acknowledgement identity depends on the
 /// filename, envelope id, and mailbox workspace agreeing exactly.
 pub fn list_messages(paths: &Paths, canonical_workspace: &Path) -> Result<Vec<MessageEnvelope>> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
+    list_messages_in(
+        &ensure_workspace(paths, canonical_workspace)?,
+        canonical_workspace,
+    )
+}
+
+/// `list_messages` from an already-ensured mailbox.
+pub fn list_messages_in(
+    mp: &MessagePaths,
+    canonical_workspace: &Path,
+) -> Result<Vec<MessageEnvelope>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(&mp.msgs_dir) {
         Ok(e) => e,
@@ -839,8 +865,12 @@ fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
 }
 
 pub fn read_cursor(paths: &Paths, canonical_workspace: &Path, consumer_id: Uuid) -> Result<Cursor> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
-    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    read_cursor_in(&ensure_workspace(paths, canonical_workspace)?, consumer_id)
+}
+
+/// `read_cursor` from an already-ensured mailbox.
+pub fn read_cursor_in(mp: &MessagePaths, consumer_id: Uuid) -> Result<Cursor> {
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(mp), false)?;
     let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
     let _cursor = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
     let mut value = read_cursor_file(&path)?;
@@ -879,9 +909,17 @@ pub fn ack_messages(
     consumer_id: Uuid,
     ids: &[Uuid],
 ) -> Result<Vec<Uuid>> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
+    ack_messages_in(
+        &ensure_workspace(paths, canonical_workspace)?,
+        consumer_id,
+        ids,
+    )
+}
+
+/// `ack_messages` in an already-ensured mailbox.
+pub fn ack_messages_in(mp: &MessagePaths, consumer_id: Uuid, ids: &[Uuid]) -> Result<Vec<Uuid>> {
     let path = mp.cursors_dir.join(format!("{consumer_id}.json"));
-    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(mp), false)?;
     let _cursor = FileLock::exclusive(&cursor_lock_path(&mp.cursors_dir, consumer_id), false)?;
     let mut cursor = read_cursor_file(&path)?;
     let retained_ids = retained_message_ids(&mp.msgs_dir)?;
@@ -899,12 +937,11 @@ pub fn ack_messages(
 
 /// Known tags for a workspace (design doc section 2.3), from session
 /// metadata -- live or historical, not just currently-running sessions.
-pub fn known_tags(paths: &Paths, canonical_workspace: &Path) -> Vec<String> {
-    let mut tags: Vec<String> = list_records(paths)
-        .unwrap_or_default()
-        .into_iter()
+pub fn known_tags(records: &[SessionRecord], canonical_workspace: &Path) -> Vec<String> {
+    let mut tags: Vec<String> = records
+        .iter()
         .filter(|r| r.workspace == canonical_workspace)
-        .map(|r| r.tag)
+        .map(|r| r.tag.clone())
         .collect();
     tags.sort();
     tags.dedup();
@@ -1197,23 +1234,37 @@ fn maintain_workspace_cursors_locked(
 /// mailbox lock used by append makes the scan/delete/cursor-compaction pass a
 /// transaction with respect to sends and acknowledgements.
 pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcReport> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
-    let _mailbox = FileLock::exclusive(&mailbox_lock_path(&mp), false)?;
+    gc_workspace_in(
+        &ensure_workspace(paths, canonical_workspace)?,
+        canonical_workspace,
+        &list_records(paths)?,
+    )
+}
+
+/// `gc_workspace` on an already-ensured mailbox; `records` (every session
+/// record on this host) decides which consumers' cursor state is still
+/// live.
+pub fn gc_workspace_in(
+    mp: &MessagePaths,
+    canonical_workspace: &Path,
+    records: &[SessionRecord],
+) -> Result<GcReport> {
+    let _mailbox = FileLock::exclusive(&mailbox_lock_path(mp), false)?;
     let report = prune_workspace_locked(
-        &mp,
+        mp,
         canonical_workspace,
         None,
         MAX_MESSAGES_PER_WORKSPACE,
         MAX_WORKSPACE_BYTES,
         true,
     )?;
-    let active_consumers = list_records(paths)?
-        .into_iter()
+    let active_consumers = records
+        .iter()
         .filter(|record| record.workspace == canonical_workspace && record.worker_phase_active())
         .map(|record| record.id)
         .collect();
     maintain_workspace_cursors_locked(
-        &mp,
+        mp,
         &active_consumers,
         now_secs(),
         STALE_CURSOR_RETENTION_SECS,
@@ -1226,7 +1277,19 @@ pub fn gc_workspace(paths: &Paths, canonical_workspace: &Path) -> Result<GcRepor
 /// section 4: "pruning is opportunistic ... any `a message` invocation may
 /// unlink expired files"). `a message gc` itself bypasses this gate.
 pub fn maybe_gc(paths: &Paths, canonical_workspace: &Path) -> Result<()> {
-    let mp = ensure_workspace(paths, canonical_workspace)?;
+    maybe_gc_in(
+        &ensure_workspace(paths, canonical_workspace)?,
+        canonical_workspace,
+        &list_records(paths)?,
+    )
+}
+
+/// `maybe_gc` on an already-ensured mailbox.
+pub fn maybe_gc_in(
+    mp: &MessagePaths,
+    canonical_workspace: &Path,
+    records: &[SessionRecord],
+) -> Result<()> {
     let marker = mp.workspace_dir.join(".gc_marker");
     // A marker mtime in the future (clock step, restored backup) must not
     // make every call sweep: saturate the age at zero instead of erroring.
@@ -1237,102 +1300,118 @@ pub fn maybe_gc(paths: &Paths, canonical_workspace: &Path) -> Result<()> {
             now_secs().saturating_sub(modified) > OPPORTUNISTIC_GC_INTERVAL_SECS
         });
     if due {
-        gc_workspace(paths, canonical_workspace)?;
+        gc_workspace_in(mp, canonical_workspace, records)?;
         let _ = fs::write(&marker, now_secs().to_string());
     }
     Ok(())
 }
 
-/// Resolves the sender identity for `send`/`log` (design doc section 2.1):
-/// `--from <tag>` (matched against session metadata for this workspace)
-/// first, else `APLEXER_SESSION_ID`/`APLEXER_TAG` from the environment
-/// (with a best-effort lookup of the full session record for engine/
-/// profile), else anonymous.
-pub fn resolve_sender(
-    paths: &Paths,
+/// The session record for `tag` in `canonical_workspace`, live or
+/// historical -- the one lookup `--from`, `--to`, `reply`, and pane
+/// delivery all share.
+pub fn session_by_tag<'a>(
+    records: &'a [SessionRecord],
+    canonical_workspace: &Path,
+    tag: &str,
+) -> Option<&'a SessionRecord> {
+    records
+        .iter()
+        .find(|r| r.workspace == canonical_workspace && r.tag == tag)
+}
+
+/// A resolved sender or consumer identity: the session id plus whatever
+/// of tag/engine/profile its record -- or, failing that, the environment
+/// -- could supply. `send`/`log` degrade to anonymous without one
+/// (`MessageFrom::from_identity`); `inbox`/`ack` require one
+/// (`SessionIdentity::required`) -- design doc section 2.1 and section 7's
+/// closing note.
+#[derive(Debug, Clone)]
+pub struct SessionIdentity {
+    pub id: Uuid,
+    pub tag: Option<String>,
+    pub engine: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl SessionIdentity {
+    fn from_record(record: &SessionRecord) -> Self {
+        Self {
+            id: record.id,
+            tag: Some(record.tag.clone()),
+            engine: Some(record.engine.clone()),
+            profile: record.profile.clone(),
+        }
+    }
+
+    /// The consumer identity `inbox`/`ack` need, or a clear error when
+    /// neither `--from` nor `APLEXER_SESSION_ID` was available.
+    pub fn required(identity: Option<Self>) -> Result<Self> {
+        identity.ok_or_else(|| {
+            anyhow!(
+                "no session identity: APLEXER_SESSION_ID is not set (you're not inside an aplexer \
+                 session) and no --from TAG was given"
+            )
+        })
+    }
+
+    /// Whether `envelope` is addressed to this session (`addressed_to`).
+    pub fn receives(&self, envelope: &MessageEnvelope) -> bool {
+        addressed_to(
+            envelope,
+            self.id,
+            self.tag.as_deref().unwrap_or(""),
+            self.engine.as_deref().unwrap_or(""),
+        )
+    }
+}
+
+impl MessageFrom {
+    /// The sender recorded on an envelope: the identity when one resolved,
+    /// else anonymous.
+    pub fn from_identity(identity: Option<SessionIdentity>) -> Self {
+        match identity {
+            Some(identity) => Self {
+                session_id: Some(identity.id),
+                tag: identity.tag,
+                engine: identity.engine,
+                profile: identity.profile,
+                external: false,
+            },
+            None => Self::anonymous(),
+        }
+    }
+}
+
+/// Resolution order (design doc section 7): `--from <tag>` matched against
+/// session metadata for this workspace (an unknown tag is an error), else
+/// `APLEXER_SESSION_ID` with a best-effort record lookup for tag/engine/
+/// profile (falling back to `APLEXER_TAG`), else `None`.
+pub fn resolve_identity(
+    records: &[SessionRecord],
     canonical_workspace: &Path,
     from_tag: Option<&str>,
-) -> Result<MessageFrom> {
+) -> Result<Option<SessionIdentity>> {
     if let Some(tag) = from_tag {
-        let record = list_records(paths)?
-            .into_iter()
-            .find(|r| r.workspace == canonical_workspace && r.tag == tag)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no session tagged {tag:?} has ever existed in workspace {}",
-                    canonical_workspace.display()
-                )
-            })?;
-        return Ok(MessageFrom {
-            session_id: Some(record.id),
-            tag: Some(record.tag),
-            engine: Some(record.engine),
-            profile: record.profile,
-            external: false,
-        });
+        let record = session_by_tag(records, canonical_workspace, tag).ok_or_else(|| {
+            anyhow!(
+                "no session tagged {tag:?} has ever existed in workspace {}",
+                canonical_workspace.display()
+            )
+        })?;
+        return Ok(Some(SessionIdentity::from_record(record)));
     }
-    if let Some(session_id) = crate::discover_session_id() {
-        if let Some(record) = list_records(paths)?
-            .into_iter()
-            .find(|r| r.id == session_id)
-        {
-            return Ok(MessageFrom {
-                session_id: Some(record.id),
-                tag: Some(record.tag),
-                engine: Some(record.engine),
-                profile: record.profile,
-                external: false,
-            });
-        }
-        return Ok(MessageFrom {
-            session_id: Some(session_id),
+    let Some(session_id) = crate::discover_session_id() else {
+        return Ok(None);
+    };
+    Ok(Some(match records.iter().find(|r| r.id == session_id) {
+        Some(record) => SessionIdentity::from_record(record),
+        None => SessionIdentity {
+            id: session_id,
             tag: std::env::var("APLEXER_TAG").ok(),
             engine: None,
             profile: None,
-            external: false,
-        });
-    }
-    Ok(MessageFrom::anonymous())
-}
-
-/// Resolves the *consumer* identity for `inbox`/`ack` (design doc section
-/// 7's closing note: these need a consumer identity, unlike `send`/`log`
-/// which degrade gracefully to anonymous). Errors clearly when neither
-/// `--from` nor `APLEXER_SESSION_ID` is available.
-pub fn resolve_consumer(
-    paths: &Paths,
-    canonical_workspace: &Path,
-    from_tag: Option<&str>,
-) -> Result<(Uuid, String, String)> {
-    if let Some(tag) = from_tag {
-        let record = list_records(paths)?
-            .into_iter()
-            .find(|r| r.workspace == canonical_workspace && r.tag == tag)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no session tagged {tag:?} has ever existed in workspace {}",
-                    canonical_workspace.display()
-                )
-            })?;
-        return Ok((record.id, record.tag, record.engine));
-    }
-    if let Some(session_id) = crate::discover_session_id() {
-        let (tag, engine) = list_records(paths)?
-            .into_iter()
-            .find(|r| r.id == session_id)
-            .map(|r| (r.tag, r.engine))
-            .unwrap_or_else(|| {
-                (
-                    std::env::var("APLEXER_TAG").unwrap_or_default(),
-                    String::new(),
-                )
-            });
-        return Ok((session_id, tag, engine));
-    }
-    bail!(
-        "no session identity: APLEXER_SESSION_ID is not set (you're not inside an aplexer \
-         session) and no --from TAG was given"
-    )
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -2038,9 +2117,27 @@ mod tests {
         let second = test_message(workspace, Uuid::from_u128(2));
         let delayed_lower = test_message(workspace, Uuid::from_u128(0));
 
-        write_message_with_limits(&paths, &first, 2, MAX_WORKSPACE_BYTES).unwrap();
-        write_message_with_limits(&paths, &second, 2, MAX_WORKSPACE_BYTES).unwrap();
-        write_message_with_limits(&paths, &delayed_lower, 2, MAX_WORKSPACE_BYTES).unwrap();
+        write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &first,
+            2,
+            MAX_WORKSPACE_BYTES,
+        )
+        .unwrap();
+        write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &second,
+            2,
+            MAX_WORKSPACE_BYTES,
+        )
+        .unwrap();
+        write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &delayed_lower,
+            2,
+            MAX_WORKSPACE_BYTES,
+        )
+        .unwrap();
 
         let retained = list_messages(&paths, workspace).unwrap();
         assert_eq!(retained.len(), 2);
@@ -2060,8 +2157,20 @@ mod tests {
         second.body = "second".into();
         let second_size = serialized_envelope(&second).unwrap().len() as u64;
 
-        write_message_with_limits(&paths, &first, 10, second_size).unwrap();
-        write_message_with_limits(&paths, &second, 10, second_size).unwrap();
+        write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &first,
+            10,
+            second_size,
+        )
+        .unwrap();
+        write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &second,
+            10,
+            second_size,
+        )
+        .unwrap();
 
         let retained = list_messages(&paths, workspace).unwrap();
         assert_eq!(retained.len(), 1);
@@ -2075,8 +2184,13 @@ mod tests {
         let workspace = Path::new("/tmp/aplexer-impossible-cap-workspace");
         let message = test_message(workspace, Uuid::from_u128(1));
 
-        let error = write_message_with_limits(&paths, &message, 0, MAX_WORKSPACE_BYTES)
-            .expect_err("a zero-message quota must reject the append");
+        let error = write_message_limited(
+            &ensure_workspace(&paths, workspace).unwrap(),
+            &message,
+            0,
+            MAX_WORKSPACE_BYTES,
+        )
+        .expect_err("a zero-message quota must reject the append");
 
         assert!(error.to_string().contains("enforce mailbox quota"));
         assert!(list_messages(&paths, workspace).unwrap().is_empty());
