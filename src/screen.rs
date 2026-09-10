@@ -319,6 +319,16 @@ impl MarginTracker {
     /// caused that the client should react to (re-assert its own
     /// status-bar reservation) -- see design doc section 7 and `CsiEvent`.
     pub fn scan(&mut self, data: &[u8]) -> CsiEvent {
+        self.scan_with(data, |_| {})
+    }
+
+    /// `scan`, also handing every completed `ESC`/`CSI` sequence to
+    /// `observer` -- the one pass over the bytes, shared.
+    pub(crate) fn scan_with(
+        &mut self,
+        data: &[u8],
+        mut observer: impl FnMut(Sequence<'_>),
+    ) -> CsiEvent {
         let mut result = CsiEvent::default();
         let Self {
             rows,
@@ -327,6 +337,7 @@ impl MarginTracker {
             subregion_seen,
         } = self;
         scanner.feed_with(data, |sequence| {
+            observer(sequence);
             let event = Self::apply(*rows, region, subregion_seen, sequence);
             result.margins_reset |= event.margins_reset;
             result.erase |= event.erase;
@@ -593,7 +604,18 @@ impl ScreenTracker {
     /// Feed PTY bytes; returns `Some(LayoutChange)` when the workload did
     /// something the attached client must react to.
     pub fn process(&mut self, data: &[u8]) -> Option<LayoutChange> {
-        let csi = self.margins.scan(data);
+        self.process_with(data, |_| {})
+    }
+
+    /// `process`, also handing every completed `ESC`/`CSI` sequence to
+    /// `observer` (`ClientScreen::relay` asks what a run *was* after seeing
+    /// what it did to the cursor).
+    pub(crate) fn process_with(
+        &mut self,
+        data: &[u8],
+        observer: impl FnMut(Sequence<'_>),
+    ) -> Option<LayoutChange> {
+        let csi = self.margins.scan_with(data, observer);
         self.parser.process(data);
         let now_alt = self.parser.screen().alternate_screen();
         let alt_flip = now_alt != self.alt_screen;
@@ -1629,12 +1651,12 @@ impl ClientScreen {
 
             let end = i + self.run_len(data, i);
             let run = &data[i..end];
-            let line_feed = run.len() == 1 && matches!(run[0], b'\n' | 0x0b | 0x0c);
-            let sequence = run[0] == 0x1b || !self.screen.at_escape_boundary();
-            let final_byte = run[run.len() - 1];
+            let mut moved_down = run.len() == 1 && matches!(run[0], b'\n' | 0x0b | 0x0c);
             let exposed = self.exposed();
             let before_row = self.screen.cursor_position().0;
-            let change = self.screen.process(run);
+            let change = self.screen.process_with(run, |sequence| {
+                moved_down |= Self::moves_down(sequence);
+            });
             i = end;
 
             let last_row = self.last_row();
@@ -1643,8 +1665,6 @@ impl ClientScreen {
 
             // Mechanisms 1 and 4: the model clamped on its last row where the
             // host, one row taller, walked onto the reserved row.
-            let moved_down =
-                line_feed || (sequence && at_boundary && matches!(final_byte, b'B' | b'E' | b'e'));
             if exposed && before_row == last_row && row == last_row && moved_down {
                 rewrite.splice(i, &self.clamp_repair());
             }
@@ -1704,13 +1724,36 @@ impl ClientScreen {
             && self.pending_wrap_on_last_row()
     }
 
+    /// A sequence that moves the cursor down by a count rather than to an
+    /// absolute row -- CUD, CNL, VPR (`CSI B`/`E`/`e`, plain parameters
+    /// only) and NEL (`ESC E`). Matched on the parsed shape rather than the
+    /// final byte, so `ESC ( B` (a charset designation, in every `tput sgr0`)
+    /// is not mistaken for a `CSI B`, and a sequence split across chunks is
+    /// still recognized when it completes.
+    fn moves_down(sequence: Sequence<'_>) -> bool {
+        matches!(
+            sequence,
+            Sequence::Esc(b'E')
+                | Sequence::Csi {
+                    final_byte: b'B' | b'E' | b'e',
+                    plain: true,
+                    ..
+                }
+        )
+    }
+
     /// The repair for a downward move the model clamped: put the host back
-    /// on the model's cursor. Neither a line feed nor a downward cursor move
-    /// leaves a pending-wrap state, so a plain `CUP` is an exact restore.
+    /// on the model's cursor. A plain `CUP` when the model's column is a
+    /// real cell; `cursor_restore` when it is past the last one, because
+    /// `vt100` keeps a pending wrap across `CUD` and a `CUP` would clamp it
+    /// away on the host.
     fn clamp_repair(&self) -> Vec<u8> {
         let (row, col) = self.screen.cursor_position();
-        let col = col.min(self.screen.cols().saturating_sub(1));
-        format!("\x1b[{};{}H", row + 1, col + 1).into_bytes()
+        if col < self.screen.cols() {
+            format!("\x1b[{};{}H", row + 1, col + 1).into_bytes()
+        } else {
+            self.screen.cursor_restore()
+        }
     }
 
     /// The client's own `1;{rows}` reservation plus an absolute cursor
@@ -3876,6 +3919,55 @@ mod boundary_tests {
             rig.assert_agrees("after a downward cursor move off the last row");
             rig.assert_bar_intact("by a downward cursor move");
         }
+    }
+
+    /// `ESC ( B` -- the charset designation `tput sgr0` and every bash
+    /// prompt end with -- has the final byte of `CSI B` but moves nothing.
+    /// It must not be repaired as a cursor-down: the repair is a `CUP` that
+    /// cannot express the pending wrap the model may be in, so a misfire
+    /// there clamps the host's wrap away. Neither whole nor split across
+    /// chunks, and the real `CSI B` split the same way is still repaired.
+    #[test]
+    fn relay_does_not_mistake_a_charset_designation_for_cursor_down() {
+        for chunks in [&[&b"\x1b(B"[..]][..], &[&b"\x1b("[..], &b"B"[..]][..]] {
+            let mut rig = RelayRig::new(24, 20);
+            rig.relay(b"\x1b[5;15r\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+            for chunk in chunks {
+                assert!(
+                    !rig.relay(chunk),
+                    "{chunk:?} moves nothing and must not be rewritten"
+                );
+            }
+            rig.relay(b"X");
+            rig.assert_agrees("after a charset designation in pending wrap");
+            rig.assert_bar_intact("by a charset designation");
+        }
+
+        let mut rig = RelayRig::new(24, 20);
+        rig.relay(b"\x1b[5;15r\x1b[23;1HX");
+        rig.relay(b"\x1b[");
+        assert!(
+            rig.relay(b"B"),
+            "a CSI B split across chunks is still a cursor-down"
+        );
+        rig.assert_agrees("after a split cursor-down off the last row");
+    }
+
+    /// `vt100` keeps a pending wrap across `CUD` (the column is untouched),
+    /// so the repair after a cursor-down on the last row has to reproduce
+    /// it; a `CUP` clamps the host to the last cell instead, and the host's
+    /// next character then overwrites that cell where the model wraps.
+    #[test]
+    fn relay_cursor_down_repair_keeps_a_pending_wrap() {
+        let mut rig = RelayRig::new(24, 20);
+        rig.relay(b"\x1b[5;15r\x1b[23;1HABCDEFGHIJKLMNOPQRST");
+        assert!(rig.relay(b"\x1b[B"));
+        rig.assert_agrees("after a cursor-down in pending wrap");
+        assert_eq!(
+            rig.workload.screen().cursor_position(),
+            (22, 20),
+            "the workload is in pending wrap after the cursor-down"
+        );
     }
 
     /// Mechanism 3: Claude Code opens with `ESC 7`, `ESC [ r`, `ESC 8`. The
