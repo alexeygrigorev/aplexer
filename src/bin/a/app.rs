@@ -66,6 +66,8 @@ mod message_commands;
 mod mouse;
 #[path = "rpc.rs"]
 mod rpc;
+#[path = "rpc_connection.rs"]
+mod rpc_connection;
 #[path = "scroll.rs"]
 mod scroll;
 #[path = "scroll_input.rs"]
@@ -107,6 +109,7 @@ pub(crate) use list_tty::*;
 pub(crate) use message_commands::*;
 pub(crate) use mouse::*;
 pub(crate) use rpc::*;
+pub(crate) use rpc_connection::*;
 pub(crate) use scroll::*;
 pub(crate) use scroll_input::*;
 pub(crate) use session_commands::*;

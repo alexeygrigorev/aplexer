@@ -90,6 +90,8 @@ const PRODUCTION_SOURCE: &str = concat!(
     "\n",
     include_str!("../a/rpc.rs"),
     "\n",
+    include_str!("../a/rpc_connection.rs"),
+    "\n",
     include_str!("../a/terminal.rs"),
     "\n",
     include_str!("../a/status_bar.rs"),
