@@ -1134,6 +1134,38 @@ pub(super) mod tests {
         );
     }
 
+    /// `a start` holds the registry lock for its whole spawn-and-poll; a
+    /// rename that blocked on it outlived the client's control deadline
+    /// and then applied unobserved. It must refuse instead, in time, with
+    /// an error that says the registry is busy and nothing changed.
+    #[test]
+    pub(super) fn rename_refuses_in_time_while_the_registry_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("session.json"));
+        runtime.paths.ensure().unwrap();
+        let _held = FileLock::exclusive(&runtime.paths.registry_lock(), true).unwrap();
+
+        let started = Instant::now();
+        let error = runtime
+            .rename(dir.path().to_path_buf(), "renamed".into())
+            .expect_err("rename must not wait out a held registry lock");
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("registry is busy"),
+            "{error:#}"
+        );
+        assert!(
+            elapsed >= RENAME_REGISTRY_WAIT
+                && elapsed < RENAME_REGISTRY_WAIT + Duration::from_secs(1),
+            "rename gave up after {elapsed:?}, expected about {RENAME_REGISTRY_WAIT:?}"
+        );
+        assert_eq!(runtime.record().unwrap().tag, "before");
+        assert!(
+            !runtime.record_path.exists(),
+            "a refused rename wrote the record"
+        );
+    }
+
     #[test]
     pub(super) fn startup_history_node_must_be_regular_or_absent() {
         let dir = tempfile::tempdir().unwrap();

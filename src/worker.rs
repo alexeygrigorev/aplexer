@@ -106,6 +106,13 @@ pub const DESCENDANT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// 5 ms instead -- ~20 ms saved on every HUP/TERM kill without touching the
 /// steady-state lifecycle cadence.
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long a Rename RPC keeps trying for the registry lock. `a start` holds
+/// that lock across its whole spawn and readiness poll (the startup timeout,
+/// 10 s by default), while the client waits for the Rename reply under its
+/// 3 s control deadline: blocking on the lock meant a rename issued during a
+/// start timed out client-side and then applied anyway once the lock came
+/// free. Bounded well under the deadline so the refusal reaches the client.
+const RENAME_REGISTRY_WAIT: Duration = Duration::from_secs(2);
 
 type FileIdentity = (u64, u64);
 type RecoveredControlSocket = (UnixListener, FileIdentity, Option<FileLock>, FileIdentity);
@@ -564,7 +571,7 @@ impl WorkerRuntime {
         validate_tag(&tag)?;
         let workspace = canonical_workspace(&workspace)?;
         let id = lock(&self.record)?.id;
-        let _registry = FileLock::exclusive(&self.paths.registry_lock(), false)?;
+        let _registry = registry_lock_within(&self.paths, RENAME_REGISTRY_WAIT)?;
         let conflicts: Vec<SessionRecord> = list_records(&self.paths)?
             .into_iter()
             .filter(|record| record.id != id && record.workspace == workspace && record.tag == tag)
@@ -620,6 +627,29 @@ impl WorkerRuntime {
             r.reported_state = Some(state);
             r.reported_state_at_ms = Some(now_ms());
         })
+    }
+}
+
+/// Take the registry lock without blocking past `wait` (see
+/// `RENAME_REGISTRY_WAIT`). A lock still held at the deadline is reported
+/// as a distinct, retryable "registry is busy" error rather than as a
+/// failed rename.
+fn registry_lock_within(paths: &Paths, wait: Duration) -> Result<FileLock> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match FileLock::exclusive(&paths.registry_lock(), true) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if io_kind(&error) == Some(io::ErrorKind::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "registry is busy (another aplexer command holds {}); retry the rename",
+                        paths.registry_lock().display()
+                    );
+                }
+                thread::sleep(DESCENDANT_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
