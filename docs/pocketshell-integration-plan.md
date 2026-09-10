@@ -127,8 +127,8 @@ That is no longer remotely true. Verified against the built binary and source:
   enriched with `worker_alive`; human output is a workspace-grouped tree. Cheap by design (pid
   checks only, no per-session socket round-trips).
 - `a attach` — with a tmux-style reserved status-bar row (live cgroup memory indicator),
-  history-tail replay (32KB default, `--history-bytes` to override), detach on `Ctrl-]` or
-  `Ctrl-b d`, clean terminal reset on detach.
+  history-tail replay (32KB default, `--history-bytes` to override), detach on `Ctrl-b d`,
+  clean terminal reset on detach.
 - `a send` (`--stdin/--hex/--enter`, workspace+tag or UUID-prefix addressing), `a capture`
   (`--bytes`, `-o`; falls back to persisted history for dead sessions), `a status` (`--json`;
   live cgroup memory/OOM telemetry via worker RPC), `a kill` (kills a broken session's surviving

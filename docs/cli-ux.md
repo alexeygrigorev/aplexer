@@ -106,7 +106,7 @@ The row is adaptive rather than merely truncated. Wide terminals receive full co
 
 Success looks like:
 
-- `Ctrl-b n/p`, `N/P`, `1-9`, and `l` keep their current meanings;
+- `Ctrl-b Right/Left` (sessions), `Up/Down` (workspaces), `N/P`, `1-9`, and `l` switch in place, and `Ctrl-b n` creates another session here;
 - `Ctrl-b d` clearly means “leave this client, keep the session”;
 - unknown `Ctrl-b` sequences are forwarded, preserving application input;
 - terminal modes, scroll regions, cursor visibility, and alternate-screen state are restored;

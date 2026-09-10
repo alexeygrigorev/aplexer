@@ -308,6 +308,8 @@ fn nested_attach_refuses_a_live_inner_session_and_names_the_way_out() {
     let message = format!("{error:#}");
     assert!(message.contains("/ws/inner"), "message: {message}");
     assert!(message.contains("peeked"), "message: {message}");
-    assert!(message.contains("Ctrl-]"), "message: {message}");
+    // The way out has to be a chord the scanner actually binds: `Ctrl-]`
+    // was named here long after it stopped being one.
+    assert!(message.contains("Ctrl-b d"), "message: {message}");
     assert!(message.contains("--force"), "message: {message}");
 }

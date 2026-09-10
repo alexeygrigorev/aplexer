@@ -381,7 +381,7 @@ pub(crate) fn attach_goodbye_line(
 /// alternate-screen state, and the `Ctrl-b` chord, and the inner session's
 /// output replaces what the outer session's agent believes is on screen --
 /// the same reason tmux routes `switch-client` through its server. The
-/// aplexer-shaped answer is already shipped: detach (`Ctrl-]`), then let
+/// aplexer-shaped answer is already shipped: detach (`Ctrl-b d`), then let
 /// the now-outer client do the in-process `Ctrl-b` switch. The inner id
 /// comes from `discover_session_id` (the env var, or the ancestor /proc
 /// walk when an agent runs `a attach` with a scrubbed env) and is only
@@ -408,7 +408,7 @@ pub(crate) fn nested_attach_conflict_for(paths: &Paths, inner: Option<Uuid>) -> 
     }
     bail!(
         "already inside session {}/{}, refusing to render another nested in \
-         its pane -- detach first (Ctrl-]), then switch with Ctrl-b arrows; \
+         its pane -- detach first (Ctrl-b d), then switch with Ctrl-b arrows; \
          or pass --force to attach nested anyway",
         inner_record.workspace.display(),
         inner_record.tag
