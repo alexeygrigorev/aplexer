@@ -2,13 +2,20 @@
 
 use super::*;
 
-fn load_config_text(text: &str) -> Result<Config> {
+/// A `Paths` triple inside a fresh temporary directory, which lives as
+/// long as the returned guard.
+fn temp_paths() -> (tempfile::TempDir, Paths) {
     let root = tempfile::tempdir().unwrap();
     let paths = Paths {
         runtime_root: root.path().join("runtime"),
         state_root: root.path().join("state"),
         config_file: root.path().join("config.toml"),
     };
+    (root, paths)
+}
+
+fn load_config_text(text: &str) -> Result<Config> {
+    let (_root, paths) = temp_paths();
     fs::write(&paths.config_file, text).unwrap();
     Config::load(&paths)
 }
@@ -44,12 +51,7 @@ fn zcodex_is_a_built_in_codex_variant() {
 /// `a` and to the worker that acts on it.
 #[test]
 fn config_keep_exited_matches_full_config_load() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = Paths {
-        runtime_root: root.path().join("runtime"),
-        state_root: root.path().join("state"),
-        config_file: root.path().join("config.toml"),
-    };
+    let (_root, paths) = temp_paths();
 
     // No config file at all: the documented default.
     assert!(!config_keep_exited(&paths));
@@ -117,14 +119,10 @@ fn unsupported_config_version_is_reported_before_unknown_fields() {
 /// reproducible without root.
 #[test]
 fn unreadable_config_file_is_an_error_not_defaults() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, mut paths) = temp_paths();
     let blocker = root.path().join("not-a-dir");
     fs::write(&blocker, "").unwrap();
-    let mut paths = Paths {
-        runtime_root: root.path().join("runtime"),
-        state_root: root.path().join("state"),
-        config_file: blocker.join("config.toml"),
-    };
+    paths.config_file = blocker.join("config.toml");
     let message = format!("{:#}", Config::load(&paths).unwrap_err());
     assert!(message.contains("read"), "{message}");
     assert!(message.contains("config.toml"), "{message}");
@@ -136,22 +134,11 @@ fn unreadable_config_file_is_an_error_not_defaults() {
 
 #[test]
 fn config_rejects_oversized_profile_history() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = Paths {
-        runtime_root: root.path().join("runtime"),
-        state_root: root.path().join("state"),
-        config_file: root.path().join("config.toml"),
-    };
-    fs::write(
-        &paths.config_file,
-        format!(
-            "version = 1\n[profiles.too_large]\nhistory_bytes = {}\n",
-            MAX_HISTORY_BYTES + 1
-        ),
-    )
-    .unwrap();
-
-    let error = Config::load(&paths).unwrap_err();
+    let error = load_config_text(&format!(
+        "version = 1\n[profiles.too_large]\nhistory_bytes = {}\n",
+        MAX_HISTORY_BYTES + 1
+    ))
+    .unwrap_err();
     let message = format!("{error:#}");
     assert!(
         message.contains("profile \"too_large\" history_bytes"),
