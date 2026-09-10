@@ -34,39 +34,28 @@ pub(crate) fn establish(
     want_screen: bool,
     geometry: Option<(u16, u16)>,
 ) -> Result<AttachHandshake> {
-    let mut reader = connect(record)?;
     let (rows, cols) = match geometry {
         Some((rows, cols)) => (Some(rows), Some(cols)),
         None => (None, None),
     };
-    let request = Request::new(
-        record.id,
+    let (mut reader, result) = rpc_call(
+        record,
         Operation::Attach {
             history_bytes: replay_bytes,
             want_screen,
             rows,
             cols,
         },
-    );
-    let id = request.request_id.clone();
-    write_json(&mut reader, &request)?;
-    let response: Response =
-        frame_json(read_frame(&mut reader)?.ok_or_else(|| anyhow!("missing attach response"))?)?;
-    if response.request_id != id {
-        bail!("response request id mismatch");
-    }
-    let result = response.into_result()?;
+        None,
+    )?;
     let screen = result.get("screen").and_then(|v| v.as_bool());
-    let initial = read_frame(&mut reader)?.ok_or_else(|| anyhow!("missing history frame"))?;
-    if initial.kind != FrameKind::Data {
-        bail!("expected history data");
-    }
+    let initial = read_data_frame(&mut reader, "history data")?;
     // Only the handshake is an RPC. Once subscribed, silence is a normal
     // state for an interactive terminal and must not detach the client.
     clear_streaming_deadlines(&reader)?;
     Ok(AttachHandshake {
         reader,
-        initial: initial.payload,
+        initial,
         screen,
     })
 }
