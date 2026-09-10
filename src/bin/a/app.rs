@@ -40,6 +40,8 @@ mod cli;
 mod commands;
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "input_scanner.rs"]
+mod input_scanner;
 #[path = "list_helpers.rs"]
 mod list_helpers;
 #[path = "list_plain.rs"]
@@ -68,6 +70,7 @@ pub(crate) use attach_threads::*;
 pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
+pub(crate) use input_scanner::*;
 pub(crate) use list_helpers::*;
 pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
