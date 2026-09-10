@@ -379,11 +379,26 @@ reads are handled by construction), recognizing only:
 
 - `ESC c` (RIS): margins ← full, report `margins_reset`.
 - `ESC [ params r` with **no** private markers (`?`/`<`/`=`/`>`) and no
-  intermediates: parse `top;bottom` (1-based, validated `top < bottom ≤
-  rows`); empty params or full-range ⇒ margins ← full + report
-  `margins_reset`; a proper sub-range ⇒ store it (used by `snapshot()`,
-  §6.2) — no reset report, because a sub-range of the workload's rows
-  cannot cover the client's reserved bar row (§7).
+  intermediates: DECSTBM, canonicalized exactly the way vt100 0.16.2 does
+  (`perform.rs::canonicalize_params_decstbm` + `grid.rs::set_scroll_region`):
+  the first two `;`-separated values (digits before any `:`), `0`/empty ⇒
+  default (`1` / `rows`), bottom clamped to `rows`; `top < bottom` short of
+  the full screen ⇒ store the sub-range (used by `snapshot()`, §6.2) — no
+  reset report, because a sub-range of the workload's rows cannot cover the
+  client's reserved bar row (§7); anything else (empty, full-range,
+  `top ≥ bottom`) ⇒ margins ← full + report `margins_reset`.
+
+  **Correction, from review.** The first version *validated* `top < bottom ≤
+  rows` and ignored anything else, "matching how real terminals silently
+  ignore a malformed DECSTBM". vt100 does not ignore it: it clamps and falls
+  back to the full screen. The divergence was reachable on every attach —
+  the client shrinks the PTY by one row, and a TUI that has not yet seen the
+  WINCH sends its old bottom (`CSI 1;24 r` on a 23-row grid): the grid went
+  full-screen while the tracker kept its sub-range, `snapshot()` re-emitted
+  a stale DECSTBM, and `ClientScreen::exposed()` kept rewriting the stream
+  for a region that no longer existed. Pinned differentially against the
+  real crate by `margin_tracker_decstbm_sweep_matches_real_vt100` and
+  `margin_tracker_decstbm_parameter_shapes_match_real_vt100`.
 - Param buffer capped (32 bytes; overflow ⇒ discard sequence unparsed).
 
 Everything else passes through untouched — this is a recognizer for two

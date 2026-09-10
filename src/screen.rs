@@ -94,43 +94,36 @@ enum MarginParseState {
 /// unparsed)").
 const MARGIN_PARAM_CAP: usize = 32;
 
-/// A ~50-line worker-side byte state machine that recovers the one piece of
-/// terminal state `vt100::Screen` parses correctly during `process()` but
-/// does not expose or re-emit in `state_formatted()`: the current DECSTBM
-/// scroll-region margins (docs/terminal-state-design.md section 5.4).
+/// Recovers the one piece of terminal state `vt100::Screen` parses during
+/// `process()` but neither exposes nor re-emits in `state_formatted()`: the
+/// current DECSTBM scroll region (docs/terminal-state-design.md section
+/// 5.4).
 ///
-/// Persistent across chunks by construction -- state lives in `self`, so a
-/// sequence split across two PTY reads (`b"\x1b"` in one chunk, `b"[3;20r"`
-/// in the next) is handled correctly without any special-casing.
+/// A byte state machine whose state lives in `self`, so a sequence split
+/// across two PTY reads is handled by construction. It recognizes exactly
+/// three shapes and passes everything else through unexamined:
 ///
-/// Recognizes exactly two sequences; everything else passes through
-/// unexamined (this is a recognizer for two sequences, not a second
-/// emulator):
-///
-/// - `ESC c` (RIS): margins reset to full-screen; always reported as a
-///   margin reset, regardless of what the margins were before.
-/// - `ESC [ params r` with **no** private markers (`?`/`<`/`=`/`>`) and no
-///   intermediate bytes: DECSTBM. Empty params, or a range that spans the
-///   full screen (`top == 1 && bottom == rows`), resets to full-screen and
-///   is reported; a validated proper sub-range (`1 <= top < bottom <=
-///   rows`) is stored with no reset report, because the client re-asserts
-///   that sub-range rather than replacing it (see `draw_status_bar` in
-///   `src/bin/a.rs` and design doc section 7 -- including the documented
-///   limitation that a sub-range does not protect the client's reserved row
-///   the way the client's own reservation does); anything that fails
-///   validation is ignored (no state change, no report), matching how real
-///   terminals silently ignore a malformed DECSTBM.
-/// - `ESC [ ... J` (Erase in Display / ED), any parameter and any private
-///   marker: reported unconditionally as a `CsiEvent::erase` trigger,
-///   regardless of the `Ps` value. ED ignores scroll margins per spec, so
-///   even a scoped DECSTBM sub-range doesn't protect the client's reserved
-///   bottom row from an `ED2`/`ED3` full-screen erase -- and Ink-based TUIs
-///   (Codex, Claude Code) send exactly that on nearly every redraw. Being
-///   unconditional (not trying to determine from cursor position whether a
-///   bare/`0J` "cursor to end of screen" could reach the last row) is a
-///   deliberate over-trigger: the fallout is one extra harmless status-bar
-///   redraw, while under-triggering means the bar can stay silently wiped
-///   until the next debounce/max-interval tick.
+/// - `ESC c` (RIS): margins reset to full-screen, reported as
+///   `margins_reset`.
+/// - `ESC [ params r` with no private marker (`?`/`<`/`=`/`>`) and no
+///   intermediate byte: DECSTBM, canonicalized exactly as vt100 0.16 does
+///   (`perform.rs::canonicalize_params_decstbm` and
+///   `grid.rs::set_scroll_region`): the first two `;`-separated values,
+///   digits before any `:` only, `0` or empty meaning the default (`1` /
+///   `rows`), bottom clamped to `rows`. A result with `top < bottom` short of
+///   the whole screen is stored as a sub-range and *not* reported, because
+///   the client re-asserts a sub-range rather than replacing it (design doc
+///   section 7). Everything else -- empty, full-range, `top >= bottom` -- is
+///   the full screen and is reported. An out-of-range DECSTBM is therefore a
+///   reset rather than a no-op: the grid beside this tracker treats it as
+///   one, and `ScreenTracker::snapshot` pairs the grid's contents with
+///   *these* margins, so the two must agree.
+/// - `ESC [ ... J` (Erase in Display), any parameter and any private marker:
+///   reported as `erase` unconditionally. ED ignores scroll margins, so even
+///   a DECSTBM sub-range does not protect the client's reserved bottom row,
+///   and Ink-based TUIs send `2J` on nearly every redraw. Over-triggering
+///   costs one harmless status-bar redraw; under-triggering leaves the bar
+///   wiped until the next timer tick.
 #[derive(Debug, Clone)]
 pub struct MarginTracker {
     rows: u16,
@@ -383,7 +376,7 @@ impl MarginTracker {
                 }
             },
             MarginParseState::Csi => match byte {
-                b'0'..=b'9' | b';' => {
+                b'0'..=b'9' | b';' | b':' => {
                     if self.param_buf.len() >= MARGIN_PARAM_CAP {
                         // Overflow: discard this sequence unparsed.
                         self.state = MarginParseState::Ground;
@@ -425,53 +418,45 @@ impl MarginTracker {
         if final_byte != b'r' || self.disqualified {
             return CsiEvent::default();
         }
-        let text = match std::str::from_utf8(&self.param_buf) {
-            Ok(text) => text,
-            Err(_) => return CsiEvent::default(),
-        };
-        if text.is_empty() {
-            self.region = None;
-            return CsiEvent {
-                margins_reset: true,
-                erase: false,
-            };
-        }
-        let mut parts = text.splitn(2, ';');
-        let top_raw = parts.next().unwrap_or("");
-        let bottom_raw = parts.next().unwrap_or("");
-        let top: u16 = if top_raw.is_empty() {
-            1
+        let (top, bottom) = decstbm_params(&self.param_buf, self.rows);
+        // `grid.rs::set_scroll_region`: the bottom is clamped to the screen
+        // and only `top < bottom` sets a region; anything else is the full
+        // screen (and homes the cursor, which `snapshot` re-fixes).
+        let bottom = bottom.min(self.rows);
+        if top < bottom && !(top == 1 && bottom == self.rows) {
+            self.region = Some((top, bottom));
+            self.subregion_seen = true;
+            CsiEvent::default()
         } else {
-            match top_raw.parse() {
-                Ok(value) => value,
-                Err(_) => return CsiEvent::default(),
-            }
-        };
-        let bottom: u16 = if bottom_raw.is_empty() {
-            self.rows
-        } else {
-            match bottom_raw.parse() {
-                Ok(value) => value,
-                Err(_) => return CsiEvent::default(),
-            }
-        };
-        if top < 1 || bottom > self.rows || top >= bottom {
-            // Malformed / out of range: real terminals ignore this; so do
-            // we -- no state change, no report.
-            return CsiEvent::default();
-        }
-        if top == 1 && bottom == self.rows {
             self.region = None;
             CsiEvent {
                 margins_reset: true,
                 erase: false,
             }
-        } else {
-            self.region = Some((top, bottom));
-            self.subregion_seen = true;
-            CsiEvent::default()
         }
     }
+}
+
+/// vt100's `canonicalize_params_decstbm`, over the raw parameter bytes: the
+/// first two `;`-separated values, each read as the digits before any `:`
+/// sub-parameter (vt100 takes a parameter's first sub-parameter), saturating
+/// like `vte`'s accumulator; `0` or empty means the default -- `1` for the
+/// top, `rows` for the bottom. No clamping here: that is the grid's job.
+fn decstbm_params(params: &[u8], rows: u16) -> (u16, u16) {
+    let mut values = params.split(|&b| b == b';').map(|param| {
+        param
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .fold(0u16, |n, &d| {
+                n.saturating_mul(10).saturating_add(u16::from(d - b'0'))
+            })
+    });
+    let top = values.next().unwrap_or(0);
+    let bottom = values.next().unwrap_or(0);
+    (
+        if top == 0 { 1 } else { top },
+        if bottom == 0 { rows } else { bottom },
+    )
 }
 
 /// What a scanned chunk of PTY bytes did that `ScreenTracker::process`
@@ -1965,17 +1950,93 @@ mod tests {
         assert_eq!(t.margins(), None);
     }
 
+    /// vt100 does not ignore a malformed DECSTBM: `grid.rs::set_scroll_region`
+    /// clamps the bottom to the screen and falls back to the full screen
+    /// unless `top < bottom`. The tracker has to say the same, or the
+    /// snapshot re-emits a sub-range the grid beside it no longer holds.
     #[test]
-    fn margin_tracker_invalid_range_ignored() {
+    fn margin_tracker_out_of_range_decstbm_resets_to_full_screen_like_vt100() {
         let mut t = MarginTracker::new(24);
-        // top >= bottom: invalid, ignored.
+        t.scan(b"\x1b[3;20r");
+        // top >= bottom: the full screen.
         let event = t.scan(b"\x1b[20;3r");
-        assert!(!event.margins_reset);
+        assert!(event.margins_reset);
         assert_eq!(t.margins(), None);
-        // bottom > rows: invalid, ignored.
+        // bottom > rows: clamped to the screen, so `1;99` is the full screen.
+        t.scan(b"\x1b[3;20r");
         let event = t.scan(b"\x1b[1;99r");
-        assert!(!event.margins_reset);
+        assert!(event.margins_reset);
         assert_eq!(t.margins(), None);
+        // ...and `5;99` is a bottom-anchored sub-range.
+        assert!(!t.scan(b"\x1b[5;99r").margins_reset);
+        assert_eq!(t.margins(), Some((5, 24)));
+    }
+
+    /// The attach race: the client shrinks the PTY by one row to reserve the
+    /// status bar, and a TUI that has not yet seen the WINCH sends the
+    /// bottom it knew. vt100 clamps that to the new screen -- here the whole
+    /// screen -- and so must the tracker, or `ClientScreen::exposed` keeps
+    /// treating the last row as outside a region that no longer exists.
+    #[test]
+    fn margin_tracker_pre_winch_bottom_on_a_shrunk_screen_is_full_screen() {
+        let mut t = MarginTracker::new(23);
+        let event = t.scan(b"\x1b[1;24r");
+        assert!(event.margins_reset);
+        assert_eq!(t.margins(), None);
+    }
+
+    /// Every DECSTBM parameter shape vt100's `canonicalize_params_decstbm`
+    /// gives a meaning to -- `0`, empty, a single value, a third value, a
+    /// `:` sub-parameter -- read back from the real crate rather than from
+    /// its source.
+    #[test]
+    fn margin_tracker_decstbm_parameter_shapes_match_real_vt100() {
+        for params in [
+            "", "0;0", "5", ";20", "0;20", "5;0", "5;20;7", "5:3;20", ":5;20", "5;20:3", "20;5",
+            "5;5", "1;24", "1;25", "5;25", "24;25", "0;25", "70000;20", "5;70000",
+        ] {
+            let seq = format!("\x1b[{params}r");
+            let mut real = vt100::Parser::new(24, 80, 0);
+            real.process(seq.as_bytes());
+            let expected = probe_vt100_scroll_region(&mut real);
+
+            let mut tracker = MarginTracker::new(24);
+            let event = tracker.scan(seq.as_bytes());
+            let actual = tracker.margins().unwrap_or((1, 24));
+            assert_eq!(actual, expected, "DECSTBM {params:?}: vt100={expected:?}");
+            assert_eq!(
+                event.margins_reset,
+                expected == (1, 24),
+                "DECSTBM {params:?} must report a reset exactly when it is the full screen"
+            );
+        }
+    }
+
+    /// Exhaustive: every `top;bottom` pair from 0 to two past the screen, at
+    /// every height from 2 to 24 rows, against the real crate.
+    #[test]
+    fn margin_tracker_decstbm_sweep_matches_real_vt100() {
+        let mut compared = 0usize;
+        for rows in 2u16..=24 {
+            for top in 0..=rows + 2 {
+                for bottom in 0..=rows + 2 {
+                    let seq = format!("\x1b[{top};{bottom}r");
+                    let mut real = vt100::Parser::new(rows, 4, 0);
+                    real.process(seq.as_bytes());
+                    let expected = probe_vt100_scroll_region(&mut real);
+
+                    let mut tracker = MarginTracker::new(rows);
+                    tracker.scan(seq.as_bytes());
+                    let actual = tracker.margins().unwrap_or((1, rows));
+                    compared += 1;
+                    assert_eq!(
+                        actual, expected,
+                        "DECSTBM {top};{bottom} @ {rows} rows: vt100={expected:?} tracker={actual:?}"
+                    );
+                }
+            }
+        }
+        assert!(compared > 5_000, "sweep covered only {compared} cases");
     }
 
     // -- MarginTracker: Erase in Display (CSI ... J) detection --
