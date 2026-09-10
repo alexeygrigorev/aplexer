@@ -165,16 +165,7 @@ fn probe_worker_ready(
         Ok(Some(frame)) => frame,
         Ok(None) | Err(_) => return Ok(false),
     };
-    let response: Response = frame_json(frame).context("parse worker readiness response")?;
-    if response.version != PROTOCOL_VERSION {
-        bail!("worker readiness response used unsupported protocol version");
-    }
-    if response.request_id != request_id {
-        bail!("worker readiness response request id mismatch");
-    }
-    let result = response
-        .into_result()
-        .context("worker readiness Ping failed")?;
+    let result = response_result(frame, &request_id).context("worker readiness Ping failed")?;
     if result.get("pong").and_then(Value::as_bool) != Some(true) {
         bail!("worker readiness response omitted pong");
     }

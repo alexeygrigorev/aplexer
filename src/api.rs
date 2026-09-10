@@ -29,13 +29,13 @@ use startup_cleanup::*;
 use crate::agent_kind::{detect_agent, AgentKind, DEFAULT_PROC_ROOT};
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
-    ensure_private_dir, ensure_sigchld_compatible_for_child_management, frame_json, io_kind,
+    ensure_private_dir, ensure_sigchld_compatible_for_child_management, io_kind,
     kill_grace_duration, list_records, parse_byte_size, process_start_time_ticks,
-    public_session_record, read_frame, read_persisted_history_tail, read_record,
-    read_session_record, reap_verdict, resolve_record, session_metadata_env, validate_tag,
-    worker_executable, write_frame, write_json, Config, ContainmentReap, FileLock, FrameKind,
-    Limits, Operation, Paths, Phase, Request, Response, SessionRecord, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, SCHEMA_VERSION,
+    public_session_record, read_frame, read_persisted_history_tail, read_record, read_response,
+    read_session_record, reap_verdict, resolve_record, response_result, session_metadata_env,
+    validate_tag, worker_executable, write_frame, write_json, Config, ContainmentReap, FileLock,
+    FrameKind, Limits, Operation, Paths, Phase, Request, SessionRecord, MAX_FRAME_BYTES,
+    SCHEMA_VERSION,
 };
 
 struct LaunchEnvironmentGuard(PathBuf);
@@ -252,15 +252,7 @@ fn rpc_simple_within(
     if let Some(data) = data {
         write_frame(&mut stream, FrameKind::Data, data)?;
     }
-    let frame = read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed connection"))?;
-    let response: Response = frame_json(frame).context("parse worker response")?;
-    if response.version != PROTOCOL_VERSION {
-        bail!("worker response used unsupported protocol version");
-    }
-    if response.request_id != request_id {
-        bail!("worker response request id mismatch");
-    }
-    response.into_result()
+    read_response(&mut stream, &request_id)
 }
 
 /// Return the live session record when reachable, or the persisted record plus
@@ -322,17 +314,7 @@ fn rpc_capture(record: &SessionRecord, max_bytes: Option<usize>) -> Result<Vec<u
     let request = Request::new(record.id, Operation::Capture { max_bytes });
     let request_id = request.request_id.clone();
     write_json(&mut stream, &request)?;
-    let response: Response = frame_json(
-        read_frame(&mut stream)?.ok_or_else(|| anyhow!("worker closed before capture response"))?,
-    )
-    .context("parse worker capture response")?;
-    if response.version != PROTOCOL_VERSION {
-        bail!("worker response used unsupported protocol version");
-    }
-    if response.request_id != request_id {
-        bail!("worker response request id mismatch");
-    }
-    let result = response.into_result()?;
+    let result = read_response(&mut stream, &request_id)?;
     let reported = result
         .get("bytes")
         .and_then(Value::as_u64)

@@ -2,7 +2,7 @@
 //! request/response/server-event/attach-control message types shared by the
 //! CLI, the worker, and external clients.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
@@ -206,6 +206,29 @@ impl Response {
         }
     }
 }
+/// Validate a worker's reply to the request `request_id` and unwrap its
+/// result: the frame must be JSON, speak this protocol version, and answer
+/// that exact request. One implementation for every RPC caller, so the
+/// three checks cannot drift apart between the library's simple RPCs, its
+/// capture path, and the readiness Ping.
+pub fn response_result(frame: Frame, request_id: &str) -> Result<Value> {
+    let response: Response = frame_json(frame).context("parse worker response")?;
+    if response.version != PROTOCOL_VERSION {
+        bail!("worker response used unsupported protocol version");
+    }
+    if response.request_id != request_id {
+        bail!("worker response request id mismatch");
+    }
+    response.into_result()
+}
+
+/// `response_result` over the next frame on `reader`; a closed connection
+/// before any frame is its own error.
+pub fn read_response<R: Read>(reader: &mut R, request_id: &str) -> Result<Value> {
+    let frame = read_frame(reader)?.ok_or_else(|| anyhow!("worker closed connection"))?;
+    response_result(frame, request_id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ServerEvent {
