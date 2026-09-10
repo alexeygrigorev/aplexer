@@ -895,12 +895,11 @@ enum BoundaryState {
     Esc,
     /// `ESC [` seen; consuming parameter/intermediate bytes.
     Csi,
-    /// Inside an `OSC`/`DCS`/`SOS`/`PM`/`APC` string.
+    /// Inside an `OSC`/`DCS`/`SOS`/`PM`/`APC` string. `ESC` ends it (the
+    /// `\` of an `ST` is then an ordinary `ESC` final byte), as does `BEL`
+    /// for an `OSC` -- `vte`'s transitions, so the model and this recognizer
+    /// agree on where the string stops.
     Str {
-        osc: bool,
-    },
-    /// `ESC` seen inside such a string (candidate `ST`).
-    StrEsc {
         osc: bool,
     },
 }
@@ -1030,17 +1029,12 @@ impl StreamBoundary {
                 }
             }
             BoundaryState::Str { osc } => {
-                if osc && byte == 0x07 {
-                    self.state = BoundaryState::Ground;
-                } else if byte == 0x1b {
-                    self.state = BoundaryState::StrEsc { osc };
-                }
-            }
-            BoundaryState::StrEsc { osc } => {
-                if byte == b'\\' {
-                    self.state = BoundaryState::Ground;
-                } else {
-                    self.state = BoundaryState::Str { osc };
+                if (osc && byte == 0x07) || byte == 0x1b {
+                    self.state = if byte == 0x1b {
+                        BoundaryState::Esc
+                    } else {
+                        BoundaryState::Ground
+                    };
                 }
             }
         }
@@ -3535,6 +3529,21 @@ mod boundary_tests {
                 "{complete:?} ends between sequences"
             );
         }
+    }
+
+    /// `vte` ends an `OSC`/`DCS`/`SOS`/`PM`/`APC` string at *any* `ESC`, not
+    /// only at the `ESC \\` of a proper `ST`: what follows the `ESC` is a new
+    /// sequence. A recognizer that fell back into the string on `ESC [` would
+    /// report "mid-sequence" until the next `BEL`/`ST`, however far away --
+    /// and stall every status-bar redraw with it.
+    #[test]
+    fn a_string_ends_at_esc_like_vte() {
+        assert!(boundary_after(&[b"\x1b]0;title\x1b[1m"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\x1bPtmux;\x1b[1m"]).at_escape_boundary());
+        assert!(!boundary_after(&[b"\x1b]0;title\x1b[1"]).at_escape_boundary());
+        assert!(boundary_after(&[b"\x1b]0;title\x1b\\"]).at_escape_boundary());
+        // The same, split at the `ESC`.
+        assert!(boundary_after(&[b"\x1b]0;title\x1b", b"[1m"]).at_escape_boundary());
     }
 
     /// A sequence split across two PTY reads is still one sequence: the state
