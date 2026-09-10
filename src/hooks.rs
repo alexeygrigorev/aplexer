@@ -330,9 +330,6 @@ pub fn merge_nested_hooks(doc: &mut Value, events: &[(&str, &str)], a_bin: &str)
     Ok(changed)
 }
 
-/// Remove every state-report hook entry from the given events. Drops
-/// emptied groups, events, and the top-level `hooks` object when we
-/// emptied them. Returns true when anything changed.
 /// Removes every `state-report` hook from a nested hooks document, keyed by
 /// the ours-by-content command match alone, across ALL event groups -- not
 /// just the events the current install tables name. The event tables change
@@ -340,7 +337,8 @@ pub fn merge_nested_hooks(doc: &mut Value, events: &[(&str, &str)], a_bin: &str)
 /// uninstall that iterated only the current names would leave a retired
 /// event's entry behind forever, pushing state from an event this version no
 /// longer believes in. Foreign commands (no `state-report` in them) are
-/// never touched, whatever the event.
+/// never touched, whatever the event. Drops emptied groups, events, and the
+/// top-level `hooks` object. Returns true when anything changed.
 pub fn unmerge_nested_hooks(doc: &mut Value) -> bool {
     let Some(hooks) = doc.get_mut("hooks").and_then(Value::as_object_mut) else {
         return false;
@@ -351,7 +349,6 @@ pub fn unmerge_nested_hooks(doc: &mut Value) -> bool {
         let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
             continue;
         };
-        let before = groups.len();
         let mut kept = Vec::with_capacity(groups.len());
         for group in groups.drain(..) {
             match group {
@@ -381,7 +378,6 @@ pub fn unmerge_nested_hooks(doc: &mut Value) -> bool {
                 other => kept.push(other),
             }
         }
-        let _ = before;
         if kept.is_empty() {
             hooks.remove(&event);
         } else {
@@ -713,415 +709,396 @@ fn uninstall_nested_file(path: &Path) -> Result<(bool, String)> {
 // Per-engine drivers
 // ---------------------------------------------------------------------------
 
+/// One managed file's outcome: `(changed, message)`, or an error naming
+/// the file. An empty message is dropped from the engine's summary.
+type FileOutcome = Result<(bool, String)>;
+
+fn named(path: &Path, outcome: FileOutcome) -> FileOutcome {
+    outcome.map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))
+}
+
+fn display_paths<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|p| p.as_ref().display().to_string())
+        .collect()
+}
+
+/// `(failed, changed, messages)` over an engine's file outcomes.
+fn fold_outcomes(outcomes: Vec<FileOutcome>) -> (bool, bool, Vec<String>) {
+    let mut failed = false;
+    let mut changed = false;
+    let mut messages = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        match outcome {
+            Ok((file_changed, message)) => {
+                changed |= file_changed;
+                messages.push(message);
+            }
+            Err(e) => {
+                failed = true;
+                messages.push(e.to_string());
+            }
+        }
+    }
+    (failed, changed, messages)
+}
+
+impl EngineInitStatus {
+    fn new(
+        engine: &str,
+        installed: bool,
+        action: &str,
+        messages: Vec<String>,
+        paths: Vec<String>,
+    ) -> Self {
+        Self {
+            engine: engine.to_string(),
+            installed,
+            action: action.to_string(),
+            message: messages
+                .into_iter()
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<_>>()
+                .join("; "),
+            paths,
+        }
+    }
+
+    /// Install verdict: any error fails the engine; otherwise `installed`
+    /// when any file changed, else `present`.
+    fn installed(engine: &str, outcomes: Vec<FileOutcome>, paths: Vec<String>) -> Self {
+        let (failed, changed, messages) = fold_outcomes(outcomes);
+        let action = if failed {
+            "error"
+        } else if changed {
+            "installed"
+        } else {
+            "present"
+        };
+        Self::new(engine, !failed, action, messages, paths)
+    }
+
+    /// Check verdict: installed only when every file reports present.
+    fn checked(engine: &str, checks: Vec<(bool, String)>, paths: Vec<String>) -> Self {
+        let installed = checks.iter().all(|(present, _)| *present);
+        let action = if installed { "present" } else { "absent" };
+        let messages = checks.into_iter().map(|(_, message)| message).collect();
+        Self::new(engine, installed, action, messages, paths)
+    }
+
+    /// Uninstall verdict: `removed` when anything was taken out, `absent`
+    /// when there was nothing of ours, `error` when a removal failed.
+    fn uninstalled(engine: &str, outcomes: Vec<FileOutcome>, paths: Vec<String>) -> Self {
+        let (failed, changed, messages) = fold_outcomes(outcomes);
+        let action = if failed {
+            "error"
+        } else if changed {
+            "removed"
+        } else {
+            "absent"
+        };
+        Self::new(engine, false, action, messages, paths)
+    }
+}
+
+// Engines whose hooks merge into one or more shared JSON settings files.
+
+fn install_nested_files(
+    engine: &str,
+    files: &[PathBuf],
+    events: &[(&str, &str)],
+    a_bin: &str,
+) -> EngineInitStatus {
+    let outcomes = files
+        .iter()
+        .map(|path| named(path, install_nested_file(path, events, a_bin)))
+        .collect();
+    EngineInitStatus::installed(engine, outcomes, display_paths(files))
+}
+
+fn check_nested_files(
+    engine: &str,
+    files: &[PathBuf],
+    events: &[(&str, &str)],
+) -> EngineInitStatus {
+    let checks = files
+        .iter()
+        .map(|path| check_nested_file(path, events))
+        .collect();
+    EngineInitStatus::checked(engine, checks, display_paths(files))
+}
+
+fn uninstall_nested_files(engine: &str, files: &[PathBuf]) -> EngineInitStatus {
+    let outcomes = files
+        .iter()
+        .map(|path| named(path, uninstall_nested_file(path)))
+        .collect();
+    EngineInitStatus::uninstalled(engine, outcomes, display_paths(files))
+}
+
+// Engines with one file that is entirely ours (grok's `aplexer.json` in a
+// merged hooks dir, opencode's plugin): written whole, removed whole.
+
+fn install_owned_file(engine: &str, path: &Path, text: Result<String>) -> EngineInitStatus {
+    let outcome = text
+        .and_then(|text| write_if_changed(path, &text))
+        .map(|wrote| {
+            let verb = if wrote {
+                "wrote"
+            } else {
+                "already installed in"
+            };
+            (wrote, format!("{verb} {}", path.display()))
+        });
+    EngineInitStatus::installed(engine, vec![named(path, outcome)], display_paths([path]))
+}
+
+fn remove_owned_file(path: &Path) -> FileOutcome {
+    match fs::remove_file(path) {
+        Ok(()) => Ok((true, format!("removed {}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((false, format!("{} not present", path.display())))
+        }
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn uninstall_owned_file(engine: &str, path: &Path) -> EngineInitStatus {
+    EngineInitStatus::uninstalled(
+        engine,
+        vec![named(path, remove_owned_file(path))],
+        display_paths([path]),
+    )
+}
+
+// claude
+
 fn install_claude(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
-    let mut changed_any = false;
-    let mut messages = Vec::new();
-    let mut failed = false;
-    for path in &targets.claude_settings {
-        match install_nested_file(path, &CLAUDE_EVENTS, a_bin) {
-            Ok((changed, message)) => {
-                changed_any |= changed;
-                messages.push(message);
-            }
-            Err(e) => {
-                failed = true;
-                messages.push(format!("{}: {e:#}", path.display()));
-            }
-        }
-    }
-    EngineInitStatus {
-        engine: "claude".to_string(),
-        installed: !failed && messages.len() == targets.claude_settings.len(),
-        action: if failed {
-            "error"
-        } else if changed_any {
-            "installed"
-        } else {
-            "present"
-        }
-        .to_string(),
-        message: messages.join("; "),
-        paths: targets
-            .claude_settings
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect(),
-    }
-}
-
-fn install_codex(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
-    let mut changed_any = false;
-    let mut messages = Vec::new();
-    let mut failed = false;
-    let mut paths = Vec::new();
-    for dir in &targets.codex_dirs {
-        let hooks_path = dir.join(CODEX_HOOKS_FILENAME);
-        paths.push(hooks_path.display().to_string());
-        match install_nested_file(&hooks_path, &CODEX_EVENTS, a_bin) {
-            Ok((changed, message)) => {
-                changed_any |= changed;
-                messages.push(message);
-            }
-            Err(e) => {
-                failed = true;
-                messages.push(format!("{}: {e:#}", hooks_path.display()));
-            }
-        }
-        // Legacy notify: only when absent, never clobbering a foreign
-        // program (which may be PocketShell's handler or the user's own).
-        let config_path = dir.join("config.toml");
-        paths.push(config_path.display().to_string());
-        if config_path.exists() {
-            match fs::read_to_string(&config_path) {
-                Err(e) => {
-                    failed = true;
-                    messages.push(format!("{}: {e:#}", config_path.display()));
-                }
-                Ok(text) => match codex_notify_state(&text) {
-                    NotifyState::Ours | NotifyState::Foreign => {}
-                    NotifyState::Absent => {
-                        let (new_text, _) = ensure_codex_notify(&text, a_bin);
-                        match write_if_changed(&config_path, &new_text) {
-                            Ok(true) => {
-                                messages.push(format!("set notify in {}", config_path.display()))
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                failed = true;
-                                messages.push(format!("{}: {e:#}", config_path.display()));
-                            }
-                        }
-                    }
-                },
-            }
-        }
-    }
-    EngineInitStatus {
-        engine: "codex".to_string(),
-        installed: !failed,
-        action: if failed {
-            "error"
-        } else if changed_any {
-            "installed"
-        } else {
-            "present"
-        }
-        .to_string(),
-        // `zcodex` shares CODEX_HOME, so it is covered by the same dirs.
-        message: messages.join("; ") + " (covers zcodex via shared CODEX_HOME)",
-        paths,
-    }
-}
-
-fn install_grok(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
-    let path = targets.grok_dir.join("hooks").join(GROK_HOOKS_FILENAME);
-    // Owned file in a merged dir: no need to read anything else.
-    let mut doc = Value::Object(Default::default());
-    match merge_nested_hooks(&mut doc, &GROK_EVENTS, a_bin) {
-        Err(e) => EngineInitStatus {
-            engine: "grok".to_string(),
-            installed: false,
-            action: "error".to_string(),
-            message: format!("{}: {e:#}", path.display()),
-            paths: vec![path.display().to_string()],
-        },
-        Ok(_) => match render_json(&doc).and_then(|text| write_if_changed(&path, &text)) {
-            Err(e) => EngineInitStatus {
-                engine: "grok".to_string(),
-                installed: false,
-                action: "error".to_string(),
-                message: format!("{}: {e:#}", path.display()),
-                paths: vec![path.display().to_string()],
-            },
-            Ok(wrote) => EngineInitStatus {
-                engine: "grok".to_string(),
-                installed: true,
-                action: if wrote { "installed" } else { "present" }.to_string(),
-                message: format!(
-                    "{} {}",
-                    if wrote {
-                        "wrote"
-                    } else {
-                        "already installed in"
-                    },
-                    path.display()
-                ),
-                paths: vec![path.display().to_string()],
-            },
-        },
-    }
-}
-
-fn install_gemini(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
-    match install_nested_file(&targets.gemini_settings, &GEMINI_EVENTS, a_bin) {
-        Ok((changed, message)) => EngineInitStatus {
-            engine: "gemini".to_string(),
-            installed: true,
-            action: if changed { "installed" } else { "present" }.to_string(),
-            message,
-            paths: vec![targets.gemini_settings.display().to_string()],
-        },
-        Err(e) => EngineInitStatus {
-            engine: "gemini".to_string(),
-            installed: false,
-            action: "error".to_string(),
-            message: format!("{}: {e:#}", targets.gemini_settings.display()),
-            paths: vec![targets.gemini_settings.display().to_string()],
-        },
-    }
-}
-
-fn install_opencode(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
-    let path = targets.opencode_plugin_dir.join(OPENCODE_PLUGIN_FILENAME);
-    let source = opencode_plugin_source(a_bin);
-    match write_if_changed(&path, &source) {
-        Ok(wrote) => EngineInitStatus {
-            engine: "opencode".to_string(),
-            installed: true,
-            action: if wrote { "installed" } else { "present" }.to_string(),
-            message: format!(
-                "{} {}",
-                if wrote {
-                    "wrote plugin"
-                } else {
-                    "plugin already installed"
-                },
-                path.display()
-            ),
-            paths: vec![path.display().to_string()],
-        },
-        Err(e) => EngineInitStatus {
-            engine: "opencode".to_string(),
-            installed: false,
-            action: "error".to_string(),
-            message: format!("{}: {e:#}", path.display()),
-            paths: vec![path.display().to_string()],
-        },
-    }
+    install_nested_files("claude", &targets.claude_settings, &CLAUDE_EVENTS, a_bin)
 }
 
 fn check_claude(targets: &HookTargets) -> EngineInitStatus {
-    let mut ok = true;
-    let mut messages = Vec::new();
-    for path in &targets.claude_settings {
-        let (present, message) = check_nested_file(path, &CLAUDE_EVENTS);
-        ok &= present;
-        messages.push(message);
-    }
-    EngineInitStatus {
-        engine: "claude".to_string(),
-        installed: ok,
-        action: if ok { "present" } else { "absent" }.to_string(),
-        message: messages.join("; "),
-        paths: targets
-            .claude_settings
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect(),
-    }
-}
-
-fn check_codex(targets: &HookTargets) -> EngineInitStatus {
-    let mut ok = true;
-    let mut messages = Vec::new();
-    let mut paths = Vec::new();
-    for dir in &targets.codex_dirs {
-        let hooks_path = dir.join(CODEX_HOOKS_FILENAME);
-        paths.push(hooks_path.display().to_string());
-        let (present, message) = check_nested_file(&hooks_path, &CODEX_EVENTS);
-        ok &= present;
-        messages.push(message);
-    }
-    EngineInitStatus {
-        engine: "codex".to_string(),
-        installed: ok,
-        action: if ok { "present" } else { "absent" }.to_string(),
-        message: messages.join("; ") + " (covers zcodex via shared CODEX_HOME)",
-        paths,
-    }
-}
-
-fn check_grok(targets: &HookTargets) -> EngineInitStatus {
-    let path = targets.grok_dir.join("hooks").join(GROK_HOOKS_FILENAME);
-    let (installed, message) = check_nested_file(&path, &GROK_EVENTS);
-    EngineInitStatus {
-        engine: "grok".to_string(),
-        installed,
-        action: if installed { "present" } else { "absent" }.to_string(),
-        message,
-        paths: vec![path.display().to_string()],
-    }
-}
-
-fn check_gemini(targets: &HookTargets) -> EngineInitStatus {
-    let (installed, message) = check_nested_file(&targets.gemini_settings, &GEMINI_EVENTS);
-    EngineInitStatus {
-        engine: "gemini".to_string(),
-        installed,
-        action: if installed { "present" } else { "absent" }.to_string(),
-        message,
-        paths: vec![targets.gemini_settings.display().to_string()],
-    }
-}
-
-fn check_opencode(targets: &HookTargets) -> EngineInitStatus {
-    let path = targets.opencode_plugin_dir.join(OPENCODE_PLUGIN_FILENAME);
-    let installed = if !path.exists() {
-        false
-    } else {
-        fs::read_to_string(&path)
-            .map(|text| text.contains("state-report"))
-            .unwrap_or(false)
-    };
-    EngineInitStatus {
-        engine: "opencode".to_string(),
-        installed,
-        action: if installed { "present" } else { "absent" }.to_string(),
-        message: if installed {
-            format!("plugin installed at {}", path.display())
-        } else {
-            format!("{} not present", path.display())
-        },
-        paths: vec![path.display().to_string()],
-    }
+    check_nested_files("claude", &targets.claude_settings, &CLAUDE_EVENTS)
 }
 
 fn uninstall_claude(targets: &HookTargets) -> EngineInitStatus {
-    uninstall_nested_driver("claude", &targets.claude_settings)
+    uninstall_nested_files("claude", &targets.claude_settings)
 }
 
-fn uninstall_codex(targets: &HookTargets) -> EngineInitStatus {
-    let mut changed_any = false;
-    let mut messages = Vec::new();
+// codex: `hooks.json` per home, plus the legacy `notify` in `config.toml`.
+// `zcodex` shares CODEX_HOME, so it is covered by the same dirs.
+
+const CODEX_NOTE: &str = " (covers zcodex via shared CODEX_HOME)";
+
+fn codex_hooks_paths(targets: &HookTargets) -> Vec<PathBuf> {
+    targets
+        .codex_dirs
+        .iter()
+        .map(|dir| dir.join(CODEX_HOOKS_FILENAME))
+        .collect()
+}
+
+/// Legacy notify: set only when the file exists and has no `notify` at
+/// all, never clobbering a foreign program (which may be PocketShell's
+/// handler or the user's own).
+fn ensure_codex_notify_file(config_path: &Path, a_bin: &str) -> FileOutcome {
+    if !config_path.exists() {
+        return Ok((false, String::new()));
+    }
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    if codex_notify_state(&text) != NotifyState::Absent {
+        return Ok((false, String::new()));
+    }
+    let (new_text, _) = ensure_codex_notify(&text, a_bin);
+    let wrote = write_if_changed(config_path, &new_text)?;
+    let message = if wrote {
+        format!("set notify in {}", config_path.display())
+    } else {
+        String::new()
+    };
+    Ok((wrote, message))
+}
+
+fn remove_codex_notify_file(config_path: &Path) -> FileOutcome {
+    if !config_path.exists() {
+        return Ok((false, String::new()));
+    }
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let (new_text, changed) = remove_codex_notify(&text);
+    if !changed {
+        return Ok((false, String::new()));
+    }
+    write_if_changed(config_path, &new_text)?;
+    Ok((
+        true,
+        format!("removed notify from {}", config_path.display()),
+    ))
+}
+
+fn install_codex(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
+    let mut outcomes = Vec::new();
     let mut paths = Vec::new();
     for dir in &targets.codex_dirs {
         let hooks_path = dir.join(CODEX_HOOKS_FILENAME);
-        paths.push(hooks_path.display().to_string());
-        match uninstall_nested_file(&hooks_path) {
-            Ok((changed, message)) => {
-                changed_any |= changed;
-                messages.push(message);
-            }
-            Err(e) => messages.push(format!("{}: {e:#}", hooks_path.display())),
-        }
         let config_path = dir.join("config.toml");
-        paths.push(config_path.display().to_string());
-        if config_path.exists() {
-            match fs::read_to_string(&config_path) {
-                Err(e) => messages.push(format!("{}: {e:#}", config_path.display())),
-                Ok(text) => {
-                    let (new_text, changed) = remove_codex_notify(&text);
-                    if changed {
-                        match write_if_changed(&config_path, &new_text) {
-                            Ok(_) => {
-                                changed_any = true;
-                                messages
-                                    .push(format!("removed notify from {}", config_path.display()));
-                            }
-                            Err(e) => messages.push(format!("{}: {e:#}", config_path.display())),
-                        }
-                    }
-                }
-            }
-        }
+        outcomes.push(named(
+            &hooks_path,
+            install_nested_file(&hooks_path, &CODEX_EVENTS, a_bin),
+        ));
+        outcomes.push(named(
+            &config_path,
+            ensure_codex_notify_file(&config_path, a_bin),
+        ));
+        paths.extend(display_paths([&hooks_path, &config_path]));
     }
-    EngineInitStatus {
-        engine: "codex".to_string(),
-        installed: false,
-        action: if changed_any { "removed" } else { "absent" }.to_string(),
-        message: messages.join("; "),
-        paths,
+    let mut status = EngineInitStatus::installed("codex", outcomes, paths);
+    status.message += CODEX_NOTE;
+    status
+}
+
+fn check_codex(targets: &HookTargets) -> EngineInitStatus {
+    let mut status = check_nested_files("codex", &codex_hooks_paths(targets), &CODEX_EVENTS);
+    status.message += CODEX_NOTE;
+    status
+}
+
+fn uninstall_codex(targets: &HookTargets) -> EngineInitStatus {
+    let mut outcomes = Vec::new();
+    let mut paths = Vec::new();
+    for dir in &targets.codex_dirs {
+        let hooks_path = dir.join(CODEX_HOOKS_FILENAME);
+        let config_path = dir.join("config.toml");
+        outcomes.push(named(&hooks_path, uninstall_nested_file(&hooks_path)));
+        outcomes.push(named(&config_path, remove_codex_notify_file(&config_path)));
+        paths.extend(display_paths([&hooks_path, &config_path]));
     }
+    EngineInitStatus::uninstalled("codex", outcomes, paths)
+}
+
+// grok
+
+fn grok_hooks_path(targets: &HookTargets) -> PathBuf {
+    targets.grok_dir.join("hooks").join(GROK_HOOKS_FILENAME)
+}
+
+fn install_grok(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
+    // Owned file in a merged dir: no need to read anything else.
+    let mut doc = Value::Object(Default::default());
+    let text = merge_nested_hooks(&mut doc, &GROK_EVENTS, a_bin).and_then(|_| render_json(&doc));
+    install_owned_file("grok", &grok_hooks_path(targets), text)
+}
+
+fn check_grok(targets: &HookTargets) -> EngineInitStatus {
+    check_nested_files("grok", &[grok_hooks_path(targets)], &GROK_EVENTS)
 }
 
 fn uninstall_grok(targets: &HookTargets) -> EngineInitStatus {
-    let path = targets.grok_dir.join("hooks").join(GROK_HOOKS_FILENAME);
-    if path.exists() {
-        match fs::remove_file(&path) {
-            Ok(()) => EngineInitStatus {
-                engine: "grok".to_string(),
-                installed: false,
-                action: "removed".to_string(),
-                message: format!("removed {}", path.display()),
-                paths: vec![path.display().to_string()],
-            },
-            Err(e) => EngineInitStatus {
-                engine: "grok".to_string(),
-                installed: false,
-                action: "error".to_string(),
-                message: format!("{}: {e:#}", path.display()),
-                paths: vec![path.display().to_string()],
-            },
-        }
-    } else {
-        EngineInitStatus {
-            engine: "grok".to_string(),
-            installed: false,
-            action: "absent".to_string(),
-            message: format!("{} not present", path.display()),
-            paths: vec![path.display().to_string()],
-        }
-    }
+    uninstall_owned_file("grok", &grok_hooks_path(targets))
+}
+
+// gemini
+
+fn install_gemini(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
+    install_nested_files(
+        "gemini",
+        std::slice::from_ref(&targets.gemini_settings),
+        &GEMINI_EVENTS,
+        a_bin,
+    )
+}
+
+fn check_gemini(targets: &HookTargets) -> EngineInitStatus {
+    check_nested_files(
+        "gemini",
+        std::slice::from_ref(&targets.gemini_settings),
+        &GEMINI_EVENTS,
+    )
 }
 
 fn uninstall_gemini(targets: &HookTargets) -> EngineInitStatus {
-    uninstall_nested_driver("gemini", std::slice::from_ref(&targets.gemini_settings))
+    uninstall_nested_files("gemini", std::slice::from_ref(&targets.gemini_settings))
+}
+
+// opencode
+
+fn opencode_plugin_path(targets: &HookTargets) -> PathBuf {
+    targets.opencode_plugin_dir.join(OPENCODE_PLUGIN_FILENAME)
+}
+
+fn install_opencode(targets: &HookTargets, a_bin: &str) -> EngineInitStatus {
+    install_owned_file(
+        "opencode",
+        &opencode_plugin_path(targets),
+        Ok(opencode_plugin_source(a_bin)),
+    )
+}
+
+fn check_opencode(targets: &HookTargets) -> EngineInitStatus {
+    let path = opencode_plugin_path(targets);
+    let installed = fs::read_to_string(&path).is_ok_and(|text| text.contains("state-report"));
+    let message = if installed {
+        format!("plugin installed at {}", path.display())
+    } else {
+        format!("{} not present", path.display())
+    };
+    EngineInitStatus::checked(
+        "opencode",
+        vec![(installed, message)],
+        display_paths([&path]),
+    )
 }
 
 fn uninstall_opencode(targets: &HookTargets) -> EngineInitStatus {
-    let path = targets.opencode_plugin_dir.join(OPENCODE_PLUGIN_FILENAME);
-    if path.exists() {
-        match fs::remove_file(&path) {
-            Ok(()) => EngineInitStatus {
-                engine: "opencode".to_string(),
-                installed: false,
-                action: "removed".to_string(),
-                message: format!("removed plugin {}", path.display()),
-                paths: vec![path.display().to_string()],
-            },
-            Err(e) => EngineInitStatus {
-                engine: "opencode".to_string(),
-                installed: false,
-                action: "error".to_string(),
-                message: format!("{}: {e:#}", path.display()),
-                paths: vec![path.display().to_string()],
-            },
-        }
-    } else {
-        EngineInitStatus {
-            engine: "opencode".to_string(),
-            installed: false,
-            action: "absent".to_string(),
-            message: format!("{} not present", path.display()),
-            paths: vec![path.display().to_string()],
-        }
-    }
-}
-
-fn uninstall_nested_driver(engine: &str, files: &[PathBuf]) -> EngineInitStatus {
-    let mut changed_any = false;
-    let mut messages = Vec::new();
-    for path in files {
-        match uninstall_nested_file(path) {
-            Ok((changed, message)) => {
-                changed_any |= changed;
-                messages.push(message);
-            }
-            Err(e) => messages.push(format!("{}: {e:#}", path.display())),
-        }
-    }
-    EngineInitStatus {
-        engine: engine.to_string(),
-        installed: false,
-        action: if changed_any { "removed" } else { "absent" }.to_string(),
-        message: messages.join("; "),
-        paths: files.iter().map(|p| p.display().to_string()).collect(),
-    }
+    uninstall_owned_file("opencode", &opencode_plugin_path(targets))
 }
 
 // ---------------------------------------------------------------------------
 // Engine selection + top-level drivers
 // ---------------------------------------------------------------------------
+
+struct EngineDriver {
+    engine: &'static str,
+    install: fn(&HookTargets, &str) -> EngineInitStatus,
+    check: fn(&HookTargets) -> EngineInitStatus,
+    uninstall: fn(&HookTargets) -> EngineInitStatus,
+}
+
+/// In `HOOK_ENGINES` order, which is also the order statuses are reported.
+const ENGINE_DRIVERS: [EngineDriver; 5] = [
+    EngineDriver {
+        engine: "claude",
+        install: install_claude,
+        check: check_claude,
+        uninstall: uninstall_claude,
+    },
+    EngineDriver {
+        engine: "codex",
+        install: install_codex,
+        check: check_codex,
+        uninstall: uninstall_codex,
+    },
+    EngineDriver {
+        engine: "grok",
+        install: install_grok,
+        check: check_grok,
+        uninstall: uninstall_grok,
+    },
+    EngineDriver {
+        engine: "gemini",
+        install: install_gemini,
+        check: check_gemini,
+        uninstall: uninstall_gemini,
+    },
+    EngineDriver {
+        engine: "opencode",
+        install: install_opencode,
+        check: check_opencode,
+        uninstall: uninstall_opencode,
+    },
+];
 
 /// Normalise `--engine` for `a init`: `zcodex` rides the codex dirs, every
 /// other id must be one of `HOOK_ENGINES`.
@@ -1138,76 +1115,33 @@ pub fn normalize_engine_filter(engine: &str) -> Result<&'static str> {
     }
 }
 
-fn selected(engine: Option<&str>, candidate: &str) -> bool {
-    match engine {
-        None => true,
-        Some(want) => want == candidate,
-    }
+fn selected_drivers(engine: Option<&str>) -> impl Iterator<Item = &'static EngineDriver> + '_ {
+    ENGINE_DRIVERS
+        .iter()
+        .filter(move |driver| engine.is_none_or(|want| want == driver.engine))
 }
 
 /// Install hooks for the selected engines. Idempotent; merge, never
 /// clobber (see the module docs).
 pub fn install(targets: &HookTargets, a_bin: &str, engine: Option<&str>) -> Vec<EngineInitStatus> {
-    let mut out = Vec::new();
-    if selected(engine, "claude") {
-        out.push(install_claude(targets, a_bin));
-    }
-    if selected(engine, "codex") {
-        out.push(install_codex(targets, a_bin));
-    }
-    if selected(engine, "grok") {
-        out.push(install_grok(targets, a_bin));
-    }
-    if selected(engine, "gemini") {
-        out.push(install_gemini(targets, a_bin));
-    }
-    if selected(engine, "opencode") {
-        out.push(install_opencode(targets, a_bin));
-    }
-    out
+    selected_drivers(engine)
+        .map(|driver| (driver.install)(targets, a_bin))
+        .collect()
 }
 
 /// Check hook presence for the selected engines. No files are touched.
 pub fn check(targets: &HookTargets, engine: Option<&str>) -> Vec<EngineInitStatus> {
-    let mut out = Vec::new();
-    if selected(engine, "claude") {
-        out.push(check_claude(targets));
-    }
-    if selected(engine, "codex") {
-        out.push(check_codex(targets));
-    }
-    if selected(engine, "grok") {
-        out.push(check_grok(targets));
-    }
-    if selected(engine, "gemini") {
-        out.push(check_gemini(targets));
-    }
-    if selected(engine, "opencode") {
-        out.push(check_opencode(targets));
-    }
-    out
+    selected_drivers(engine)
+        .map(|driver| (driver.check)(targets))
+        .collect()
 }
 
 /// Remove our hooks for the selected engines. Only `state-report` entries
 /// and our own generated files are removed.
 pub fn uninstall(targets: &HookTargets, engine: Option<&str>) -> Vec<EngineInitStatus> {
-    let mut out = Vec::new();
-    if selected(engine, "claude") {
-        out.push(uninstall_claude(targets));
-    }
-    if selected(engine, "codex") {
-        out.push(uninstall_codex(targets));
-    }
-    if selected(engine, "grok") {
-        out.push(uninstall_grok(targets));
-    }
-    if selected(engine, "gemini") {
-        out.push(uninstall_gemini(targets));
-    }
-    if selected(engine, "opencode") {
-        out.push(uninstall_opencode(targets));
-    }
-    out
+    selected_drivers(engine)
+        .map(|driver| (driver.uninstall)(targets))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1473,6 +1407,12 @@ mod tests {
         assert_eq!(normalize_engine_filter("zcodex").unwrap(), "codex");
         assert_eq!(normalize_engine_filter("codex").unwrap(), "codex");
         assert!(normalize_engine_filter("shell").is_err());
+    }
+
+    #[test]
+    fn engine_drivers_match_the_documented_engine_list() {
+        let driven: Vec<&str> = ENGINE_DRIVERS.iter().map(|d| d.engine).collect();
+        assert_eq!(driven, HOOK_ENGINES);
     }
 
     #[test]
