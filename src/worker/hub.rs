@@ -498,12 +498,21 @@ impl OutputHub {
             inner.subscribers.remove(&id);
         }
     }
-    pub(super) fn finish(&self, exit: ExitInfo) {
+    /// Record the terminal outcome (an outcome already recorded wins) and
+    /// hand it to every subscriber, running `persist` in between under the
+    /// same lock so post-mortem files are written before any client learns
+    /// the session is over.
+    fn terminate_all(&self, event: OutputEvent, persist: impl FnOnce(&mut HubInner)) {
         if let Ok(mut inner) = self.inner.lock() {
-            let terminal = inner
-                .terminal
-                .get_or_insert_with(|| OutputEvent::Exit(exit.clone()))
-                .clone();
+            let terminal = inner.terminal.get_or_insert(event).clone();
+            persist(&mut inner);
+            for (_, subscriber) in inner.subscribers.drain() {
+                subscriber.terminate(terminal.clone());
+            }
+        }
+    }
+    pub(super) fn finish(&self, exit: ExitInfo) {
+        self.terminate_all(OutputEvent::Exit(exit), |inner| {
             if let Err(error) = inner.history.flush_final() {
                 eprintln!("aplexer worker: flush history at exit: {error:#}");
                 inner.history_persistence_error = Some(format!("{error:#}"));
@@ -516,10 +525,7 @@ impl OutputHub {
             if let Err(error) = fs::write(&self.screen_txt_path, inner.screen.contents()) {
                 eprintln!("aplexer worker: write screen.txt at exit: {error:#}");
             }
-            for (_, subscriber) in inner.subscribers.drain() {
-                subscriber.terminate(terminal.clone());
-            }
-        }
+        });
     }
     /// Terminate subscribers without any durable writes, for sessions the
     /// worker is about to delete (benchmark PLAN P0.2): `run_lifecycle`
@@ -530,26 +536,10 @@ impl OutputHub {
     /// removal path (natural exit, Ctrl-D / shell EOF, or `a kill`); any
     /// failure or OOM keeps the evidence via the regular `finish` path.
     pub(super) fn finish_killed(&self, exit: ExitInfo) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let terminal = inner
-                .terminal
-                .get_or_insert_with(|| OutputEvent::Exit(exit.clone()))
-                .clone();
-            for (_, subscriber) in inner.subscribers.drain() {
-                subscriber.terminate(terminal.clone());
-            }
-        }
+        self.terminate_all(OutputEvent::Exit(exit), |_| {});
     }
     pub(super) fn fail_subscribers(&self, message: String) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let terminal = inner
-                .terminal
-                .get_or_insert(OutputEvent::Error(message))
-                .clone();
-            for (_, subscriber) in inner.subscribers.drain() {
-                subscriber.terminate(terminal.clone());
-            }
-        }
+        self.terminate_all(OutputEvent::Error(message), |_| {});
     }
     #[cfg(test)]
     pub(super) fn inject_history_append_failure(&self, errno: i32) {
