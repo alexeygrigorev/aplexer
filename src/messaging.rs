@@ -175,28 +175,40 @@ fn mailbox_json_files_equal(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+/// Paths of `dir`'s entries whose extension is one of `extensions`, in
+/// byte order. A missing directory lists as empty: every mailbox
+/// subdirectory has a documented empty state, and creating it is
+/// `ensure_workspace`'s job, not a reader's.
+fn entries_with_extension(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
     };
+    let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
+        let path = entry
+            .with_context(|| format!("enumerate {}", dir.display()))?
+            .path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if extension.is_some_and(|extension| extensions.contains(&extension)) {
+            paths.push(path);
         }
-        if !entry.file_type()?.is_file() {
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let paths = entries_with_extension(dir, &["json"])?;
+    for path in &paths {
+        if !fs::symlink_metadata(path)?.file_type().is_file() {
             bail!(
                 "refusing to migrate non-file mailbox entry {}",
                 path.display()
             );
         }
-        paths.push(path);
     }
-    paths.sort();
     Ok(paths)
 }
 
@@ -760,17 +772,7 @@ pub fn list_messages_in(
     canonical_workspace: &Path,
 ) -> Result<Vec<MessageEnvelope>> {
     let mut out = Vec::new();
-    let entries = match fs::read_dir(&mp.msgs_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let entry = entry.with_context(|| format!("enumerate {}", mp.msgs_dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in entries_with_extension(&mp.msgs_dir, &["json"])? {
         out.push(load_message_file(&path, canonical_workspace)?);
     }
     // Uuid's Ord is a byte-wise compare of the 128-bit value; for UUIDv7 the
@@ -835,29 +837,21 @@ fn read_cursor_file(path: &Path) -> Result<Cursor> {
         .with_context(|| format!("parse mailbox cursor {}", path.display()))
 }
 
+fn uuid_stem(path: &Path) -> Option<Uuid> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| Uuid::parse_str(stem).ok())
+}
+
 fn retained_message_ids(msgs_dir: &Path) -> Result<BTreeSet<Uuid>> {
-    let entries = match fs::read_dir(msgs_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", msgs_dir.display())),
-    };
     let mut ids = BTreeSet::new();
-    for entry in entries {
-        let entry = entry.with_context(|| format!("enumerate {}", msgs_dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
+    for path in entries_with_extension(msgs_dir, &["json"])? {
         // Cursor maintenance must not bless an unexpected mailbox entry as a
         // retained message id merely because its filename looks like a UUID.
         // Use the same bounded, no-follow regular-file check as actual loads;
         // parsing the full envelope remains the list/show operation's job.
         let _ = open_message_file(&path)?;
-        if let Some(id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| Uuid::parse_str(stem).ok())
-        {
+        if let Some(id) = uuid_stem(&path) {
             ids.insert(id);
         }
     }
@@ -966,18 +960,7 @@ fn mailbox_entries(
     read_created_at: bool,
 ) -> Result<Vec<MailboxEntry>> {
     let mut entries = Vec::new();
-    let dir = match fs::read_dir(&mp.msgs_dir) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read {}", mp.msgs_dir.display()));
-        }
-    };
-    for entry in dir {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
+    for path in entries_with_extension(&mp.msgs_dir, &["json"])? {
         // Even when append quota enforcement needs only the size, use the
         // same no-follow/non-regular/oversize preflight as envelope reads.
         // Explicit TTL GC additionally parses and validates the envelope from
@@ -994,10 +977,9 @@ fn mailbox_entries(
             size,
         });
     }
-    // Message paths are UUIDv7 filenames, so bytewise path order is the
-    // existing deterministic mailbox order. Malformed names still get a
+    // Message paths are UUIDv7 filenames, so the listing's bytewise path
+    // order is chronological mailbox order. Malformed names still get a
     // stable eviction order rather than escaping the cap.
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
 }
 
@@ -1087,31 +1069,10 @@ fn prune_workspace_locked(
 }
 
 fn cursor_entry_ids(cursors_dir: &Path) -> Result<BTreeSet<Uuid>> {
-    let entries = match fs::read_dir(cursors_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", cursors_dir.display())),
-    };
-    let mut ids = BTreeSet::new();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("json" | "lock")
-        ) {
-            continue;
-        }
-        let Some(consumer_id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| Uuid::parse_str(stem).ok())
-        else {
-            continue;
-        };
-        ids.insert(consumer_id);
-    }
-    Ok(ids)
+    Ok(entries_with_extension(cursors_dir, &["json", "lock"])?
+        .iter()
+        .filter_map(|path| uuid_stem(path))
+        .collect())
 }
 
 fn modified_secs(path: &Path) -> Result<Option<u64>> {
