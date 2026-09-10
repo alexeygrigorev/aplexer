@@ -170,6 +170,18 @@ pub(crate) fn trusted_system_helper(name: &str) -> Result<PathBuf> {
     )
 }
 
+/// `systemd-run <bus> --scope --collect [--quiet] --unit=<unit>` from the
+/// trusted helper, ready for unit properties and the `-- argv` tail.
+fn systemd_run_scope(systemd_run: PathBuf, bus_flag: &str, unit: &str, quiet: bool) -> Command {
+    let mut command = Command::new(systemd_run);
+    command.arg(bus_flag).arg("--scope").arg("--collect");
+    if quiet {
+        command.arg("--quiet");
+    }
+    command.arg(format!("--unit={unit}"));
+    command
+}
+
 /// End-to-end probe of the system-manager scope backend behind the
 /// `APLEXER_LAUNCH_SYSTEM_SCOPE=system` escape (issue #1): resolves the same
 /// trusted helpers the real launch path resolves, then creates and collects
@@ -184,16 +196,9 @@ pub fn probe_system_scope_backend() -> Result<()> {
     let systemd_run = trusted_system_helper("systemd-run")?;
     let true_binary = trusted_system_helper("true")?;
     let unit = format!("aplexer-escape-probe-{}", Uuid::new_v4().simple());
-    let mut command = Command::new(systemd_run);
+    let mut command = systemd_run_scope(systemd_run, "--system", &unit, true);
     command
-        .args([
-            "--system",
-            "--scope",
-            "--collect",
-            "--quiet",
-            &format!("--unit={unit}"),
-            "--",
-        ])
+        .arg("--")
         .arg(&true_binary)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -274,17 +279,13 @@ pub(crate) fn wrap_worker_in_system_scope(id: Uuid, worker: &mut Command) -> Res
     let systemd_run = trusted_system_helper("systemd-run")?;
     let program = worker.get_program().to_os_string();
     let worker_args: Vec<OsString> = worker.get_args().map(|arg| arg.to_os_string()).collect();
-    let mut command = Command::new(systemd_run);
-    command.args([
+    let mut command = systemd_run_scope(
+        systemd_run,
         "--system",
-        "--scope",
-        "--collect",
-        "--quiet",
-        &format!("--unit=aplexer-worker-{id}"),
-        "--",
-    ]);
-    command.arg(&program);
-    command.args(&worker_args);
+        &format!("aplexer-worker-{id}"),
+        true,
+    );
+    command.arg("--").arg(&program).args(&worker_args);
     *worker = command;
     Ok(())
 }
@@ -419,14 +420,8 @@ impl Cgroup {
         let systemctl = trusted_system_helper("systemctl")?;
         let sleep = trusted_system_helper("sleep")?;
         let unit = format!("aplexer-workload-{id}");
-        let mut command = Command::new(systemd_run);
-        command
-            .arg(bus_flag)
-            .arg("--scope")
-            .arg("--collect")
-            .arg(format!("--unit={unit}"))
-            .arg("-p")
-            .arg("Delegate=yes");
+        let mut command = systemd_run_scope(systemd_run, bus_flag, &unit, false);
+        command.arg("-p").arg("Delegate=yes");
         if let Some(value) = limits.memory_bytes {
             command.arg("-p").arg(format!("MemoryMax={value}"));
             // Without a swap cap, hitting MemoryMax doesn't OOM-kill the
