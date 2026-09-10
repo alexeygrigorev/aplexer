@@ -191,224 +191,29 @@ pub(crate) fn attach(
         }
     }
 
-    let input_writer = writer.clone();
-    let input_active = active.clone();
+    // The input thread owns the scanner, pager routing, and switching
+    // actions; attach only supplies its shared runtime state.
     // Set when THIS client ends its attach on purpose (Ctrl-b d, or its
     // stdin hit EOF) as opposed to the session ending under it. Combined
     // with `session_ended` / `worker_error` after the frame loop, this is
     // what keeps "Detached from ..." off the connection-loss and
     // worker-error paths -- see `classify_attach_stop`.
     let detached_by_client = Arc::new(AtomicBool::new(false));
-    let input_detached = detached_by_client.clone();
-    let input_paths = paths.clone();
-    let input_term = term.clone();
-    let input_shared_record = shared_record.clone();
-    let input_last_session = last_session.clone();
-    let input_pending_switch = pending_switch.clone();
-    let input_switch_in_progress = switch_in_progress.clone();
-    let input_status_ctx = status_ctx.clone();
-    let input_want_screen = !explicit_history;
-    let input_status_enabled = status_enabled;
-    thread::spawn(move || {
-        let mut input = io::stdin();
-        let mut buffer = [0u8; 8192];
-        // Ctrl-b (0x02) prefix state machine -- Ctrl-b d detaches,
-        // Ctrl-b ? flashes the key reference, Ctrl-b r redraws the live
-        // screen, Ctrl-b c creates another session here, Ctrl-b n/p/N/P/l/1-9
-        // switch sessions, anything else
-        // pending is not a real prefix (both bytes forward to the
-        // workload). See
-        // `InputScanner` for the byte-level rules and why this needs to
-        // survive across separate read() calls, not just within one
-        // buffer.
-        //
-        // Design choice: real tmux turns Ctrl-b into a standing "prefix"
-        // that consumes the next keystroke as a command (or no-ops/bells if
-        // unrecognized), never forwarding Ctrl-b itself to the pane. aplexer
-        // has no such command-prefix system and isn't growing one just for
-        // this, so the simplest reasonable behavior is used instead: a
-        // *bound* Ctrl-b sequence (d/?/r/c/n/p/N/P/l/1-9) is consumed; anything
-        // else is not a prefix at all -- both bytes are forwarded through as
-        // ordinary input, so a program that wants a literal Ctrl-b (some
-        // editors and REPLs use it) isn't broken by this feature.
-        let mut scanner = InputScanner::default();
-        // Sits between the chord scanner and the socket: while the pager is
-        // up it consumes every byte (no keystroke reaches the workload --
-        // the whole point of the mode), and while the client holds the
-        // mouse it consumes mouse reports the workload never asked for and
-        // turns a wheel roll up into the pager.
-        let mut scroll_input = ScrollInput::default();
-        // Whether `KEY_OVERLAY_DELAY` has already fired for the `Ctrl-b`
-        // currently being held. Not "is the box up" -- that lives in
-        // `KeyOverlay::active`, which the resize thread can also clear -- but
-        // "this prefix has had its one chance to raise it", which is what
-        // keeps a terminal too small for the box from flashing on a loop.
-        let mut overlay_armed = false;
-        'outer: while input_active.load(Ordering::Relaxed) {
-            // The only two places this loop does not simply block on stdin,
-            // and they are mutually exclusive by construction (see
-            // `KEY_OVERLAY_DELAY`, which spells out why that matters):
-            //
-            // - a half-typed arrow chord has `CHORD_ESCAPE_TIMEOUT` to
-            //   complete, after which the withheld bytes are released to the
-            //   workload as ordinary input;
-            // - a lone `Ctrl-b` has `KEY_OVERLAY_DELAY` before the keymap is
-            //   drawn for it. The short-circuit is what keeps this free: with
-            //   nothing pending, neither `readable` call is even reached.
-            let chord_expired =
-                scanner.awaiting_escape() && !readable(libc::STDIN_FILENO, CHORD_ESCAPE_TIMEOUT);
-            if !chord_expired
-                && !overlay_armed
-                && scanner.awaiting_key()
-                && !input_status_ctx.scroll.is_active()
-                && !readable(libc::STDIN_FILENO, KEY_OVERLAY_DELAY)
-            {
-                // Hesitation on the prefix rather than a chord typed from
-                // muscle memory. Draw the keymap and go straight back to
-                // waiting for the key it explains -- the prefix is still
-                // pending, so that key runs its binding exactly as it would
-                // have. `overlay_armed` latches the deadline for *this*
-                // prefix so a terminal too small for the box flashes the
-                // one-line reference once instead of every 350ms.
-                overlay_armed = true;
-                show_key_overlay(&input_status_ctx);
-                continue;
-            }
-            let actions = if chord_expired {
-                let flushed = scanner.flush_pending();
-                overlay_armed = false;
-                if dismiss_key_overlay(&input_status_ctx) {
-                    // `Esc` with the box up means "never mind", and taking
-                    // the box down is the whole of it: the withheld
-                    // `Ctrl-b ESC` is consumed rather than typed into the
-                    // workload, which is what every menu of this shape does.
-                    // Without the box this is unchanged -- both bytes go
-                    // through, so an editor still gets its Escape.
-                    Vec::new()
-                } else {
-                    flushed
-                }
-            } else {
-                let n = match input.read(&mut buffer) {
-                    Ok(0) => {
-                        input_detached.store(true, Ordering::Relaxed);
-                        detach_attached_client(&input_writer, &input_active);
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        input_detached.store(true, Ordering::Relaxed);
-                        detach_attached_client(&input_writer, &input_active);
-                        break;
-                    }
-                };
-                if !input_tty || !input_status_enabled {
-                    if send_data(&input_writer, &buffer[..n]).is_err() {
-                        detach_attached_client(&input_writer, &input_active);
-                        break;
-                    }
-                    continue;
-                }
-                let actions = scanner.scan(&buffer[..n]);
-                if scanner.settled() {
-                    overlay_armed = false;
-                    // A key arrived, so the overlay is over *before* its
-                    // action runs: everything below -- a switch's replayed
-                    // screen, a `?` flash, the pager's first frame -- draws
-                    // onto the restored screen instead of onto the box. A
-                    // key that turned out not to be a chord has already been
-                    // put back into `actions` as ordinary input by `scan`,
-                    // so the fall-through contract is untouched.
-                    dismiss_key_overlay(&input_status_ctx);
-                }
-                actions
-            };
-            for action in actions {
-                match action {
-                    InputAction::Forward(bytes) => {
-                        // Ordering matters: a Forward before a Switch goes
-                        // to the old session (keystrokes typed before the
-                        // chord); a Forward after it goes to the new one,
-                        // automatically, because perform_switch swapped the
-                        // stream inside input_writer's mutex.
-                        let bytes = scroll_input.route(&input_status_ctx, &bytes);
-                        if bytes.is_empty() {
-                            continue;
-                        }
-                        if send_data(&input_writer, &bytes).is_err() {
-                            detach_attached_client(&input_writer, &input_active);
-                            break 'outer;
-                        }
-                    }
-                    InputAction::Detach => {
-                        // Leave the pager first: detach restores the host
-                        // from the *live* model, and the reset sequence it
-                        // writes assumes the relay owns the screen again.
-                        exit_scroll_mode(&input_status_ctx);
-                        input_detached.store(true, Ordering::Relaxed);
-                        detach_attached_client(&input_writer, &input_active);
-                        break 'outer;
-                    }
-                    InputAction::Help => {
-                        flash_status(&input_status_ctx, attach_key_help());
-                    }
-                    InputAction::Redraw => {
-                        // `Ctrl-b r` means "this display is garbled, redraw
-                        // what I am looking at". While the pager is up that
-                        // is the pager, not the live screen -- painting the
-                        // live screen here would silently swap the user's
-                        // view without giving them the keyboard back.
-                        if input_status_ctx.scroll.is_active()
-                            && !input_status_ctx.scroll.is_typing()
-                        {
-                            paint_scroll_view(&input_status_ctx);
-                        } else {
-                            redraw_live_screen(&input_status_ctx);
-                        }
-                    }
-                    InputAction::Scroll => {
-                        enter_scroll_mode(&input_status_ctx, ScrollCommand::Stay);
-                    }
-                    InputAction::Switch(target) => {
-                        // A switch replaces the model wholesale; the pager
-                        // is looking at the outgoing session's history, so
-                        // it has to close before the swap. `SwitchTarget::New`
-                        // (Ctrl-b c) rides this same arm: it starts a session
-                        // first and then switches to it, so a create that
-                        // fails lands in the same Err below -- a flash on the
-                        // bar, the attach to the current session untouched.
-                        exit_scroll_mode(&input_status_ctx);
-                        let result = perform_switch(
-                            &input_paths,
-                            target,
-                            switch_replay_bytes,
-                            input_want_screen,
-                            &input_term,
-                            &input_shared_record,
-                            &input_last_session,
-                            &input_writer,
-                            &input_pending_switch,
-                            &input_switch_in_progress,
-                        );
-                        // On Err nothing was sent to A and nothing swapped
-                        // (perform_switch's ordering guarantee) -- the user
-                        // just stays where they were with an explanation on
-                        // the bar. The consumed chord bytes are never
-                        // forwarded either way.
-                        if let Err(e) = result {
-                            flash_status(&input_status_ctx, format!("{e:#}"));
-                        }
-                    }
-                }
-            }
-        }
-        // Whatever ended this thread -- stdin EOF, a read error, a dead
-        // socket, `Ctrl-b d` -- must not leave the relay suspended behind a
-        // box nobody can dismiss any more: this thread is the only one that
-        // takes keys. A no-op in the ordinary case, because a key arriving is
-        // what dismisses the overlay and `Ctrl-b d` is a key.
-        dismiss_key_overlay(&input_status_ctx);
+    spawn_input_thread(InputThreadConfig {
+        input_tty,
+        status_enabled,
+        want_screen: !explicit_history,
+        replay_bytes: switch_replay_bytes,
+        writer: writer.clone(),
+        active: active.clone(),
+        detached: detached_by_client.clone(),
+        paths: paths.clone(),
+        term: term.clone(),
+        record: shared_record.clone(),
+        last_session: last_session.clone(),
+        pending_switch: pending_switch.clone(),
+        switch_in_progress: switch_in_progress.clone(),
+        status: status_ctx.clone(),
     });
     if display_tty {
         let resize_writer = writer.clone();

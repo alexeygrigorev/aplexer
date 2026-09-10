@@ -28,6 +28,8 @@ pub(crate) use uuid::Uuid;
 
 #[path = "attach.rs"]
 mod attach;
+#[path = "attach_input.rs"]
+mod attach_input;
 #[path = "cli.rs"]
 mod cli;
 #[path = "commands.rs"]
@@ -48,6 +50,7 @@ mod system;
 mod terminal;
 
 pub(crate) use attach::*;
+pub(crate) use attach_input::*;
 pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
