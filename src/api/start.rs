@@ -368,6 +368,33 @@ pub(super) fn exited_worker_completed_startup(record: &SessionRecord) -> bool {
         && record.containment_empty == Some(true)
 }
 
+/// What a worker that has already exited during startup means for the
+/// start: a clean exit whose record is gone is a session that finished and
+/// auto-removed itself (that deletion is the proof the lifecycle
+/// completed); a clean exit that left a completed record
+/// (`exited_worker_completed_startup`) did not fail to start either; every
+/// other shape -- a crashed worker, an unreadable-but-present record, a
+/// non-terminal one -- is a startup failure named by the exit status
+/// rather than by a read error.
+fn exited_worker_outcome(
+    paths: &Paths,
+    id: Uuid,
+    status: std::process::ExitStatus,
+    last_seen: SessionRecord,
+) -> Result<SessionRecord> {
+    if status.success() {
+        if !paths.record(id).exists() {
+            return Ok(auto_removed_completion(last_seen));
+        }
+        if let Ok(final_record) = read_session_record(paths, id) {
+            if exited_worker_completed_startup(&final_record) {
+                return Ok(final_record);
+            }
+        }
+    }
+    bail!("worker exited during startup: {status}")
+}
+
 /// Reconstruct a start response for a worker that finished cleanly and
 /// deleted its own record (natural exit, Ctrl-D, or an in-startup kill).
 /// The on-disk record is already gone; this is only what `a start --json`
@@ -490,7 +517,9 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
                 .unwrap_or("<empty>")
         );
     }
-    worker_command(id, req.python.as_deref())?;
+    // Resolved before the registry lock so a missing worker executable
+    // fails the start without holding up other commands.
+    let mut command = worker_command(id, req.python.as_deref())?;
     let _registry = FileLock::exclusive(&paths.registry_lock(), false)?;
     // Read under the registry lock taken above, and keep holding it through
     // the whole spawn: this read IS the locked read, and no other aplexer
@@ -629,7 +658,6 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
         atomic_write_json(&paths.record(id), &record)?;
         let worker_log = File::create(paths.state_session(id).join("worker.log"))
             .context("create worker log")?;
-        let mut command = worker_command(id, req.python.as_deref())?;
         // Opt-in placement escape (issue #1): `setsid()` detaches the worker
         // from the launching terminal but leaves it in the ambient cgroup,
         // which is beneath user@UID.service whenever this launch is. When
@@ -722,10 +750,7 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
             // That is success for this start, not "worker vanished".
             if !paths.record(id).exists() {
                 if let Some(status) = startup.child_mut().try_wait()? {
-                    if status.success() {
-                        return Ok(auto_removed_completion(last_seen));
-                    }
-                    bail!("worker exited during startup: {status}");
+                    return exited_worker_outcome(paths, id, status, last_seen);
                 }
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -759,25 +784,7 @@ fn start_session_launch(paths: &Paths, req: &StartRequest) -> Result<SessionReco
                 _ => {}
             }
             if let Some(status) = startup.child_mut().try_wait()? {
-                // A worker that exited cleanly after durably recording a
-                // completed session did not fail to start (see
-                // `exited_worker_completed_startup`). The same is true of
-                // a worker that finished and auto-removed its record: that
-                // deletion is itself the proof the lifecycle completed.
-                // An unreadable-but-still-present record falls through to
-                // the failure below rather than replacing the startup
-                // diagnosis with a read error.
-                if status.success() {
-                    if !paths.record(id).exists() {
-                        return Ok(auto_removed_completion(current));
-                    }
-                    if let Ok(final_record) = read_session_record(paths, id) {
-                        if exited_worker_completed_startup(&final_record) {
-                            return Ok(final_record);
-                        }
-                    }
-                }
-                bail!("worker exited during startup: {status}");
+                return exited_worker_outcome(paths, id, status, current);
             }
             // Polled at 5 ms, not 25 ms (benchmark PLAN P0.3): worker startup
             // is a serial chain (record write -> spawn -> PTY -> workload ->
