@@ -40,6 +40,10 @@ mod cli;
 mod commands;
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "list_plain.rs"]
+mod list_plain;
+#[path = "list_tty.rs"]
+mod list_tty;
 #[path = "rpc.rs"]
 mod rpc;
 #[path = "scroll.rs"]
@@ -60,6 +64,8 @@ pub(crate) use attach_threads::*;
 pub(crate) use cli::*;
 pub(crate) use commands::*;
 pub(crate) use diagnostics::*;
+pub(crate) use list_plain::*;
+pub(crate) use list_tty::*;
 pub(crate) use rpc::*;
 pub(crate) use scroll::*;
 pub(crate) use session_commands::*;
