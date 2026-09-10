@@ -117,7 +117,7 @@ fn scroll_bar_text_keeps_the_mode_and_position_at_every_width() {
         available: 2000,
     };
     for cols in [10usize, 20, 40, 80, 200] {
-        let text = scroll_bar_text(view, cols, false);
+        let text = scroll_bar_text(view, cols, false, false);
         assert_eq!(
             terminal_display_width(&text),
             cols,
@@ -196,12 +196,12 @@ fn an_empty_pager_says_why_it_is_empty() {
         offset: 0,
         available: 0,
     };
-    let alt = scroll_bar_text(empty, 120, true);
+    let alt = scroll_bar_text(empty, 120, true, false);
     assert!(
         alt.contains("no history: the workload owns the screen"),
         "an alt-screen workload's empty pager must name the reason: {alt:?}"
     );
-    let primary = scroll_bar_text(empty, 120, false);
+    let primary = scroll_bar_text(empty, 120, false, false);
     assert!(
         primary.contains("no history"),
         "an empty pager on the primary screen must say so too, not offer \
@@ -217,7 +217,7 @@ fn an_empty_pager_says_why_it_is_empty() {
     // hint that the emptiness was the answer rather than a failure.
     for cols in [80usize, 100, 200] {
         for alt in [true, false] {
-            let text = scroll_bar_text(empty, cols, alt);
+            let text = scroll_bar_text(empty, cols, alt, false);
             assert!(
                 text.contains("no history"),
                 "the reason must fit a {cols}-column terminal (alt={alt}): {text:?}"
@@ -237,6 +237,7 @@ fn an_empty_pager_says_why_it_is_empty() {
                 available: 900,
             },
             cols,
+            false,
             false,
         );
         assert!(
@@ -406,23 +407,28 @@ fn type_through_forwards_text_until_esc_returns_to_paging() {
 
 /// The type-through bar keeps the pager's position readout (the offset is
 /// still where the user left it) and names the mode; narrow widths
-/// degrade without ever exceeding the row.
+/// degrade without ever exceeding the row. It fills the row exactly, like
+/// the reading bar: a short row left the reverse-video bar ending mid-line
+/// with whatever was under it showing through.
 #[test]
 fn typing_bar_names_the_mode_and_keeps_the_position() {
     let view = ScrollView {
         offset: 12,
         available: 240,
     };
-    let text = scroll_bar_typing_text(view, 120);
+    let text = scroll_bar_text(view, 120, false, true);
     assert!(text.contains("SCROLL 12/240"), "{text:?}");
     assert!(text.contains("TYPE"), "{text:?}");
-    assert!(text.chars().count() <= 120);
-    let medium = scroll_bar_typing_text(view, 20);
-    assert!(
-        medium.contains("TYPE") && medium.chars().count() <= 20,
-        "{medium:?}"
-    );
-    assert_eq!(scroll_bar_typing_text(view, 4), "TYPE");
+    for cols in [4usize, 20, 120] {
+        let text = scroll_bar_text(view, cols, false, true);
+        assert!(text.contains("TYPE"), "{text:?}");
+        assert_eq!(
+            terminal_display_width(&text),
+            cols,
+            "the typing bar must fill exactly its row at {cols} columns: {text:?}"
+        );
+    }
+    assert_eq!(scroll_bar_text(view, 4, false, true), "TYPE");
 }
 
 #[test]

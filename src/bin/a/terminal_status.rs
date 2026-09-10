@@ -292,6 +292,25 @@ pub(crate) fn terminal_display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// The widest candidate that fits `cols`, sanitized for the terminal and
+/// padded to the full row -- or `fallback`, truncated, when none does.
+/// Candidates are rendered one at a time, so a wide terminal pays for the
+/// first and a narrow one never formats the layouts it cannot show.
+pub(crate) fn fit_bar_text(
+    cols: usize,
+    candidates: impl IntoIterator<Item = String>,
+    fallback: &str,
+) -> String {
+    let fits = candidates
+        .into_iter()
+        .map(|candidate| sanitize_terminal_text(&candidate))
+        .find(|candidate| terminal_display_width(candidate) <= cols);
+    pad_or_truncate(
+        &fits.unwrap_or_else(|| sanitize_terminal_text(fallback)),
+        cols,
+    )
+}
+
 /// Pads or truncates to exactly `cols` terminal display cells without
 /// splitting an extended grapheme cluster. This keeps wide glyphs, combining
 /// sequences, and emoji aligned while the reverse-video bar spans the full

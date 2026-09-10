@@ -86,17 +86,35 @@ pub(crate) fn reanchor_view(view: &mut ScrollView, fresh_available: usize) {
 /// brackets, because this bar is the *only* thing telling the user their
 /// keystrokes are going to the pager instead of to their agent -- the single
 /// question the mode has to answer at a glance. Trimmed from the right as
-/// the terminal narrows, down to a minimum that keeps the word SCROLL and
-/// the way out.
-pub(crate) fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -> String {
+/// the terminal narrows, down to a minimum that keeps the mode word and the
+/// way out.
+///
+/// With `typing` (type-through, `i`) the pager still owns the reserved row
+/// and its position readout stays honest, but the mode word and the hint
+/// change: the keyboard currently belongs to the session, and Esc is the
+/// way back to paging.
+pub(crate) fn scroll_bar_text(
+    view: ScrollView,
+    cols: usize,
+    alt_screen: bool,
+    typing: bool,
+) -> String {
     let position = format!("SCROLL {}/{}", view.offset, view.available);
     // An empty pager must say *why* it is empty, and must say it on an
-    // ordinary 80-column terminal rather than only on a wide one. So the two
+    // ordinary 80-column terminal rather than only on a wide one. So the
     // cases get different ladders: with history the row spends its width on
     // the navigation keys, and with none it spends the width on the reason
     // instead -- offering PgUp/PgDn for a pager that cannot move is the thing
     // that reads as a broken feature.
-    let candidates: Vec<String> = if view.available == 0 {
+    let (suffixes, fallback): (Vec<String>, &str) = if typing {
+        (
+            vec![
+                " · TYPE — keys go to the session · Esc back to paging".into(),
+                " · TYPE".into(),
+            ],
+            "TYPE",
+        )
+    } else if view.available == 0 {
         let why = if alt_screen {
             // A full-screen application owns the grid; `vt100` gives the
             // alternate screen no scrollback, as every real terminal does.
@@ -111,27 +129,32 @@ pub(crate) fn scroll_bar_text(view: ScrollView, cols: usize, alt_screen: bool) -
             // nothing to page back to, and what the user wants is on screen.
             "no history: nothing has scrolled off this screen"
         };
-        vec![
-            format!("{position} · {why} · q live"),
-            format!("{position} · {why}"),
-            format!("{position} · no history · q live"),
-            format!("{position} · no history"),
-        ]
+        (
+            vec![
+                format!(" · {why} · q live"),
+                format!(" · {why}"),
+                " · no history · q live".into(),
+                " · no history".into(),
+                String::new(),
+            ],
+            "SCROLL · q",
+        )
     } else {
-        vec![
-            format!(
-                "{position} · PgUp/PgDn ↑↓ Home/End · q live · keys go here, not to the session"
-            ),
-            format!("{position} · PgUp/PgDn ↑↓ Home/End · q live"),
-            format!("{position} · q live"),
-        ]
+        (
+            vec![
+                " · PgUp/PgDn ↑↓ Home/End · q live · keys go here, not to the session".into(),
+                " · PgUp/PgDn ↑↓ Home/End · q live".into(),
+                " · q live".into(),
+                String::new(),
+            ],
+            "SCROLL · q",
+        )
     };
-    for candidate in candidates.into_iter().chain([position.clone()]) {
-        if terminal_display_width(&candidate) <= cols {
-            return pad_or_truncate(&sanitize_terminal_text(&candidate), cols);
-        }
-    }
-    pad_or_truncate(&sanitize_terminal_text("SCROLL · q"), cols)
+    fit_bar_text(
+        cols,
+        suffixes.iter().map(|suffix| format!("{position}{suffix}")),
+        fallback,
+    )
 }
 
 /// The bar row, drawn for scroll mode: no workload cursor restore (the
@@ -195,11 +218,12 @@ pub(crate) fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
     }
     seq.extend_from_slice(&frame);
     if geom.reserved {
-        let text = if ctx.scroll.is_typing() {
-            scroll_bar_typing_text(*view, geom.cols as usize)
-        } else {
-            scroll_bar_text(*view, geom.cols as usize, alt_screen)
-        };
+        let text = scroll_bar_text(
+            *view,
+            geom.cols as usize,
+            alt_screen,
+            ctx.scroll.is_typing(),
+        );
         seq.extend_from_slice(&scroll_bar_sequence(geom, &text));
         // Recorded against the same dirty-check `refresh_scroll_bar` reads,
         // so the status tick right after a navigation does not rewrite a row
@@ -254,11 +278,7 @@ pub(crate) fn refresh_scroll_bar(ctx: &StatusBarCtx) -> bool {
     // the next paint must compensate by, and the tick is the only writer
     // between paints when the user is only reading (`reanchor_view`).
     reanchor_view(&mut view, available);
-    let text = if typing {
-        scroll_bar_typing_text(*view, geom.cols as usize)
-    } else {
-        scroll_bar_text(*view, geom.cols as usize, alt_screen)
-    };
+    let text = scroll_bar_text(*view, geom.cols as usize, alt_screen, typing);
     drop(view);
     // Dirty-checked against the same `last_drawn` the live bar uses, so this
     // tick is a no-op in the common case *and* still repairs the row when
@@ -312,24 +332,6 @@ pub(crate) fn maintain_pager_bar(ctx: &StatusBarCtx) {
         flush_pending_layout(ctx);
     }
     refresh_scroll_bar(ctx);
-}
-
-/// The bar while type-through is active. The pager still owns the reserved
-/// row and its position readout stays honest, but the mode word and the hint
-/// change: the keyboard currently belongs to the session, and Esc is the way
-/// back to paging.
-pub(crate) fn scroll_bar_typing_text(view: ScrollView, cols: usize) -> String {
-    let full = format!(
-        "SCROLL {}/{} · TYPE — keys go to the session · Esc back to paging",
-        view.offset, view.available
-    );
-    if full.chars().count() <= cols {
-        full
-    } else if cols >= 14 {
-        format!("SCROLL {}/{} · TYPE", view.offset, view.available)
-    } else {
-        "TYPE".to_string()
-    }
 }
 
 /// Enter scroll mode and run the gesture that asked for it.
