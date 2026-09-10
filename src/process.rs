@@ -169,17 +169,28 @@ pub fn process_state(pid: u32) -> Result<char> {
 /// requiring a real process in a specific state -- the same split
 /// `direct_child_pids_in` uses.
 pub(crate) fn process_state_in(proc_root: &Path, pid: u32) -> Result<char> {
+    let (stat_path, after_comm) = proc_stat_after_comm(proc_root, pid)?;
+    after_comm
+        .split_whitespace()
+        .next()
+        .and_then(|state| state.chars().next())
+        .ok_or_else(|| anyhow!("malformed {}", stat_path.display()))
+}
+
+/// `<proc_root>/<pid>/stat` from field 3 (the state) onwards, with the
+/// file's path for error messages. The parenthesized comm field may itself
+/// contain spaces or `)`, so the fields after it are located from its final
+/// close-paren, never by a naive whitespace split of the whole line.
+fn proc_stat_after_comm(proc_root: &Path, pid: u32) -> Result<(PathBuf, String)> {
     let stat_path = proc_root.join(pid.to_string()).join("stat");
     let stat =
         fs::read_to_string(&stat_path).with_context(|| format!("read {}", stat_path.display()))?;
-    // The parenthesized comm field may itself contain spaces or `)`, so the
-    // state is the first token after its final close-paren, never field 3 of
-    // a naive whitespace split.
-    stat.rfind(')')
+    let after_comm = stat
+        .rfind(')')
         .and_then(|end| stat.get(end + 1..))
-        .and_then(|after_comm| after_comm.split_whitespace().next())
-        .and_then(|state| state.chars().next())
-        .ok_or_else(|| anyhow!("malformed {}", stat_path.display()))
+        .ok_or_else(|| anyhow!("malformed {}", stat_path.display()))?
+        .to_owned();
+    Ok((stat_path, after_comm))
 }
 
 /// Whether `pid` has exited but has not been reaped by its parent.
@@ -229,20 +240,20 @@ pub(crate) fn thread_group_holds_only_the_leader(proc_root: &Path, pid: u32) -> 
 /// clock ticks since boot. Combined with the pid, this distinguishes a
 /// persisted process from a later process that reused its numeric pid.
 pub fn process_start_time_ticks(pid: u32) -> Result<u64> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path).with_context(|| format!("read {stat_path}"))?;
-    // The parenthesized comm field may itself contain spaces or `)`, so split
-    // after its final close-paren rather than tokenizing the whole line.
-    let after_comm = stat
-        .rfind(')')
-        .and_then(|end| stat.get(end + 1..))
-        .ok_or_else(|| anyhow!("malformed {stat_path}"))?;
+    process_start_time_ticks_in(Path::new(crate::agent_kind::DEFAULT_PROC_ROOT), pid)
+}
+
+/// `process_start_time_ticks` against an arbitrary `/proc` root, the same
+/// split `process_state_in` has, so the field arithmetic can be pinned on a
+/// synthetic stat line.
+pub(crate) fn process_start_time_ticks_in(proc_root: &Path, pid: u32) -> Result<u64> {
+    let (stat_path, after_comm) = proc_stat_after_comm(proc_root, pid)?;
     after_comm
         .split_whitespace()
         .nth(19) // field 3 is index 0 here; starttime is field 22
-        .ok_or_else(|| anyhow!("{stat_path} has no process start time"))?
+        .ok_or_else(|| anyhow!("{} has no process start time", stat_path.display()))?
         .parse()
-        .with_context(|| format!("parse process start time from {stat_path}"))
+        .with_context(|| format!("parse process start time from {}", stat_path.display()))
 }
 
 pub(crate) fn linux_boot_id() -> Result<String> {

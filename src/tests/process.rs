@@ -104,6 +104,29 @@ fn zombie_detection_requires_an_empty_thread_group() {
     );
 }
 
+/// Field 22 of `/proc/<pid>/stat` is the start time, counted from the
+/// state field that follows the comm -- a comm with spaces and a `)` in
+/// it must not shift the count.
+#[test]
+fn process_start_time_is_field_22_after_the_comm() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("7");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("stat"),
+        "7 (od d) ba) S 1 7 7 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 987654 1000 2\n",
+    )
+    .unwrap();
+    assert_eq!(process_start_time_ticks_in(root.path(), 7).unwrap(), 987654);
+
+    fs::write(dir.join("stat"), "7 (short) S 1 7\n").unwrap();
+    let error = process_start_time_ticks_in(root.path(), 7).unwrap_err();
+    assert!(
+        error.to_string().contains("no process start time"),
+        "{error:#}"
+    );
+}
+
 /// A persisted worker pid is fed straight to these probes. Pid 0 asks
 /// `kill(2)` about the caller's own process group and a pid above
 /// `i32::MAX` wraps to a negative `pid_t`, so both used to answer "alive"
