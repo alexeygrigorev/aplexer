@@ -88,6 +88,8 @@ mod switching;
 mod system;
 #[path = "terminal.rs"]
 mod terminal;
+#[path = "terminal_status.rs"]
+mod terminal_status;
 
 pub(crate) use attach::*;
 pub(crate) use attach_input::*;
@@ -120,6 +122,7 @@ pub(crate) use switch_targets::*;
 pub(crate) use switching::*;
 pub(crate) use system::*;
 pub(crate) use terminal::*;
+pub(crate) use terminal_status::*;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
