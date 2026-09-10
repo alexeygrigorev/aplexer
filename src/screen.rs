@@ -77,31 +77,15 @@ pub fn validate_size(rows: u16, cols: u16) -> Result<(u16, u16)> {
     Ok((rows, cols))
 }
 
-/// Byte-level parser states `MarginTracker` walks through. Deliberately not
-/// a general escape-sequence parser: only enough state to recognize `ESC c`
-/// (RIS) and `ESC [ ... r` (DECSTBM), with everything else falling straight
-/// back to `Ground`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarginParseState {
-    Ground,
-    Esc,
-    Csi,
-}
-
-/// Cap on how many parameter bytes a single CSI sequence's digits/`;` may
-/// accumulate to before this tracker gives up on it (docs/terminal-state-design.md
-/// section 5.4: "Param buffer capped (32 bytes; overflow => discard sequence
-/// unparsed)").
-const MARGIN_PARAM_CAP: usize = 32;
-
 /// Recovers the one piece of terminal state `vt100::Screen` parses during
 /// `process()` but neither exposes nor re-emits in `state_formatted()`: the
 /// current DECSTBM scroll region (docs/terminal-state-design.md section
 /// 5.4).
 ///
-/// A byte state machine whose state lives in `self`, so a sequence split
-/// across two PTY reads is handled by construction. It recognizes exactly
-/// three shapes and passes everything else through unexamined:
+/// Built on `StreamBoundary`'s scanner (state lives in `self`, so a
+/// sequence split across two PTY reads is handled by construction) and
+/// interprets exactly three of the sequences it reports, passing everything
+/// else through unexamined:
 ///
 /// - `ESC c` (RIS): margins reset to full-screen, reported as
 ///   `margins_reset`.
@@ -127,12 +111,10 @@ const MARGIN_PARAM_CAP: usize = 32;
 #[derive(Debug, Clone)]
 pub struct MarginTracker {
     rows: u16,
-    state: MarginParseState,
-    param_buf: Vec<u8>,
-    /// Set when this CSI sequence has a private marker or an intermediate
-    /// byte, which disqualifies it from being the bare `CSI params r` this
-    /// tracker recognizes.
-    disqualified: bool,
+    /// The scanner this tracker reads `RIS`/`DECSTBM`/`ED` out of -- and,
+    /// through `boundary()`, the stream's boundary state for everyone else,
+    /// so a single pass over the bytes serves both.
+    scanner: StreamBoundary,
     /// Current scroll region as *tracked*, 1-based inclusive `(top, bottom)`;
     /// `None` means full-screen (the default, and the common case).
     ///
@@ -160,12 +142,15 @@ impl MarginTracker {
     pub fn new(rows: u16) -> Self {
         Self {
             rows: rows.max(1),
-            state: MarginParseState::Ground,
-            param_buf: Vec::new(),
-            disqualified: false,
+            scanner: StreamBoundary::new(),
             region: None,
             subregion_seen: false,
         }
+    }
+
+    /// The stream's boundary state, as of the last byte scanned.
+    pub fn boundary(&self) -> &StreamBoundary {
+        &self.scanner
     }
 
     /// The current scroll region as it should be **emitted**: a proper
@@ -215,9 +200,7 @@ impl MarginTracker {
     /// session's scroll region would apply it to the new one.
     pub fn reset(&mut self) {
         self.region = None;
-        self.state = MarginParseState::Ground;
-        self.param_buf.clear();
-        self.disqualified = false;
+        self.scanner.reset();
         self.subregion_seen = false;
     }
 
@@ -337,110 +320,66 @@ impl MarginTracker {
     /// status-bar reservation) -- see design doc section 7 and `CsiEvent`.
     pub fn scan(&mut self, data: &[u8]) -> CsiEvent {
         let mut result = CsiEvent::default();
-        for &byte in data {
-            let event = self.step(byte);
+        let Self {
+            rows,
+            scanner,
+            region,
+            subregion_seen,
+        } = self;
+        scanner.feed_with(data, |sequence| {
+            let event = Self::apply(*rows, region, subregion_seen, sequence);
             result.margins_reset |= event.margins_reset;
             result.erase |= event.erase;
-        }
+        });
         result
     }
 
-    fn step(&mut self, byte: u8) -> CsiEvent {
-        // Like `vte`: `ESC` abandons whatever is in flight and starts a new
-        // sequence, `CAN`/`SUB` abandon it and return to ground.
-        match byte {
-            0x1b => {
-                self.state = MarginParseState::Esc;
-                return CsiEvent::default();
+    /// Fold one complete sequence into the tracked region. Takes the fields
+    /// rather than `self` because it runs inside `scanner`'s callback.
+    fn apply(
+        rows: u16,
+        region: &mut Option<(u16, u16)>,
+        subregion_seen: &mut bool,
+        sequence: Sequence<'_>,
+    ) -> CsiEvent {
+        let reset = CsiEvent {
+            margins_reset: true,
+            erase: false,
+        };
+        let params = match sequence {
+            Sequence::Esc(b'c') => {
+                *region = None;
+                return reset;
             }
-            0x18 | 0x1a => {
-                self.state = MarginParseState::Ground;
-                return CsiEvent::default();
+            // Erase in Display -- see the type's doc comment: unconditional,
+            // whatever the parameter or private marker.
+            Sequence::Csi {
+                final_byte: b'J', ..
+            } => {
+                return CsiEvent {
+                    margins_reset: false,
+                    erase: true,
+                }
             }
-            _ => {}
-        }
-        match self.state {
-            MarginParseState::Ground => CsiEvent::default(),
-            MarginParseState::Esc => match byte {
-                b'c' => {
-                    self.state = MarginParseState::Ground;
-                    self.region = None;
-                    CsiEvent {
-                        margins_reset: true,
-                        erase: false,
-                    }
-                }
-                b'[' => {
-                    self.state = MarginParseState::Csi;
-                    self.param_buf.clear();
-                    self.disqualified = false;
-                    CsiEvent::default()
-                }
-                _ => {
-                    // Not a sequence we track -- back to ground so the next
-                    // byte is processed fresh.
-                    self.state = MarginParseState::Ground;
-                    CsiEvent::default()
-                }
-            },
-            MarginParseState::Csi => match byte {
-                b'0'..=b'9' | b';' | b':' => {
-                    if self.param_buf.len() >= MARGIN_PARAM_CAP {
-                        // Overflow: discard this sequence unparsed.
-                        self.state = MarginParseState::Ground;
-                    } else {
-                        self.param_buf.push(byte);
-                    }
-                    CsiEvent::default()
-                }
-                b'?' | b'<' | b'=' | b'>' => {
-                    self.disqualified = true;
-                    CsiEvent::default()
-                }
-                0x20..=0x2f => {
-                    // Intermediate byte.
-                    self.disqualified = true;
-                    CsiEvent::default()
-                }
-                0x40..=0x7e => {
-                    let event = self.finish_csi(byte);
-                    self.state = MarginParseState::Ground;
-                    event
-                }
-                _ => CsiEvent::default(),
-            },
-        }
-    }
-
-    /// `final_byte` is the CSI sequence's terminating byte. Returns the
-    /// triggers this sequence caused, if any.
-    fn finish_csi(&mut self, final_byte: u8) -> CsiEvent {
-        if final_byte == b'J' {
-            // Erase in Display -- see `CsiEvent::erase`'s doc comment above:
-            // unconditional, regardless of Ps or `disqualified`.
-            return CsiEvent {
-                margins_reset: false,
-                erase: true,
-            };
-        }
-        if final_byte != b'r' || self.disqualified {
-            return CsiEvent::default();
-        }
-        let (top, bottom) = decstbm_params(&self.param_buf, self.rows);
+            Sequence::Csi {
+                params,
+                final_byte: b'r',
+                plain: true,
+            } => params,
+            _ => return CsiEvent::default(),
+        };
+        let (top, bottom) = decstbm_params(params, rows);
         // `grid.rs::set_scroll_region`: the bottom is clamped to the screen
         // and only `top < bottom` sets a region; anything else is the full
         // screen (and homes the cursor, which `snapshot` re-fixes).
-        let bottom = bottom.min(self.rows);
-        if top < bottom && !(top == 1 && bottom == self.rows) {
-            self.region = Some((top, bottom));
-            self.subregion_seen = true;
+        let bottom = bottom.min(rows);
+        if top < bottom && !(top == 1 && bottom == rows) {
+            *region = Some((top, bottom));
+            *subregion_seen = true;
             CsiEvent::default()
         } else {
-            self.region = None;
-            CsiEvent {
-                margins_reset: true,
-                erase: false,
-            }
+            *region = None;
+            reset
         }
     }
 }
@@ -497,16 +436,12 @@ pub struct LayoutChange {
 
 /// The live per-session screen model: a `vt100::Parser` fed continuously by
 /// the worker's PTY reader, plus the `MarginTracker` that compensates for
-/// the one gap in what `vt100` exposes. See design doc sections 4-6.
+/// the one gap in what `vt100` exposes -- and whose scanner doubles as the
+/// stream's boundary tracker (`at_escape_boundary`), so every chunk is
+/// walked once besides the parse. See design doc sections 4-6.
 pub struct ScreenTracker {
     parser: vt100::Parser,
     margins: MarginTracker,
-    /// Whether the stream this tracker has consumed is currently between
-    /// escape sequences. `try_set_size` consults it before injecting the
-    /// synthetic scroll-up a shrink is compensated with: glued into a
-    /// half-received sequence it would corrupt the parse instead of fixing
-    /// the resize.
-    boundary: StreamBoundary,
     /// Last-observed `alternate_screen()` value, for flip detection.
     alt_screen: bool,
     /// Retained scrollback lines this tracker was built with, so a rebuild
@@ -559,7 +494,6 @@ impl ScreenTracker {
         Ok(Self {
             parser: vt100::Parser::new(rows, cols, scrollback),
             margins: MarginTracker::new(rows),
-            boundary: StreamBoundary::new(),
             alt_screen: false,
             scrollback,
         })
@@ -659,7 +593,6 @@ impl ScreenTracker {
     /// Feed PTY bytes; returns `Some(LayoutChange)` when the workload did
     /// something the attached client must react to.
     pub fn process(&mut self, data: &[u8]) -> Option<LayoutChange> {
-        self.boundary.feed(data);
         let csi = self.margins.scan(data);
         self.parser.process(data);
         let now_alt = self.parser.screen().alternate_screen();
@@ -677,21 +610,12 @@ impl ScreenTracker {
     }
 
     /// Replay bytes for their *history* only -- `ClientScreen::seed_history`'s
-    /// inner loop, and the one caller that is allowed to skip the margin
-    /// scan `process` does.
-    ///
-    /// Skipping it is not an optimization looking for a justification: the
-    /// seed strips every DECSTBM out of the tail before this sees it
-    /// (`without_scroll_regions`) and resets the tracker immediately
-    /// afterwards, so the scan is guaranteed to find nothing and its result
-    /// is guaranteed to be discarded. It is a second full pass over multiple
-    /// megabytes on the attach path, and the attach path is where it is least
-    /// affordable. `alt_screen` is still tracked, because the seed's epilogue
-    /// relies on it being current.
+    /// inner loop. `process` with the layout change dropped: the seed strips
+    /// every DECSTBM out of the tail first (`without_scroll_regions`) and
+    /// resets the margins afterwards, so there is nothing to report and
+    /// nobody to report it to.
     pub fn seed(&mut self, data: &[u8]) {
-        self.boundary.feed(data);
-        self.parser.process(data);
-        self.alt_screen = self.parser.screen().alternate_screen();
+        self.process(data);
     }
 
     /// Resizes the parser's grid (content-preserving) and re-fits the margin
@@ -720,15 +644,12 @@ impl ScreenTracker {
     /// and the next resize retries.
     pub fn try_set_size(&mut self, rows: u16, cols: u16) -> Result<()> {
         let (rows, cols) = validate_size(rows, cols)?;
-        if rows < self.rows()
-            && self.margins.margins().is_none()
-            && self.boundary.at_escape_boundary()
-        {
+        if rows < self.rows() && self.margins.margins().is_none() && self.at_escape_boundary() {
             let (cursor_row, _) = self.cursor_position();
             let excess = i32::from(cursor_row) - i32::from(rows) + 1;
             if excess > 0 {
                 let su = format!("\x1b[{excess}S").into_bytes();
-                self.boundary.feed(&su);
+                self.margins.scan(&su);
                 self.parser.process(&su);
             }
         }
@@ -784,12 +705,28 @@ impl ScreenTracker {
 
     /// Forget any tracked DECSTBM sub-range and any half-parsed sequence,
     /// without touching the grid. Used after `ClientScreen::seed_history`
-    /// replays a raw tail, whose trailing state was never this client's --
-    /// which is also why the boundary tracker is reset here: the tail's
-    /// mid-sequence ending was the log's, not the live stream's.
+    /// replays a raw tail, whose trailing state was never this client's:
+    /// the tail's mid-sequence ending was the log's, not the live stream's.
     pub fn reset_margins(&mut self) {
         self.margins.reset();
-        self.boundary.reset();
+    }
+
+    /// True when the stream this tracker has consumed is between complete
+    /// sequences and characters -- `StreamBoundary::at_escape_boundary`.
+    pub fn at_escape_boundary(&self) -> bool {
+        self.margins.boundary().at_escape_boundary()
+    }
+
+    /// True while the workload has an unclosed `CSI ? 2026 h` frame --
+    /// `StreamBoundary::in_synchronized_update`.
+    pub fn in_synchronized_update(&self) -> bool {
+        self.margins.boundary().in_synchronized_update()
+    }
+
+    /// How many leading bytes of `data` the stream needs before it is back
+    /// at a boundary -- `StreamBoundary::bytes_to_ground`.
+    pub fn bytes_to_ground(&self, data: &[u8]) -> usize {
+        self.margins.boundary().bytes_to_ground(data)
     }
 
     /// Whether a DECSTBM sub-range has been seen since this tracker's margins
@@ -851,28 +788,29 @@ impl ScreenTracker {
 }
 
 /// Where in an escape sequence (or a multi-byte UTF-8 character) a relayed
-/// byte stream currently sits, plus how deeply nested it is inside a
-/// synchronized-output block.
+/// byte stream currently sits, how deeply nested it is inside a
+/// synchronized-output block, and which `ESC`/`CSI` sequences it has just
+/// completed.
 ///
-/// This exists for one reason: `a attach` is a raw byte relay, and the
-/// status bar interjects its own bytes into that relay. A PTY read boundary
-/// lands at an arbitrary byte offset, so "between two chunks" is emphatically
-/// **not** "between two escape sequences" -- measured against a real
-/// continuously-streaming TUI workload, 5 of 10 status-bar redraws were
-/// spliced into the middle of an unterminated `CSI` sequence
-/// (`...\x1b[38;5;` + our redraw + `91m...`). The host terminal's parser
-/// abandons the partial sequence when our `ESC` arrives, and the workload's
-/// remaining parameter bytes are then printed as literal text into its own
-/// frame -- which is exactly the reported corruption (stray digit/letter
-/// runs welded into rows, everything after them shifted along the row).
-/// Splitting a multi-byte UTF-8 character is the same failure with a
-/// replacement glyph instead of digits.
+/// This exists because `a attach` is a raw byte relay and the status bar
+/// interjects its own bytes into that relay. A PTY read boundary lands at
+/// an arbitrary byte offset, so "between two chunks" is not "between two
+/// escape sequences": measured against a real continuously-streaming TUI,
+/// 5 of 10 status-bar redraws were spliced into the middle of an
+/// unterminated `CSI` (`...\x1b[38;5;` + our redraw + `91m...`), and the
+/// host terminal then printed the workload's remaining parameter bytes as
+/// text into its own frame. Splitting a multi-byte UTF-8 character is the
+/// same failure with a replacement glyph instead of digits. So the client
+/// asks this type "is the stream at a boundary where an injection is
+/// invisible?" before writing anything of its own.
 ///
-/// So the client asks this type "is the stream at a boundary where an
-/// injection is invisible?" before writing anything of its own. Deliberately
-/// a boundary recognizer, not a parser: it never interprets a sequence's
-/// meaning, only where one begins and ends.
-#[derive(Debug, Clone)]
+/// A boundary recognizer, not a parser: it follows `vte`'s transitions --
+/// what opens a sequence, what ends it, what aborts it -- so it agrees with
+/// the `vt100` model about where sequences are, but never interprets one.
+/// The consumers that do (`MarginTracker`) take the completed sequences
+/// from `feed_with`. `Copy` with a fixed parameter buffer, so
+/// `bytes_to_ground` can probe a copy without allocating on the relay path.
+#[derive(Debug, Clone, Copy)]
 pub struct StreamBoundary {
     state: BoundaryState,
     /// UTF-8 continuation bytes still expected for the character in flight.
@@ -883,9 +821,16 @@ pub struct StreamBoundary {
     /// issue #5 -- is telling us precisely where its frame boundaries are,
     /// for free.
     sync_depth: u16,
-    /// Private marker + parameter bytes of the CSI in flight, capped; only
-    /// used to recognize `?2026h`/`?2026l`.
-    csi_params: Vec<u8>,
+    /// Private-marker, parameter and intermediate bytes (`0x20..=0x3f`) of
+    /// the CSI in flight -- the first `CSI_PARAM_CAP` of them.
+    params: [u8; CSI_PARAM_CAP],
+    params_len: u8,
+    /// The CSI in flight is a bare `Ps;Ps...` list: no private marker, no
+    /// intermediate byte, and short enough to have been kept whole.
+    csi_plain: bool,
+    /// The `ESC` in flight has collected an intermediate byte (`ESC ( B`),
+    /// so its final byte does not make a bare `ESC c`-shaped sequence.
+    esc_intermediate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -896,7 +841,7 @@ enum BoundaryState {
     /// `ESC [` seen; consuming parameter/intermediate bytes.
     Csi,
     /// Inside an `OSC`/`DCS`/`SOS`/`PM`/`APC` string. `ESC` ends it (the
-    /// `\` of an `ST` is then an ordinary `ESC` final byte), as does `BEL`
+    /// `\\` of an `ST` is then an ordinary `ESC` final byte), as does `BEL`
     /// for an `OSC` -- `vte`'s transitions, so the model and this recognizer
     /// agree on where the string stops.
     Str {
@@ -904,9 +849,29 @@ enum BoundaryState {
     },
 }
 
-/// Cap on the CSI parameter bytes retained for `?2026` recognition. `?2026`
-/// is 5 bytes; anything longer cannot be it.
-const BOUNDARY_PARAM_CAP: usize = 8;
+/// Cap on the CSI parameter bytes kept for a sequence's consumers
+/// (docs/terminal-state-design.md section 5.4: "Param buffer capped (32
+/// bytes; overflow => discard sequence unparsed)"). A longer sequence still
+/// ends where it ends -- the boundary is tracked regardless -- but is
+/// reported as not `plain`.
+const CSI_PARAM_CAP: usize = 32;
+
+/// A complete `ESC` or `CSI` sequence `StreamBoundary::feed_with` has just
+/// consumed, in the shape its consumers match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sequence<'a> {
+    /// `ESC final` with no intermediate byte: `ESC c` (RIS), `ESC E` (NEL),
+    /// `ESC 7` -- but not `ESC ( B`.
+    Esc(u8),
+    /// `ESC [ params final`. `plain` is false when a private marker, an
+    /// intermediate byte or an over-long parameter list means `params` is
+    /// not a bare `Ps;Ps...` list to be read.
+    Csi {
+        params: &'a [u8],
+        final_byte: u8,
+        plain: bool,
+    },
+}
 
 impl Default for StreamBoundary {
     fn default() -> Self {
@@ -920,7 +885,10 @@ impl StreamBoundary {
             state: BoundaryState::Ground,
             utf8_remaining: 0,
             sync_depth: 0,
-            csi_params: Vec::new(),
+            params: [0; CSI_PARAM_CAP],
+            params_len: 0,
+            csi_plain: true,
+            esc_intermediate: false,
         }
     }
 
@@ -928,10 +896,7 @@ impl StreamBoundary {
     /// session's bytes are a different stream and cannot continue this one's
     /// half-parsed sequence or synchronized-output block.
     pub fn reset(&mut self) {
-        self.state = BoundaryState::Ground;
-        self.utf8_remaining = 0;
-        self.sync_depth = 0;
-        self.csi_params.clear();
+        *self = Self::new();
     }
 
     /// True when the stream is between complete sequences and characters --
@@ -948,8 +913,16 @@ impl StreamBoundary {
     }
 
     pub fn feed(&mut self, data: &[u8]) {
+        self.feed_with(data, |_| {});
+    }
+
+    /// Feed bytes, handing every `ESC`/`CSI` sequence that completes inside
+    /// them to `on_sequence`, in order.
+    pub(crate) fn feed_with(&mut self, data: &[u8], mut on_sequence: impl FnMut(Sequence<'_>)) {
         for &byte in data {
-            self.step(byte);
+            if let Some(sequence) = self.step(byte) {
+                on_sequence(sequence);
+            }
         }
     }
 
@@ -961,10 +934,10 @@ impl StreamBoundary {
     /// sequence to the model in **one** `process` call instead of walking it
     /// a byte at a time, while still guaranteeing that the model's cursor is
     /// re-read at every point where a printable character could actually be
-    /// printed. Deliberately a probe over a clone of the state machine rather
-    /// than a second, subtly-different recognizer.
+    /// printed. A probe over a copy of the state machine rather than a
+    /// second, subtly-different recognizer.
     pub fn bytes_to_ground(&self, data: &[u8]) -> usize {
-        let mut probe = self.clone();
+        let mut probe = *self;
         for (n, &byte) in data.iter().enumerate() {
             probe.step(byte);
             if probe.at_escape_boundary() {
@@ -974,91 +947,117 @@ impl StreamBoundary {
         data.len()
     }
 
-    fn step(&mut self, byte: u8) {
-        // CAN/SUB abort whatever is in flight, in every state.
-        if byte == 0x18 || byte == 0x1a {
-            self.state = BoundaryState::Ground;
-            self.utf8_remaining = 0;
-            self.csi_params.clear();
-            return;
+    fn step(&mut self, byte: u8) -> Option<Sequence<'_>> {
+        // `vte`'s "anywhere" transitions: `ESC` abandons whatever is in
+        // flight -- a half-parsed sequence, a control string, a partial
+        // character -- and starts a sequence; `CAN`/`SUB` abandon it and
+        // return to ground.
+        match byte {
+            0x1b => {
+                self.state = BoundaryState::Esc;
+                self.utf8_remaining = 0;
+                self.esc_intermediate = false;
+                return None;
+            }
+            0x18 | 0x1a => {
+                self.state = BoundaryState::Ground;
+                self.utf8_remaining = 0;
+                return None;
+            }
+            _ => {}
         }
         match self.state {
             BoundaryState::Ground => {
-                if self.utf8_remaining > 0 {
-                    if (0x80..0xc0).contains(&byte) {
-                        self.utf8_remaining -= 1;
-                    } else {
-                        // Malformed continuation: the host terminal gives up
-                        // on the character too, so this byte starts fresh.
-                        self.utf8_remaining = 0;
-                        self.start_ground(byte);
-                    }
-                } else {
-                    self.start_ground(byte);
+                if self.utf8_remaining > 0 && (0x80..0xc0).contains(&byte) {
+                    self.utf8_remaining -= 1;
+                    return None;
                 }
+                // A continuation that was not expected, or a lead byte where
+                // a continuation was: the host terminal gives up on the
+                // character too, so this byte starts fresh.
+                self.utf8_remaining = match byte {
+                    0xc2..=0xdf => 1,
+                    0xe0..=0xef => 2,
+                    0xf0..=0xf4 => 3,
+                    _ => 0,
+                };
+                None
             }
             BoundaryState::Esc => match byte {
-                0x1b => {}
-                b'[' => {
-                    self.state = BoundaryState::Csi;
-                    self.csi_params.clear();
-                }
-                b']' => self.state = BoundaryState::Str { osc: true },
-                b'P' | b'X' | b'^' | b'_' => self.state = BoundaryState::Str { osc: false },
                 // Intermediate bytes keep the escape sequence open.
-                0x20..=0x2f => {}
-                _ => self.state = BoundaryState::Ground,
-            },
-            BoundaryState::Csi => {
-                if (0x40..=0x7e).contains(&byte) {
-                    self.finish_csi(byte);
+                0x20..=0x2f => {
+                    self.esc_intermediate = true;
+                    None
+                }
+                b'[' if !self.esc_intermediate => {
+                    self.state = BoundaryState::Csi;
+                    self.params_len = 0;
+                    self.csi_plain = true;
+                    None
+                }
+                b']' if !self.esc_intermediate => {
+                    self.state = BoundaryState::Str { osc: true };
+                    None
+                }
+                b'P' | b'X' | b'^' | b'_' if !self.esc_intermediate => {
+                    self.state = BoundaryState::Str { osc: false };
+                    None
+                }
+                0x30..=0x7e => {
                     self.state = BoundaryState::Ground;
-                } else if byte == 0x1b {
-                    self.state = BoundaryState::Esc;
-                    self.csi_params.clear();
-                } else {
-                    if self.csi_params.len() < BOUNDARY_PARAM_CAP {
-                        self.csi_params.push(byte);
-                    } else {
-                        // Too long to be `?2026`; keep consuming, stop
-                        // recording (and make sure a truncated prefix can
-                        // never be mistaken for one).
-                        self.csi_params.push(b'x');
-                        self.csi_params.remove(0);
-                    }
+                    (!self.esc_intermediate).then_some(Sequence::Esc(byte))
                 }
-            }
+                // C0 controls execute without closing the sequence; DEL and
+                // high bytes are ignored.
+                _ => None,
+            },
+            BoundaryState::Csi => match byte {
+                0x40..=0x7e => {
+                    self.state = BoundaryState::Ground;
+                    Some(self.finish_csi(byte))
+                }
+                0x20..=0x3f => {
+                    self.record_param(byte);
+                    None
+                }
+                _ => None,
+            },
             BoundaryState::Str { osc } => {
-                if (osc && byte == 0x07) || byte == 0x1b {
-                    self.state = if byte == 0x1b {
-                        BoundaryState::Esc
-                    } else {
-                        BoundaryState::Ground
-                    };
+                if osc && byte == 0x07 {
+                    self.state = BoundaryState::Ground;
                 }
+                None
             }
         }
     }
 
-    fn start_ground(&mut self, byte: u8) {
-        match byte {
-            0x1b => self.state = BoundaryState::Esc,
-            0xc2..=0xdf => self.utf8_remaining = 1,
-            0xe0..=0xef => self.utf8_remaining = 2,
-            0xf0..=0xf4 => self.utf8_remaining = 3,
-            _ => {}
+    fn record_param(&mut self, byte: u8) {
+        let len = usize::from(self.params_len);
+        if len == CSI_PARAM_CAP {
+            self.csi_plain = false;
+            return;
+        }
+        self.params[len] = byte;
+        self.params_len += 1;
+        if !matches!(byte, b'0'..=b'9' | b';' | b':') {
+            self.csi_plain = false;
         }
     }
 
-    fn finish_csi(&mut self, final_byte: u8) {
-        if self.csi_params == b"?2026" {
+    fn finish_csi(&mut self, final_byte: u8) -> Sequence<'_> {
+        let len = usize::from(self.params_len);
+        if &self.params[..len] == b"?2026" {
             match final_byte {
                 b'h' => self.sync_depth = self.sync_depth.saturating_add(1),
                 b'l' => self.sync_depth = self.sync_depth.saturating_sub(1),
                 _ => {}
             }
         }
-        self.csi_params.clear();
+        Sequence::Csi {
+            params: &self.params[..len],
+            final_byte,
+            plain: self.csi_plain,
+        }
     }
 }
 
@@ -1293,7 +1292,6 @@ fn without_scroll_regions(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// every row the workload can reach.
 pub struct ClientScreen {
     screen: ScreenTracker,
-    boundary: StreamBoundary,
     /// When set, bytes written to the host have alt-screen DECSET/DECRST
     /// stripped so the attach client can own the host's alternate screen.
     host_alt: Option<HostAltHold>,
@@ -1312,7 +1310,6 @@ impl ClientScreen {
     pub fn try_new_with_scrollback(rows: u16, cols: u16, scrollback: usize) -> Result<Self> {
         Ok(Self {
             screen: ScreenTracker::try_new_with_scrollback(rows, cols, scrollback)?,
-            boundary: StreamBoundary::new(),
             host_alt: None,
         })
     }
@@ -1333,8 +1330,8 @@ impl ClientScreen {
     /// allowed to leave state behind:
     ///
     /// - The tail can begin mid-escape-sequence (it is a byte-count slice of
-    ///   a log), so `StreamBoundary` is reset afterwards rather than being
-    ///   left holding a half-sequence that was never the workload's.
+    ///   a log), so the scanner is reset afterwards (`reset_margins`) rather
+    ///   than left holding a half-sequence that was never the workload's.
     /// - The epilogue leaves the primary grid selected, full-screen margins,
     ///   and a default pen, and `MarginTracker` is reset to match, so a
     ///   DECSTBM or `?1049h` that happened to be in force at the end of the
@@ -1350,7 +1347,6 @@ impl ClientScreen {
         self.screen.seed(&without_scroll_regions(data));
         self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
         self.screen.reset_margins();
-        self.boundary.reset();
     }
 
     /// Whether a DECSTBM sub-range has been seen since this client's history
@@ -1437,12 +1433,12 @@ impl ClientScreen {
         if candidate.scrollback_available() < self.scrollback_available() {
             return;
         }
+        // The candidate's tracker comes with its own scanner, reset after the
+        // seed (the tail can begin mid-escape-sequence, exactly as at attach)
+        // and at a boundary after the snapshot. The host-alt hold is
+        // untouched: the rebuild wrote nothing to the host, so what the hold
+        // tracks is still true.
         self.screen = candidate.screen;
-        // The tail can begin mid-escape-sequence, exactly as at attach
-        // (`seed_history` resets the copy it used; this one has not been
-        // near the seed). The host-alt hold is untouched: the rebuild wrote
-        // nothing to the host, so what the hold tracks is still true.
-        self.boundary.reset();
     }
 
     /// `ScreenTracker::scrolled_frame` -- the pager's view of the history,
@@ -1496,7 +1492,6 @@ impl ClientScreen {
     /// during a snapshot; the snapshot is itself an absolute repaint).
     pub fn feed(&mut self, data: &[u8]) {
         self.screen.process(data);
-        self.boundary.feed(data);
     }
 
     /// Feed a live PTY chunk and return the bytes the client should actually
@@ -1569,12 +1564,11 @@ impl ClientScreen {
     /// makes the model's cursor guaranteed-current at every byte that could
     /// wrap off that row.
     pub fn relay(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        if self.boundary.at_escape_boundary() && !self.exposed() && !data.contains(&0x1b) {
+        if self.screen.at_escape_boundary() && !self.exposed() && !data.contains(&0x1b) {
             // No `ESC` anywhere and a stream that is between sequences: this
             // chunk cannot set, reset or otherwise move a scroll region, so
             // the host keeps the client's own reservation for all of it and
             // (see above) cannot diverge. One bulk parse, no per-run walk.
-            self.boundary.feed(data);
             self.screen.process(data);
             return None;
         }
@@ -1609,17 +1603,16 @@ impl ClientScreen {
             let run = self.run_len(data, i);
             let end = i + run;
             let line_feed = run == 1 && matches!(data[i], b'\n' | 0x0b | 0x0c);
-            let sequence = data[i] == 0x1b || !self.boundary.at_escape_boundary();
+            let sequence = data[i] == 0x1b || !self.screen.at_escape_boundary();
             let final_byte = data[end - 1];
             let exposed = self.exposed();
             let before_row = self.screen.cursor_position().0;
             let change = self.screen.process(&data[i..end]);
-            self.boundary.feed(&data[i..end]);
             i = end;
 
             let last_row = self.last_row();
             let (row, col) = self.screen.cursor_position();
-            let at_boundary = self.boundary.at_escape_boundary();
+            let at_boundary = self.screen.at_escape_boundary();
 
             // Mechanisms 1 and 4: the model clamped on its last row where the
             // host, one row taller, walked onto the reserved row.
@@ -1694,7 +1687,7 @@ impl ClientScreen {
     /// scroll region -- `vt100` reports the pending-wrap state as a cursor
     /// column equal to the screen width.
     fn wrap_would_walk(&self, byte: u8) -> bool {
-        if byte < 0x20 || byte == 0x7f || !self.boundary.at_escape_boundary() || !self.exposed() {
+        if byte < 0x20 || byte == 0x7f || !self.screen.at_escape_boundary() || !self.exposed() {
             return false;
         }
         let (row, col) = self.screen.cursor_position();
@@ -1719,8 +1712,8 @@ impl ClientScreen {
         if matches!(byte, b'\n' | 0x0b | 0x0c) {
             return 1;
         }
-        if byte == 0x1b || !self.boundary.at_escape_boundary() {
-            return self.boundary.bytes_to_ground(&data[i..]).max(1);
+        if byte == 0x1b || !self.screen.at_escape_boundary() {
+            return self.screen.bytes_to_ground(&data[i..]).max(1);
         }
         // A printable run cannot change the margins (that needs an `ESC`,
         // which ends the run), so when the last row is not exposed there is
@@ -1778,7 +1771,6 @@ impl ClientScreen {
         if let Ok(fresh) = ScreenTracker::try_new_with_scrollback(rows, cols, scrollback) {
             self.screen = fresh;
         }
-        self.boundary.reset();
         if let Some(hold) = self.host_alt.as_mut() {
             hold.reset();
         }
@@ -1792,7 +1784,7 @@ impl ClientScreen {
     /// between complete escape sequences and characters. This is a hard
     /// requirement -- injecting anywhere else corrupts the workload's frame.
     pub fn at_escape_boundary(&self) -> bool {
-        self.boundary.at_escape_boundary()
+        self.screen.at_escape_boundary()
     }
 
     /// True while the workload is part-way through a synchronized-output
@@ -1801,7 +1793,7 @@ impl ClientScreen {
     /// but a workload that never closes one must not be able to starve the
     /// bar forever (see `STATUS_BAR_SYNC_DEFER_LIMIT` in `src/bin/a.rs`).
     pub fn in_synchronized_update(&self) -> bool {
-        self.boundary.in_synchronized_update()
+        self.screen.in_synchronized_update()
     }
 
     pub fn cursor_restore(&self) -> Vec<u8> {
