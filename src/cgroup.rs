@@ -1019,6 +1019,35 @@ pub(crate) fn reap_helper_child_async(mut child: std::process::Child) {
     });
 }
 
+/// Give up on a helper: kill it, reap it off the critical path (see
+/// `reap_helper_child_async`), and hand back `error`.
+fn abandon_helper<T>(mut child: std::process::Child, error: anyhow::Error) -> Result<T> {
+    let _ = child.kill();
+    reap_helper_child_async(child);
+    Err(error)
+}
+
+/// Move everything currently readable from a nonblocking `reader` into
+/// `buffer`: `Ok(true)` at EOF, `Ok(false)` once a read would block, and an
+/// error if the total ever exceeds `limit` bytes.
+fn drain_nonblocking(reader: &mut impl Read, buffer: &mut Vec<u8>, limit: usize) -> Result<bool> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+                if buffer.len() > limit {
+                    bail!("output exceeds {} KiB", limit / 1024);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// Run a small setup query without allowing a wedged helper to defeat the
 /// caller's wall-clock timeout. Stdout is intentionally bounded: systemctl's
 /// ControlGroup value is one short path, and anything larger is malformed.
@@ -1039,63 +1068,39 @@ pub(crate) fn command_output_until(
     // descendant reaper.
     let helper_pid = child.id();
     crate::worker::own_child_pid(helper_pid);
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("{operation} helper has no stdout"))?;
-    let flags = unsafe { libc::fcntl(child_stdout.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe {
-            libc::fcntl(
-                child_stdout.as_raw_fd(),
-                libc::F_SETFL,
-                flags | libc::O_NONBLOCK,
-            )
-        } < 0
-    {
-        let error = io::Error::last_os_error();
-        let _ = child.kill();
-        reap_helper_child_async(child);
-        return Err(error).with_context(|| format!("make {operation} output nonblocking"));
+    let Some(mut child_stdout) = child.stdout.take() else {
+        return abandon_helper(child, anyhow!("{operation} helper has no stdout"));
+    };
+    let fd = child_stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let error = anyhow::Error::from(io::Error::last_os_error());
+        return abandon_helper(
+            child,
+            error.context(format!("make {operation} output nonblocking")),
+        );
     }
     let mut stdout = Vec::new();
     let mut stdout_eof = false;
     let mut status = None;
     loop {
-        loop {
-            let mut buffer = [0_u8; 4096];
-            match child_stdout.read(&mut buffer) {
-                Ok(0) => {
-                    stdout_eof = true;
-                    break;
-                }
-                Ok(count) => {
-                    stdout.extend_from_slice(&buffer[..count]);
-                    if stdout.len() > 64 * 1024 {
-                        let _ = child.kill();
-                        reap_helper_child_async(child);
-                        bail!("output from {operation} exceeds 64 KiB");
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    let _ = child.kill();
-                    reap_helper_child_async(child);
-                    return Err(error).with_context(|| format!("read output from {operation}"));
-                }
+        match drain_nonblocking(&mut child_stdout, &mut stdout, 64 * 1024) {
+            Ok(eof) => stdout_eof |= eof,
+            Err(error) => {
+                return abandon_helper(
+                    child,
+                    error.context(format!("read output from {operation}")),
+                )
             }
         }
-
         if status.is_none() {
             match child.try_wait() {
                 Ok(Some(result)) => status = Some(result),
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    let _ = child.kill();
-                    reap_helper_child_async(child);
-                    return Err(error).with_context(|| format!("wait for {operation}"));
+                    let error = anyhow::Error::from(error);
+                    return abandon_helper(child, error.context(format!("wait for {operation}")));
                 }
             }
         }
@@ -1110,13 +1115,11 @@ pub(crate) fn command_output_until(
 
         if Instant::now() >= deadline {
             if status.is_none() {
-                let _ = child.kill();
                 // A helper stuck in uninterruptible sleep must not extend the
-                // startup deadline. Reap asynchronously once the kernel permits.
-                reap_helper_child_async(child);
-            } else {
-                crate::worker::disown_child_pid(helper_pid);
+                // startup deadline; abandoning reaps it once the kernel permits.
+                return abandon_helper(child, anyhow!("timed out waiting to {operation}"));
             }
+            crate::worker::disown_child_pid(helper_pid);
             bail!("timed out waiting to {operation}");
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
