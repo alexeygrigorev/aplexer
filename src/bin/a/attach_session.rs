@@ -239,6 +239,11 @@ fn apply_session_switch(
         );
     }
     if config.status_enabled {
+        // The cache belongs to the outgoing session. This is the one draw
+        // outside the status thread that fetches: the relay is idle here
+        // (B's first frame has not been read yet), and the alternative is a
+        // bar that fills in its siblings and memory a tick later.
+        refresh_live_status(&config.status);
         draw_status_bar(&config.status, true);
     }
 }

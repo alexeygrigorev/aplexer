@@ -13,6 +13,10 @@ pub(crate) struct StatusBarCtx {
     pub(crate) term: Arc<Mutex<TermGeom>>,
     pub(crate) paths: Paths,
     pub(crate) record: Arc<Mutex<SessionRecord>>,
+    /// The worker-side facts the bar shows (memory, foreground, reported
+    /// state, siblings), fetched by the status thread and rendered from by
+    /// everyone else -- see `LiveStatus` for why no render may fetch.
+    pub(crate) live: Arc<Mutex<LiveStatus>>,
     pub(crate) flash: Arc<Mutex<Option<(String, Instant)>>>,
     /// (text, rows, cols, workload margins) last actually written, so an
     /// unchanged bar isn't rewritten every debounce tick -- see
@@ -207,22 +211,24 @@ pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
+    // Nothing below leaves the process: the worker round-trip, the agent
+    // detection and the registry read all happened on the status thread
+    // (`LiveStatus`).
+    let live = cached_live_status(ctx, record.id);
     let home = env::var_os("HOME").map(PathBuf::from);
     let ws = display_workspace(&record.workspace, home.as_deref());
     let mut ep = match &record.profile {
         Some(p) => format!("{}/{}", record.engine, p),
         None => record.engine.clone(),
     };
-    let raw = live_status(&record);
+    let raw = live.raw;
     // Which agent is live in this session right now -- the same query-time
-    // detection every JSON surface carries (`api::record_agent`): one walk
-    // of this session's own, shallow process tree per bar refresh, cheap
-    // next to the Status round-trip the bar already pays. When it names the
-    // same program as the live foreground read, the foreground annotation
-    // steps aside -- `claude  shell -> claude` would say claude twice -- so
-    // an agent not in the foreground (claude running, vim in front) shows
-    // both facts: `claude  shell -> vim`.
-    let agent = extra_agent_label(&record, aplexer::api::record_agent(&record));
+    // detection every JSON surface carries (`api::record_agent`). When it
+    // names the same program as the live foreground read, the foreground
+    // annotation steps aside -- `claude  shell -> claude` would say claude
+    // twice -- so an agent not in the foreground (claude running, vim in
+    // front) shows both facts: `claude  shell -> vim`.
+    let agent = extra_agent_label(&record, live.agent);
     let foreground = raw
         .as_ref()
         .and_then(|raw| foreground_override(&record, raw))
@@ -232,7 +238,7 @@ pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
     }
     let agent_segment = agent.map(|name| format!("  {name}")).unwrap_or_default();
     let mem = raw.as_ref().and_then(|raw| memory_indicator(&record, raw));
-    let siblings = workspace_summary(ctx, &record);
+    let siblings = live.siblings;
     let state_record = overlay_reported_state(&record, raw.as_ref());
     let now = now_ms();
     let (state_word, _) = session_ui_state(&state_record, now);
@@ -341,12 +347,10 @@ pub(crate) fn draw_status_bar(ctx: &StatusBarCtx, force: bool) -> bool {
     // "safe" answer the status thread got is stale by the time its bytes go
     // out. See `write_locked` for the lock order this relies on.
     // Cheap pre-gate, before anything is rendered. The main frame loop calls
-    // this after *every* PTY chunk while a redraw is pending, and rendering
-    // the bar text reads session records off disk -- doing that per chunk
-    // under a streaming workload is a throughput cliff. The authoritative
-    // check is the one inside `status_bar_redraw_locked`, which runs under
-    // the stdout lock; this one only avoids the work when the answer is
-    // already known to be "not here".
+    // this after *every* PTY chunk while a redraw is pending; the
+    // authoritative check is the one inside `status_bar_redraw_locked`,
+    // which runs under the stdout lock, and this one only avoids the render
+    // when the answer is already known to be "not here".
     {
         let (at_boundary, in_sync) = {
             let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
@@ -451,9 +455,9 @@ pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> 
 }
 
 /// Geometry plus the rendered bar text, or `None` when the terminal has no
-/// reserved row. Deliberately computed *before* the stdout lock is taken:
-/// `status_bar_text` reads session records off disk, and the PTY relay must
-/// not block behind that.
+/// reserved row. Computed before the stdout lock is taken by convention:
+/// the text is a pure format of the record and the `LiveStatus` cache, so
+/// nothing here can block the PTY relay, but nothing needs the lock either.
 pub(crate) fn status_bar_render(ctx: &StatusBarCtx) -> Option<(TermGeom, String)> {
     let geom = match ctx.term.lock() {
         Ok(g) => *g,

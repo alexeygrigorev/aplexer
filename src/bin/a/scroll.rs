@@ -404,7 +404,6 @@ pub(crate) fn exit_scroll_mode(ctx: &StatusBarCtx) {
 /// `enter_typing` runs it before raising `typing` -- both orderings mean a
 /// relay chunk can only ever land on the view it belongs on.
 pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
-    // Reads session records off disk; must not happen under the stdout lock.
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let (snapshot, restore, margins) = {

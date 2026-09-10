@@ -15,14 +15,85 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// One `Operation::Status` round-trip per status-bar redraw, shared by the
-/// memory and foreground-command indicators below so a single bar refresh
-/// costs one worker round-trip, not one per indicator. `None` on any RPC
-/// failure (worker briefly unreachable) -- every indicator built from this
-/// just degrades to "omitted" in that case, same as before this was
-/// shared.
+/// One `Operation::Status` round-trip, shared by the memory and
+/// foreground-command indicators below so a refresh costs one worker
+/// round-trip, not one per indicator. `None` on any RPC failure (worker
+/// briefly unreachable) -- every indicator built from this just degrades to
+/// "omitted" in that case.
 pub(crate) fn live_status(record: &SessionRecord) -> Option<Value> {
     rpc_simple(record, Operation::Status, None).ok()
+}
+
+/// Everything a status-bar render needs that costs more than a `format!`:
+/// the worker's Status answer (a socket round-trip, up to
+/// `CONTROL_RPC_TIMEOUT` against a stalled worker), the detected agent (a
+/// `/proc` walk) and the sibling list (a registry read).
+///
+/// **Fetched on the status thread only** (`refresh_live_status`), at most
+/// once per `LIVE_STATUS_TTL`; every thread that draws the bar renders
+/// from the copy in `StatusBarCtx::live`. Rendering used to fetch all
+/// three itself, and the bar is rendered from the relay (every `Layout`
+/// event, every chunk while a redraw is parked) and from the input thread
+/// (a flash, the key overlay, the pager's exit) -- so a slow worker stalled
+/// keystrokes and relayed output for seconds at a time, and a `working`
+/// spinner cost a round-trip per 150 ms frame.
+#[derive(Clone, Default)]
+pub(crate) struct LiveStatus {
+    /// The session the facts were fetched for. A switch swaps
+    /// `StatusBarCtx::record` underneath the cache, and the new session
+    /// must not borrow the old one's memory, foreground or siblings.
+    pub(crate) session: Option<Uuid>,
+    pub(crate) raw: Option<Value>,
+    pub(crate) agent: Option<aplexer::agent_kind::AgentKind>,
+    pub(crate) siblings: String,
+    pub(crate) fetched_at: Option<Instant>,
+}
+
+/// How old the cached facts may be before the status thread fetches again.
+/// One second keeps the memory readout and a fresh `working` push visible
+/// within a beat while cutting the animating bar's round-trips from seven
+/// a second to one.
+pub(crate) const LIVE_STATUS_TTL: Duration = Duration::from_secs(1);
+
+/// Fetch the attached session's live facts into `ctx.live`. Blocking, so
+/// only the status thread and a session switch (where the relay is idle
+/// by construction) call it.
+pub(crate) fn refresh_live_status(ctx: &StatusBarCtx) {
+    let record = ctx
+        .record
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let fresh = LiveStatus {
+        session: Some(record.id),
+        raw: live_status(&record),
+        agent: aplexer::api::record_agent(&record),
+        siblings: workspace_summary(&ctx.paths, &record),
+        fetched_at: Some(Instant::now()),
+    };
+    *ctx.live.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
+}
+
+/// The cached facts for `session`, or none when the cache was fetched for
+/// another session (or never): every indicator then degrades to "omitted",
+/// exactly as a failed round-trip does.
+pub(crate) fn cached_live_status(ctx: &StatusBarCtx, session: Uuid) -> LiveStatus {
+    let live = ctx.live.lock().unwrap_or_else(PoisonError::into_inner);
+    if live.session == Some(session) {
+        live.clone()
+    } else {
+        LiveStatus::default()
+    }
+}
+
+/// Whether the next draw should fetch first.
+pub(crate) fn live_status_is_stale(ctx: &StatusBarCtx) -> bool {
+    let session = ctx.record.lock().unwrap_or_else(PoisonError::into_inner).id;
+    let live = ctx.live.lock().unwrap_or_else(PoisonError::into_inner);
+    live.session != Some(session)
+        || live
+            .fetched_at
+            .is_none_or(|fetched| fetched.elapsed() >= LIVE_STATUS_TTL)
 }
 
 /// The attached session's record as the state derivation should see it.
@@ -167,8 +238,8 @@ pub(crate) fn engine_label(
 /// makes sense as a complete index. Example: `1:main* 2:review
 /// 3:build(broken)`. A single-session workspace omits the segment (empty
 /// string), same as before.
-pub(crate) fn workspace_summary(ctx: &StatusBarCtx, record: &SessionRecord) -> String {
-    let records = match list_records(&ctx.paths) {
+pub(crate) fn workspace_summary(paths: &Paths, record: &SessionRecord) -> String {
+    let records = match list_records(paths) {
         Ok(r) => r,
         Err(_) => return String::new(),
     };

@@ -69,6 +69,7 @@ fn status_ctx_for_test(reserved: bool) -> StatusBarCtx {
             "t",
             Phase::Running,
         ))),
+        live: Arc::new(Mutex::new(LiveStatus::default())),
         flash: Arc::new(Mutex::new(None)),
         last_drawn: Arc::new(Mutex::new(None)),
         screen: Arc::new(Mutex::new(

@@ -235,6 +235,7 @@ fn status_bar_names_the_agent_running_in_a_shell_session() {
     let (sentinel, mut child) = spawn_fake_claude(dir.path());
     let ctx = status_ctx_for_test(true);
     ctx.record.lock().unwrap().workload_pid = Some(child.id());
+    refresh_live_status(&ctx);
 
     // Full layout: the agent sits between the state and the engine cell.
     let full = status_bar_text(&ctx, 256);
@@ -257,6 +258,7 @@ fn status_bar_does_not_repeat_an_agent_the_engine_already_names() {
         record.engine = "claude".to_string();
         record.workload_pid = Some(child.id());
     }
+    refresh_live_status(&ctx);
 
     let full = status_bar_text(&ctx, 256);
     assert!(full.contains("  claude  |  ^b ?"), "{full:?}");
@@ -264,6 +266,45 @@ fn status_bar_does_not_repeat_an_agent_the_engine_already_names() {
 
     fs::remove_file(&sentinel).unwrap();
     child.wait().unwrap();
+}
+
+/// The bar is rendered from the relay and the input thread, so a render
+/// must never wait on the worker: the status thread fetches into the
+/// cache, and everyone renders from it. A worker that accepts and then
+/// says nothing is the stall this guards against.
+#[test]
+fn bar_renders_from_the_cache_without_a_worker_round_trip() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("worker.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let connections = || {
+        let mut count = 0;
+        while listener.accept().is_ok() {
+            count += 1;
+        }
+        count
+    };
+    let ctx = status_ctx_for_test(true);
+    ctx.record.lock().unwrap().socket_path = socket;
+
+    assert!(live_status_is_stale(&ctx), "an empty cache is stale");
+    refresh_live_status(&ctx);
+    assert_eq!(connections(), 1, "the refresh is the one round-trip");
+    assert!(!live_status_is_stale(&ctx));
+
+    for cols in [40usize, 80, 256] {
+        status_bar_text(&ctx, cols);
+    }
+    status_bar_render(&ctx);
+    assert_eq!(connections(), 0, "a render must not talk to the worker");
+
+    // A switch swaps the record: the old session's facts are not the new
+    // session's, so the cache reads as stale and renders as empty.
+    ctx.record.lock().unwrap().id = Uuid::new_v4();
+    assert!(live_status_is_stale(&ctx));
+    let switched = ctx.record.lock().unwrap().id;
+    assert!(cached_live_status(&ctx, switched).session.is_none());
 }
 
 #[test]

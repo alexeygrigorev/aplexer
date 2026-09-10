@@ -164,7 +164,6 @@ pub(crate) fn paint_key_overlay(ctx: &StatusBarCtx) -> bool {
     let Some(lines) = key_overlay_lines(key_overlay_rows(geom) as usize, geom.cols as usize) else {
         return false;
     };
-    // Reads session records off disk; must not happen under the stdout lock.
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let snapshot = {
@@ -258,7 +257,6 @@ pub(crate) fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
     if !ctx.overlay.is_active() {
         return false;
     }
-    // Reads session records off disk; must not happen under the stdout lock.
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let (snapshot, restore, margins) = {

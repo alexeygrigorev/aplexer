@@ -117,6 +117,7 @@ pub(crate) fn attach(
         term: term.clone(),
         paths: paths.clone(),
         record: shared_record.clone(),
+        live: Arc::new(Mutex::new(LiveStatus::default())),
         flash: Arc::new(Mutex::new(None)),
         last_drawn: Arc::new(Mutex::new(None)),
         screen: workload_screen.clone(),

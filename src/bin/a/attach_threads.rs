@@ -147,6 +147,12 @@ fn run_status_loop(config: StatusThreadConfig) {
         let anim_due = animating || was_animating;
         was_animating = animating;
         if anim_due || (idle_for >= STATUS_BAR_IDLE_GAP && !drawn_for_current_idle) || overdue {
+            // The one place the worker is asked: before a draw this thread
+            // decided on, and only once the cache has aged out. An animating
+            // bar draws every tick and fetches once a second.
+            if live_status_is_stale(&config.status) {
+                refresh_live_status(&config.status);
+            }
             // A deferred write does not reset the deadline; the next safe
             // boundary must still get a real draw.
             if draw_status_bar(&config.status, overdue) {
@@ -157,11 +163,17 @@ fn run_status_loop(config: StatusThreadConfig) {
     }
 }
 
+/// Whether the bar's state glyph is a spinner right now -- judged from the
+/// same overlaid record `status_bar_text` renders, so a `working` push the
+/// worker received after attach animates rather than freezing until the
+/// next unrelated redraw.
 fn status_is_animating(status: &StatusBarCtx) -> bool {
     let record = status
         .record
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    spinner_frame(session_ui_state(&record, now_ms()).0, now_ms()).is_some()
+    let live = cached_live_status(status, record.id);
+    let state = overlay_reported_state(&record, live.raw.as_ref());
+    spinner_frame(session_ui_state(&state, now_ms()).0, now_ms()).is_some()
 }
