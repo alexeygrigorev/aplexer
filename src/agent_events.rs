@@ -640,13 +640,23 @@ fn grok_native_continuation(payload: &Value) -> Option<String> {
         .and_then(|p| str_field(p, "sessionId"))
 }
 
+/// `timestamp` may be seconds or milliseconds since the epoch; anything
+/// negative or overflowing is not a time and falls through.
+fn grok_epoch_ms(n: i64) -> Option<u64> {
+    let n = u64::try_from(n).ok()?;
+    if n < 10_000_000_000 {
+        n.checked_mul(1000)
+    } else {
+        Some(n)
+    }
+}
+
 fn grok_row_timestamp(payload: &Value) -> String {
-    if let Some(n) = payload.get("timestamp").and_then(|t| t.as_i64()) {
-        let ms = if n < 10_000_000_000 {
-            (n as u64) * 1000
-        } else {
-            n as u64
-        };
+    if let Some(ms) = payload
+        .get("timestamp")
+        .and_then(|t| t.as_i64())
+        .and_then(grok_epoch_ms)
+    {
         return iso8601_utc(ms);
     }
     if let Some(n) = payload
@@ -1914,5 +1924,23 @@ mod tests {
             .starts_with("discarded "));
         assert_eq!(events[1].content, "ok");
         assert_eq!(events[1].sequence, 1);
+    }
+
+    #[test]
+    fn grok_row_timestamp_rejects_negative_values() {
+        let seconds: Value = serde_json::from_str(r#"{"timestamp":1700000000}"#).unwrap();
+        assert_eq!(grok_row_timestamp(&seconds), iso8601_utc(1_700_000_000_000));
+        let millis: Value = serde_json::from_str(r#"{"timestamp":1700000000000}"#).unwrap();
+        assert_eq!(grok_row_timestamp(&millis), iso8601_utc(1_700_000_000_000));
+        let negative: Value = serde_json::from_str(
+            r#"{"timestamp":-5,"params":{"_meta":{"agentTimestampMs":1700000000000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_row_timestamp(&negative),
+            iso8601_utc(1_700_000_000_000)
+        );
+        let garbage: Value = serde_json::from_str(r#"{"timestamp":-9223372036854775808}"#).unwrap();
+        assert_eq!(grok_row_timestamp(&garbage), "");
     }
 }
