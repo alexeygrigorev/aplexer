@@ -650,12 +650,14 @@ impl Config {
         let selected_profile = profile_name
             .map(str::to_owned)
             .or_else(|| self.default_profile.clone());
-        let profile = selected_profile
-            .as_ref()
-            .and_then(|name| self.profiles.get(name));
-        if selected_profile.is_some() && profile.is_none() {
-            bail!("unknown profile {}", selected_profile.as_deref().unwrap());
-        }
+        let profile = match selected_profile.as_deref() {
+            Some(name) => Some(
+                self.profiles
+                    .get(name)
+                    .ok_or_else(|| anyhow!("unknown profile {name}"))?,
+            ),
+            None => None,
+        };
         let selected_engine = engine_name
             .map(str::to_owned)
             .or_else(|| profile.and_then(|p| p.engine.clone()))
@@ -665,50 +667,19 @@ impl Config {
             .engines
             .get(&selected_engine)
             .ok_or_else(|| anyhow!("unknown engine {selected_engine}"))?;
-        let direct_supplied = !direct.is_empty();
-        let mut command = if direct_supplied {
-            direct
-        } else if let Some(cmd) = profile.and_then(|p| p.command.clone()) {
-            cmd
-        } else {
-            let mut argv = engine.command.clone();
-            if let Some(exec) = profile.and_then(|p| p.executable.clone()) {
-                if argv.is_empty() {
-                    argv.push(exec);
-                } else {
-                    argv[0] = exec;
-                }
-            }
-            argv
-        };
+        let command = build_argv(direct, engine, profile);
         if command.is_empty() {
             bail!("engine {selected_engine} has no command");
-        }
-        if !direct_supplied {
-            if let Some(p) = profile {
-                if p.command.is_none() {
-                    command.extend(p.args.clone());
-                }
-            }
         }
         let mut merged_env = engine.env.clone();
         if let Some(p) = profile {
             merged_env.extend(p.env.clone());
         }
         merged_env.extend(env_overrides.clone());
-        let mut merged_limits = profile.map(|p| p.limits.clone()).unwrap_or_default();
-        if limits.memory_bytes.is_some() {
-            merged_limits.memory_bytes = limits.memory_bytes;
-        }
-        if limits.pids.is_some() {
-            merged_limits.pids = limits.pids;
-        }
-        if limits.cpu_quota_us.is_some() {
-            merged_limits.cpu_quota_us = limits.cpu_quota_us;
-        }
-        if limits.cpu_period_us.is_some() {
-            merged_limits.cpu_period_us = limits.cpu_period_us;
-        }
+        let merged_limits = merge_limits(
+            profile.map(|p| p.limits.clone()).unwrap_or_default(),
+            limits,
+        );
         validate_limits(&merged_limits, "resolved launch limits")?;
         let launch_cwd = cwd
             .map(Path::to_path_buf)
@@ -736,6 +707,42 @@ impl Config {
             limits: merged_limits,
             history_bytes,
         })
+    }
+}
+
+/// The launch argv before skip-permissions handling: an explicit `-- argv`
+/// verbatim; else the profile's whole `command`; else the engine's command
+/// with the profile's `executable` swapped into argv[0] and its `args`
+/// appended. (`validate` forbids an engine command without an argv[0].)
+fn build_argv(
+    direct: Vec<String>,
+    engine: &EngineConfig,
+    profile: Option<&ProfileConfig>,
+) -> Vec<String> {
+    if !direct.is_empty() {
+        return direct;
+    }
+    if let Some(command) = profile.and_then(|p| p.command.clone()) {
+        return command;
+    }
+    let mut argv = engine.command.clone();
+    if let Some(profile) = profile {
+        if let (Some(first), Some(executable)) = (argv.first_mut(), &profile.executable) {
+            *first = executable.clone();
+        }
+        argv.extend(profile.args.iter().cloned());
+    }
+    argv
+}
+
+/// `base` (the profile's limits) with every explicitly requested launch
+/// limit laid over it.
+fn merge_limits(base: Limits, overrides: &Limits) -> Limits {
+    Limits {
+        memory_bytes: overrides.memory_bytes.or(base.memory_bytes),
+        pids: overrides.pids.or(base.pids),
+        cpu_quota_us: overrides.cpu_quota_us.or(base.cpu_quota_us),
+        cpu_period_us: overrides.cpu_period_us.or(base.cpu_period_us),
     }
 }
 
