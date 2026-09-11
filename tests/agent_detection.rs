@@ -380,10 +380,9 @@ fn a_fake_zcodex_inside_a_shell_session_reports_the_codex_kind() {
     // surface that reports the agent.
     let row = harness.list_row(&id);
     assert_eq!(row["agent_profile"], Value::String("zcodex".into()));
-    let status: Value = serde_json::from_str(
-        &harness.run_ok(&["status", &id, "--json"], Duration::from_secs(10)),
-    )
-    .expect("status JSON");
+    let status: Value =
+        serde_json::from_str(&harness.run_ok(&["status", &id, "--json"], Duration::from_secs(10)))
+            .expect("status JSON");
     assert_eq!(status["agent_profile"], Value::String("zcodex".into()));
 
     harness.run_ok(
