@@ -1,19 +1,24 @@
-//! A stalled attached client must not be dropped by a flooding session.
+//! A stalled attached client must not be dropped by a flooding session --
+//! and a wedged one must not clog the worker forever.
 //!
 //! Reproduction of the "attach silently disconnects on busy codex sessions"
 //! class of report: the client's terminal (the pty this test plays) stops
 //! draining for a while -- a background tab, a slow link, a slept laptop --
 //! while the workload keeps producing. The worker's subscriber queue is
-//! coalesced exactly so this stays survivable, but when the client stops
-//! reading, the *socket* buffer (~200 KB) fills too, and a worker-side write
-//! deadline turns the stall into a disconnect: the writer thread's write()
-//! fails once no buffer space frees within CLIENT_IO_TIMEOUT, the worker
-//! closes the socket, and the client prints "Connection to ... lost." the
-//! moment its terminal wakes up.
+//! coalesced exactly so this stays survivable, and the streaming writer runs
+//! under a stall guard (`pump_output`'s `StallGuard`): writes use a tick-long
+//! SO_SNDTIMEO, and only a send queue that has not drained a single byte
+//! across ATTACH_STALL_TICKS consecutive ticks (a peer gone without a FIN,
+//! or a client wedged writing into a dead terminal) gets the attach closed.
+//! A merely slow or paused client always drains something within the window
+//! and is never dropped.
 //!
-//! The test floods the session, stalls the pty reader long enough for the
-//! socket to fill and the deadline to lapse, then resumes and requires the
-//! same attach to still be alive and still streaming live output.
+//! The first test floods the session, stalls the pty reader well short of
+//! the reap window, then resumes and requires the same attach to still be
+//! alive and still streaming live output. The second stalls past the window
+//! and requires the worker to reap the attach: the client exits with the
+//! connection-loss goodbye instead of the worker carrying a blocked writer
+//! thread (and its subscriber + connection slots) until the session ends.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -266,9 +271,15 @@ fn escape(bytes: &[u8]) -> String {
 }
 
 /// Long enough for the socket buffer (~200 KB at net.core.wmem_default) to
-/// fill behind the stalled client and the worker's 10 s client write deadline
-/// to lapse with the writer thread still blocked.
+/// fill behind the stalled client and the stall guard to count several
+/// barren ticks -- still far short of the reap window, so a survivor test
+/// never races it.
 const STALL: Duration = Duration::from_secs(18);
+
+/// The reap window is ATTACH_STALL_TICKS x ATTACH_STALL_TICK = 60s; stalling
+/// past it plus one margin means the worker must have reaped the attach by
+/// the time the client unblocks.
+const WEDGE: Duration = Duration::from_secs(80);
 
 #[test]
 fn stalled_client_survives_a_flooding_session_and_resumes_live_output() {
@@ -347,5 +358,63 @@ fn stalled_client_survives_a_flooding_session_and_resumes_live_output() {
         find_bytes(&out, b"Connection to").is_none(),
         "the client printed a connection-loss goodbye even though it survived:\n{}",
         escape(&out)
+    );
+}
+
+#[test]
+fn wedged_client_is_reaped_after_sustained_zero_drain() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("wedge");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_flood_session(&harness, &workspace, "wedge");
+    let _guard = SessionGuard {
+        harness: &harness,
+        id: id.clone(),
+    };
+
+    let mut client = StallablePtyClient::spawn(&harness, &id, 24, 80);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while last_marker(&client.output()).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the client never saw the flood; captured:\n{}",
+            escape(&client.output())
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Wedge the "terminal" past the reap window: the client wedges writing
+    // into the frozen pty, stops reading its socket, and the worker's stall
+    // guard must close the attach instead of carrying a blocked writer (and
+    // its subscriber + connection slots) until the session ends.
+    client.set_stalled(true);
+    thread::sleep(WEDGE);
+    client.set_stalled(false);
+
+    // Unfreezing drains the pty, the wedged write completes, and the next
+    // socket read sees the worker's shutdown: the client must exit on its
+    // own with the connection-loss goodbye (which the embedding client --
+    // PocketShell's reattach ladder -- already treats as "dial again").
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(_status) = client.try_wait() {
+            break;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "the worker never reaped the wedged attach; the client is still alive"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let out = client.output();
+    assert!(
+        find_bytes(&out, b"Connection to").is_some(),
+        "the reaped client did not report the connection loss; captured tail:\n{}",
+        escape(&{
+            let tail = out.len().saturating_sub(4096);
+            out[tail..].to_vec()
+        })
     );
 }
