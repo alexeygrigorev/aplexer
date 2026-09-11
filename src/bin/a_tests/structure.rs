@@ -47,7 +47,7 @@ const FUNNELLED_WRITERS: &[&str] = &[
     "redraw_live_screen",
     "paint_scroll_view",
     "refresh_scroll_bar",
-    "paint_live_screen",
+    "paint_live_screen_then",
     "sync_client_mouse",
     "paint_key_overlay",
 ];
@@ -319,7 +319,7 @@ fn scroll_mode_writes_are_the_only_stream_suspended_ones() {
         // Also the overlay's dismissal frame (`dismiss_key_overlay` calls
         // it), which can be the first write after the suspension whenever
         // nothing was repainted in between (a resize, say).
-        ("paint_live_screen", true),
+        ("paint_live_screen_then", true),
         // The overlay's own frame: always the first write after the
         // relay was suspended for it.
         ("paint_key_overlay", true),
@@ -358,6 +358,38 @@ fn scroll_mode_writes_are_the_only_stream_suspended_ones() {
             "`{name}` writes the first bytes after the relay is suspended, so it must lead \
                  with SCROLL_CANCEL (CAN) to end whatever escape sequence the host was \
                  part-way through -- that prefix is what makes skipping the boundary gate safe"
+        );
+    }
+}
+
+/// Leaving a modal used to paint, release stdout, *then* drop the flag
+/// `relay_to_terminal` checks under that lock. A chunk waiting on the lock
+/// fed the model, skipped the write, and the next Ink-style partial
+/// repaint welded onto a host one frame behind -- the "scroll up, come
+/// back, screen is garbled until detach" report. Every resume must flip
+/// its flag inside `paint_live_screen_then`'s stdout hold.
+#[test]
+fn modal_resume_flips_flags_inside_the_live_repaint_lock() {
+    let lines = production_source_lines();
+    for (name, flag) in [
+        ("exit_scroll_mode", "active.store(false"),
+        ("enter_typing", "typing.store(true"),
+        ("dismiss_key_overlay", "overlay.active.store(false"),
+    ] {
+        let body = top_level_fn_body(&lines, name);
+        assert!(
+            body.contains("paint_live_screen_then"),
+            "`{name}` must resume the live screen under the stdout lock the relay \
+                 checks, not paint and then flip `{flag}` after releasing it"
+        );
+        assert!(
+            body.contains(flag),
+            "`{name}` must still flip `{flag}`"
+        );
+        assert!(
+            !body.contains("paint_live_screen(ctx);"),
+            "`{name}` must not call `paint_live_screen` (that helper releases \
+                 stdout before the caller can flip `{flag}`)"
         );
     }
 }

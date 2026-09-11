@@ -242,15 +242,17 @@ pub(crate) fn show_key_overlay(ctx: &StatusBarCtx) -> bool {
 /// Take the overlay down, put the screen back, and let the relay resume.
 /// Returns whether there was an overlay to take down.
 ///
-/// The restore is `paint_live_screen` -- the same model repaint the pager's
-/// exit writes, for the same reason (see its doc comment) -- and it runs
-/// before `active` drops, so no chunk can land on the box.
+/// The restore is `paint_live_screen_then` -- the same model repaint the
+/// pager's exit writes, for the same reason (see its doc comment) -- and
+/// `active` drops under that paint's stdout lock, so a chunk waiting on
+/// the lock cannot be fed-and-skipped onto the box.
 pub(crate) fn dismiss_key_overlay(ctx: &StatusBarCtx) -> bool {
     if !ctx.overlay.is_active() {
         return false;
     }
-    paint_live_screen(ctx);
-    ctx.overlay.active.store(false, Ordering::SeqCst);
+    paint_live_screen_then(ctx, || {
+        ctx.overlay.active.store(false, Ordering::SeqCst);
+    });
     true
 }
 // ---------------------------------------------------------------------------

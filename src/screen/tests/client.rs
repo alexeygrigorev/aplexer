@@ -175,6 +175,42 @@ fn seeding_retains_lines_that_scrolled_out_of_a_scroll_region() {
     );
 }
 
+/// **The composer-outside-the-region regression.** The tail above ends its
+/// region at the grid's last row, where stripping alone already replays
+/// every line feed as a full-screen scroll. The shape the `main` session
+/// actually logs is the one that lost everything: the agent TUI reserves
+/// its composer *below* the region (`1;24` on a 31-row grid, `1;26` on a
+/// 32-row one), so the transcript's line feeds land above the grid's
+/// bottom row and a stripped replay turns each into a cursor walk that
+/// overwrites the same row -- an hour of output seeds one screenful and
+/// the pager opens on `SCROLL 26/26`. Each such feed must become the
+/// full-grid scroll the region's own scroll amounts to for the history.
+#[test]
+fn seeding_recovers_a_transcript_region_that_ends_above_the_grid_bottom() {
+    let mut tail = b"\x1b[1;24r".to_vec();
+    for i in 1..=200 {
+        tail.extend_from_slice(format!("\x1b[24;1HREGION-{i:03}\r\n").as_bytes());
+    }
+
+    let mut seeded = ClientScreen::try_new_with_scrollback(31, 40, 500).unwrap();
+    seeded.seed_history(&tail);
+    let available = seeded.scrollback_available();
+    assert!(
+        available > 150,
+        "a transcript region ending above the grid bottom retained only {available} lines: \
+             this is the SCROLL 26/26 bug"
+    );
+
+    // And the retained rows are the transcript, oldest first, not the
+    // blank filler a row-overwriting replay would leave.
+    let (frame, _, _) = seeded.scrolled_frame(available);
+    let text = String::from_utf8_lossy(&frame).into_owned();
+    assert!(
+        text.contains("REGION-001"),
+        "the oldest transcript rows must lead the history:\n{text}"
+    );
+}
+
 /// The strip is narrow on purpose: DECSTBM goes, and the sequence that
 /// merely looks like it -- `CSI ? Ps r`, XTRESTORE -- stays, because
 /// swallowing a workload's private-mode restore would be a new bug in
@@ -408,6 +444,28 @@ fn refresh_scrollback_adopts_a_rebuild_that_retains_at_least_as_much() {
     );
 }
 
+/// The pager refresh must keep live cells the client already has. A
+/// worker snapshot from one RPC ago does not; feeding *this* model's
+/// `snapshot()` under the same lock as the swap does.
+#[test]
+fn refresh_scrollback_from_the_clients_own_snapshot_keeps_live_bytes() {
+    let mut region_tail = b"\x1b[3;23r".to_vec();
+    for i in 1..=80 {
+        region_tail.extend_from_slice(format!("REGION-{i:03}\r\n").as_bytes());
+    }
+    let mut client = ClientScreen::try_new_with_scrollback(23, 40, 500).unwrap();
+    client.feed(&region_tail);
+    client.feed(b"\x1b[23;1HAFTER-RPC-BYTE");
+    let snapshot = client.snapshot();
+    client.refresh_scrollback(&region_tail, &snapshot);
+    let (live_frame, _, _) = client.scrolled_frame(0);
+    let live_text = String::from_utf8_lossy(&live_frame).into_owned();
+    assert!(
+        live_text.contains("AFTER-RPC-BYTE"),
+        "bytes the live path already had must survive the pager rebuild:\n{live_text}"
+    );
+}
+
 /// Handing the mouse back to the workload has to be expressible as one
 /// self-contained write, whatever the client turned on for itself.
 #[test]
@@ -485,6 +543,19 @@ fn host_alt_hold_drops_1049_and_keeps_other_modes() {
     assert_eq!(hold.push(b"\x1b[?47l\x1b[?1047h"), b"");
 }
 
+/// 1007 is the other host-owned mode: on by default on the alternate
+/// screen, it turns a wheel roll into cursor keys and types those into
+/// the agent. The attach client sends `?1007l` at start; the hold must
+/// stop the workload from turning it back on, including in a combined
+/// DECSET list.
+#[test]
+fn host_alt_hold_drops_1007_and_keeps_other_modes() {
+    let mut hold = HostAltHold::new();
+    assert_eq!(hold.push(b"\x1b[?1007hhello\x1b[?1007l"), b"hello");
+    assert_eq!(hold.push(b"\x1b[?1007;2004h"), b"\x1b[?2004h");
+    assert_eq!(hold.push(b"\x1b[?1000h"), b"\x1b[?1000h");
+}
+
 #[test]
 fn host_alt_hold_strips_a_split_1049l() {
     let mut hold = HostAltHold::new();
@@ -523,6 +594,14 @@ fn client_screen_filter_host_is_off_until_enabled() {
             .windows(8)
             .any(|w| w == b"\x1b[?1049h"),
         "the host-bound snapshot must not switch the host's screen"
+    );
+    assert!(
+        client
+            .host_snapshot()
+            .windows(8)
+            .any(|w| w == b"\x1b[?1007l"),
+        "every host snapshot must pin alternateScroll off, or a live repaint \
+         leaves the wheel typing cursor keys into the agent"
     );
 }
 

@@ -383,6 +383,7 @@ pub(crate) fn redraw_live_screen(ctx: &StatusBarCtx) -> bool {
     match live_screen_refresh_locked(ctx) {
         Some(seq) => {
             if write_client_locked(&mut *out, &ctx.screen, &seq, BoundaryPolicy::Defer) {
+                note_mouse_hold(ctx);
                 true
             } else {
                 ctx.pending_refresh.store(true, Ordering::Relaxed);
@@ -401,6 +402,7 @@ pub(crate) fn live_screen_refresh_locked(ctx: &StatusBarCtx) -> Option<Vec<u8>> 
     }
     ctx.pending_refresh.store(false, Ordering::Relaxed);
     let mut seq = host_snapshot(&ctx.screen);
+    seq.extend_from_slice(&host_wheel_hold_sequence(ctx));
     if let Some((geom, text)) = status_bar_render(ctx) {
         // Gated once, above, for the whole sequence: the bar rides on the
         // snapshot's boundary.
@@ -430,6 +432,7 @@ pub(crate) fn host_snapshot(screen: &Arc<Mutex<aplexer::screen::ClientScreen>>) 
 /// before the caller took the stdout lock.
 pub(crate) fn live_screen_sequence(ctx: &StatusBarCtx, bar: Option<(TermGeom, String)>) -> Vec<u8> {
     let mut seq = host_snapshot(&ctx.screen);
+    seq.extend_from_slice(&host_wheel_hold_sequence(ctx));
     if let Some((geom, text)) = bar {
         let (restore, margins) = {
             let screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);

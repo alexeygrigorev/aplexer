@@ -497,6 +497,65 @@ fn a_split_mouse_report_is_buffered_not_leaked_to_the_workload() {
     assert!(ctx.scroll.is_active());
 }
 
+/// While the pager is up the wheel belongs to the pager, even if the
+/// workload has asked for the mouse. Handing it back mid-scroll is how a
+/// wheel roll that started the pager becomes cursor-up walking prompt
+/// history.
+#[test]
+fn pager_keeps_the_mouse_even_when_the_workload_asked_for_it() {
+    let mut ctx = status_ctx_for_test(true);
+    ctx.mouse_capture = true;
+    ctx.screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .feed(b"\x1b[?1000h\x1b[?1006h");
+    assert!(
+        ctx.screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .workload_wants_mouse(),
+        "control: the workload has the mouse"
+    );
+    assert!(
+        !client_should_own_mouse(&ctx),
+        "live, the workload that asked for the mouse keeps it"
+    );
+    ctx.scroll.active.store(true, Ordering::SeqCst);
+    assert!(
+        client_should_own_mouse(&ctx),
+        "the pager must keep the wheel for as long as it is up"
+    );
+}
+
+/// Re-enabling the client's mouse must also pin alternateScroll off.
+/// Otherwise a snapshot that restored the workload's (empty) mouse modes
+/// leaves the host on its alt-screen default, and the next wheel notch
+/// is cursor-up into the agent.
+#[test]
+fn client_mouse_enable_pins_alternate_scroll_off() {
+    let text = String::from_utf8_lossy(CLIENT_MOUSE_ENABLE);
+    assert!(
+        text.contains("\x1b[?1007l"),
+        "borrowing the mouse must keep alternateScroll off: {text:?}"
+    );
+    assert!(
+        text.contains("\x1b[?1000h") && text.contains("\x1b[?1006h"),
+        "the wheel still needs SGR button reporting: {text:?}"
+    );
+}
+
+/// A live-screen repaint (pager exit, Ctrl-b r, overlay dismiss) must
+/// re-assert `?1007l`, because `state_formatted()` does not mention it.
+#[test]
+fn live_repaint_reasserts_alternate_scroll_off() {
+    let ctx = status_ctx_for_test(true);
+    let text = String::from_utf8_lossy(&live_screen_sequence(&ctx, None)).into_owned();
+    assert!(
+        text.contains("\x1b[?1007l"),
+        "leaving the pager must not put alternateScroll back on: {text:?}"
+    );
+}
+
 /// The counterpart guarantee: a bare `ESC` at the end of a chunk is
 /// forwarded immediately while the pager is down, so pressing Escape in
 /// an editor inside the session does not wait for the next keystroke.

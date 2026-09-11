@@ -811,6 +811,43 @@ tracker swap are missing until the workload's next repaint, and rows that
 scrolled by in that sliver are missing from the rebuilt history for good —
 a sub-millisecond window, against holding the model lock across two RPCs.
 
+**The `SCROLL 26/26` wipe, and the region-scroll synthesis.** The sub-range
+handling above recovers rows a *live pane* would have scrolled out of its
+region — but the streaming shape of the codex TUI is narrower still: its
+transcript scrolls inside a region whose line feeds land *above* the grid's
+bottom row (`1;24r` on a 31-row grid), so a stripped replay turns each into
+a cursor walk that repaints one row — an hour of output seeds one
+screenful, and the pager the user opened on a fresh session showed `SCROLL
+26/26`. The seed therefore mirrors the raw stream's regions in a private
+`MarginTracker` and, at each `\n` the region says would have scrolled a
+region anchored at the grid's top, feeds a full-grid scroll instead — the
+discarding is the one thing a throwaway grid must not do. Measured on that
+session's real 1.8 MiB tail: 38 retained rows by stripping alone, 90 with
+the synthesis.
+
+**Repaint-scroll capture.** One loss class remains, and it is measured, not
+hypothetical: a diff-rendering TUI can scroll *nothing at all* — the same
+1.8 MiB log holds 45,231 absolute cursor addresses against 113 line feeds,
+each new transcript line written over an old one. No replay can retain what
+the grid never released, so the seed replays in two passes: a probe pass
+groups the stripped tail (~4 KiB of synchronized-output frames at a time)
+and flags each group whose row-text diff reads as a vertical shift
+(`seed_repaint_shift` — changed rows aligning against themselves *n*
+rows up, with slack for the TUI's chrome repainting in the same frames),
+then the real pass pre-scrolls the grid by exactly that many rows before
+the group's bytes, so the displaced rows enter the retained history
+natively, in order. The guards are the point: spinner frames and composer
+edits change one or two rows and never match the shift shape; a group that
+scrolled natively is skipped (no double capture); the alternate screen has
+no history anywhere; repeated displacement of the same row scrolls in once.
+Measured A/B over twelve real retained tails (release build): +27 rows on
+one mixed paint/scroll session, +5 on another, none on the remaining ten —
+the codex TUI family scrolls through region scrolls the synthesis already
+recovers — for ~40% more seed time (~30 ms per dense MiB). Kept because
+the region and line-feed paths have no answer for a pure repaint-shift
+scroller; pinned by the `seed_captures_*`/`seed_does_not_*` tests in
+`src/screen/tests/tracker.rs`.
+
 **The spinner-hour wipe.** The tail is a byte budget out of a log, and
 bytes are not rows: an agent idling between turns spends the budget on a
 spinner — thousands of absolute cursor addresses, not one line feed — so

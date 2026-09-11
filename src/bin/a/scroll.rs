@@ -232,13 +232,29 @@ pub(crate) fn paint_scroll_view(ctx: &StatusBarCtx) -> bool {
             .unwrap_or_else(PoisonError::into_inner) = Some((text, geom.rows, geom.cols, None));
     }
     seq.extend_from_slice(b"\x1b[?25l");
+    seq.extend_from_slice(&host_wheel_hold_sequence(ctx));
     drop(view);
-    write_client_locked(
+    let wrote = write_client_locked(
         &mut *out,
         &ctx.screen,
         &seq,
         BoundaryPolicy::StreamSuspended,
-    )
+    );
+    if wrote {
+        note_mouse_hold(ctx);
+    }
+    wrote
+}
+
+/// Record that the host now matches `client_should_own_mouse`. Call only
+/// after the matching `host_wheel_hold_sequence` actually went out.
+pub(crate) fn note_mouse_hold(ctx: &StatusBarCtx) {
+    if !ctx.mouse_capture {
+        return;
+    }
+    *ctx.mouse_owned
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(client_should_own_mouse(ctx));
 }
 
 /// Refresh just the pager's bar row, so the retained-line count stays honest
@@ -360,7 +376,9 @@ pub(crate) fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
     // rows the user is opening the pager to find, and the worker's retained
     // raw tail still has them (`refresh_pager_history`). Runs with
     // `active` already set, so the relay is suspended while it works and the
-    // pager's first frame goes onto a quiet host.
+    // pager's first frame goes onto a quiet host. The rebuild snapshots the
+    // *client's* live grid under the model lock, so bytes that arrived
+    // during the tail RPC stay on the grid the exit repaint will show.
     refresh_pager_history(ctx);
     // A fresh view says `available: 0`, but the first pager frame will find
     // a model that may already hold pages of history (the live grid's own,
@@ -390,27 +408,39 @@ pub(crate) fn enter_scroll_mode(ctx: &StatusBarCtx, first: ScrollCommand) {
 /// the frames the relay declined to write are already accounted for in it.
 /// The bar is rewritten in the same sequence because the snapshot's `ED2`
 /// blanks the reserved row.
+///
+/// `active` (and `typing`) drop *under the same stdout lock as the paint*.
+/// `relay_to_terminal` checks those flags under that lock: if they fall
+/// after the paint has released it, a chunk that was waiting on the lock
+/// feeds the model, sees the pager still owning the host, and skips the
+/// write. The next chunk then lands as an Ink-style partial repaint on a
+/// host that is missing those bytes -- the welded-row garble that only a
+/// detach/reattach (a fresh snapshot) could clear.
 pub(crate) fn exit_scroll_mode(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_active() {
         return;
     }
-    paint_live_screen(ctx);
-    ctx.scroll.typing.store(false, Ordering::SeqCst);
-    ctx.scroll.active.store(false, Ordering::SeqCst);
+    paint_live_screen_then(ctx, || {
+        ctx.scroll.typing.store(false, Ordering::SeqCst);
+        ctx.scroll.active.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Paint the host from the live model while a client modal still has the
 /// relay suspended: the snapshot `Ctrl-b r` writes, plus the bar.
-/// `exit_scroll_mode` runs this before dropping `active`, `enter_typing`
-/// before raising `typing`, and `dismiss_key_overlay` before dropping the
-/// overlay's `active` -- every ordering means a relay chunk can only ever
-/// land on the view it belongs on.
 ///
 /// The repaint is deliberately the *model*, not a saved rectangle of cells:
 /// the model has been fed every byte that arrived while the modal was up,
 /// so this is the screen as it *is*, not a photograph of the one the modal
 /// covered.
-pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
+///
+/// `then` runs *before* the stdout lock is released. That is the lock
+/// `relay_to_terminal` checks modal flags under. Every resume --
+/// `exit_scroll_mode` dropping `active`, `enter_typing` raising `typing`,
+/// `dismiss_key_overlay` dropping the overlay -- must flip its flag here,
+/// so a chunk waiting on the lock cannot be fed-and-skipped after the
+/// paint and leave the host one frame behind the model.
+pub(crate) fn paint_live_screen_then(ctx: &StatusBarCtx, then: impl FnOnce()) {
     let bar = status_bar_render(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let mut seq = SCROLL_CANCEL.to_vec();
@@ -421,6 +451,8 @@ pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
         &seq,
         BoundaryPolicy::StreamSuspended,
     );
+    note_mouse_hold(ctx);
+    then();
     *ctx.last_drawn
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
@@ -429,18 +461,16 @@ pub(crate) fn paint_live_screen(ctx: &StatusBarCtx) {
 /// `i` in the pager: hand the keyboard to the workload without leaving the
 /// pager -- the thing tmux copy-mode cannot do. The view repaints to the
 /// live screen first (so typing has its echo and the reply is visible as it
-/// streams), then `typing` rises under the stdout lock, which is the lock
-/// `relay_to_terminal` checks the flag under -- the relay stays suspended
-/// until the flip, so no chunk can land on the pager's view.
+/// streams), then `typing` rises under the same stdout lock as that paint,
+/// which is the lock `relay_to_terminal` checks the flag under -- the relay
+/// stays suspended until the flip, so no chunk can land on the pager's view.
 pub(crate) fn enter_typing(ctx: &StatusBarCtx) {
     if !ctx.scroll.is_active() || ctx.scroll.is_typing() {
         return;
     }
-    paint_live_screen(ctx);
-    {
-        let _held = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
+    paint_live_screen_then(ctx, || {
         ctx.scroll.typing.store(true, Ordering::SeqCst);
-    }
+    });
     // The bar's wording changes with the mode; the dirty-check still holds
     // the live bar text, so rewrite the row now rather than on the next tick.
     refresh_scroll_bar(ctx);
@@ -517,18 +547,56 @@ pub(crate) fn apply_scroll_command(ctx: &StatusBarCtx, command: ScrollCommand) {
     }
 }
 
-/// Borrow the host's mouse reporting for the client, or hand it back to the
-/// workload -- whichever the workload's own state currently calls for.
+/// Whether the attach client should be the one receiving wheel events.
 ///
-/// **Precedence, stated deliberately: the workload wins.** A TUI that has
-/// asked for mouse reporting is a TUI with panes of its own to scroll, and
-/// tmux's answer -- the pane's application gets the mouse when it requested
-/// it -- is the right one. So the client borrows the mouse only while the
-/// workload wants none, and gives it back the moment the workload asks,
-/// re-asserting the workload's exact modes with
-/// `ClientScreen::workload_mouse_sequence` so the handover cannot leave the
-/// terminal in a state neither side chose. While the workload holds the
-/// mouse the wheel goes to it and `Ctrl-b [` is the way into the pager.
+/// Live, the workload wins: a TUI that asked for mouse reporting has panes
+/// of its own to scroll, and tmux's answer -- the pane's application gets
+/// the mouse when it requested it -- is the right one. **The pager is the
+/// exception.** While the user is reading history the wheel has to keep
+/// driving the pager; handing it back mid-scroll lets a terminal with
+/// `alternateScroll` turn the next notch into cursor-up/down and type
+/// those into the agent's prompt. `Ctrl-b [` is the way in only when the
+/// pager is down and the workload holds the mouse.
+pub(crate) fn client_should_own_mouse(ctx: &StatusBarCtx) -> bool {
+    if !ctx.mouse_capture {
+        return false;
+    }
+    if ctx.scroll.is_active() {
+        return true;
+    }
+    !ctx.screen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .workload_wants_mouse()
+}
+
+/// Host bytes that keep alternateScroll off and put the mouse where
+/// `client_should_own_mouse` says it belongs. Every full client repaint
+/// writes this after the snapshot, because `state_formatted()` restores
+/// the *workload's* mouse modes (often none) and does not mention 1007 --
+/// leaving the host on its alt-screen default, which is how a wheel roll
+/// that started the pager ends up walking prompt history.
+pub(crate) fn host_wheel_hold_sequence(ctx: &StatusBarCtx) -> Vec<u8> {
+    let mut seq = b"\x1b[?1007l".to_vec();
+    if !ctx.mouse_capture {
+        return seq;
+    }
+    if client_should_own_mouse(ctx) {
+        seq.extend_from_slice(CLIENT_MOUSE_ENABLE);
+    } else {
+        seq.extend_from_slice(
+            &ctx.screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .workload_mouse_sequence(),
+        );
+        seq.extend_from_slice(b"\x1b[?1007l");
+    }
+    seq
+}
+
+/// Borrow the host's mouse reporting for the client, or hand it back to the
+/// workload -- whichever `client_should_own_mouse` currently calls for.
 ///
 /// Boundary-gated like every other client injection: this is a live splice
 /// into a relayed stream (the workload can flip mouse modes at any byte),
@@ -540,11 +608,7 @@ pub(crate) fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
     }
     // Decided before anything is built: this runs on every status tick,
     // and the answer is almost always "already where it should be".
-    let want = !ctx
-        .screen
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .workload_wants_mouse();
+    let want = client_should_own_mouse(ctx);
     {
         let owned = ctx
             .mouse_owned
@@ -554,14 +618,7 @@ pub(crate) fn sync_client_mouse(ctx: &StatusBarCtx) -> bool {
             return false;
         }
     }
-    let seq = if want {
-        CLIENT_MOUSE_ENABLE.to_vec()
-    } else {
-        ctx.screen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .workload_mouse_sequence()
-    };
+    let seq = host_wheel_hold_sequence(ctx);
     let mut out = ctx.stdout.lock().unwrap_or_else(PoisonError::into_inner);
     let policy = if ctx.scroll.is_active() {
         BoundaryPolicy::StreamSuspended

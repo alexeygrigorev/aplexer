@@ -135,11 +135,11 @@ pub(crate) fn seed_client_scrollback(
 /// The gate keeps every other workload exactly as it is. `subregion_seen` is
 /// false for anything that never sent a sub-range -- shells, logs, tail -f --
 /// and those sessions' live-maintained history is complete, so they pay
-/// neither the two bounded RPCs (capture + screen, ~13-40 ms of replay
-/// measured at `scrollback_seed_bytes`) nor the risk of a byte-capped replay
-/// holding fewer rows than their live scrollback already does. The alternate
+/// neither the capture RPC (~13-40 ms of replay measured at
+/// `scrollback_seed_bytes`) nor the risk of a byte-capped replay holding
+/// fewer rows than their live scrollback already does. The alternate
 /// screen skips too: that grid has no scrollback anywhere, so there is
-/// nothing to rebuild for a full-screen application, only RPCs to spend.
+/// nothing to rebuild for a full-screen application, only an RPC to spend.
 ///
 /// The tail is fetched **whole** (`rpc_capture`'s `None`: everything the
 /// worker still retains, bounded by `DEFAULT_HISTORY_BYTES`), not at the
@@ -178,13 +178,16 @@ pub(crate) fn refresh_pager_history(ctx: &StatusBarCtx) {
     if tail.is_empty() {
         return;
     }
-    let Ok(snapshot) = rpc_capture_screen(&record, false) else {
-        return;
-    };
-    ctx.screen
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .refresh_scrollback(&tail, &snapshot);
+    // The live grid comes from this client, not from a second worker RPC.
+    // A worker snapshot is already stale by one round-trip, and bytes the
+    // relay fed during that window would be dropped on the swap -- the
+    // next Ink-style partial repaint then welds onto a host painted from
+    // the behind grid. Snapshot and swap share the model lock, so a
+    // chunk waiting in `relay_to_terminal` is processed onto the rebuilt
+    // tracker instead of onto the one the snapshot described.
+    let mut screen = ctx.screen.lock().unwrap_or_else(PoisonError::into_inner);
+    let snapshot = screen.snapshot();
+    screen.refresh_scrollback(&tail, &snapshot);
 }
 
 /// Whether the client may borrow mouse reporting from the host terminal.
@@ -202,15 +205,22 @@ pub(crate) fn mouse_capture_enabled() -> bool {
     )
 }
 
-/// The client's own mouse reporting: every protocol and encoding this client
-/// knows about turned off, then button press/release (`?1000h`) in SGR
-/// encoding (`?1006h`).
+/// The client's own mouse reporting: alternateScroll off, every protocol
+/// and encoding this client knows about turned off, then button
+/// press/release (`?1000h`) in SGR encoding (`?1006h`).
+///
+/// `?1007l` is not optional. On the alternate screen a terminal with
+/// xterm's `alternateScroll` (on by default nearly everywhere) answers a
+/// wheel event by synthesizing cursor-up/down, which walks the agent's
+/// prompt history. The attach client turns that off at start; this
+/// sequence re-asserts it whenever we borrow the mouse, because a
+/// snapshot or a workload DECSET can put the default back.
 ///
 /// `?1000h` rather than `?1002h`/`?1003h` deliberately: press/release is all
 /// a wheel needs, and not asking for motion reports keeps the terminal from
 /// streaming a report per cell of mouse movement across the socket.
 pub(crate) const CLIENT_MOUSE_ENABLE: &[u8] =
-    b"\x1b[?9l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1000h\x1b[?1006h";
+    b"\x1b[?1007l\x1b[?9l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1000h\x1b[?1006h";
 
 /// `CAN` -- "abandon any control sequence in flight". Leads every write made
 /// under `BoundaryPolicy::StreamSuspended`; see that variant's doc comment

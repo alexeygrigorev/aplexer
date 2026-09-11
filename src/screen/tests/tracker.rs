@@ -444,3 +444,165 @@ fn resize_does_not_transpose_soft_wrapped_line() {
         "screen contents look shredded to one character per row:\n{contents}"
     );
 }
+
+// -- Seed: rows displaced by repaint-driven scrolling (see `ScreenTracker::seed`) --
+
+/// Absolute-addressed paint of whole rows, the way a diff-rendering TUI
+/// writes a frame: no line feeds, no scroll regions, no scrolling. Rows are
+/// drawn at 200 columns so one transcript line fills one grid row, and one
+/// frame (~4.4 KB) clears `SEED_CAPTURE_MIN_GROUP_BYTES` on its own.
+fn repaint_frame(lines: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (row, text) in lines.iter().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H{}", row + 1, text).as_bytes());
+    }
+    out
+}
+
+fn repaint_transcript(first: usize, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| format!("L{:02} {}", first + i, "x".repeat(170)))
+        .collect()
+}
+
+/// Wrap every frame in a synchronized-output pair, as agent TUIs wrap every
+/// repaint -- and as the seed segments the stream.
+fn synced_frames(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for frame in frames {
+        out.extend_from_slice(b"\x1b[?2026h");
+        out.extend_from_slice(frame);
+        out.extend_from_slice(b"\x1b[?2026l");
+    }
+    out
+}
+
+#[test]
+fn seed_captures_rows_displaced_by_a_repaint_scroll() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    let stream = synced_frames(&[
+        repaint_frame(&repaint_transcript(0, 24)),
+        repaint_frame(&repaint_transcript(1, 24)),
+        repaint_frame(&repaint_transcript(2, 24)),
+    ]);
+    tracker.seed(&stream);
+    assert_eq!(
+        tracker.scrollback_available(),
+        2,
+        "each one-line repaint scroll must leave its top row in the history"
+    );
+
+    // The oldest displaced row leads the deepest view as transcript text,
+    // not just as a retained-row count.
+    let (frame, clamped, available) = tracker.scrolled_frame(2);
+    assert_eq!((clamped, available), (2, 2));
+    let mut viewer = vt100::Parser::new(24, 200, 0);
+    viewer.process(&frame);
+    let text = viewer.screen().contents();
+    assert!(
+        text.starts_with("L00"),
+        "the deepest pager view must start at the oldest displaced row: {text:?}"
+    );
+}
+
+#[test]
+fn seed_does_not_capture_single_row_edits_or_relayouts() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    // A spinner-scale repaint of ONE row, repeated writes padding the frame
+    // past the capture floor -- the shape of idle agent-TUI churn.
+    let mut spinner = Vec::new();
+    for i in 0..8 {
+        spinner.extend_from_slice(format!("\x1b[1;1Hspinner {i} {}", "s".repeat(170)).as_bytes());
+    }
+    // A full relayout: every row rewritten to unrelated content.
+    let mut shuffled = repaint_transcript(100, 24);
+    shuffled.reverse();
+    let stream = synced_frames(&[
+        repaint_frame(&repaint_transcript(0, 24)),
+        spinner,
+        repaint_frame(&shuffled),
+    ]);
+    tracker.seed(&stream);
+    assert_eq!(
+        tracker.scrollback_available(),
+        0,
+        "a spinner frame or a relayout is not a scroll -- capturing them would \
+             flood the history with animation frames"
+    );
+}
+
+#[test]
+fn seed_does_not_double_capture_natively_scrolled_rows() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    let mut streamed = Vec::new();
+    for i in 0..40 {
+        streamed.extend_from_slice(format!("out {:02} {}\r\n", i, "y".repeat(170)).as_bytes());
+    }
+    tracker.seed(&streamed);
+    // Reference: what plain vt100 retains for the same stream.
+    let mut reference = vt100::Parser::new(24, 200, 2000);
+    reference.process(&streamed);
+    let expected = {
+        let screen = reference.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let retained = screen.scrollback();
+        screen.set_scrollback(0);
+        retained
+    };
+    assert!(expected > 0, "reference must have scrolled");
+    assert_eq!(
+        tracker.scrollback_available(),
+        expected,
+        "line-feed output must be retained once -- the shift test would only \
+             find its rows a second time"
+    );
+}
+
+#[test]
+fn seed_captures_nothing_on_the_alternate_screen() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    let mut stream = b"\x1b[?1049h".to_vec();
+    stream.extend_from_slice(&repaint_frame(&repaint_transcript(0, 24)));
+    stream.extend_from_slice(&repaint_frame(&repaint_transcript(1, 24)));
+    tracker.seed(&stream);
+    assert_eq!(
+        tracker.scrollback_available(),
+        0,
+        "the alternate grid has no retained history anywhere"
+    );
+}
+
+#[test]
+fn seed_captures_across_synchronized_frame_boundaries() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    tracker.seed(&synced_frames(&[
+        repaint_frame(&repaint_transcript(0, 24)),
+        repaint_frame(&repaint_transcript(1, 24)),
+        repaint_frame(&repaint_transcript(2, 24)),
+    ]));
+    assert_eq!(
+        tracker.scrollback_available(),
+        2,
+        "both repaint scrolls must be detected across frame-aligned groups"
+    );
+}
+
+#[test]
+fn seed_dedups_the_same_displaced_row() {
+    let mut tracker = ScreenTracker::try_new_with_scrollback(24, 200, 2000).unwrap();
+    // Toggle the transcript between two positions; only the upward toggle is
+    // a shift, and it displaces the same top line every time.
+    let stream = synced_frames(&[
+        repaint_frame(&repaint_transcript(10, 24)),
+        repaint_frame(&repaint_transcript(11, 24)),
+        repaint_frame(&repaint_transcript(10, 24)),
+        repaint_frame(&repaint_transcript(11, 24)),
+    ]);
+    tracker.seed(&stream);
+    assert_eq!(
+        tracker.scrollback_available(),
+        1,
+        "a repaint that displaces the same row again and again must scroll it \
+             in once"
+    );
+}

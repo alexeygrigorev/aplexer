@@ -1,6 +1,7 @@
-/// Filters alt-screen DECSET/DECRST out of bytes written to the *host*
+/// Filters host-owned DECSET/DECRST out of bytes written to the *host*
 /// terminal, so `a attach` can keep the host on the alternate screen for the
-/// whole client lifetime.
+/// whole client lifetime, and keep xterm `alternateScroll` (DECSET 1007)
+/// off.
 ///
 /// The pre-attach primary screen (the `a` session list, the user's shell)
 /// stays frozen underneath. Host scrollback therefore cannot mix those rows
@@ -10,6 +11,12 @@
 /// the primary list mid-attach. Combined DECSET lists keep every other mode
 /// (`CSI ? 1049;2004 h` becomes `CSI ? 2004 h`). Incomplete CSIs are held
 /// across `push` calls so a split `\x1b[?1049` / `l` cannot leak a 1049l.
+///
+/// 1007 is the same class of bug on the input side: on by default on the
+/// alternate screen nearly everywhere, it turns a wheel roll into
+/// cursor-up/down and types those into the workload (agent prompt history).
+/// The attach client sends `?1007l` at start; this hold stops the workload
+/// from turning it back on.
 #[derive(Debug, Default)]
 pub(super) struct HostAltHold {
     state: HoldState,
@@ -83,7 +90,7 @@ impl HostAltHold {
                 if (0x40..=0x7e).contains(&byte) {
                     self.held.push(byte);
                     if self.private && !self.intermediate && (byte == b'h' || byte == b'l') {
-                        out.extend_from_slice(&filter_alt_screen_modes(&self.params, byte));
+                        out.extend_from_slice(&filter_host_held_modes(&self.params, byte));
                     } else {
                         out.extend_from_slice(&self.held);
                     }
@@ -109,12 +116,13 @@ impl HostAltHold {
     }
 }
 
-/// Bytes after `CSI ?` in a DECSET/DECRST. Drops 47/1047/1048/1049 and
-/// rebuilds the sequence from whatever remains; empty if nothing remains.
-fn filter_alt_screen_modes(params: &[u8], final_byte: u8) -> Vec<u8> {
+/// Bytes after `CSI ?` in a DECSET/DECRST. Drops alt-screen switches
+/// (47/1047/1048/1049) and alternateScroll (1007), and rebuilds the
+/// sequence from whatever remains; empty if nothing remains.
+fn filter_host_held_modes(params: &[u8], final_byte: u8) -> Vec<u8> {
     let mut kept: Vec<&[u8]> = Vec::new();
     for part in params.split(|b| *b == b';') {
-        if part.iter().all(|b| b.is_ascii_digit()) && mode_is_alt_screen(part) {
+        if part.iter().all(|b| b.is_ascii_digit()) && mode_is_host_held(part) {
             continue;
         }
         kept.push(part);
@@ -133,10 +141,10 @@ fn filter_alt_screen_modes(params: &[u8], final_byte: u8) -> Vec<u8> {
     seq
 }
 
-fn mode_is_alt_screen(num: &[u8]) -> bool {
+fn mode_is_host_held(num: &[u8]) -> bool {
     let mut n = 0u32;
     for &d in num {
         n = n.saturating_mul(10).saturating_add(u32::from(d - b'0'));
     }
-    matches!(n, 47 | 1047 | 1048 | 1049)
+    matches!(n, 47 | 1047 | 1048 | 1049 | 1007)
 }

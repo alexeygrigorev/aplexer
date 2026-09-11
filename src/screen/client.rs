@@ -134,17 +134,22 @@ impl ClientScreen {
     /// snapshot: a freshly attached client's model is empty, and without
     /// this "attach and scroll up" would show nothing until the workload
     /// produced a screenful. Model-only, and allowed to leave no state
-    /// behind: the tail is replayed with its scroll regions removed
-    /// (`without_scroll_regions`), the epilogue leaves the primary grid,
-    /// full-screen margins and a default pen, and the margins and scanner
-    /// are reset (`reset_margins`) so neither a DECSTBM or `?1049h` in force
-    /// at the end of the tail nor its mid-sequence ending can outlive the
-    /// seed and contradict the snapshot fed next.
+    /// behind: the tail is replayed through `ScreenTracker::seed`, which
+    /// strips the tail's scroll regions for the parse but converts each
+    /// region scroll a real terminal would have performed into a full-grid
+    /// scroll, and pre-scrolls past repaint-driven row overwrites, so a
+    /// region-holding or diff-rendering TUI's transcript enters the
+    /// retained history instead of overwriting itself row after row; the
+    /// epilogue leaves the primary grid, full-screen margins and a default
+    /// pen, and the margins and scanner are reset (`reset_margins`) so
+    /// neither a DECSTBM or `?1049h` in force at the end of the tail nor
+    /// its mid-sequence ending can outlive the seed and contradict the
+    /// snapshot fed next.
     pub fn seed_history(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        self.screen.seed(&without_scroll_regions(data));
+        self.screen.seed(data);
         self.screen.process(b"\x1b[?1049l\x1b[r\x1b[m");
         self.screen.reset_margins();
         self.wrap_guarded = false;
@@ -178,8 +183,10 @@ impl ClientScreen {
     /// reaches the host. Bytes that arrive between the caller fetching the
     /// snapshot and this swap are missing until the workload's next repaint,
     /// and rows scrolled by in that sliver are missing from the history for
-    /// good -- bounded, and the price of not holding the model lock across
-    /// two RPCs.
+    /// good. The attach pager avoids that sliver by passing *this* client's
+    /// own `snapshot()` under the same lock as the swap (`refresh_pager_history`),
+    /// so the live grid the exit repaint shows is the one the relay has been
+    /// feeding, not a worker photograph from one RPC ago.
     ///
     /// A tail that rebuilds to *less* history than the model already holds
     /// is refused too: the tail is a byte budget out of a log and bytes are
@@ -206,8 +213,10 @@ impl ClientScreen {
         // seed (the tail can begin mid-escape-sequence, exactly as at attach)
         // and at a boundary after the snapshot. The host-alt hold is
         // untouched: the rebuild wrote nothing to the host, so what the hold
-        // tracks is still true.
+        // tracks is still true. `wrap_guarded` is a live-stream latch for a
+        // cursor this grid no longer has.
         self.screen = candidate.screen;
+        self.wrap_guarded = false;
     }
 
     /// `ScreenTracker::scrolled_frame` -- the pager's view of the history,
@@ -256,10 +265,11 @@ impl ClientScreen {
 
     /// Rewrite `data` for the host terminal: drop alt-screen enter/exit so
     /// they cannot pop the host back to the primary screen (and its
-    /// pre-attach scrollback). `None` means `data` can be written as-is --
-    /// the hold is off, or nothing in the chunk could need rewriting (no
-    /// `ESC` in it and no sequence held over from the previous one), which
-    /// is bulk output and is not copied.
+    /// pre-attach scrollback), and drop alternateScroll (1007) so a
+    /// workload cannot turn the wheel into arrow keys. `None` means `data`
+    /// can be written as-is -- the hold is off, or nothing in the chunk
+    /// could need rewriting (no `ESC` in it and no sequence held over from
+    /// the previous one), which is bulk output and is not copied.
     pub fn filter_host(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         self.host_alt
             .as_mut()
@@ -578,9 +588,18 @@ impl ClientScreen {
 
     /// `snapshot`, passed through `filter_host` -- the bytes to actually
     /// write to the host terminal to repaint it from this model.
+    ///
+    /// Always ends with `?1007l`. `state_formatted()` does not mention
+    /// alternateScroll, and a live repaint that restored the workload's
+    /// input modes used to leave the host on its alt-screen default --
+    /// wheel becomes cursor-up/down, which types prompt history into the
+    /// agent. Pinning it here means every snapshot write holds the mode
+    /// the attach client took at start, not the terminal's default.
     pub fn host_snapshot(&mut self) -> Vec<u8> {
         let snapshot = self.snapshot();
-        self.filter_host(&snapshot).unwrap_or(snapshot)
+        let mut out = self.filter_host(&snapshot).unwrap_or(snapshot);
+        out.extend_from_slice(b"\x1b[?1007l");
+        out
     }
 
     #[cfg(test)]

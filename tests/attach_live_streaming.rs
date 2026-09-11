@@ -798,3 +798,59 @@ fn typing_bar_survives_workload_erases_during_type_through() {
     client.detach();
     harness.run_ok(&["kill", &id, "--signal", "KILL"], Duration::from_secs(5));
 }
+
+/// Scroll up and back while an Ink-style TUI is still painting. The host
+/// and the worker's model must still agree afterwards.
+///
+/// The failure this pins: leaving the pager released the stdout lock
+/// *before* dropping `active`, so a relay chunk waiting on that lock fed
+/// the model, skipped the write, and the next composer repaint (absolute
+/// columns, no row clear) welded onto a host one frame behind. Detach and
+/// reattach cleared it because reattach paints a fresh snapshot; coming
+/// back from the pager must do the same without that extra round-trip.
+#[test]
+fn scrolling_up_and_back_mid_stream_keeps_host_and_worker_aligned() {
+    let harness = Harness::new();
+    let root = TempDir::new().expect("workspace root");
+    let workspace = root.path().join("scroll-roundtrip");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let id = start_session(&harness, &workspace, "scroll");
+    let _guard = SessionGuard {
+        harness: &harness,
+        id: id.clone(),
+    };
+    let mut client = PtyClient::spawn(&harness, &id, HOST_ROWS, HOST_COLS);
+    client.wait_for(b"\x1b[1;23r", "the client's status-row reservation");
+    thread::sleep(Duration::from_millis(900));
+
+    let script = write_agent_script(&workspace, 200);
+    harness.run_ok(
+        &["send", &id, &format!("python3 {script}"), "--enter"],
+        Duration::from_secs(5),
+    );
+    client.wait_for(b"step-10", "the TUI is painting");
+
+    for row in 5..8 {
+        client.send(format!("\x1b[<64;30;{row}M").as_bytes());
+        thread::sleep(Duration::from_millis(80));
+    }
+    client.wait_for(b"SCROLL", "the pager's bar");
+
+    client.send(b"q");
+    client.wait_for(b"DONE-PROBE-MARKER", "the workload's final frame");
+    thread::sleep(Duration::from_millis(400));
+
+    assert_eventual_agreement(
+        &client,
+        &harness,
+        &id,
+        |bytes| host_terminal(bytes, HOST_ROWS, HOST_COLS),
+        MODEL_ROWS,
+        HOST_COLS,
+        "DONE-PROBE-MARKER",
+        "scroll up and back mid-stream",
+    );
+
+    client.detach();
+}
