@@ -296,9 +296,12 @@ fn agent_appears_and_clears_as_a_fake_claude_runs_inside_a_shell_session() {
 /// zcodex (the codex-rs build this repo's sibling sessions run) must detect
 /// as codex, not an undetected shell: the `z` lead means the codex
 /// whole-word rule can never fire, so without a zcodex rule every zcodex
-/// session on the box reported `agent: null`. Zcodex is a codex variant
-/// (`config::engine_family` maps the engine onto codex), so the wire kind is
-/// the codex one.
+/// session on the box reported `agent: null`. Zcodex ships no built-in
+/// engine -- it is one box's setup -- so the test defines the variation the
+/// way a real installation does, through the config file (`profile_variants`
+/// derives the `zcodex` token from the profile), and the wire kind is the
+/// codex one (`config::engine_family` maps the engine onto codex). The
+/// detected profile rides along as `agent_profile`.
 #[test]
 fn a_fake_zcodex_inside_a_shell_session_reports_the_codex_kind() {
     assert!(
@@ -316,6 +319,17 @@ fn a_fake_zcodex_inside_a_shell_session_reports_the_codex_kind() {
     let ready = harness.workspace.path().join("zcodex.ready");
     let sentinel = harness.workspace.path().join("zcodex.keep-running");
     fs::write(&sentinel, b"run").expect("write sentinel");
+
+    // The variation exists only because this config declares it -- the same
+    // shape the README's worked example documents for the real fork.
+    fs::write(
+        &harness.config,
+        format!(
+            "[profiles.zcodex]\nengine = \"codex\"\nexecutable = \"{}\"\n",
+            script.display()
+        ),
+    )
+    .expect("write harness config with the zcodex profile");
 
     let home = format!("HOME={workspace}");
     let stdout = harness.run_ok(
@@ -362,6 +376,15 @@ fn a_fake_zcodex_inside_a_shell_session_reports_the_codex_kind() {
     );
     assert_eq!(harness.snapshot_agent(&id), Value::String("codex".into()));
     assert_eq!(harness.status_agent(&id), Value::String("codex".into()));
+    // The variation is attributed to the config-declared profile on every
+    // surface that reports the agent.
+    let row = harness.list_row(&id);
+    assert_eq!(row["agent_profile"], Value::String("zcodex".into()));
+    let status: Value = serde_json::from_str(
+        &harness.run_ok(&["status", &id, "--json"], Duration::from_secs(10)),
+    )
+    .expect("status JSON");
+    assert_eq!(status["agent_profile"], Value::String("zcodex".into()));
 
     harness.run_ok(
         &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],

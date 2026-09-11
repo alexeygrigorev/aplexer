@@ -8,10 +8,13 @@ use super::{Config, EngineConfig, ShortcutConfig};
 /// Transcript-family normalization: a variant engine -- a fork of a built-in
 /// engine CLI with the same wire format and the same native conversation-log
 /// location -- is identified with that engine's family for parsing, while
-/// sessions and emitted events keep the variant's own id. `zcodex` is a
-/// codex-rs fork (same `-c` overrides, same rollout JSONL under
-/// `CODEX_HOME`/`~/.codex`), so it rides the codex machinery; everything
-/// else is its own family.
+/// sessions and emitted events keep the variant's own id. `zcodex` (a
+/// codex-rs fork: same `-c` overrides, same rollout JSONL under
+/// `CODEX_HOME`/`~/.codex`) is the one shipped alias, so a user config that
+/// defines its own `zcodex` engine rides the codex machinery; everything
+/// else is its own family. aplexer ships no `zcodex` engine itself -- the
+/// fork is one box's setup, defined in that box's config file (README,
+/// "A real config").
 pub fn engine_family(engine: &str) -> &str {
     match engine {
         "zcodex" => "codex",
@@ -21,10 +24,10 @@ pub fn engine_family(engine: &str) -> &str {
 
 impl Config {
     /// The engines every installation gets, before user config extends or
-    /// overrides them. `zcodex` is a codex variant (see `engine_family`): a
-    /// codex-rs fork with the same CLI surface and the same rollout log, so
-    /// its launch spec mirrors codex's exactly, with the fork's own binary
-    /// name. `opencode` is the PocketShell built-in
+    /// overrides them. Variant engines (`zcodex`, a private claude wrapper)
+    /// are deliberately absent: they are one installation's config, not a
+    /// shared default -- define them in `[engines.*]` or `[profiles.*]`.
+    /// `opencode` is the PocketShell built-in
     /// (tools/pocketshell/src/pocketshell/engines.py ::builtin_manifests)
     /// that aplexer's engine set was missing -- required for aplexer to
     /// become authoritative for pocketshell's engine registry
@@ -44,7 +47,7 @@ impl Config {
         // LaunchSpecs. opencode has none there (permissions are config-driven
         // via opencode.json) and gemini is an aplexer-only extra with no
         // pocketshell source, so both stay empty.
-        let engines: [(&str, &[&str], &[&str]); 7] = [
+        let engines: [(&str, &[&str], &[&str]); 6] = [
             ("shell", &[shell.as_str(), "-l"], &[]),
             (
                 "codex",
@@ -52,11 +55,6 @@ impl Config {
                 &["--dangerously-bypass-approvals-and-sandbox"],
             ),
             ("claude", &["claude"], &["--dangerously-skip-permissions"]),
-            (
-                "zcodex",
-                &["zcodex", "-c", "check_for_update_on_startup=false"],
-                &["--dangerously-bypass-approvals-and-sandbox"],
-            ),
             ("gemini", &["gemini"], &[]),
             ("grok", &["grok"], &["--always-approve"]),
             ("opencode", &["opencode"], &[]),

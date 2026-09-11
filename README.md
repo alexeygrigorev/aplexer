@@ -69,7 +69,13 @@ carries `agent`: which coding agent (`claude`, `codex`, `opencode`, `grok`, or
 query time from the workload's descendant process tree rather than from
 configuration. A session is usually `engine: "shell"` with the agent started
 by hand inside it, so `engine` cannot answer that question; nothing is
-persisted, so the answer cannot go stale.
+persisted, so the answer cannot go stale. Alongside it, `agent_profile`
+names which of that agent's configured variations it is running as — a
+profile id (`zcodex`, `godex`, …) resolved from the agent process's own
+environment (`CODEX_HOME`/`CLAUDE_CONFIG_DIR`) or from a variation binary
+the config defines, or `"default"` for the engine's own config (`null`
+exactly when `agent` is). The TTY list shows the same fact as
+`codex/zcodex` in the engine column.
 
 **Reattach repaints the live screen, tmux-style.** The worker feeds every PTY byte through a terminal-state model continuously — attached or not — so `a attach` renders *the screen as it is right now* (cursor position, colors, alternate screen, bracketed paste and mouse modes, scroll margins) rather than replaying a tail of raw byte history. Reattaching to a running full-screen agent TUI puts it back exactly where the agent thinks it is, instead of leaving a stale cursor and a half-drawn frame, and the payload is a few hundred bytes to a few KB instead of a fixed 32 KB. `a attach --history-bytes N` is the escape hatch back to the old raw-tail replay (byte-exact scripted consumers, or seeding your terminal's native scrollback). See [docs/terminal-state-design.md](docs/terminal-state-design.md).
 
@@ -128,9 +134,6 @@ command = ["$SHELL", "-l"]   # resolved from $SHELL at load time, "/bin/sh" as a
 [engines.codex]
 command = ["codex", "-c", "check_for_update_on_startup=false"]
 
-[engines.zcodex]
-command = ["zcodex", "-c", "check_for_update_on_startup=false"]
-
 [engines.claude]
 command = ["claude"]
 
@@ -141,7 +144,7 @@ command = ["gemini"]
 command = ["grok"]
 ```
 
-Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703). `zcodex` is a codex variant — a codex-rs fork with the same CLI surface and the same rollout log (`CODEX_HOME`, defaulting to `~/.codex`) — so its builtin mirrors codex's and its conversation-log handling (`a transcript`, below) rides the codex machinery (`engine_family` in `src/lib.rs`), with sessions and emitted events keeping the `zcodex` engine id.
+Override or add an engine in your config file the same way. Codex's builtin already suppresses the startup update-check modal (the same flag PocketShell's host CLI has used since #703). **Variant engines are deliberately not built-ins**: a fork like `zcodex` — a codex-rs fork with the same CLI surface and the same rollout log (`CODEX_HOME`, defaulting to `~/.codex`) — is one installation's setup, not something every installation should ship. Define it in your config file (the worked example below does exactly that); aplexer only records that the engine id `zcodex` parses like codex (`engine_family` in `src/config/builtins.rs`), so its conversation-log handling (`a transcript`, below) rides the codex machinery while sessions and emitted events keep the `zcodex` engine id.
 
 Agent engine ids (every id except the literal `shell` engine) always add the
 built-in provider/cloud credential list to `env_unset`, preserving the
@@ -196,6 +199,8 @@ view for older clients: it is appended on the same checkpoints, compacted at
 twice the configured cap, and reduced to the exact tail on clean exit. New
 readers use the checksummed generations for crash recovery and dead capture.
 
+A profile can also swap the binary itself, not just the config dir: `executable` replaces only argv[0] of the engine's command, and `command`/`args` replace the whole argv — that is how a fork of an agent CLI becomes a first-class launch target (see the worked example below).
+
 Launch a profile explicitly with `a start --engine codex --profile zodex`, or from inside a workspace `a start --profile zodex` (the profile's own `engine` field fills in `--engine`).
 
 ### Shortcuts
@@ -236,6 +241,63 @@ Add your own the same way:
 engine = "codex"
 profile = "review"   # the [profiles.review] example above
 ```
+
+### A real config
+
+Everything above, working together on a machine that runs plain Codex/Claude plus a codex fork (`zcodex`) and Z.AI/Go-proxied sibling accounts (`~/.zodex`, `~/.godex`, `~/.zlaude`). This is a real `~/.config/aplexer/config.toml`, annotated:
+
+```toml
+# Pin absolute paths. Several engine binaries live under nvm's active node
+# version, which is only on PATH for INTERACTIVE shells (~/.bashrc sources
+# nvm below its non-interactive early-return guard). A client that drives
+# `a start` over non-interactive SSH has a minimal PATH, and a bare command
+# name silently fails with "not found". Pinning the resolved absolute path
+# makes engine launch independent of shell PATH sourcing entirely.
+[engines.codex]
+command = ["/home/alexey/.nvm/versions/node/v24.13.1/bin/codex", "-c", "check_for_update_on_startup=false"]
+skip_permissions_argv = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[engines.claude]
+command = ["/home/alexey/.nvm/versions/node/v24.13.1/bin/claude"]
+skip_permissions_argv = ["--dangerously-skip-permissions"]
+
+[engines.gemini]
+command = ["/home/alexey/.nvm/versions/node/v24.13.1/bin/gemini"]
+
+[engines.opencode]
+command = ["/home/alexey/.nvm/versions/node/v24.13.1/bin/opencode"]
+
+# A fork of codex is just another engine: same family (see engine_family
+# above), its own binary. Not a built-in -- this table is what makes it
+# exist on this machine.
+[engines.zcodex]
+command = ["/home/alexey/.local/bin/zcodex", "-c", "check_for_update_on_startup=false"]
+skip_permissions_argv = ["--dangerously-bypass-approvals-and-sandbox"]
+
+# The fork as a profile too: the plain codex engine with the fork's binary
+# and the fork's own CODEX_HOME, so `a start --profile zcodex` gets both.
+# (~/.zodex and ~/.godex need no entries -- auto-discovery derives their
+# profiles from the sibling dirs' marker files.)
+[profiles.zcodex]
+engine = "codex"
+executable = "/home/alexey/.local/bin/zcodex"
+
+[profiles.zcodex.env]
+CODEX_HOME = "/home/alexey/.zcodex"
+```
+
+With this file in place, detection needs no further configuration — `a list --json` reports what is actually running:
+
+```console
+$ a list --json | jq -r '.[] | [.tag, .agent, .agent_profile] | @tsv'
+refactoring   codex      zcodex     # fork binary, no env needed: the config's zcodex token matches
+ops2          codex      default    # plain codex
+db            codex      godex      # hand-launched with CODEX_HOME=~/.godex: named by the dir stem
+layout        claude     default    # plain claude
+wiki          opencode   default    # no profile env exists for opencode
+```
+
+A variation defined only in some *other* installation's config is detected there the same way — nothing variation-specific is hardcoded, so the same binary finds `zebra` on a machine whose config calls the fork `zebra`.
 
 Inspect effective discovery/resolution any time with `a engines`, `a profiles`, and `a doctor`.
 Configuration is strict: unknown keys, empty commands, dangling
