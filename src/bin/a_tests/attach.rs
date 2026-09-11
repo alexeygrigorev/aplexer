@@ -591,3 +591,29 @@ fn check_attachable_does_not_advise_killing_a_still_starting_session() {
     assert!(check_attachable(&ready).is_ok());
 }
 
+
+#[test]
+fn attach_handshake_treats_deadline_expiries_as_transient_and_nothing_else() {
+    // A worker busy past the control deadline -- a history fsync holding
+    // the hub lock a subscribe waits behind -- surfaces as a bare
+    // SO_RCVTIMEO WouldBlock, possibly under context layers. Those must be
+    // retryable, or every such stall reports "disconnect on attach".
+    assert!(is_deadline_expiry(&anyhow::Error::from(io::Error::from(
+        io::ErrorKind::WouldBlock
+    ))));
+    assert!(is_deadline_expiry(&anyhow::Error::from(io::Error::from(
+        io::ErrorKind::TimedOut
+    ))));
+    assert!(is_deadline_expiry(
+        &anyhow::Error::from(io::Error::from(io::ErrorKind::WouldBlock))
+            .context("set control response deadline")
+    ));
+    // A genuine answer must reach the user instead of being retried into.
+    assert!(!is_deadline_expiry(&anyhow::Error::msg("worker closed connection")));
+    assert!(!is_deadline_expiry(&anyhow::Error::from(io::Error::from(
+        io::ErrorKind::ConnectionRefused
+    ))));
+    // The handshake budget strictly exceeds the control budget: a plain
+    // RPC stays snappy while Attach waits out a busy disk.
+    assert!(ATTACH_HANDSHAKE_TIMEOUT > CONTROL_RPC_TIMEOUT);
+}

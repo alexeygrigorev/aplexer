@@ -6,6 +6,21 @@ pub(crate) const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 pub(crate) const CONTROL_RPC_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// The attach handshake's reply budget. Serving an `Attach` does disk-bound
+/// work on the worker -- and the hub lock every subscribe must wait behind
+/// is the same lock the periodic history flush holds across its fsync -- so
+/// on a busy or nearly-full disk the reply can legitimately outrun
+/// `CONTROL_RPC_TIMEOUT`. A client that gave up at 3s left the worker
+/// writing its handshake into a closed socket ("aplexer connection: Broken
+/// pipe" in worker.log) while the user saw the attach die: the recurring
+/// "disconnected on attach". `Kill` already needed the same escape hatch
+/// (`rpc_call_within`); the handshake gets a wider budget, and `establish`
+/// retries deadline expiries on top because they are transient by nature.
+#[cfg(not(test))]
+pub(crate) const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+pub(crate) const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(200);
+
 pub(crate) fn set_control_deadlines(stream: &UnixStream) -> Result<()> {
     stream
         .set_read_timeout(Some(CONTROL_RPC_TIMEOUT))
