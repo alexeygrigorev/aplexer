@@ -55,18 +55,28 @@
 //! - Gemini: same nested shape in `settings.json`, with Claude's `Stop`
 //!   spelled `AfterAgent` and `UserPromptSubmit` spelled `BeforeAgent`.
 //! - OpenCode: an owned plugin file in the global plugin dir, mapping
-//!   `session.idle` → `idle`, `permission.asked` / `session.error` →
-//!   `waiting`, `session.created` → `working`.
+//!   `session.status` (`busy`/`retry` → `working`, `idle` → `idle`) plus
+//!   legacy `session.idle` → `idle`, `permission.asked` / `session.error` →
+//!   `waiting`, `session.created` → `working`, and `tool.execute.before` →
+//!   `working` (a starting tool means back to work). `session.status` is
+//!   the authoritative signal — `session.idle` is deprecated — and it is
+//!   what covers new prompts in an existing session, which `session.created`
+//!   (once per session) does not.
 //!
 //! State vocabulary in every mapping is `a state-report`'s own
 //! (`idle`/`waiting`/`working`, matching PocketShell's
 //! Idle/WaitingForInput/Working one for one): a finished turn rests
 //! (`idle`), a permission prompt or error needs the user (`waiting`), a
 //! submitted prompt or (re)started session is back to work (`working`).
-//! There is deliberately no per-tool hook (e.g. `PreToolUse`): after an
-//! `idle` push goes stale the PTY-activity heuristic takes over again and
-//! reports `active` while the agent produces output, so the resume boundary
-//! needs no hook of its own.
+//! OpenCode is the one exception with a per-tool hook:
+//! `tool.execute.before` → `working`. Its `session.status idle` can fire
+//! mid-turn between think→tool steps, and `session.created` fires only once
+//! per session, so without a tool-start signal a mid-turn `idle` blip (or a
+//! second turn's work after the first turn's `idle`) had no follow-up push
+//! to correct it. The other engines need no such hook: after an `idle` push
+//! goes stale the PTY-activity heuristic takes over again and reports
+//! `active` while the agent produces output, so the resume boundary needs
+//! no hook of its own.
 //!
 //! Layout: this file holds the event tables, the hook command, and target
 //! resolution; `nested` merges into the shared nested-hooks JSON shape,

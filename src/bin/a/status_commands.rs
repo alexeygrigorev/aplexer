@@ -171,34 +171,22 @@ pub(crate) fn cmd_status(paths: &Paths, target: TargetArgs, json_output: bool) -
     Ok(())
 }
 
-/// The terminal rendering of `a status` -- task-first (tag and state lead;
-/// pids and sockets are evidence at the bottom), state qualified by its
-/// source, and exactly one next action chosen from lifecycle/reachability/
-/// containment evidence rather than a generic "try these commands" list.
-/// The redirected rendering above stays byte-identical to the pre-UX format.
-fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
-    let current = &status.current;
-    let raw = &status.raw;
-    let worker_reachable = status.worker_reachable;
-    let rpc_error = status.rpc_error.as_deref();
-    let history_persistence_error = status.history_persistence_error.as_deref();
-    let record_persistence_error = status.record_persistence_error.as_deref();
-    let now = now_ms();
-    let (mut state, mut source) = session_ui_state(current, now);
-    // A live worker that will not answer is its own condition -- more
-    // specific than any state the record could claim.
-    if current.worker_alive() && !worker_reachable {
-        state = "unreachable";
-        source = "lifecycle";
+/// The state the TTY status leads with, and where it came from. A live
+/// worker that will not answer is its own condition -- more specific than
+/// any state the record could claim.
+fn tty_state(status: &StatusData, now: u64) -> (&'static str, &'static str) {
+    let (state, source) = session_ui_state(&status.current, now);
+    if status.current.worker_alive() && !status.worker_reachable {
+        ("unreachable", "lifecycle")
+    } else {
+        (state, source)
     }
-    let color = color_enabled();
-    let short_id = current.id.to_string()[..8].to_string();
-    let workspace = display_workspace(
-        &current.workspace,
-        env::var_os("HOME").as_deref().map(Path::new),
-    );
-    let engine = engine_profile(current);
+}
 
+/// Tag and derived state lead; the lifecycle fallback line follows only
+/// when it disagrees with the headline state.
+fn print_status_headline(status: &StatusData, state: &str, source: &str, color: bool) {
+    let current = &status.current;
     let (glyph, glyph_color) = state_glyph(state);
     println!(
         "{}  {}",
@@ -220,8 +208,19 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
             paint(color, ANSI_DIM, &format!("lifecycle: {lifecycle}"))
         );
     }
+}
+
+/// Who this session is and what it runs: workspace, engine, detected
+/// agent, lineage, foreground command, last activity, launch command.
+fn print_status_identity(paths: &Paths, status: &StatusData, now: u64, color: bool) {
+    let current = &status.current;
+    let raw = &status.raw;
+    let workspace = display_workspace(
+        &current.workspace,
+        env::var_os("HOME").as_deref().map(Path::new),
+    );
     println!("  workspace   {workspace}");
-    println!("  engine      {engine}");
+    println!("  engine      {}", engine_profile(current));
     // Same display rule as the list and the attach status bar: the detected
     // agent gets its own line only when the declared engine doesn't already
     // name it (`api::record_detected`, the pair `a status --json` reports as
@@ -263,13 +262,20 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     );
+}
+
+/// The evidence lines: process identity and reachability, exit, errors,
+/// persistence failures, live cgroup stats.
+fn print_status_diagnostics(status: &StatusData) {
+    let current = &status.current;
+    let raw = &status.raw;
     println!(
         "  processes   worker {} ({}) · workload {}",
         current
             .worker_pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "—".to_string()),
-        if worker_reachable {
+        if status.worker_reachable {
             "reachable"
         } else {
             "unreachable"
@@ -288,13 +294,13 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
     if let Some(error) = current.error.as_deref() {
         println!("  error       {error}");
     }
-    if let Some(error) = rpc_error {
+    if let Some(error) = status.rpc_error.as_deref() {
         println!("  rpc         {error}");
     }
-    if let Some(error) = history_persistence_error {
+    if let Some(error) = status.history_persistence_error.as_deref() {
         println!("  history     {error}");
     }
-    if let Some(error) = record_persistence_error {
+    if let Some(error) = status.record_persistence_error.as_deref() {
         println!("  record      {error}");
     }
     if let Some(cgroup) = raw.get("cgroup") {
@@ -302,22 +308,25 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
             println!("  resources   {cgroup}");
         }
     }
-    println!();
+}
 
-    // One next action, chosen from the same evidence model `a doctor` uses:
-    // attach what is live, capture what is over, and get dead records out of
-    // the way by the cheapest safe route (`a prune` when the record is one
-    // it can reap, else `a kill` -- whose own refusal message is the right
-    // teacher for the rare uncontainable case). A live-but-unreachable
-    // worker gets a diagnosis pointer, not a destructive command.
+/// One next action, chosen from the same evidence model `a doctor` uses:
+/// attach what is live, capture what is over, and get dead records out of
+/// the way by the cheapest safe route (`a prune` when the record is one
+/// it can reap, else `a kill` -- whose own refusal message is the right
+/// teacher for the rare uncontainable case). A live-but-unreachable
+/// worker gets a diagnosis pointer, not a destructive command.
+fn print_status_next_actions(status: &StatusData, state: &str) {
+    let current = &status.current;
+    let short_id = current.id.to_string()[..8].to_string();
     let attachable = matches!(
         current.phase,
         Phase::Starting | Phase::Running | Phase::Exiting
     ) && current.worker_alive()
-        && worker_reachable;
+        && status.worker_reachable;
     if attachable {
         println!("Attach: a open {short_id}");
-        return Ok(());
+        return;
     }
     if matches!(current.phase, Phase::Exited | Phase::Failed) || state == "broken" {
         println!("Inspect output: a capture {short_id} --screen --plain");
@@ -328,8 +337,24 @@ fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
         } else {
             println!("Remove record:  a kill {short_id}");
         }
-    } else if !worker_reachable {
+    } else if !status.worker_reachable {
         println!("Diagnose:       a check");
     }
+}
+
+/// The terminal rendering of `a status` -- task-first (tag and state lead;
+/// pids and sockets are evidence at the bottom), state qualified by its
+/// source, and exactly one next action chosen from lifecycle/reachability/
+/// containment evidence rather than a generic "try these commands" list.
+/// The redirected rendering above stays byte-identical to the pre-UX format.
+fn cmd_status_tty(paths: &Paths, status: &StatusData) -> Result<()> {
+    let now = now_ms();
+    let (state, source) = tty_state(status, now);
+    let color = color_enabled();
+    print_status_headline(status, state, source, color);
+    print_status_identity(paths, status, now, color);
+    print_status_diagnostics(status);
+    println!();
+    print_status_next_actions(status, state);
     Ok(())
 }

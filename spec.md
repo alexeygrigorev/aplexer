@@ -1103,10 +1103,15 @@ Representative element (additional persisted fields may also be present):
 time (never persisted, so never stale), `null` when none is detectable.
 `agent_profile` names which of that agent's configured variations (profiles,
 section 9) it runs as, read from the agent process's own environment
-(`CODEX_HOME`/`CLAUDE_CONFIG_DIR`) or, failing that, from a variant binary
-name (`zcodex`); it is the profile id -- the config dir's stem, exactly how
-discovery registers profiles -- or `"default"` when the agent runs the
-engine's own config untouched, and `null` exactly when `agent` is.
+(`CODEX_HOME`/`CLAUDE_CONFIG_DIR`, per discovery's rule table) or, failing
+that, from a command token matching a configured variation -- a variant
+engine (`zcodex`) or any profile in the config, keyed by its id and its
+`executable`/`command` basename; it is the profile id -- the config dir's
+stem, exactly how discovery registers profiles -- or `"default"` when the
+agent runs the engine's own config untouched, and `null` exactly when
+`agent` is. Detection is config-driven, not hardcoded: a variation defined
+only in some installation's config file is detected there without a code
+change.
 
 `last_accessed_ms` is when a client last attached to the session's PTY
 (absent until the first attach, including on records written before the

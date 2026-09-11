@@ -9,6 +9,20 @@ use super::*;
 /// Render our OpenCode plugin. The `a` path is embedded as a JSON string
 /// literal (valid JS), and the plugin shells out via argv — no shell
 /// quoting issues — wrapped so hook failures never surface to the agent.
+///
+/// Event mapping:
+/// - `session.status` with `status.type: busy|retry` → `working`, `idle` → `idle`.
+///   This is the authoritative signal (`session.idle` is deprecated but still
+///   emitted for backward compatibility). It fires on every busy↔idle
+///   transition, including new prompts in an existing session — which
+///   `session.created` (once per session) does not cover. Without it, the
+///   first `idle` push stayed sticky for all later turns: "says idle but
+///   actually working".
+/// - `session.idle` → `idle` (compat for older servers that still emit it).
+/// - `permission.asked` / `session.error` → `waiting`.
+/// - `session.created` → `working` (initial session start).
+/// - `tool.execute.before` → `working` (a tool starting means back to work,
+///   correcting any micro-`idle` blip between think→tool steps).
 pub fn opencode_plugin_source(a_bin: &str) -> String {
     let a_json = serde_json::to_string(a_bin).unwrap_or_else(|_| "\"a\"".to_string());
     format!(
@@ -34,7 +48,15 @@ function report(state) {{
 export const AplexerStateReport = async () => {{
   return {{
     event: async ({{ event }}) => {{
-      if (event.type === "session.idle") {{
+      if (!event || typeof event.type !== "string") return;
+      if (event.type === "session.status") {{
+        const s = event.properties?.status?.type ?? event.properties?.status;
+        if (s === "busy" || s === "retry") {{
+          report("working");
+        }} else if (s === "idle") {{
+          report("idle");
+        }}
+      }} else if (event.type === "session.idle") {{
         report("idle");
       }} else if (event.type === "permission.asked") {{
         report("waiting");
@@ -43,6 +65,9 @@ export const AplexerStateReport = async () => {{
       }} else if (event.type === "session.created") {{
         report("working");
       }}
+    }},
+    "tool.execute.before": async () => {{
+      report("working");
     }},
   }};
 }};

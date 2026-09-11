@@ -21,20 +21,30 @@ fn load_config_text(text: &str) -> Result<Config> {
 }
 
 #[test]
-fn zcodex_is_a_built_in_codex_variant() {
+fn zcodex_is_not_a_builtin_but_still_a_codex_family_variant() {
+    // The codex-rs fork is one box's setup, not a shared default: no
+    // built-in engine ships for it...
     let config = load_config_text("").unwrap();
-    let zcodex = config
+    assert!(
+        !config.engines.contains_key("zcodex"),
+        "zcodex must not ship as a built-in engine; define it in user config"
+    );
+    // ... but a user config that defines the fork's engine rides the codex
+    // machinery for transcript parsing (`engine_family`), exactly as any
+    // same-wire-format variant should.
+    let defined = load_config_text(
+        r#"
+        [engines.zcodex]
+        command = ["/opt/dev-small/zcodex", "-c", "check_for_update_on_startup=false"]
+        skip_permissions_argv = ["--dangerously-bypass-approvals-and-sandbox"]
+        "#,
+    )
+    .unwrap();
+    let zcodex = defined
         .engines
         .get("zcodex")
-        .expect("built-in zcodex engine");
-    assert_eq!(
-        zcodex.command,
-        vec![
-            "zcodex".to_string(),
-            "-c".to_string(),
-            "check_for_update_on_startup=false".to_string(),
-        ]
-    );
+        .expect("user-defined zcodex engine");
+    assert_eq!(zcodex.command.len(), 3);
     assert_eq!(
         zcodex.skip_permissions_argv,
         vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
@@ -42,6 +52,58 @@ fn zcodex_is_a_built_in_codex_variant() {
     assert_eq!(engine_family("zcodex"), "codex");
     assert_eq!(engine_family("codex"), "codex");
     assert_eq!(engine_family("claude"), "claude");
+}
+
+/// Agent detection's variation tokens are derived from the loaded config
+/// (`agent_kind::profile_variants`), not hardcoded: a profile only some
+/// other installation defines is detected there without a code change.
+/// Asserts only box-independent keys -- discovery legitimately adds this
+/// HOME's own profiles on top.
+#[test]
+fn detection_variants_follow_user_config_variations() {
+    let config = load_config_text(
+        r#"
+        [profiles.acme]
+        engine = "codex"
+
+        [profiles.zteam]
+        engine = "claude"
+        executable = "zteam-bin"
+        "#,
+    )
+    .unwrap();
+    let variants = crate::agent_kind::profile_variants(&config);
+    // A user-defined variation of a known agent, keyed by the profile id...
+    assert_eq!(
+        variants.get("acme"),
+        Some(&(crate::agent_kind::AgentKind::Codex, "acme".to_owned()))
+    );
+    // ... and by the binary that profile launches ...
+    assert_eq!(
+        variants.get("zteam-bin"),
+        Some(&(crate::agent_kind::AgentKind::Claude, "zteam".to_owned()))
+    );
+    // Canonical agent commands are never variation tokens.
+    assert!(!variants.contains_key("codex"));
+    assert!(!variants.contains_key("claude"));
+}
+
+/// An engine-less profile resolves to the configured default engine -- the
+/// same resolution `Config::resolve` applies at launch -- so with an agent
+/// as the default it is a variation of that agent, and with the default
+/// `shell` it names no variation at all.
+#[test]
+fn detection_variant_engine_resolution_mirrors_launch_resolution() {
+    let agent_default =
+        load_config_text("default_engine = \"codex\"\n\n[profiles.side]\n").unwrap();
+    let variants = crate::agent_kind::profile_variants(&agent_default);
+    assert!(variants.contains_key("side"));
+
+    let shell_default = load_config_text("[profiles.side]\n").unwrap();
+    // The map still carries whatever discovery found on this HOME; what
+    // matters is that the engine-less profile under a shell default
+    // contributes nothing.
+    assert!(!crate::agent_kind::profile_variants(&shell_default).contains_key("side"));
 }
 
 /// `config_keep_exited` is a second reader of the same setting, chosen

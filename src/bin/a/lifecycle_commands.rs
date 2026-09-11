@@ -59,96 +59,130 @@ pub(crate) fn force_kill_stale_worker(record: &SessionRecord) -> Result<()> {
     signal_recorded_worker(record, libc::SIGKILL).context("force-kill unreachable worker")
 }
 
-pub(crate) fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
-    let record = resolve(paths, &args.target)?;
-    let signal = parse_signal(&args.signal)?;
-    let grace = kill_grace_duration(args.grace_ms)?;
-    let rpc = rpc_call_within(
-        &record,
-        Operation::Kill {
-            signal,
-            grace_ms: args.grace_ms,
-        },
-        None,
-        aplexer::api::kill_response_timeout(grace),
-    )
-    .map(|(_, result)| result);
-    if let Err(error) = rpc {
-        let worker_alive = record.worker_alive();
-        // A missing socket file, or a leftover socket with no listener
-        // (SIGKILL leaves the file; connect then fails with
-        // ConnectionRefused), proves an "alive" pid is unreachable. A
-        // mere RPC timeout/reset can be transient, so those still return.
-        let socket_missing = worker_alive && !record.socket_path.exists();
-        let stale_socket = error.chain().any(|cause| {
-            cause
-                .downcast_ref::<io::Error>()
-                .is_some_and(|cause| cause.kind() == io::ErrorKind::ConnectionRefused)
-        });
-        if worker_alive && !socket_missing && !stale_socket {
-            return Err(error);
-        }
-        if socket_missing || stale_socket {
-            preflight_broken_containment_recovery(&record)?;
-            force_kill_stale_worker(&record)?;
-            if record.containment_proven_empty() {
-                remove_session_state(paths, record.id)
-                    .with_context(|| format!("remove stale session {}", record.id))?;
-                eprintln!(
-                    "a: removed session {} after stopping unreachable worker pid {}",
-                    record.id,
-                    record.worker_pid.unwrap_or(0),
-                );
-                if json_output {
-                    println!("{}", json!({"id":record.id,"signal":signal}));
-                }
-                return Ok(());
-            }
-            recover_broken_containment(&record, signal, args.grace_ms)?;
-            mark_broken_workload_killed(paths, &record)?;
-            eprintln!(
-                "a: killed session {} (worker pid {} was unreachable; containment cleanup confirmed)",
-                record.id,
-                record.worker_pid.unwrap_or(0),
-            );
-            if json_output {
-                println!("{}", json!({"id":record.id,"signal":signal}));
-            }
-            return Ok(());
-        }
-        if !record.worker_finished() {
-            recover_broken_containment(&record, signal, args.grace_ms)?;
-            mark_broken_workload_killed(paths, &record)?;
-            // That finalization was client-side and deliberately kept the
-            // evidence for a broken workload; the worker is already gone,
-            // so there is no worker-side removal to wait for below.
-            if json_output {
-                println!(
-                    "{}",
-                    json!({"id":record.id,"signal":signal,"record_removed":false})
-                );
-            }
-            return Ok(());
-        }
-        if !record.containment_proven_empty() {
-            recover_broken_containment(&record, signal, args.grace_ms)?;
-        }
-        remove_session_state(paths, record.id)
-            .with_context(|| format!("remove finished session {}", record.id))?;
-        eprintln!("a: removed {} session {}", record.phase.name(), record.id);
-        if json_output {
-            println!(
-                "{}",
-                json!({"id":record.id,"signal":signal,"record_removed":true})
-            );
-        }
-        return Ok(());
+/// The kill RPC did not reach a working worker. Classify why, then take
+/// exactly one of four client-side paths: return transient failures, stop
+/// a provably-unreachable worker, finalize a broken workload, or remove a
+/// record whose worker already finished.
+fn handle_failed_kill_rpc(
+    paths: &Paths,
+    record: &SessionRecord,
+    error: anyhow::Error,
+    signal: i32,
+    grace_ms: u64,
+    json_output: bool,
+) -> Result<()> {
+    let worker_alive = record.worker_alive();
+    // A missing socket file, or a leftover socket with no listener
+    // (SIGKILL leaves the file; connect then fails with
+    // ConnectionRefused), proves an "alive" pid is unreachable. A
+    // mere RPC timeout/reset can be transient, so those still return.
+    let socket_missing = worker_alive && !record.socket_path.exists();
+    let stale_socket = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::ConnectionRefused)
+    });
+    if worker_alive && !socket_missing && !stale_socket {
+        return Err(error);
     }
-    // The RPC was accepted, so the worker removes the record itself during
-    // finalization. Give it a moment so `a kill` returns with the session
-    // already gone from `a list` (a client that kills-then-lists must never
-    // observe the exited corpse the old behavior left behind), and say so
-    // plainly on the two outcomes where the record is still there.
+    if socket_missing || stale_socket {
+        return stop_unreachable_worker(paths, record, signal, grace_ms, json_output);
+    }
+    if !record.worker_finished() {
+        return finalize_broken_workload(paths, record, signal, grace_ms, json_output);
+    }
+    remove_finished_record(paths, record, signal, grace_ms, json_output)
+}
+
+/// The worker pid is provably unreachable (socket gone or refusing):
+/// stop it directly, then either remove the state (containment already
+/// proven empty) or recover the containment client-side and mark the
+/// record as the evidence.
+fn stop_unreachable_worker(
+    paths: &Paths,
+    record: &SessionRecord,
+    signal: i32,
+    grace_ms: u64,
+    json_output: bool,
+) -> Result<()> {
+    preflight_broken_containment_recovery(record)?;
+    force_kill_stale_worker(record)?;
+    if record.containment_proven_empty() {
+        remove_session_state(paths, record.id)
+            .with_context(|| format!("remove stale session {}", record.id))?;
+        eprintln!(
+            "a: removed session {} after stopping unreachable worker pid {}",
+            record.id,
+            record.worker_pid.unwrap_or(0),
+        );
+    } else {
+        recover_broken_containment(record, signal, grace_ms)?;
+        mark_broken_workload_killed(paths, record)?;
+        eprintln!(
+            "a: killed session {} (worker pid {} was unreachable; containment cleanup confirmed)",
+            record.id,
+            record.worker_pid.unwrap_or(0),
+        );
+    }
+    if json_output {
+        println!("{}", json!({"id":record.id,"signal":signal}));
+    }
+    Ok(())
+}
+
+/// The worker is gone but never recorded the workload's exit: recover the
+/// containment client-side and mark the record Failed as evidence.
+fn finalize_broken_workload(
+    paths: &Paths,
+    record: &SessionRecord,
+    signal: i32,
+    grace_ms: u64,
+    json_output: bool,
+) -> Result<()> {
+    recover_broken_containment(record, signal, grace_ms)?;
+    mark_broken_workload_killed(paths, record)?;
+    // That finalization was client-side and deliberately kept the
+    // evidence for a broken workload; the worker is already gone,
+    // so there is no worker-side removal to wait for below.
+    if json_output {
+        println!(
+            "{}",
+            json!({"id":record.id,"signal":signal,"record_removed":false})
+        );
+    }
+    Ok(())
+}
+
+/// The record already says the worker finished: recover any missing
+/// containment proof, then remove the durable state.
+fn remove_finished_record(
+    paths: &Paths,
+    record: &SessionRecord,
+    signal: i32,
+    grace_ms: u64,
+    json_output: bool,
+) -> Result<()> {
+    if !record.containment_proven_empty() {
+        recover_broken_containment(record, signal, grace_ms)?;
+    }
+    remove_session_state(paths, record.id)
+        .with_context(|| format!("remove finished session {}", record.id))?;
+    eprintln!("a: removed {} session {}", record.phase.name(), record.id);
+    if json_output {
+        println!(
+            "{}",
+            json!({"id":record.id,"signal":signal,"record_removed":true})
+        );
+    }
+    Ok(())
+}
+
+/// The RPC was accepted, so the worker removes the record itself during
+/// finalization. Give it a moment so `a kill` returns with the session
+/// already gone from `a list` (a client that kills-then-lists must never
+/// observe the exited corpse the old behavior left behind), and say so
+/// plainly on the two outcomes where the record is still there.
+fn report_kill_outcome(paths: &Paths, record: &SessionRecord, signal: i32, json_output: bool) {
     let removed = wait_for_kill_record_removal(paths, record.id);
     match removed {
         KillRecordOutcome::Removed => {}
@@ -171,6 +205,26 @@ pub(crate) fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Resu
             })
         );
     }
+}
+
+pub(crate) fn cmd_kill(paths: &Paths, args: KillArgs, json_output: bool) -> Result<()> {
+    let record = resolve(paths, &args.target)?;
+    let signal = parse_signal(&args.signal)?;
+    let grace = kill_grace_duration(args.grace_ms)?;
+    let rpc = rpc_call_within(
+        &record,
+        Operation::Kill {
+            signal,
+            grace_ms: args.grace_ms,
+        },
+        None,
+        aplexer::api::kill_response_timeout(grace),
+    )
+    .map(|(_, result)| result);
+    if let Err(error) = rpc {
+        return handle_failed_kill_rpc(paths, &record, error, signal, args.grace_ms, json_output);
+    }
+    report_kill_outcome(paths, &record, signal, json_output);
     Ok(())
 }
 

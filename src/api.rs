@@ -30,7 +30,10 @@ use startup_containment::*;
 use startup_guard::*;
 use worker_reaper::*;
 
-use crate::agent_kind::{detect_agent_detailed, AgentKind, DetectedAgent, DEFAULT_PROC_ROOT};
+use crate::agent_kind::{
+    detect_agent_detailed, profile_variants, AgentKind, DetectedAgent, ProfileVariants,
+    DEFAULT_PROC_ROOT,
+};
 use crate::{
     atomic_write_json, canonical_workspace, cleanup_recorded_cgroup_until, command_exists,
     ensure_private_dir, ensure_sigchld_compatible_for_child_management, io_kind,
@@ -148,10 +151,32 @@ pub fn record_agent(record: &SessionRecord) -> Option<AgentKind> {
 /// (`agent_kind::DetectedAgent`) -- the `agent`/`agent_profile` pair the
 /// JSON surfaces report.
 pub fn record_detected(record: &SessionRecord) -> Option<DetectedAgent> {
+    record_detected_with(record, &default_profile_variants())
+}
+
+/// `record_detected` with the caller's [`profile_variants`] table -- for
+/// callers that already hold the config (`a list` detects one agent per
+/// row, so it builds the table once instead of per row).
+pub fn record_detected_with(
+    record: &SessionRecord,
+    variants: &ProfileVariants,
+) -> Option<DetectedAgent> {
     if !record.worker_phase_active() {
         return None;
     }
-    detect_agent_detailed(Path::new(DEFAULT_PROC_ROOT), record.workload_pid?)
+    detect_agent_detailed(Path::new(DEFAULT_PROC_ROOT), record.workload_pid?, variants)
+}
+
+/// The variant table for query-time callers with no config at hand:
+/// discovered default paths, and empty variants (canonical agents only)
+/// when either discovery or the config load fails, so detection degrades
+/// instead of failing the whole command.
+fn default_profile_variants() -> ProfileVariants {
+    crate::Paths::discover()
+        .ok()
+        .and_then(|paths| Config::load(&paths).ok())
+        .map(|config| profile_variants(&config))
+        .unwrap_or_default()
 }
 
 pub fn snapshot_json(paths: &Paths, running: bool) -> Result<Value> {

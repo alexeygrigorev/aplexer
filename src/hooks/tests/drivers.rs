@@ -5,15 +5,22 @@ fn opencode_plugin_embeds_the_a_binary_and_maps_events() {
     let source = opencode_plugin_source(A_BIN);
     assert!(source.contains(A_BIN));
     for event in [
+        "session.status",
         "session.idle",
         "permission.asked",
         "session.error",
         "session.created",
+        "tool.execute.before",
     ] {
         assert!(source.contains(event), "missing {event}");
     }
     for state in ["idle", "waiting", "working"] {
         assert!(source.contains(state), "missing {state}");
+    }
+    // busy/retry (the session.status payload) must map back to work, or the
+    // first idle push stays sticky for all later turns in the same session.
+    for status in ["busy", "retry"] {
+        assert!(source.contains(status), "missing {status}");
     }
 }
 

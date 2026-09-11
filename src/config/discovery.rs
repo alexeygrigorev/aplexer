@@ -11,9 +11,13 @@ use crate::paths::home_dir;
 /// should absorb PocketShell's existing profile discovery concepts"), ported
 /// from PocketShell's `tools/pocketshell/src/pocketshell/profiles.py`.
 pub(crate) struct ProfileDiscoveryRule {
-    engine: &'static str,
-    env_var: &'static str,
-    default_dirname: &'static str,
+    pub(crate) engine: &'static str,
+    /// The profile-config environment variable the agent honours, and the
+    /// basename of its default config dir. `agent_kind`'s env-based profile
+    /// resolution reads exactly these two fields, so the detector and the
+    /// discoverer can never disagree about where a variation lives.
+    pub(crate) env_var: &'static str,
+    pub(crate) default_dirname: &'static str,
     markers: &'static [&'static str],
     hints: &'static [&'static str],
 }
