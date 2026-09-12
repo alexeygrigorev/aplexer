@@ -123,10 +123,12 @@ fn ctrl_b_r_redraws_without_forwarding() {
     assert_eq!(bytes(&actions), b"xy");
     assert_eq!(actions.len(), 3);
     assert!(matches!(actions[1], InputAction::Redraw));
-    // Capital R is not the chord -- tmux's refresh-client is lowercase.
+    // Capital R is its own chord now (rename this session), still distinct
+    // from lowercase r's redraw.
     let mut scanner = InputScanner::default();
     let actions = scanner.scan(&[0x02, b'R']);
-    assert_eq!(bytes(&actions), &[0x02, b'R']);
+    assert!(matches!(actions.as_slice(), [InputAction::Rename]));
+    assert!(bytes(&actions).is_empty());
 }
 
 fn bytes(actions: &[InputAction]) -> Vec<u8> {

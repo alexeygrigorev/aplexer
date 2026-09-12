@@ -127,6 +127,7 @@ pub(crate) fn attach(
         sync_deferred_since: Arc::new(Mutex::new(None)),
         scroll: scroll_mode.clone(),
         overlay: key_overlay.clone(),
+        prompt: Arc::new(Mutex::new(None)),
         mouse_owned: Arc::new(Mutex::new(None)),
         mouse_capture: status_enabled && input_tty && mouse_capture_enabled(),
     };

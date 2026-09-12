@@ -174,6 +174,26 @@ fn scan_ctrl_b_bracket_and_digits_survive_the_arrow_chords() {
     ));
 }
 
+/// `Ctrl-b R` (capital -- lowercase `r` stays "redraw") opens the rename
+/// prompt, split-proof like every other chord, and the pair stays distinct
+/// in both cases.
+#[test]
+fn scan_ctrl_b_capital_r_renames_lowercase_r_redraws() {
+    let mut s = InputScanner::default();
+    assert!(matches!(
+        s.scan(&[0x02, b'R']).as_slice(),
+        [InputAction::Rename]
+    ));
+    let mut split = InputScanner::default();
+    assert!(split.scan(&[0x02]).is_empty());
+    assert!(matches!(split.scan(b"R").as_slice(), [InputAction::Rename]));
+    let mut redraw = InputScanner::default();
+    assert!(matches!(
+        redraw.scan(&[0x02, b'r']).as_slice(),
+        [InputAction::Redraw]
+    ));
+}
+
 /// The keymap has exactly one definition; the three renderings are views
 /// of it. This is the guard on that: each must mention every bound key,
 /// and the table must still spell the bindings the scanner implements.
@@ -226,6 +246,7 @@ fn the_key_reference_is_generated_from_the_binding_table() {
             "1-9",
             "l",
             "r",
+            "R",
             "?"
         ]
     );

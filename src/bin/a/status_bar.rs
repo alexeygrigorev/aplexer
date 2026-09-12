@@ -73,6 +73,13 @@ pub(crate) struct StatusBarCtx {
     /// `scroll` is -- while a modal owns the host, the model keeps eating
     /// bytes and the terminal is written nothing.
     pub(crate) overlay: Arc<KeyOverlay>,
+    /// The `Ctrl-b R` rename prompt's current line, `Some` only while the
+    /// prompt owns the reserved row. Rendered by `status_bar_text` in
+    /// preference to everything else, so the status thread's periodic
+    /// redraws (which would otherwise repaint the tag over the prompt) keep
+    /// the prompt alive instead; the prompt's own edits just change the
+    /// string and force a redraw.
+    pub(crate) prompt: Arc<Mutex<Option<String>>>,
     /// Who currently owns mouse reporting on the host: `Some(true)` this
     /// client (so the wheel reaches `a`), `Some(false)` the workload,
     /// `None` nothing asserted yet. See `sync_client_mouse`.
@@ -132,6 +139,11 @@ pub(crate) const ATTACH_BINDINGS: &[AttachBinding] = &[
         description: "create another session in this workspace and switch to it",
     },
     AttachBinding {
+        keys: "s",
+        brief: Some("s sessions"),
+        description: "list this workspace's sessions; 1-9 attaches, Esc cancels",
+    },
+    AttachBinding {
         keys: "d",
         brief: Some("d detach"),
         description: "detach (the workload keeps running)",
@@ -160,6 +172,11 @@ pub(crate) const ATTACH_BINDINGS: &[AttachBinding] = &[
         keys: "r",
         brief: Some("r redraw"),
         description: "redraw the live screen (recover a garbled display)",
+    },
+    AttachBinding {
+        keys: "R",
+        brief: Some("R rename"),
+        description: "rename this session's tag (Enter confirms, Esc cancels)",
     },
     AttachBinding {
         keys: "?",
@@ -197,6 +214,12 @@ pub(crate) fn flash_status(ctx: &StatusBarCtx, message: impl Into<String>) {
 /// that keeps state and `^b ?` alive on even a few columns. Renders a flashed
 /// message instead of all of these while one is active (section 6.1).
 pub(crate) fn status_bar_text(ctx: &StatusBarCtx, cols: usize) -> String {
+    {
+        let prompt = ctx.prompt.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(line) = prompt.as_ref() {
+            return pad_or_truncate(&sanitize_terminal_text(line), cols);
+        }
+    }
     {
         let mut flash = ctx.flash.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((msg, at)) = flash.clone() {

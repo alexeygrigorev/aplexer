@@ -3,6 +3,7 @@ use clap::Parser;
 
 include!("attach.rs");
 include!("input.rs");
+include!("rename_prompt.rs");
 include!("scroll.rs");
 include!("status.rs");
 include!("switching.rs");

@@ -92,6 +92,7 @@ fn status_ctx_for_test(reserved: bool) -> StatusBarCtx {
         sync_deferred_since: Arc::new(Mutex::new(None)),
         scroll: Arc::new(ScrollMode::new()),
         overlay: Arc::new(KeyOverlay::default()),
+        prompt: Arc::new(Mutex::new(None)),
         mouse_owned: Arc::new(Mutex::new(None)),
         mouse_capture: false,
     }

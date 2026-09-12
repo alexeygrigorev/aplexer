@@ -70,6 +70,8 @@ mod list_tty;
 mod message_commands;
 #[path = "mouse.rs"]
 mod mouse;
+#[path = "rename_prompt.rs"]
+mod rename_prompt;
 #[path = "rpc.rs"]
 mod rpc;
 #[path = "rpc_connection.rs"]
@@ -122,6 +124,7 @@ pub(crate) use list_plain::*;
 pub(crate) use list_tty::*;
 pub(crate) use message_commands::*;
 pub(crate) use mouse::*;
+pub(crate) use rename_prompt::*;
 pub(crate) use rpc::*;
 pub(crate) use rpc_connection::*;
 pub(crate) use scroll::*;

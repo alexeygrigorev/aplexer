@@ -19,6 +19,16 @@ pub(crate) enum InputAction {
     /// Local, like Help -- the garbled cells are on this terminal, not in
     /// the session.
     Redraw,
+    /// `Ctrl-b R`: rename this session's tag. Local until Enter: the prompt
+    /// owns the reserved status-bar row and every keystroke it reads, then
+    /// the commit is one control RPC -- no byte reaches the workload.
+    Rename,
+    /// `Ctrl-b s`: the session picker. Local until a digit: a box over the
+    /// screen lists this workspace's sessions under the same 1-9 numbering
+    /// the status bar prints; 1-9 attaches (the ordinary switch path), Esc
+    /// cancels -- and until one of those arrives, no keystroke reaches the
+    /// workload.
+    Sessions,
     /// `Ctrl-b [`: open the scrollback pager (tmux's copy-mode chord). Local
     /// and, crucially, *consumed*: from here until the user leaves the mode,
     /// no keystroke reaches the workload.
@@ -128,13 +138,14 @@ impl InputScanner {
 
     /// Scan rules (docs/fast-session-switching-design.md section 5.1):
     /// `Ctrl-b d` detaches; `?` flashes the key reference; `r` redraws the
-    /// live screen; `[` opens the scrollback pager; `n` creates another
-    /// session in this workspace and switches to it; `Right`/`Left` move
-    /// between the sessions of this workspace and `Down`/`Up` between
-    /// workspaces; `N P l 1-9` switch. Anything else pending is "not a
-    /// real prefix" -- the withheld `Ctrl-b` byte is forwarded and the
-    /// current byte is reprocessed normally, so unbound `Ctrl-b` sequences
-    /// still pass through to the workload untouched.
+    /// live screen; `R` opens the rename prompt; `[` opens the scrollback
+    /// pager; `s` opens the session picker; `n` creates another session in
+    /// this workspace and switches to it; `Right`/`Left` move between the
+    /// sessions of this workspace and `Down`/`Up` between workspaces;
+    /// `N P l 1-9` switch. Anything else pending is "not a real prefix" --
+    /// the withheld `Ctrl-b` byte is forwarded and the current byte is
+    /// reprocessed normally, so unbound `Ctrl-b` sequences still pass
+    /// through to the workload untouched.
     pub(crate) fn scan(&mut self, buffer: &[u8]) -> Vec<InputAction> {
         let mut actions = Vec::new();
         let mut out: Vec<u8> = Vec::new();
@@ -203,6 +214,7 @@ impl InputScanner {
                     }
                     b'?' => Some(InputAction::Help),
                     b'r' => Some(InputAction::Redraw),
+                    b'R' => Some(InputAction::Rename),
                     b'[' => Some(InputAction::Scroll),
                     // The product ask, on the key the user asked for. Session
                     // navigation lives on the arrows (above), so `n` is free
@@ -211,6 +223,7 @@ impl InputScanner {
                     // and leaving it as a lone "previous" next to an `n` that
                     // creates would be a trap. It falls through untouched.
                     b'n' => Some(InputAction::Switch(SwitchTarget::New)),
+                    b's' => Some(InputAction::Sessions),
                     b'N' => Some(InputAction::Switch(SwitchTarget::NextGlobal)),
                     b'P' => Some(InputAction::Switch(SwitchTarget::PrevGlobal)),
                     b'l' => Some(InputAction::Switch(SwitchTarget::Last)),
