@@ -186,11 +186,17 @@ fn pump_output(
         let outcome = (|| -> Result<PumpOutcome> {
             let mut out = lock(&writer)?;
             match event {
-                OutputEvent::Data(data) => stall
-                    .write(&mut out, |out| {
-                        FrameTransfer::new(FrameKind::Data, &data)?.pump(out)
-                    })?
-                    .into_outcome(),
+                OutputEvent::Data(data) => {
+                    // One transfer per event, reused across every stall-guard
+                    // retry: building it inside the closure would restart the
+                    // frame after a partial write and duplicate the bytes the
+                    // peer already parsed (a desynced client dies with
+                    // "invalid protocol magic").
+                    let mut transfer = FrameTransfer::new(FrameKind::Data, &data)?;
+                    stall
+                        .write(&mut out, |out| transfer.pump(out))?
+                        .into_outcome()
+                }
                 OutputEvent::Layout(change) => {
                     // Old clients' serde_json::from_slice::<ServerEvent>
                     // would hard-fail on an unrecognized `event` tag --
@@ -205,27 +211,24 @@ fn pump_output(
                         margins_reset: change.margins_reset,
                         erase_reset: change.erase_reset,
                     })?;
+                    let mut transfer = FrameTransfer::new(FrameKind::Json, &payload)?;
                     stall
-                        .write(&mut out, |out| {
-                            FrameTransfer::new(FrameKind::Json, &payload)?.pump(out)
-                        })?
+                        .write(&mut out, |out| transfer.pump(out))?
                         .into_outcome()
                 }
                 OutputEvent::Exit(exit) => {
                     let payload = serde_json::to_vec(&ServerEvent::Exit { exit })?;
+                    let mut transfer = FrameTransfer::new(FrameKind::Json, &payload)?;
                     stall
-                        .write(&mut out, |out| {
-                            FrameTransfer::new(FrameKind::Json, &payload)?.pump(out)
-                        })?
+                        .write(&mut out, |out| transfer.pump(out))?
                         .into_outcome_terminal()
                 }
                 OutputEvent::Error(message) => {
                     let payload = serde_json::to_vec(&ServerEvent::Error { message })?;
+                    let mut transfer = FrameTransfer::new(FrameKind::Json, &payload)?;
                     stall
-                        .write(&mut out, |out| {
-                            FrameTransfer::new(FrameKind::Json, &payload)?.pump(out)
-                        })?
-                        .into_outcome_terminal()
+                        .write(&mut out, |out| transfer.pump(out))?
+                        .into_outcome()
                 }
             }
         })();
