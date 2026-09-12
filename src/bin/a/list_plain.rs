@@ -1,7 +1,14 @@
 use super::*;
 
 /// The redirected rendering of `a list` -- the pre-UX format, unchanged so
-/// piped/parsed output is stable across the UX work.
+/// piped/parsed output is stable across the UX work. One deliberate
+/// exception: the engine cell follows the same `engine_label` rule as every
+/// other human surface (TTY list, `a status`, the attach bar), so a shell
+/// session an agent was launched into says `codex/zcodex`, not `shell` --
+/// "shell" there is the absence of a choice, and pocketshell-created
+/// sessions are all born `engine: "shell"`. Machine-readable consumers
+/// keep the frozen contract via `a snapshot`/`list --json`, whose records
+/// carry both `engine` and the detected `agent` pair.
 pub(crate) fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     let mut records = list_records(paths)?;
     if args.running {
@@ -26,6 +33,19 @@ pub(crate) fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
     // are the literal numbers `a <N>` and `a <N> <M>` resolve against.
     let sort = load_list_sort(paths);
     let by_workspace = group_by_workspace(records, sort);
+    let agents = detect_row_agents(paths, &by_workspace);
+    // One engine width for the whole listing, floored at the historical
+    // fixed 16 so an all-shell registry renders byte-identical to before;
+    // only labels longer than that (`engine -> agent` overrides) widen it.
+    let engine_width = by_workspace
+        .iter()
+        .flat_map(|(_, group)| group.iter())
+        .map(|r| {
+            terminal_display_width(&engine_label(r, agents.get(&r.id).and_then(|d| d.as_ref())))
+        })
+        .max()
+        .unwrap_or(16)
+        .max(16);
     let home = env::var_os("HOME").map(PathBuf::from);
     let color = color_enabled();
     for (workspace_index, (workspace, group)) in by_workspace.iter().enumerate() {
@@ -60,7 +80,15 @@ pub(crate) fn cmd_list_plain(paths: &Paths, args: ListArgs) -> Result<()> {
             let connector = paint(color, ANSI_GRAY, connector_raw);
             let idx = paint(color, ANSI_DIM, &format!("{:>2}", i + 1));
             let tag = paint(color, ANSI_BOLD, &format!("{:<14}", r.tag));
-            let ep = paint(color, ANSI_DIM, &format!("{:<16}", engine_profile(r)));
+            let ep = paint(
+                color,
+                ANSI_DIM,
+                &format!(
+                    "{:<width$}",
+                    engine_label(r, agents.get(&r.id).and_then(|d| d.as_ref())),
+                    width = engine_width
+                ),
+            );
             let state = derived_liveness(&r.phase, alive_of(r), r.created_at_ms);
             let (sdot, scolor) = state_glyph(state);
             let state = paint(color, scolor, &format!("{sdot} {state}"));

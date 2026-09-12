@@ -104,7 +104,9 @@ fn print_empty_list(running: bool, hidden_exited: usize) {
 /// keep it a fraction of the /proc reads it is made of, with the same
 /// per-record answers as the serial order (each row's `agent` is
 /// independent of every other's).
-fn detect_row_agents(
+/// Crate-visible so `cmd_list_plain` labels its rows with the same
+/// `engine_label` rule instead of re-walking /proc serially per row.
+pub(crate) fn detect_row_agents(
     paths: &Paths,
     groups: &[(PathBuf, Vec<SessionRecord>)],
 ) -> BTreeMap<Uuid, Option<aplexer::agent_kind::DetectedAgent>> {

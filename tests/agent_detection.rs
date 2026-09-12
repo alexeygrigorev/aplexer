@@ -1,5 +1,7 @@
 //! End-to-end proof that `a list --json` / `a snapshot` / `a status --json`
-//! name the agent actually running inside a session.
+//! name the agent actually running inside a session -- and that the human
+//! plain `a list` tree (the rendering pocketshell's app shows) labels the
+//! row by the agent instead of the engine's `shell`.
 //!
 //! Every pocketshell session is `engine: "shell"` with the agent launched by
 //! hand inside it, so the answer cannot come from configuration -- it has to
@@ -134,6 +136,17 @@ impl Harness {
             "`a status --json` has no `agent` key: {value}"
         );
         value["agent"].clone()
+    }
+
+    /// The plain (piped, so uncolored) `a list` row for `tag` -- the human
+    /// tree rendering, not the JSON surface.
+    fn list_plain_line(&self, tag: &str) -> String {
+        let stdout = self.run_ok(&["list"], Duration::from_secs(10));
+        stdout
+            .lines()
+            .find(|line| line.contains(tag))
+            .unwrap_or_else(|| panic!("no `a list` row for tag {tag}: {stdout}"))
+            .to_owned()
     }
 }
 
@@ -286,6 +299,89 @@ fn agent_appears_and_clears_as_a_fake_claude_runs_inside_a_shell_session() {
     );
     assert_eq!(harness.snapshot_agent(&id), Value::Null);
     assert_eq!(harness.status_agent(&id), Value::Null);
+
+    harness.run_ok(
+        &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],
+        Duration::from_secs(15),
+    );
+}
+
+/// The acceptance scenario on the human surface: the piped `a list` tree --
+/// the rendering pocketshell's app displays -- must label a shell session
+/// by the agent living in it (`claude`), not by the engine's `shell`, and
+/// go back to `shell` when the agent exits. `engine: "shell"` is the
+/// absence of a choice; a row that says `shell` under a running agent is
+/// how pocketshell-created sessions vanished in the list.
+#[test]
+fn the_plain_human_list_labels_a_shell_session_by_its_agent() {
+    assert!(
+        Path::new("/bin/bash").exists(),
+        "/bin/bash is required by this test"
+    );
+    let harness = Harness::new();
+    let workspace = harness
+        .workspace
+        .path()
+        .to_str()
+        .expect("utf8 workspace")
+        .to_owned();
+    let script = write_fake_claude(harness.workspace.path());
+    let ready = harness.workspace.path().join("claude.ready");
+    let sentinel = harness.workspace.path().join("claude.keep-running");
+    fs::write(&sentinel, b"run").expect("write sentinel");
+
+    let home = format!("HOME={workspace}");
+    let stdout = harness.run_ok(
+        &[
+            "start",
+            "--workspace",
+            &workspace,
+            "--tag",
+            "plain-list",
+            "--env",
+            &home,
+            "--json",
+            "--",
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-l",
+        ],
+        Duration::from_secs(20),
+    );
+    let started: Value = serde_json::from_str(&stdout).expect("start JSON");
+    let id = started["id"].as_str().expect("session id").to_owned();
+
+    // A bare shell row says shell ...
+    let line = harness.list_plain_line("plain-list");
+    assert!(
+        line.contains("shell"),
+        "a bare shell row should say shell: {line}"
+    );
+
+    // ... and the same row says the agent's name once one is running.
+    let command = format!(
+        "/bin/sh {} {} {}",
+        script.display(),
+        ready.display(),
+        sentinel.display()
+    );
+    harness.run_ok(&["send", &id, &command, "--enter"], Duration::from_secs(10));
+    wait_for_file(&ready, "the fake claude to start inside the session");
+    wait_until(
+        || {
+            let line = harness.list_plain_line("plain-list");
+            line.contains("claude") && !line.contains("shell")
+        },
+        "the plain `a list` row to say claude while the agent runs",
+    );
+
+    // The agent exits; the shell shows through again.
+    fs::remove_file(&sentinel).expect("remove sentinel");
+    wait_until(
+        || harness.list_plain_line("plain-list").contains("shell"),
+        "the plain `a list` row to say shell again after the agent exits",
+    );
 
     harness.run_ok(
         &["kill", &id, "--signal", "TERM", "--grace-ms", "200"],
