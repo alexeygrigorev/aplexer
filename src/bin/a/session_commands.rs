@@ -448,19 +448,31 @@ pub(crate) fn cmd_send(paths: &Paths, mut args: SendArgs, json_output: bool) -> 
     Ok(())
 }
 
-/// Deletes a session's full on-disk state: the state dir holding
-/// `session.json` (the record itself), plus a best-effort cleanup of its
-/// runtime dir (control socket, worker lock -- already gone or about to be,
-/// in every caller). Takes the registry lock the same way `cmd_start`'s
-/// superseding logic does, to avoid racing a concurrent `a start` that
-/// might be reclaiming the same workspace+tag at the same moment. Shared by
-/// every `a kill` path that actually retires a session's record, so
-/// "removed" means the same thing everywhere instead of each call site
-/// growing its own slightly-different deletion routine.
+/// Retags a session (and optionally moves it to another workspace) via the
+/// worker's Rename RPC, so the registry, the state dir, and every concurrent
+/// `a start`'s supersede check stay consistent. With no SESSION argument it
+/// renames the session this command runs inside -- resolved through
+/// `APLEXER_SESSION_ID` like `a whoami` -- which is the CLI twin of the
+/// attach client's `Ctrl-b R` prompt.
 pub(crate) fn cmd_rename(paths: &Paths, args: RenameArgs, json_output: bool) -> Result<()> {
-    let old = resolve_record(paths, Some(&args.selector), None, None)?;
+    let old = match args.selector.as_deref() {
+        Some(selector) => resolve_record(paths, Some(selector), None, None)?,
+        None => {
+            let id = discover_session_id().ok_or_else(|| {
+                anyhow!(
+                    "no SESSION given and not inside an aplexer session \
+                     (APLEXER_SESSION_ID not set)"
+                )
+            })?;
+            read_record(&paths.record(id)).with_context(|| {
+                format!("session {id} (from APLEXER_SESSION_ID) has no persisted record")
+            })?
+        }
+    };
+    let tag = args
+        .tag
+        .ok_or_else(|| anyhow!("--tag is required when SESSION is omitted"))?;
     let workspace = canonical_workspace(args.workspace.as_deref().unwrap_or(&old.workspace))?;
-    let tag = args.tag.unwrap_or_else(|| old.tag.clone());
     validate_tag(&tag)?;
     let result = rpc_simple(&old, Operation::Rename { workspace, tag }, None)?;
     if json_output {

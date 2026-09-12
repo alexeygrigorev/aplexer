@@ -100,6 +100,7 @@ pub(crate) const PRUNE_EXAMPLES: &str = r#"Examples:
 "#;
 
 pub(crate) const RENAME_EXAMPLES: &str = r#"Examples:
+  a rename --tag docs              rename the session you are inside (APLEXER_SESSION_ID)
   a rename main --tag docs         retag "main" as "docs" in the current workspace
   a rename myrepo:main --tag docs  any session selector works
 "#;

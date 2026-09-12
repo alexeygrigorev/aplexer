@@ -310,9 +310,11 @@ pub(crate) struct TranscriptArgs {
 
 #[derive(Args)]
 pub(crate) struct RenameArgs {
-    /// Session to retag: UUID/prefix, workspace:tag, or tag in the current workspace
+    /// Session to retag: UUID/prefix, workspace:tag, or tag in the current
+    /// workspace. Omitted (with --tag given) renames the session this
+    /// command runs inside, via APLEXER_SESSION_ID.
     #[arg(value_name = "SESSION")]
-    pub(crate) selector: String,
+    pub(crate) selector: Option<String>,
     /// Workspace directory to resolve the selector in
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: Option<PathBuf>,
